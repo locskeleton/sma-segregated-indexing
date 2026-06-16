@@ -161,6 +161,70 @@ Tn (chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 
 ## 5. HIỆU SUẤT & PnL — TG1
 
+### 5.0 Phân biệt thuật ngữ (ĐỌC KỸ — các từ này chồng lấn nhau)
+
+7 thuật ngữ hay lẫn, thực ra chỉ chia **4 NHÓM bản chất**. Nắm nhóm là hết rối:
+
+| Nhóm | Thuật ngữ | Đơn vị | Phạm vi | Trả lời câu hỏi |
+|---|---|---|---|---|
+| **① TIỀN** (tuyệt đối) | **PnL** | VND | ngày / kỳ | "Lãi/lỗ bao nhiêu **ĐỒNG**?" |
+| **② % LỢI SUẤT** (tương đối) | **daily return** | % | **1 ngày** | "Hôm nay so hôm qua **±%**?" |
+| | **%return** | % | **1 kỳ** | "Cả kỳ lãi **bao nhiêu %**?" |
+| | **%PnL** | % | **1 kỳ** | (= %return — **CÙNG một thứ, tên khác**) |
+| **③ PHƯƠNG PHÁP** tính % | **TWR** | (ra %) | kỳ | "% kiểu **bỏ qua nạp/rút** (đo quỹ)" → **chính là %PnL của hệ** |
+| | **MWR** | (ra %) | kỳ | "% **tiền thật của KH**, có tính timing nạp/rút" → **KHÁC** (chưa làm, điểm E) |
+| **④ CÔNG CỤ** | **unit price** | VND/unit | mỗi ngày | "Cái **thước** để đo %" — KHÔNG phải con số lợi suất |
+
+#### Trực giác từng cái (analogy)
+
+- **PnL (tiền)** = "tao lãi **10 triệu đồng**" — số tiền thật, cộng được.
+- **daily return** = "**hôm nay +2%**" — lợi suất của riêng 1 ngày.
+- **%return = %PnL** = "**cả năm +15%**" — lợi suất gộp cả kỳ. Hai tên, một nghĩa.
+- **TWR** = điểm chấm **phong độ của quỹ** — không quan tâm KH bỏ nhiều hay ít tiền, lúc nào. → **đây chính là %PnL/%return ta đang dùng.**
+- **MWR** = lợi suất **cái ví của KH** — bỏ tiền đúng đáy thì cao, bỏ đúng đỉnh thì thấp. Phụ thuộc timing.
+- **unit price** = "giá 1 cổ phần ảo" — chỉ là **thước đo**; bản thân nó không phải "lợi suất" để hiển thị.
+
+#### Sơ đồ quan hệ
+
+```
+① PnL tiền/ngày ──(r_t = PnL_t/NAV đầu_t)──► ② daily return  (TWR 1 ngày)
+                                                   │ nhân dồn Π(1+r)
+                                                   ▼
+                                          ② %return = %PnL    (TWR cả kỳ)
+                                                   ▲
+                                          đo bằng ④ unit price (UP cuối/UP đầu − 1)
+
+   ③ %PnL của hệ = TWR.   TWR ≠ MWR (MWR = % tiền thật KH, phụ thuộc nạp/rút).
+```
+
+#### Quy tắc "muốn nói X → dùng từ Y"
+
+| Mày muốn diễn đạt... | Dùng từ |
+|---|---|
+| Lãi/lỗ bao nhiêu **tiền** | **PnL** (VND) |
+| Lãi bao nhiêu **%** trong 1 kỳ | **%PnL** = **%return** |
+| % của **riêng 1 ngày** | **daily return** |
+| Nhấn mạnh "% này **đã bỏ ảnh hưởng nạp/rút**, đo quỹ" | **TWR** (= %PnL của hệ) |
+| "% **tiền thật KH** lãi, có tính lúc nạp" | **MWR** (cái khác — chưa có) |
+| Cái thước/chỉ số nội bộ để tính | **unit price** |
+
+#### Một ví dụ — cùng 1 KH, cùng kỳ KT→ngày 7 (sample forward) cho ra cả 4 con số
+
+| Con số | Giá trị | Loại |
+|---|---|---|
+| **PnL** | **+10,250,000 đ** | ① tiền cả kỳ |
+| **daily return** ngày 6 | **+25%** | ② % của 1 ngày |
+| **%return = %PnL = TWR** | **+89.87%** | ② = ③ % cả kỳ (UP_7/UP_0 − 1) |
+| **MWR** (nếu tính) | **< 89.87%** | ③ vì KH nạp phần lớn tiền MUỘN, không hưởng cú tăng đầu |
+
+→ Cùng một KH một kỳ vẫn có nhiều "con số" hợp lệ khác nhau — **vì chúng trả lời câu hỏi khác nhau.**
+
+#### 3 bẫy hay mắc
+
+1. **PnL (tiền) ≠ %PnL.** Một cái là đồng, một cái là %. Đừng gọi lẫn.
+2. **%PnL cả kỳ ≠ Σ daily return.** Phải **nhân dồn** `(1+r)`, không cộng. (`+10% rồi +10% = +21%`, không phải 20%.)
+3. **%PnL (TWR) ≠ "tổng PnL tiền / vốn".** Cái sau bỏ compound + sai base, nó gần **MWR**, KHÔNG phải %PnL của hệ.
+
 ### 5.1 PnL (bằng TIỀN)
 
 | Khái niệm | Công thức |
