@@ -19,7 +19,8 @@
 > - **SI Index**: tính EOD-only, rebalance hiệu lực tại close; rebalance là execution → lệch SI vs index là tracking error hợp lệ. (§6)
 > - **"Lãi Infy" = cash-in** (tiền KH bơm vào). (§3)
 > - **D — CHỐT GIỮ NGUYÊN (PR, không đổi)**: danh mục mẫu (PR) vs VN-Index (PR) cùng cơ sở → đúng. Gap KH/SI (TR) vs benchmark (PR) **chấp nhận** vì user quen so với VN-Index. Known accepted artifact. (§7)
-> - Còn treo: **E** (TWR vs MWR hiển thị), **F** (accrue phí daily), chi tiết lô lẻ/độ trễ giải ngân. (§12)
+> - **E — CHỐT: implement CẢ TWR và MWR** (TWR = hiệu suất chiến lược + chart; MWR = "lợi suất của bạn", Modified Dietz). (§5.3, §5.4)
+> - Còn treo: **F** (accrue phí daily), chi tiết lô lẻ/độ trễ giải ngân. (§12)
 
 ---
 
@@ -172,7 +173,7 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 | | **%return** | % | **1 kỳ** | "Cả kỳ lãi **bao nhiêu %**?" |
 | | **%PnL** | % | **1 kỳ** | (= %return — **CÙNG một thứ, tên khác**) |
 | **③ PHƯƠNG PHÁP** tính % | **TWR** | (ra %) | kỳ | "% kiểu **bỏ qua nạp/rút** (đo quỹ)" → **chính là %PnL của hệ** |
-| | **MWR** | (ra %) | kỳ | "% **tiền thật của KH**, có tính timing nạp/rút" → **KHÁC** (chưa làm, điểm E) |
+| | **MWR** | (ra %) | kỳ | "% **tiền thật của KH**, có tính timing nạp/rút" → **KHÁC TWR** (đã chốt implement — §5.4) |
 | **④ CÔNG CỤ** | **unit price** | VND/unit | mỗi ngày | "Cái **thước** để đo %" — KHÔNG phải con số lợi suất |
 
 #### Trực giác từng cái (analogy)
@@ -205,7 +206,7 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 | Lãi bao nhiêu **%** trong 1 kỳ | **%PnL** = **%return** |
 | % của **riêng 1 ngày** | **daily return** |
 | Nhấn mạnh "% này **đã bỏ ảnh hưởng nạp/rút**, đo quỹ" | **TWR** (= %PnL của hệ) |
-| "% **tiền thật KH** lãi, có tính lúc nạp" | **MWR** (cái khác — chưa có) |
+| "% **tiền thật KH** lãi, có tính lúc nạp" | **MWR** (đã chốt implement — §5.4) |
 | Cái thước/chỉ số nội bộ để tính | **unit price** |
 
 #### Một ví dụ — cùng 1 KH, cùng kỳ KT→ngày 7 (sample BRD historic) cho ra cả 4 con số
@@ -243,15 +244,38 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 > ⚠️ **Nhất quán khung kỳ:** %PnL và PnL-tiền của cùng một nhãn kỳ phải dùng **cùng mốc bắt đầu**.
 > (File mẫu BRD bị lệch: %PnL lấy gốc cuối-ngày-3 nhưng PnL-tiền cộng cả ngày 3 — xem §14. Phải chốt: kỳ bắt đầu từ **cuối ngày trước** rồi áp đồng nhất cho cả hai.)
 
-### 5.3 TWR vs MWR — ⚠️ điểm E còn treo
+### 5.3 TWR vs MWR — ✅ điểm E CHỐT: implement CẢ HAI
 
-| | TWR (qua Unit Price) | MWR (IRR dòng tiền KH) |
+| | **TWR** (qua Unit Price) | **MWR** (money-weighted, dòng tiền KH) |
 |---|---|---|
-| Đo | Hiệu suất loại bỏ timing nạp tiền | Lợi suất tiền thật của KH |
-| Giống mọi KH? | Không (mỗi KH unit price riêng) | Không |
-| Chuẩn cho | "Fund/SI performance" | "Lợi suất cá nhân của bạn" |
+| Đo | Hiệu suất loại bỏ timing nạp/rút | Lợi suất **tiền thật** của KH |
+| Phụ thuộc timing CF? | ❌ Không | ✅ Có |
+| Dùng cho | "Hiệu suất chiến lược/SI" + **chart so benchmark FR-03** | **"Lợi suất của bạn"** (FR-01/02 headline KH) |
+| Công thức | `UnitPrice cuối/đầu − 1` (§5.2) | Modified Dietz (mặc định) / XIRR (chính xác) — §5.4 |
 
-> ⚠️ BRD hiển thị một con số % (TWR). KH SIP có thể hiểu nhầm vì TWR ≠ lợi suất tiền thật (MWR). Cần quyết hiển thị (E).
+> ✅ **Chốt E:** hiển thị **cả hai, gán nhãn rõ** — "Hiệu suất chiến lược" = TWR; "Lợi suất của bạn" = MWR. Tránh KH SIP hiểu nhầm.
+> ⚠️ Chart FR-03 (so benchmark) **bắt buộc dùng TWR** (mới so sánh công bằng). MWR chỉ cho con số cá nhân KH.
+
+### 5.4 MWR — công thức (per KH × SI, per range)
+
+**Modified Dietz** (mặc định — closed-form, không cần lặp, chuẩn GIPS cho money-weighted):
+```
+MWR(range) = (NAV_cuối − NAV_đầu − CF_ròng) / (NAV_đầu + Σ_i w_i · CF_i)
+
+  CF_ròng = Σ_i CF_i                  (tổng net flow trong kỳ)
+  CF_i    = net flow ngày t_i         (nạp +, rút −)
+  w_i     = (T − t_i) / T             (trọng số thời gian; t_i = số ngày từ đầu kỳ, T = độ dài kỳ)
+```
+- **Tử số** = `NAV_cuối − NAV_đầu − CF_ròng` = **PnL tiền cả kỳ** (lãi/lỗ thật).
+- **Mẫu số** = **vốn bình quân gia quyền thời gian** (vốn đầu kỳ + các flow tính theo thời gian nằm trong quỹ).
+
+**XIRR** (tùy chọn, chính xác — iterative): giải `r` sao cho
+```
+NAV_đầu·(1+r)^T + Σ_i CF_i·(1+r)^(T−t_i) = NAV_cuối
+```
+> Khuyến nghị: **Modified Dietz** cho hiển thị (robust, không lỗi hội tụ); XIRR cho sao kê chính xác nếu cần. Hiển thị **period return** (không annualize) để đồng bộ với TWR; annualize riêng nếu BO yêu cầu.
+
+**Inputs đều derive-on-read:** NAV 2 đầu mút + cashflow events (có ngày) trong range. Không cần bảng daily mới.
 
 ---
 
@@ -318,7 +342,8 @@ Index_t = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 | **Customer NAV** | SDI tính từ holdings + tiền của tiểu khoản (đã chuẩn hóa §2) |
 | **Customer Unit** | `Unit_(t-1) + CF_t / Customer Unit Price_(t-1)` (CF = nạp − rút của KH) |
 | **Customer Unit Price** | `Customer NAV_cuối / Customer Unit_t` (historic t-1, §4.1) |
-| **Customer %PnL** | TWR qua Customer Unit Price (⚠️ E: TWR vs MWR) |
+| **Customer %PnL (TWR)** | qua Customer Unit Price — "hiệu suất chiến lược" |
+| **Customer MWR** | Modified Dietz / XIRR — "lợi suất của bạn" (§5.4) |
 
 ### Hiệu suất SI tổng hợp (đường chart)
 
@@ -403,7 +428,7 @@ B9  Push sang Asset (snapshot, holding, performance, index, customer position)
 | — | Pooled vs Segregated | ✅ Chốt: **SMA segregated + gộp lệnh** (§9) |
 | — | Unit Price chung (plan §7) | ✅ Bỏ: dùng **per-KH** (§4.2, §8) |
 | **D** | TR (SI) vs PR (mẫu, VN-Index) | ✅ Chốt **GIỮ NGUYÊN (PR)** — mẫu vs VN-Index cùng cơ sở; gap KH-vs-benchmark chấp nhận vì UX (§7) |
-| **E** | TWR hiển thị như "% của KH" | ⚠️ Treo — tách TWR vs MWR (§5.3) |
+| **E** | TWR hiển thị như "% của KH" | ✅ Chốt: **implement CẢ TWR + MWR**, gán nhãn rõ (§5.3, §5.4) |
 | **F** | Phí quản lý cadence | ⚠️ **Treo — chốt sau.** Thu phí theo THÁNG tại ngày cố định (đã rõ). Cần chốt: (F1) phí tháng tính trên AUM snapshot ngày thu hay AUM bình quân ngày? (F2) SDI có accrue daily vào "phí phải trả" không? Khuyến nghị: **accrue daily + thu tháng** (NAV mượt, công bằng, khớp `NAV=tài sản−phí phải trả`) |
 | — | %PnL vs PnL-tiền lệch khung kỳ | ⚠️ Treo — thống nhất mốc kỳ (§5.2, §14) |
 
@@ -437,8 +462,9 @@ Unit Price_t    = NAV cuối_t / Unit_t
 # HIỆU SUẤT (TG1)
 PnL ngày        = NAV cuối − NAV đầu + NAV ra − NAV vào
 PnL cả kỳ       = Σ PnL ngày
-%PnL (TWR)      = (Unit Price cuối / Unit Price đầu − 1) × 100%   (cùng mốc kỳ với PnL tiền)
+%PnL (TWR)      = (Unit Price cuối / Unit Price đầu − 1) × 100%   (cùng mốc kỳ với PnL tiền) — "hiệu suất chiến lược"
 Daily return    = Unit Price_t / Unit Price_(t-1) − 1
+MWR (Mod.Dietz) = (NAV cuối − NAV đầu − CF_ròng) / (NAV đầu + Σ w_i·CF_i)   — "lợi suất của bạn"; w_i=(T−t_i)/T
 
 # SI TỔNG HỢP
 SI NAV          = Σ Customer NAV
@@ -543,7 +569,7 @@ File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nh�
 | %PnL = %return | period return (TWR) | `return_pct` | ② % cả kỳ = `unit_price` cuối/đầu − 1 |
 | daily return | daily return | `daily_return` | ② % 1 ngày = TWR 1 ngày |
 | TWR | time-weighted return | `twr` | = `return_pct` của hệ |
-| MWR | money-weighted return (IRR) | `mwr` | KHÁC TWR (chưa làm — điểm E) |
+| MWR | money-weighted return | `mwr` | ✅ implement; Modified Dietz mặc định, XIRR tùy chọn (§5.4) |
 
 ### 15.5 Index / benchmark (TG2)
 

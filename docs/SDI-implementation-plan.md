@@ -10,7 +10,7 @@
 
 ### Trong phạm vi (SDI)
 - Ingest: FO (tài sản/holdings), Market data (giá, VN-Index, corporate action), Danh mục mẫu (weights), Allocation (phân bổ khớp lệnh).
-- Tính: NAV per (KH×SI); Unit/Unit Price per KH (historic t-1, EOD); PnL; SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index PR).
+- Tính: NAV per (KH×SI); Unit/Unit Price per KH (historic t-1, EOD); PnL; **TWR + MWR** (E chốt cả hai); SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index PR).
 - Lưu: event-sourced ledger + chuỗi daily SI-level; derive customer-level on read.
 - Phục vụ: API cho Asset (nguồn duy nhất cho SMO) — FR-01…FR-06.
 - Batch EOD + khả năng recompute (replay).
@@ -153,7 +153,12 @@ Unit Price_t = NAV cuối_t / Unit_t
 # %PnL (TWR) — compound theo range, lấy 2 đầu mút
 %PnL(range) = UnitPrice[cuối]/UnitPrice[đầu] − 1        (cùng mốc với PnL tiền, #5)
 
-# MWR (#3) — IRR dòng tiền KH trong range → "lợi suất của bạn"
+# MWR (#3, E chốt implement) — "lợi suất của bạn", per KH×SI per range
+# Modified Dietz (mặc định):
+MWR(range) = (NAV_cuối − NAV_đầu − CF_ròng) / (NAV_đầu + Σ_i w_i·CF_i)
+   w_i = (T − t_i)/T   (t_i = ngày từ đầu kỳ; T = độ dài kỳ); tử = PnL tiền
+# XIRR (tùy chọn, chính xác): giải r: NAV_đầu·(1+r)^T + Σ CF_i·(1+r)^(T−t_i) = NAV_cuối
+# derive-on-read (NAV 2 đầu mút + cashflow events có ngày); hiển thị period (không annualize)
 
 # SI tổng hợp
 SI NAV = Σ Customer NAV ; SI Unit Price = SI NAV / Σ Customer Unit
@@ -194,7 +199,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | FR | API | Nguồn |
 |---|---|---|
 | FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_si_performance + derive customer NAV |
-| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + sdi_asset_snapshot |
+| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + **TWR (chiến lược) & MWR (lợi suất của bạn)** + sdi_asset_snapshot |
 | FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | sdi_si_performance (TR) + sdi_si_index (PR) + sdi_benchmark VN-Index (PR) — 2 đầu mút/range |
 | FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_customer_si |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_holding_daily (top20 + mã khác) |
@@ -233,6 +238,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 9. **Cổ tức**: phân biệt nguồn (holdings → income) vs KH nạp (cashflow) — KHÔNG tag nhầm (rủi ro thật của SMA).
 10. **%PnL vs PnL tiền** (#5): cùng mốc kỳ.
 11. **Cash sub-ledger typed** (O8): TỔNG tiền chỉ để tính NAV; **CF (unit) lấy từ event nhãn DEPOSIT/SIP/WITHDRAW**, income từ nhãn DIVIDEND/INTEREST, FR-06 từ components. KHÔNG decompose CF từ Δ tổng tiền. Reconcile: `Δ tổng tiền = Σ(nạp/rút) + Σ(cổ tức/lãi) + (bán − mua khớp)`.
+12. **MWR** (E): mẫu số Modified Dietz ≈ 0 (không vốn trong kỳ) → trả null/n.a., không chia 0. XIRR: đổi dấu nhiều lần / không hội tụ → fallback Modified Dietz. Hiển thị TWR & MWR **gán nhãn rõ** (chiến lược vs của bạn) tránh KH hiểu nhầm.
 
 ---
 
@@ -255,7 +261,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | # | Câu hỏi | Ảnh hưởng |
 |---|---|---|
 | ~~O1~~ | ~~**[D]** Benchmark TR/PR?~~ → ✅ **ĐÃ CHỐT: giữ VN-Index (PR)**, không dùng VN30TRI. Chấp nhận gap KH(TR)-vs-benchmark(PR) vì UX. | (đóng) |
-| O2 | **[E]** Hiển thị MWR cạnh TWR hay chỉ TWR (đặt nhãn)? | Công thức + UI |
+| ~~O2~~ | ~~**[E]** MWR cạnh TWR hay chỉ TWR?~~ → ✅ **ĐÃ CHỐT: implement CẢ HAI** (TWR=chiến lược/chart, MWR=lợi suất của bạn; Modified Dietz mặc định). §5.4 glossary, §4 plan. | (đóng) |
 | O3 | **[#7]** Danh mục mẫu có giữ tiền theo chiến lược không? | Công thức index |
 | ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance sang FO; FO gom lệnh + đẩy MP + allocate; SDI tiêu thụ execution feed.** (§9b) | (đóng) |
 | O5 | Lô lẻ: mua lô lẻ hay để dư tiền? | Cash drag, allocation |
