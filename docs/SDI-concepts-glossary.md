@@ -315,7 +315,9 @@ Index_t = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 
 ---
 
-## 7. BENCHMARK & so sánh (FR-03) — ⚠️ điểm D còn treo
+## 7. BENCHMARK & so sánh (FR-03) — ✅ điểm D đã chốt (giữ PR)
+
+> Công thức `%index` / `%vnindex` / `Hiệu suất SI` **đều đúng riêng lẻ**. "Lệch" KHÔNG ở công thức mà ở **cơ sở**: SI = **total return** (NAV đã ăn cổ tức), còn mẫu & VN-Index = **price return** (chỉ giá). Ví dụ thị trường đi ngang + cổ tức 3%: SI +3% nhưng benchmark 0% → SI nhỉnh ~mức cổ tức dù không có alpha. Mẫu (PR) vs VN-Index (PR) thì cùng cơ sở, không lệch. Đã chốt chấp nhận.
 
 | Đường | Nguồn | Phương pháp |
 |---|---|---|
