@@ -9,14 +9,14 @@
 ## 1. Mục tiêu & phạm vi
 
 ### Trong phạm vi (SDI)
-- Ingest: FO (tài sản/holdings + **execution feed** = kết quả khớp MP per TK), Market data (giá, VN-Index, corporate action), Danh mục mẫu (weights).
+- Ingest: FO (tài sản/holdings + **execution feed** = khớp MP per TK + **model_weight** = tỷ trọng mẫu FO tính), Market data (giá, VN-Index, corporate action).
 - Tính: NAV per (KH×SI); Unit/Unit Price per KH (historic t-1, EOD); PnL; **TWR + MWR** (E chốt cả hai); SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index PR).
 - Lưu: event-sourced ledger + chuỗi daily SI-level; derive customer-level on read.
 - Phục vụ: API cho Asset (nguồn duy nhất cho SMO) — FR-01…FR-06.
 - Batch EOD + khả năng recompute (replay).
 
 ### NGOÀI phạm vi (thuộc module khác)
-- **Sinh & khớp lệnh: thuộc FO** (đã chốt O4). Sau khi rebalance model, **SDI gửi yêu cầu rebalance sang FO**; **FO đặt lệnh MP trực tiếp trên TK từng KH** (KHÔNG gom + phân bổ → không có lô lẻ phân bổ, O5). Khớp → cổ phiếu; không khớp → tiền KH. SDI **chỉ tiêu thụ execution feed** từ FO.
+- **Tính tỷ trọng danh mục mẫu + sinh & khớp lệnh: thuộc FO** (đã chốt O4). **SDI chỉ gửi yêu cầu rebalance (trigger, KHÔNG chứa weights)**; **FO tính tỷ trọng mẫu + lên chiến lược + đặt lệnh MP trực tiếp trên TK từng KH** (KHÔNG gom/phân bổ → không có lô lẻ phân bổ, O5). Khớp → cổ phiếu; không khớp → tiền KH. FO **feed `model_weight` + `execution`** về SDI. SDI = **engine TÍNH thuần** (index + NAV/Unit/TWR/MWR), không quyết tỷ trọng, không khớp lệnh.
 - Tính toán tại SMO/Asset (cấm — chỉ đọc).
 
 ### Nguyên tắc
@@ -31,15 +31,14 @@
 
 ```
    BO ──┐
-   FO ──┤ (tài sản, holdings, tiền, phí, + EXECUTION FEED: kết quả khớp MP per tiểu khoản)
+   FO ──┤ (tài sản, holdings, tiền, phí; + MODEL_WEIGHT: tỷ trọng mẫu FO tính; + EXECUTION FEED: khớp MP per TK)
 Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA)
- Model ─┘ (danh mục mẫu: weights theo effective_date)
         │
         ▼
-┌─────────────────────────────┐         rebalance request
+┌─────────────────────────────┐    yêu cầu rebalance (trigger)
 │      SDI CALC ENGINE         │ ───────────────────────────►  FO
-│  B1 Sync → B2..B8 tính → B9  │   (FO đặt lệnh MP trực tiếp trên TK từng KH;
-│  Event ledger + Daily series │    khớp→CP / không→tiền → execution feed về SDI)
+│  B1 Sync → B2..B8 tính → B9  │   (FO TÍNH tỷ trọng mẫu + đặt lệnh MP trực tiếp
+│  Event ledger + Daily series │    trên TK từng KH; feed model_weight + execution về SDI)
 └─────────────────────────────┘
         │ push (B9)
         ▼
@@ -66,7 +65,7 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 | benchmark_id | BIGINT | FK → benchmark (VN-Index PR — #D giữ PR) |
 | model_holds_cash | BOOL | điểm #7 — danh mục mẫu có giữ tiền không |
 
-**`sdi_model_weight`** — danh mục mẫu (điểm #10), version theo ngày
+**`sdi_model_weight`** — danh mục mẫu (điểm #10), **FO tính & feed về** (ingest), version theo ngày
 | cột | kiểu | ghi chú |
 |---|---|---|
 | si_id, effective_date, ticker (PK) | | weights net **hiệu lực tại close** |
@@ -103,7 +102,7 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 | amount | BIGINT | (+) vào, (−) ra |
 | created_time | TIMESTAMP | |
 
-**`sdi_rebalance_request`** (request_id PK; si_id, business_date, model_effective_date, type ENUM(REBALANCE, DEPLOY, REDEEM), status) — **SDI → FO** (output). SDI gửi yêu cầu; FO đặt lệnh MP **trực tiếp trên TK từng KH** (không gom/phân bổ — O4).
+**`sdi_rebalance_request`** (request_id PK; si_id, business_date, type ENUM(REBALANCE, DEPLOY, REDEEM), status) — **SDI → FO**, chỉ là **TRIGGER (KHÔNG chứa weights)**. FO nhận → **tự tính tỷ trọng mẫu** + đặt lệnh MP trực tiếp trên TK KH (O4).
 **`sdi_execution_feed`** (exec_id PK; customer_id, si_id, ticker, side, qty, exec_price, business_date) — **FO → SDI** (ingest, source = FO). Kết quả khớp MP per tiểu khoản; giá MP là giá khớp thật trên sàn (biết sau khi khớp → EOD).
 **`sdi_customer_holding_event`** (event_id PK; customer_id, si_id, ticker, business_date, qty_delta, source ENUM(EXEC, CA, CLOSE)) — sổ cái lot, dựng từ execution feed + CA (derive holdings).
 
@@ -262,7 +261,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 |---|---|---|
 | ~~O1~~ | ~~**[D]** Benchmark TR/PR?~~ → ✅ **ĐÃ CHỐT: giữ VN-Index (PR)**, không dùng VN30TRI. Chấp nhận gap KH(TR)-vs-benchmark(PR) vì UX. | (đóng) |
 | ~~O2~~ | ~~**[E]** MWR cạnh TWR hay chỉ TWR?~~ → ✅ **ĐÃ CHỐT: implement CẢ HAI** (TWR=chiến lược/chart, MWR=lợi suất của bạn; Modified Dietz mặc định). §5.4 glossary, §4 plan. | (đóng) |
-| O3 | **[#7]** Danh mục mẫu có giữ tiền theo chiến lược không? | Công thức index |
+| O3 | **[#7]** Danh mục mẫu có giữ tiền không? → FO quyết (tính tỷ trọng). **SDI index đọc `model_weight` từ FO, xử lý cả 2** (có dòng CASH → `+w_cash×(1+r_cash)`; không → full CP). Chỉ cần FO xác nhận feed CÓ THỂ chứa dòng CASH + chốt `r_cash` (0 hay lãi suất) để test. | SDI robust 2 chiều |
 | ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance; FO đặt lệnh MP trực tiếp trên TK từng KH (không gom/phân bổ); SDI tiêu thụ execution feed.** (§9b) | (đóng) |
 | ~~O5~~ | ~~Lô lẻ: mua lô lẻ hay để dư tiền?~~ → ✅ **ĐÃ CHỐT: lệnh trực tiếp trên TK KH, không phân bổ → không có lô lẻ phân bổ; không khớp = tiền KH (cash drag tự phản ánh).** (§9b) | (đóng) |
 | O6 | Methodology ✅ **đã chốt** (phát unit tại ngày nộp + trade-date — §8 #4). Còn hỏi: **FO** nộp T→khớp T+? & cadence batch; **BO** clock từ ngày nộp hay ngày khớp (khuyến nghị: ngày nộp). | Cash drag, mốc hiệu suất |

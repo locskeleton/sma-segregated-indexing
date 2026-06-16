@@ -67,20 +67,22 @@ Có **2 thế giới song song**, đừng trộn lẫn:
 KH chuyển tiền vào tiểu khoản (theo SI)
         │
         ▼
-SDI rebalance model (weights mới)  ──yêu cầu rebalance──►  FO
-                                                            │ FO đặt lệnh MP TRỰC TIẾP trên
-                                                            │ TK từng KH (KHÔNG gom + phân bổ)
-                                                            │ khớp → cổ phiếu; không khớp → tiền KH
-        ┌──── execution feed (mã, KL, giá khớp MP) ◄────────┘
+SDI gửi YÊU CẦU rebalance (trigger)  ────────────►  FO
+                                                     │ FO TÍNH tỷ trọng danh mục mẫu
+                                                     │ FO lên chiến lược + đặt lệnh MP
+                                                     │ TRỰC TIẾP trên TK từng KH (không gom/phân bổ)
+                                                     │ khớp → cổ phiếu; không khớp → tiền KH
+        ┌── model_weight + execution feed ◄──────────┘
         ▼
 Tiền + cổ phiếu nằm THẬT trong tiểu khoản KH (KH là chủ sở hữu)
         │
         ▼
-SDI dựng holdings KH từ execution feed → tính NAV
+SDI dựng holdings KH + đọc model_weight → tính NAV + index
 ```
 
 - **Custody = segregated**: tài sản tách bạch theo tiểu khoản, KH sở hữu hợp pháp.
-- **Execution = trực tiếp trên TK từng KH, do FO làm** (O4): SDI gửi yêu cầu rebalance; **FO đặt lệnh MP trực tiếp trên tài khoản từng KH** — **KHÔNG gom rồi phân bổ** → **không có vấn đề phân bổ lô lẻ**. Khớp → cổ phiếu; không khớp → vẫn là tiền của KH. SDI **không sinh/khớp lệnh**, chỉ tiêu thụ execution feed.
+- **"Não" (tính tỷ trọng mẫu) + execution = FO** (O4): SDI **chỉ gửi yêu cầu rebalance (trigger)**; **FO tính tỷ trọng danh mục mẫu + lên chiến lược + đặt lệnh MP trực tiếp trên TK từng KH** (không gom/phân bổ → không có lô lẻ phân bổ). Khớp → cổ phiếu; không khớp → tiền KH. FO **feed `model_weight` + `execution`** về SDI.
+- **SDI = engine TÍNH thuần**: KHÔNG quyết tỷ trọng, KHÔNG sinh/khớp lệnh. Chỉ đọc `model_weight` (tính index) + `execution`/holdings (tính NAV/Unit/TWR/MWR).
 - → KHÔNG phải pooled fund (không có quỹ gộp sở hữu chung). Xem §9.
 
 ---
@@ -284,6 +286,7 @@ NAV_đầu·(1+r)^T + Σ_i CF_i·(1+r)^(T−t_i) = NAV_cuối
 
 > ⚠️ KHÔNG phải hiệu suất tiền thật của SI. Đây là **benchmark lý thuyết** của danh mục mẫu.
 > "Hiệu suất SI" (đường 1 chart) đến từ **Unit Price** (§4), không phải Index này.
+> **Nguồn weights:** `w_i` (và `w_cash` nếu có) lấy từ `model_weight` **do FO tính & feed về** — SDI chỉ đọc rồi tính index, KHÔNG tự quyết tỷ trọng.
 
 ### 6.1 Công thức
 
@@ -364,23 +367,27 @@ SI Unit Price = SI NAV / Σ Customer Unit   (asset-weighted, đại diện sản
 | Khía cạnh | Kết luận |
 |---|---|
 | Sở hữu | Segregated — tiền/CP thật trong tiểu khoản KH |
+| **Quyết cơ cấu (tỷ trọng mẫu)** | **FO** — SDI chỉ gửi yêu cầu (trigger), ingest `model_weight` |
 | Thực thi | FO đặt lệnh MP **trực tiếp trên TK từng KH** (không gom + phân bổ) → không có lô lẻ phân bổ |
+| **Vai trò SDI** | **Engine TÍNH thuần**: index (từ model_weight) + NAV/Unit/TWR/MWR (từ execution/holdings) |
 | NAV | SDI tính per (KH × SI); SI NAV = Σ KH |
 | Unit Price | **Per KH** (không chung) |
 | FR-06 | Per SI từ FO + NAV/phí do SDI tính |
 | Pháp lý | An toàn (tài sản KH tách bạch, đúng mô hình ủy thác CTCK) |
 
-### 9b. Ranh giới SDI ↔ FO khi rebalance/giải ngân (O4 đã chốt)
+### 9b. Ranh giới SDI ↔ FO (O4 đã chốt)
 
-Cầu nối TG2 (weights) → TG1 (tài khoản thật). **SDI KHÔNG sinh/khớp lệnh** — FO làm.
+**SDI = engine TÍNH thuần.** FO làm cả "não" (tỷ trọng mẫu) lẫn execution.
 
 | Thực thể | Chủ sở hữu | Vai trò |
 |---|---|---|
 | Đăng ký tham gia | SDI | KH đăng ký vào SI |
-| **Yêu cầu rebalance** | **SDI → FO** | SDI báo FO weights mới cần đạt |
+| **Yêu cầu rebalance (trigger)** | **SDI → FO** | Chỉ KÍCH HOẠT — **KHÔNG chứa weights** |
+| **Tính tỷ trọng danh mục mẫu** | **FO** | "Não" chiến lược (gồm cash nếu có) |
 | Đặt lệnh MP **trực tiếp trên TK từng KH** | **FO** | KHÔNG gom + phân bổ; khớp → CP, không khớp → tiền KH |
-| **Execution feed** | **FO → SDI** | Kết quả khớp MP per TK (mã, KL, giá khớp) |
-| Sổ cái holdings KH | SDI | Dựng từ execution feed + CA → mark-to-market NAV |
+| **`model_weight` feed** | **FO → SDI** | Cơ cấu mẫu FO đã tính → SDI dùng tính **index** |
+| **`execution` feed** | **FO → SDI** | Kết quả khớp MP per TK → SDI dùng tính **NAV** |
+| Sổ cái holdings KH + index + NAV/Unit/TWR/MWR | SDI | Tính toán & push Asset |
 
 > **Execution feed từ FO là nguồn bắt buộc** để tính NAV per KH (giá MP = giá khớp thật, biết EOD).
 > ✅ **Lô lẻ (O5) — giải quyết:** vì lệnh đặt trực tiếp trên TK KH (không phân bổ), **không có bài toán chia lô lẻ**. Phần không khớp/không mua đủ → **vẫn là tiền của KH** (cash drag), SDI phản ánh tự nhiên qua NAV. Không cần logic riêng.
