@@ -490,3 +490,105 @@ File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nh�
 → Hai ô khác mốc. Nhất quán phải là **một trong hai cặp**:
 - Từ **cuối ngày 3**: %PnL (forward) = 18,987/16,100−1 = **17.93%**, PnL tiền = **4,150,000**.
 - Từ **cuối ngày 2** (gồm ngày 3): %PnL = 18,987/15,000−1 = **26.58%**, PnL tiền = **5,250,000**.
+
+---
+
+## 15. QUY ƯỚC THUẬT NGỮ & ĐẶT TÊN CHUẨN (canonical — CODE PHẢI THEO)
+
+> Đây là **nguồn DUY NHẤT** cho tên biến/cột/field khi implement. Cột **`code`** = snake_case dùng trong DB/API/code.
+> Mục tiêu: một khái niệm = một tên, không lẫn VN/EN/viết tắt khác nhau giữa các module.
+
+### 15.1 Entity & cấu trúc
+
+| VN / BRD | English chuẩn | code | Nghĩa | Lưu ý chống lẫn |
+|---|---|---|---|---|
+| SI / SDI / DMUT / chỉ số | Strategy Investment | `si_id` | "Quỹ chỉ số" KH tham gia | **Entity dùng `si`**; `sdi_` chỉ là **prefix hệ thống**. KHÔNG dùng "strategy"/"dmut" trong code |
+| (mã hiển thị SDI01) | SI code | `si_code` | mã hiển thị | khác `si_id` (khóa số) |
+| Tiểu khoản | sub-account | `sub_account` (= `customer_id`+`si_id`) | đơn vị nhỏ nhất = (KH × SI) | 1 KH nhiều sub-account |
+| Khách hàng | customer | `customer_id` | | |
+| Danh mục mẫu | model portfolio | `model_weight` | rổ + tỷ trọng định nghĩa chiến lược | KHÁC holdings thật |
+| Holdings thực tế | holdings | `holding` | CP nắm thật | |
+| Rebalance | rebalance | `rebalance` | đổi tỷ trọng/cấu phần mẫu | |
+| Ngày làm việc | business date | `business_date` | đơn vị tính EOD | |
+
+### 15.2 Tài sản (asset)
+
+| VN / BRD | English | code | Lưu ý |
+|---|---|---|---|
+| Tổng tài sản | total assets | `total_asset` | = Tiền + Chứng khoán |
+| Giá trị chứng khoán | securities value | `stock_value` | Σ(KL × giá) |
+| Tiền (tổng) | cash | `cash` | **chỉ để tính NAV**; KHÔNG lấy Δ làm cashflow |
+| Tiền mặt | cash balance | `cash_balance` | |
+| Tiền bán chờ về | pending sell proceeds (T+) | `pending_sell` | |
+| Tiền mua chờ khớp | pending buy | `pending_buy` | |
+| Tiền chờ giải ngân | undeployed cash | `undeployed_cash` | gây cash drag |
+| Cổ tức tiền mặt | cash dividend | `cash_dividend` | **income, KHÔNG phải cash flow** |
+| Phí lưu ký | custody fee | `custody_fee` | nguồn FO |
+| Phí quản lý | management fee | `management_fee` | SDI accrue (điểm F) |
+| Phí phải trả | payable | `payable_fee` | NAV trừ cái này |
+| Phí phạt rút sớm | early redemption penalty | `early_withdrawal_penalty` | KHÔNG vào NAV in/out |
+| NAV / Tài sản ròng | net asset value | `nav` | = total_asset − payable_fee |
+| Sức mua | buying power | `buying_power` | FR-06 |
+| Tài sản có thể rút | withdrawable assets | `withdrawable_asset` | FR-06 (công thức phức tạp) |
+| Tổng vốn đầu tư | net invested capital | `net_invested_capital` | = cumulative net cash flow |
+
+### 15.3 Cash flow (4 tầng — luôn rõ tầng)
+
+| VN / BRD | English chuẩn | code | Tầng / Lưu ý |
+|---|---|---|---|
+| (loại) tiền KH bơm/rút | external cash flow | — | **category**; phân biệt income & trade |
+| Giao dịch nạp/rút | cash flow event | `cashflow_event` | **gross**, per giao dịch (ledger) |
+| NAV vào | external inflow / contribution | `cash_in` | nạp/SIP/lãi Infy |
+| NAV ra | external outflow / withdrawal | `cash_out` | rút |
+| (CF_t) | **net external cash flow** | `net_cashflow` | = `cash_in − cash_out`, **per (KH×SI), per ngày** — dùng trong công thức unit |
+| Cổ tức/lãi từ tài sản | investment income | `income` | **KHÔNG phải cash flow** → vào PnL |
+
+> Quy tắc: trong **công thức** luôn dùng `net_cashflow` (rõ "net"), KHÔNG viết trống "cashflow". `cash_in/cash_out` lấy từ **event có nhãn**, KHÔNG từ Δ`cash`.
+
+### 15.4 Unit & hiệu suất (xem §5.0 để phân biệt nghĩa)
+
+| VN / BRD | English | code | Lưu ý |
+|---|---|---|---|
+| Unit | unit (shares) | `unit` | **NUMERIC full precision**, không integer |
+| Unit Price | unit price (NAV/share) | `unit_price` | thước đo TWR; T0=10000 |
+| Delta Unit | unit change | `delta_unit` | = net_cashflow / unit_price (forward) |
+| PnL (tiền) | profit & loss | `pnl` / `daily_pnl` | ① TIỀN (VND) |
+| %PnL = %return | period return (TWR) | `return_pct` | ② % cả kỳ = `unit_price` cuối/đầu − 1 |
+| daily return | daily return | `daily_return` | ② % 1 ngày = TWR 1 ngày |
+| TWR | time-weighted return | `twr` | = `return_pct` của hệ |
+| MWR | money-weighted return (IRR) | `mwr` | KHÁC TWR (chưa làm — điểm E) |
+
+### 15.5 Index / benchmark (TG2)
+
+| VN / BRD | English | code | Lưu ý |
+|---|---|---|---|
+| SI Index (danh mục mẫu) | model index | `si_index` / `index_value` | **price return** (D giữ PR) |
+| Tỷ trọng mẫu | target weight | `target_weight` | Σ=100% (CP) |
+| Tỷ trọng holdings thật | weight | `weight` | trên tổng CP (FR-05) |
+| Giá tham chiếu | reference price | `ref_price` | close hôm trước |
+| Giá ref điều chỉnh quyền | adjusted reference price | `adjusted_ref_price` | khi có CA |
+| VN-Index | benchmark (price return) | `benchmark` / `index_value` | đường 3 FR-03 |
+| Giá đóng cửa | close price | `close_price` | |
+
+### 15.6 Phương pháp / khái niệm
+
+| VN | English | code/term | Lưu ý |
+|---|---|---|---|
+| Định giá cuối ngày (chốt EOD) | forward pricing | `forward_pricing` | ✅ chốt |
+| Định giá theo giá hôm qua | historic pricing | `historic_pricing` | ❌ deprecated |
+| Hạch toán ngày khớp | trade-date accounting | `trade_date_accounting` | ✅ |
+| Trích phí dồn ngày | accrual | `accrual` | điểm F |
+| Cản trở do tiền nhàn | cash drag | `cash_drag` | thật, per KH |
+| Sai lệch so benchmark | tracking error | `tracking_error` | hợp lệ |
+| Tài khoản riêng + gộp lệnh | separately managed account | `sma` | mô hình đã chốt |
+| Tách bạch / gộp chung | segregated / pooled | `segregated` / `pooled` | hệ = segregated |
+| Lợi suất giá / tổng | price / total return | `price_return` / `total_return` | hệ dùng PR cho benchmark |
+
+### 15.7 Quy tắc đặt tên & kiểu dữ liệu
+
+- **snake_case** theo cột `code` cho mọi DB column / API field / biến.
+- **Tiền**: `BIGINT` (VND). **Tỷ lệ/%/giá**: `NUMERIC`. **Unit**: `NUMERIC(38,10)` (full precision).
+- **Entity = `si`** (key `si_id`); `sdi_` chỉ là prefix bảng hệ thống.
+- **Trong công thức**: dùng `net_cashflow` (rõ "net"); `income` tách khỏi cash flow; `cash` (tổng) chỉ cho NAV.
+- **% lưu dạng thập phân** (`0.0733`), format `×100` ở tầng hiển thị.
+- Một khái niệm = một `code`; cấm dùng synonym khác nhau giữa các module.
