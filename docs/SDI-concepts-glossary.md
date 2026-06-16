@@ -479,8 +479,8 @@ Unit Price_t    = NAV cuối_t / Unit_t
 # HIỆU SUẤT (TG1)
 PnL ngày        = NAV cuối − NAV đầu + NAV ra − NAV vào
 PnL cả kỳ       = Σ PnL ngày
-%PnL (TWR)      = (Unit Price cuối / Unit Price đầu − 1) × 100%   (cùng mốc kỳ với PnL tiền) — "hiệu suất chiến lược"
-Daily return    = Unit Price_t / Unit Price_(t-1) − 1
+%PnL (TWR)      = UP[cuối kỳ, EOD] / UP[EOD ngày LIỀN TRƯỚC ngày đầu kỳ] − 1   (close-to-close, GỒM ngày đầu — O7)
+Daily return    = UP_t / UP_(t-1) − 1                              (đều là giá EOD; base = close hôm trước)
 MWR (Mod.Dietz) = (NAV cuối − NAV đầu − CF_ròng) / (NAV đầu + Σ w_i·CF_i)   — "lợi suất của bạn"; w_i=(T−t_i)/T
 
 # SI TỔNG HỢP
