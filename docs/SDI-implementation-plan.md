@@ -148,7 +148,7 @@ Unit Price_t = NAV cuối_t / Unit_t
 # hệ quả: net_cashflow = ΔUnit_t × Unit Price_(t-1)
 
 # %PnL (TWR) — compound theo range, lấy 2 đầu mút
-%PnL(range) = UnitPrice[cuối]/UnitPrice[đầu] − 1        (cùng mốc với PnL tiền, #5)
+%PnL(range) = UnitPrice[ngày_cuối] / UnitPrice[ngày giao dịch LIỀN TRƯỚC ngày_đầu] − 1   (O7: GỒM ngày đầu range; = nhân dồn daily return; cùng span với PnL tiền)
 
 # MWR (#3, E chốt implement) — "lợi suất của bạn", per KH×SI per range
 # Modified Dietz (mặc định):
@@ -233,7 +233,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 7. **KH/SI khởi tạo giữa range**: gốc = join_date / inception (BR-03.3).
 8. **SI CLOSED / KH rút hết**: ngừng phát unit, giữ lịch sử.
 9. **Cổ tức**: phân biệt nguồn (holdings → income) vs KH nạp (cashflow) — KHÔNG tag nhầm (rủi ro thật của SMA).
-10. **%PnL vs PnL tiền** (#5): cùng mốc kỳ.
+10. **%PnL vs PnL tiền** (O7 ✅): GỒM ngày đầu range — %PnL gốc = UP cuối ngày liền trước ngày đầu; PnL tiền = Σ từ ngày đầu. Cùng span (file mẫu trộn sai → sửa).
 11. **Cash sub-ledger typed** (O8): TỔNG tiền chỉ để tính NAV; **CF (unit) lấy từ event nhãn DEPOSIT/SIP/WITHDRAW**, income từ nhãn DIVIDEND/INTEREST, FR-06 từ components. KHÔNG decompose CF từ Δ tổng tiền. Reconcile: `Δ tổng tiền = Σ(nạp/rút) + Σ(cổ tức/lãi) + (bán − mua khớp)`.
 12. **MWR** (E): mẫu số Modified Dietz ≈ 0 (không vốn trong kỳ) → trả null/n.a., không chia 0. XIRR: đổi dấu nhiều lần / không hội tụ → fallback Modified Dietz. Hiển thị TWR & MWR **gán nhãn rõ** (chiến lược vs của bạn) tránh KH hiểu nhầm.
 
@@ -263,7 +263,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance; FO đặt lệnh MP trực tiếp trên TK từng KH (không gom/phân bổ); SDI tiêu thụ execution feed.** (§9b) | (đóng) |
 | ~~O5~~ | ~~Lô lẻ: mua lô lẻ hay để dư tiền?~~ → ✅ **ĐÃ CHỐT: lệnh trực tiếp trên TK KH, không phân bổ → không có lô lẻ phân bổ; không khớp = tiền KH (cash drag tự phản ánh).** (§9b) | (đóng) |
 | ~~O6~~ | ✅ **ĐÃ CHỐT toàn bộ**: phát unit tại ngày nộp + clock từ ngày nộp + trade-date (§8 #4). **Độ trễ nộp→khớp KHÔNG ảnh hưởng** (tiền chờ = cash 0%, ngày phẳng ×1.0) → không cần hỏi FO. | (đóng) |
-| O7 | **[#5]** Mốc kỳ chuẩn cho %PnL & PnL tiền (đầu/cuối ngày biên)? | Báo cáo |
+| ~~O7~~ | ~~**[#5]** Mốc kỳ %PnL & PnL tiền?~~ → ✅ **ĐÃ CHỐT: GỒM ngày đầu range** — %PnL = UP[cuối]/UP[liền trước ngày đầu]−1; PnL tiền = Σ từ ngày đầu; cùng span. File mẫu trộn sai (§14.2). | (đóng) |
 | ~~O8~~ | ~~Phân loại nguồn tiền — FO có gắn nhãn?~~ → ✅ **FO có nhãn ĐỦ.** Action: sửa công thức — TỔNG tiền chỉ tính NAV; **CF lấy từ event nhãn DEPOSIT/SIP/WITHDRAW, KHÔNG từ Δ tổng tiền**; giữ cash sub-ledger typed (§3 glossary, §8 #11). | (đóng, đã sửa công thức) |
 | O9 | **[F]** Phí quản lý: (F1) base = AUM snapshot ngày thu hay AUM bình quân ngày? (F2) accrue daily vào payable hay chỉ lump tại ngày thu? Thu theo tháng tại ngày cố định đã rõ. | NAV/unit price, công bằng mid-month |
 

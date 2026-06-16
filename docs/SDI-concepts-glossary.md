@@ -244,8 +244,14 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 | **Daily return** | `Unit Price_t / Unit Price_(t-1) − 1` |
 | **YTD** | từ 01/01 năm hiện tại |
 
-> ⚠️ **Nhất quán khung kỳ:** %PnL và PnL-tiền của cùng một nhãn kỳ phải dùng **cùng mốc bắt đầu**.
-> (File mẫu BRD bị lệch: %PnL lấy gốc cuối-ngày-3 nhưng PnL-tiền cộng cả ngày 3 — xem §14. Phải chốt: kỳ bắt đầu từ **cuối ngày trước** rồi áp đồng nhất cho cả hai.)
+> ✅ **O7 CHỐT — quy ước khung kỳ "GỒM ngày đầu range"** (chuẩn, = nhân dồn daily return của mọi ngày trong khoảng):
+> ```
+> Range [ngày_đầu .. ngày_cuối]:
+>   %PnL    = UP[ngày_cuối] / UP[ngày giao dịch LIỀN TRƯỚC ngày_đầu] − 1
+>   PnL tiền = Σ daily_pnl từ ngày_đầu → ngày_cuối
+> ```
+> Cả hai phủ **cùng span** (gồm ngày đầu). Telescoping: `%PnL = tích các daily return của mọi ngày trong range`.
+> ⚠️ **File mẫu SAI**: trộn %PnL=19.44% (bỏ daily return ngày 3) với PnL tiền=5,250,000 (gồm ngày 3) — xem §14.2. Theo quy ước chốt: range "ngày 3→7" → %PnL = **27.21%**, PnL tiền = **5,250,000** (cùng gồm ngày 3).
 
 ### 5.3 TWR vs MWR — ✅ điểm E CHỐT: implement CẢ HAI
 
@@ -441,7 +447,7 @@ B9  Push sang Asset (snapshot, holding, performance, index, customer position)
 | **D** | TR (SI) vs PR (mẫu, VN-Index) | ✅ Chốt **GIỮ NGUYÊN (PR)** — mẫu vs VN-Index cùng cơ sở; gap KH-vs-benchmark chấp nhận vì UX (§7) |
 | **E** | TWR hiển thị như "% của KH" | ✅ Chốt: **implement CẢ TWR + MWR**, gán nhãn rõ (§5.3, §5.4) |
 | **F** | Phí quản lý cadence | ⚠️ **Treo — chốt sau.** Thu phí theo THÁNG tại ngày cố định (đã rõ). Cần chốt: (F1) phí tháng tính trên AUM snapshot ngày thu hay AUM bình quân ngày? (F2) SDI có accrue daily vào "phí phải trả" không? Khuyến nghị: **accrue daily + thu tháng** (NAV mượt, công bằng, khớp `NAV=tài sản−phí phải trả`) |
-| — | %PnL vs PnL-tiền lệch khung kỳ | ⚠️ Treo — thống nhất mốc kỳ (§5.2, §14) |
+| **O7** | %PnL vs PnL-tiền lệch khung kỳ (file mẫu sai) | ✅ Chốt: quy ước **GỒM ngày đầu range** — %PnL gốc = UP cuối ngày liền trước; cả 2 cùng span (§5.2, §14.2) |
 
 ### Bảng dữ liệu còn THIẾU
 1. **Danh mục mẫu** (weights theo `effective_date`) — input SI Index.
@@ -509,11 +515,20 @@ Index_t         = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 - **Rounding:** Unit hiển thị 1,127 nhưng tính bằng **1,126.667** → bắt buộc **lưu full precision** (lưu integer → UP sai).
 - **Đặc tính historic (chấp nhận):** ngày có cashflow lớn, %UP (15,976/15,000−1 = 6.51%) ≠ %tiền (1.1M/15M = 7.33%) chênh nhẹ; **NAV/tiền vẫn đúng**.
 
-### 14.2 Lỗi khung kỳ trong file mẫu (cần thống nhất mốc — O7)
+### 14.2 Lỗi khung kỳ trong file mẫu — ✅ O7 đã chốt cách sửa
 
-File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nhưng `PnL tiền ngày 3→7 = 5,250,000` (cộng cả PnL ngày 3) → **khác mốc**. Nhất quán phải là **một trong hai cặp**:
-- Từ **cuối ngày 3**: %PnL = 19,082/15,976 − 1 = **19.44%**, PnL tiền (ngày 4–7) = **4,150,000**.
-- Từ **cuối ngày 2** (gồm ngày 3): %PnL = 19,082/15,000 − 1 = **27.21%**, PnL tiền (ngày 3–7) = **5,250,000**.
+**File mẫu SAI ở đây** (đã xác nhận): trộn 2 khoảng cho cùng nhãn "ngày 3→7":
+- `%PnL = 19.44%` = UP₇/UP₃ − 1 → **bỏ** daily return ngày 3 (gốc neo cuối ngày 3).
+- `PnL tiền = 5,250,000` = Σ PnL ngày 3–7 → **gồm** lãi ngày 3.
+→ Một bỏ một gồm ngày 3 → vênh.
+
+**Sửa theo O7 (gồm ngày đầu range):** gốc %PnL = UP cuối ngày **liền trước** ngày đầu range.
+```
+Range ngày 3→7  (gồm ngày 3):
+   %PnL    = UP₇/UP₂ − 1 = 19,082/15,000 − 1 = +27.21%   (= nhân dồn daily return ngày 3..7)
+   PnL tiền = Σ PnL ngày 3..7               = 5,250,000
+```
+→ Cùng span, khớp. (Nếu muốn BỎ ngày 3 thì cặp đúng phải là %PnL=19.44% + PnL tiền=4,150,000 — nhưng quy ước chốt là GỒM.)
 
 ---
 
