@@ -70,6 +70,27 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | **Filegroups** nóng/lạnh | partition năm hiện tại (SSD) vs archive (HDD) | chi phí + tốc độ |
 | **Resource Governor + MAXDOP** | giới hạn/đảm bảo tài nguyên batch | ổn định cửa sổ EOD |
 
+### 4.1 Cấu hình đặt ở cấp nào / ai thiết lập
+Hỗn hợp 3 cấp — KHÔNG phải tất cả khi tạo bảng:
+
+| Cấu hình | Cấp | Ai | Cách |
+|---|---|---|---|
+| MAXDOP, cost threshold | Instance / DB-scoped | DBA | `sp_configure` / `ALTER DATABASE SCOPED CONFIGURATION` / hint `OPTION(MAXDOP n)` |
+| Resource Governor | Instance | DBA | `CREATE RESOURCE POOL/WORKLOAD GROUP` |
+| Compatibility level 150+ | Database | DBA | `ALTER DATABASE SET COMPATIBILITY_LEVEL=150` |
+| RCSI | Database | DBA | `ALTER DATABASE SET READ_COMMITTED_SNAPSHOT ON` |
+| Filegroups nóng/lạnh | Database | DBA | `ALTER DATABASE ADD FILEGROUP/FILE` |
+| Memory-optimized filegroup | Database | DBA | `ALTER DATABASE ADD FILEGROUP … MEMORY_OPTIMIZED_DATA` |
+| Partition FUNCTION + SCHEME | DB-object (1 lần) | DBA + Dev | `CREATE PARTITION FUNCTION/SCHEME` |
+| Tạo bảng trên scheme | Object | **Dev** | `CREATE TABLE … ON ps_year(business_date)` |
+| Columnstore CCI/NCCI | Object | **Dev** | `CREATE [CLUSTERED] COLUMNSTORE INDEX` |
+| PAGE compression | Object | **Dev** | `WITH (DATA_COMPRESSION=PAGE)` |
+| Index thường | Object | **Dev** | DDL |
+| Memory-optimized table | Object (cần FG từ DBA) | **Dev** | `WITH (MEMORY_OPTIMIZED=ON)` |
+| Partition SWITCH/SPLIT/MERGE | Code (batch) | **Dev** | `ALTER TABLE … SWITCH` |
+
+→ **DBA lo hạ tầng 1 lần** (instance + database: RCSI, filegroups, compat, resource governor, partition function/scheme). **Dev viết trong DDL/batch** (columnstore, compression, index, tạo bảng trên scheme, partition switch). Partitioning = phối hợp DBA+Dev.
+
 ---
 
 ## 5. Pipeline EOD — set-based (không RBAR)
@@ -178,15 +199,25 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 
 ## 10. Lưu trữ & nén (ước tính)
 
-| Bảng | Dòng | Sau nén (ước) |
+> **Nén LÀM GIẢM dung lượng, không tăng** (CCI ~10×, PAGE ~2–4×). Mọi con số dưới là **sau nén**.
+
+### Thiết kế MẶC ĐỊNH (khuyến nghị — KHÔNG có bảng 2,5 tỷ)
+| Bảng | Dòng | Sau nén |
 |---|---|---|
 | position_state (rowstore PAGE) | 1M | ~vài trăm MB |
 | position_holding (rowstore + NCCI) | 20M | ~vài GB |
-| event ledger (CCI) | ~300M tổng | ~chục GB |
+| event ledger (CCI) | ~300M | ~chục GB |
 | SI-level daily (rowstore) | ~1M | ~nhỏ |
-| position_daily nếu bật (CCI) | 2,5 tỷ | ~100–300 GB |
+| **TỔNG mặc định** | | **~vài chục GB** ✅ |
 
-→ Không bật position_daily: tổng ~chục GB, rất gọn. Bật: thêm ~trăm GB (CCI nén) — vẫn trong tầm SQL Server, đặt phần lớn ở filegroup archive.
+Customer NAV lịch sử = **derive-on-read** → KHÔNG lưu → không có 2,5 tỷ dòng.
+
+### TÙY CHỌN (chỉ bật nếu đo thấy đọc chart chậm — KHÔNG mặc định)
+| Bảng | Dòng | Không nén | Sau nén CCI |
+|---|---|---|---|
+| position_daily | 2,5 tỷ | ~1–3 TB | ~100–300 GB |
+
+→ Bảng 2,5 tỷ là **phương án opt-in**; nén ~10× là thứ kéo nó từ TB về trăm GB (đặt ở filegroup archive). **Mặc định không tạo nó** → DB chỉ ~chục GB.
 
 ---
 
