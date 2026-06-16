@@ -2,7 +2,7 @@
 
 > Phạm vi: module **SDI** — engine tính tài sản, hiệu suất danh mục SI & từng khách hàng, cấp dữ liệu cho Asset → SMO.
 > Phiên bản: **v1.0** — 2026-06-15. Đi kèm: [SDI-concepts-glossary.md](./SDI-concepts-glossary.md) (khái niệm & công thức).
-> Mô hình đã chốt: **SMA — segregated custody + gộp lệnh**, hiệu suất **per (KH × SI)**, **forward pricing chốt EOD**, **event-sourced**.
+> Mô hình đã chốt: **SMA — segregated custody + gộp lệnh**, hiệu suất **per (KH × SI)**, **historic pricing (giá t-1) chốt EOD**, **event-sourced**.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### Trong phạm vi (SDI)
 - Ingest: FO (tài sản/holdings), Market data (giá, VN-Index, corporate action), Danh mục mẫu (weights), Allocation (phân bổ khớp lệnh).
-- Tính: NAV per (KH×SI); Unit/Unit Price per KH (forward, EOD); PnL; SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index/VN30TRI).
+- Tính: NAV per (KH×SI); Unit/Unit Price per KH (historic t-1, EOD); PnL; SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index PR).
 - Lưu: event-sourced ledger + chuỗi daily SI-level; derive customer-level on read.
 - Phục vụ: API cho Asset (nguồn duy nhất cho SMO) — FR-01…FR-06.
 - Batch EOD + khả năng recompute (replay).
@@ -63,7 +63,7 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 | status | ENUM(ACTIVE, CLOSED) | CLOSED không hiện (BR-01.3) |
 | inception_date | DATE | |
 | mgmt_fee_rate | NUMERIC | %/năm (mặc định, KH có thể override) |
-| benchmark_id | BIGINT | FK → benchmark (VN-Index / VN30TRI) |
+| benchmark_id | BIGINT | FK → benchmark (VN-Index PR — #D giữ PR) |
 | model_holds_cash | BOOL | điểm #7 — danh mục mẫu có giữ tiền không |
 
 **`sdi_model_weight`** — danh mục mẫu (điểm #10), version theo ngày
@@ -142,11 +142,13 @@ Mgmt fee          = thu THEO THÁNG tại ngày cố định    (#F TREO — ch�
 PnL ngày          = NAV cuối − NAV đầu + NAV ra − NAV vào
 Cổ tức            = income → vào Tiền (accrue ngày EX, #6), KHÔNG vào NAV vào
 
-# UNIT per KH — forward pricing, EOD (#1)
+# UNIT per KH — historic pricing (t-1), EOD (#B chốt: giá hôm trước)
 Unit Price_0=10000 ; Unit_0 = NAV_0/10000
 CF_t = NAV vào − NAV ra        # ⚠️ CHỈ từ event nhãn DEPOSIT/SIP/WITHDRAW (FO có nhãn); KHÔNG lấy Δ(tổng tiền) — cổ tức/bán CP không phải CF
-Unit Price_t = (NAV cuối_t − CF_t)/Unit_(t-1)
-ΔUnit_t = CF_t/Unit Price_t ; Unit_t = Unit_(t-1)+ΔUnit_t
+ΔUnit_t = CF_t / Unit Price_(t-1)              # giá HÔM TRƯỚC (historic)
+Unit_t = Unit_(t-1) + ΔUnit_t                  # lưu full precision
+Unit Price_t = NAV cuối_t / Unit_t
+# hệ quả: net_cashflow = ΔUnit_t × Unit Price_(t-1)
 
 # %PnL (TWR) — compound theo range, lấy 2 đầu mút
 %PnL(range) = UnitPrice[cuối]/UnitPrice[đầu] − 1        (cùng mốc với PnL tiền, #5)
@@ -173,9 +175,9 @@ B2  ÁP CORPORATE ACTION: cổ tức accrue ngày EX (#6); cập nhật holding 
 B3  DỰNG HOLDINGS per (KH×SI) từ lot events; mark-to-market = Σ(qty×close)
 B4  TÍNH NAV per (KH×SI): tài sản − phí phải trả; xử lý tiền pending [mgmt fee: #F treo — O9]
 B5  PnL ngày per KH
-B6  FORWARD UNIT (#1): gom CF ngày → UnitPrice_t=(NAV−CF)/Unit_(t-1) → ΔUnit, Unit (full precision) → ghi sdi_unit_ledger nếu có thay đổi
+B6  UNIT (historic #B): gom CF ngày → ΔUnit=CF/UnitPrice_(t-1) → Unit=Unit_(t-1)+ΔUnit (full) → UnitPrice_t=NAV/Unit → ghi sdi_unit_ledger nếu có thay đổi
 B7  SI TỔNG HỢP: SI NAV=ΣNAV, SI Unit=ΣUnit, SI Unit Price, daily_pnl/return → sdi_si_performance_daily
-B8  SI INDEX (#8) + BENCHMARK: Index_t theo weights net cuối ngày → sdi_si_index_daily; ingest VN-Index/VN30TRI (#2,#11)
+B8  SI INDEX (#8) + BENCHMARK: Index_t theo weights net cuối ngày → sdi_si_index_daily; ingest VN-Index PR (#11)
 B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, benchmark, unit_ledger
 ```
 
@@ -198,7 +200,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_holding_daily (top20 + mã khác) |
 | FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_asset_snapshot_daily |
 
-> ⚠️ FR-03 trả **3 đường cùng kỳ** (BR-03.4): SI (NAV per share), danh mục mẫu (index), VN-Index/VN30TRI. Mỗi đường = `(điểm cuối/điểm đầu −1)`.
+> ⚠️ FR-03 trả **3 đường cùng kỳ** (BR-03.4): SI (NAV per share, TR), danh mục mẫu (index, PR), VN-Index (PR). Mỗi đường = `(điểm cuối/điểm đầu −1)`.
 
 ---
 
@@ -223,7 +225,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 1. **Làm tròn unit**: lưu full precision; reconcile `SI Unit = Σ Customer Unit` (định nghĩa, không tính 2 đường).
 2. **Reconciliation FO** (#9): Σ lots per ticker (SDI) vs holdings thật FO → break detection.
 3. **Lô lẻ / cash drag** (⚠️ chốt): KH nhỏ không mua đủ rổ → dư tiền → cash drag thật, phản ánh qua NAV.
-4. **Độ trễ giải ngân** (O6 — methodology ✅ chốt): tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (forward); clock từ ngày nộp; cash drag nằm trong tiểu khoản KH (segregated, công bằng). **Trade-date accounting** (ghi nhận tại ngày khớp MP, không đợi settle T+2; tiền mua chờ khớp / bán chờ về ở cash sub-ledger). ⚠️ Độ lớn trễ + cadence = hỏi FO; clock-start = xác nhận BO.
+4. **Độ trễ giải ngân** (O6 — methodology ✅ chốt): tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock từ ngày nộp; cash drag nằm trong tiểu khoản KH (segregated, công bằng). **Trade-date accounting** (ghi nhận tại ngày khớp MP, không đợi settle T+2; tiền mua chờ khớp / bán chờ về ở cash sub-ledger). ⚠️ Độ lớn trễ + cadence = hỏi FO; clock-start = xác nhận BO.
 5. **Thiếu/đến trễ giá**: thiếu close → dùng giá liền trước, log; backfill → trigger recompute.
 6. **Ngày không giao dịch**: range lấy điểm liền trước.
 7. **KH/SI khởi tạo giữa range**: gốc = join_date / inception (BR-03.3).
@@ -240,11 +242,11 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 |---|---|---|
 | **P0** | Chốt open items §10 với BO/FO; finalize schema | — |
 | **P1** | Master + Market + Event ingest (B1); reconciliation FO | P0 |
-| **P2** | NAV + Forward Unit per KH (B2-B6); sdi_unit_ledger | P1 |
+| **P2** | NAV + Unit per KH (historic, B2-B6); sdi_unit_ledger | P1 |
 | **P3** | SI tổng hợp + SI Index + Benchmark (B7-B8) | P2 |
 | **P4** | Derive customer NAV/%, MWR (#3); API FR-01..06 (B9) | P3 |
 | **P5** | Recompute/replay, partition/archive, cache | P4 |
-| **P6** | Eval đối chiếu file mẫu (forward) + backtest 10 năm 1 SI | P5 |
+| **P6** | Eval đối chiếu file mẫu (historic, khớp ô) + backtest 10 năm 1 SI | P5 |
 
 ---
 

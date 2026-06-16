@@ -14,7 +14,7 @@
 > - **Mô hình = SMA**: segregated custody (tiền/CP nằm thật trong **tiểu khoản** KH) + thực thi gộp lệnh. KHÔNG phải pooled fund. (§1, §9)
 > - **Tiểu khoản = (KH × SI)**; một KH có nhiều tiểu khoản (tham gia nhiều SI cùng lúc). (§1)
 > - **Unit Price tính RIÊNG từng KH** từ NAV riêng + cashflow riêng — KHÔNG dùng SI Unit Price chung. (§4, §8) → đảo ngược plan §7.
-> - **Forward pricing, chốt 1 lần cuối ngày**: cashflow quy đổi unit tại giá đóng cửa của CHÍNH ngày đó (không phải hôm qua). (§4) → sửa point B.
+> - **Historic pricing, chốt 1 lần cuối ngày (point B)**: ΔUnit quy đổi tại **Unit Price ngày t-1** — giữ theo BRD gốc + file mẫu; `net_cashflow = ΔUnit × Unit Price_(t-1)`. (§4)
 > - **NAV do SDI engine TÍNH** (xử lý tiền pending + trừ phí), không đọc raw giá trị tiểu khoản. (§2)
 > - **SI Index**: tính EOD-only, rebalance hiệu lực tại close; rebalance là execution → lệch SI vs index là tracking error hợp lệ. (§6)
 > - **"Lãi Infy" = cash-in** (tiền KH bơm vào). (§3)
@@ -31,7 +31,7 @@ Có **2 thế giới song song**, đừng trộn lẫn:
 ┌─────────────────────────────────────────────────────────────────────┐
 │  THẾ GIỚI 1 — TIỀN THẬT (per Khách hàng × SI)                         │
 │  Tài sản thật trong tiểu khoản → NAV (SDI tính) → Unit / Unit Price   │
-│  → Hiệu suất TỪNG KH (NAV-per-share, forward pricing, EOD)            │
+│  → Hiệu suất TỪNG KH (NAV-per-share, historic pricing t-1)            │
 └─────────────────────────────────────────────────────────────────────┘
                               ▲  so sánh trên cùng 1 chart (FR-03)
                               ▼
@@ -98,7 +98,7 @@ Thứ tự: **Giá trị thành phần → Tổng tài sản → NAV**.
 
 > ✅ **Chốt:** NAV dùng cho tính hiệu suất **do SDI engine TÍNH**, KHÔNG đọc thẳng "giá trị thô của tiểu khoản".
 > Lý do: giá trị thô trộn **tiền chờ giải ngân (chưa đầu tư), tiền mua chờ khớp, tiền bán chờ về (T+)**, và **phí quản lý AUM do SDI tính** (chưa có trong số FO). Engine phải chuẩn hóa rồi mới ra NAV.
-> ✅ **Chốt methodology (O6):** tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (forward); clock hiệu suất chạy từ ngày nộp. Mấy ngày chờ khớp → cash drag nằm trong tiểu khoản của **chính KH đó** (segregated → công bằng). **Trade-date accounting**: mua/bán ghi nhận tại ngày khớp (giá MP), tiền mua chờ khớp / bán chờ về tracked ở cash sub-ledger.
+> ✅ **Chốt methodology (O6):** tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock hiệu suất chạy từ ngày nộp. Mấy ngày chờ khớp → cash drag nằm trong tiểu khoản của **chính KH đó** (segregated → công bằng). **Trade-date accounting**: mua/bán ghi nhận tại ngày khớp (giá MP), tiền mua chờ khớp / bán chờ về tracked ở cash sub-ledger.
 > ⚠️ Còn hỏi: **FO** — nộp T → khớp T+? & cadence gom batch (độ lớn cash drag); **BO** — clock từ ngày nộp hay ngày khớp (khuyến nghị: ngày nộp).
 
 **FR-06 (báo cáo cấu phần tài sản)** — 3 nhóm: [A] Thông tin tài khoản (sức mua, tiền mặt/tài sản có thể rút, tiền mua CK, tiền bán chờ về, cổ tức tiền), [B] Tài sản thực tế (tiền, CK), [C] Khoản phải trả (phí phải trả). Vì tiểu khoản tách theo SI nên FR-06 per SI lấy từ FO hợp lý — nhưng cột NAV/phí cuối là **SDI tính**.
@@ -121,7 +121,7 @@ Thứ tự: **Giá trị thành phần → Tổng tài sản → NAV**.
 | Dùng vào | Lấy từ |
 |---|---|
 | NAV / Tổng tài sản | **Tổng tiền (gộp OK)** |
-| **CF (forward unit)** | **CHỈ event nhãn DEPOSIT/SIP/WITHDRAW** — không decompose từ tổng |
+| **CF (unit)** | **CHỈ event nhãn DEPOSIT/SIP/WITHDRAW** — không decompose từ tổng |
 | Income (cổ tức/lãi) | event nhãn DIVIDEND/INTEREST → vào NAV, KHÔNG vào CF → tự vào PnL |
 | FR-06 (sức mua, tài sản có thể rút) | **components typed** (chờ giải ngân, phong tỏa, mua chờ khớp, bán chờ về) |
 
@@ -133,21 +133,21 @@ Thứ tự: **Giá trị thành phần → Tổng tài sản → NAV**.
 
 Mỗi tiểu khoản (KH × SI) có **chuỗi NAV riêng, cashflow riêng → Unit & Unit Price RIÊNG**.
 
-### 4.1 Công thức chuẩn — Forward pricing, chốt 1 lần cuối ngày ✅
+### 4.1 Công thức chuẩn — Historic pricing (t-1), chốt 1 lần cuối ngày ✅
 
 ```
 T0:  Unit Price_0 = 10.000
      Unit_0       = NAV_0 / 10.000
 
-Tn (chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
-     Unit Price_t = (NAV_cuối_t − CF_t) / Unit_(t-1)      # giá EOD, ex-cash
-     ΔUnit_t      = CF_t / Unit Price_t                    # quy đổi tại giá NGÀY t
+Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
+     ΔUnit_t      = CF_t / Unit Price_(t-1)               # quy đổi tại giá NGÀY HÔM TRƯỚC
      Unit_t       = Unit_(t-1) + ΔUnit_t
-     (hệ quả: Unit Price_t = NAV_cuối_t / Unit_t — tự khớp)
+     Unit Price_t = NAV_cuối_t / Unit_t                   # giá EOD ngày t
 ```
 
-> ❌→✅ **Sửa point B:** BRD gốc quy đổi ΔUnit tại `Unit Price hôm qua (t-1)` (historic pricing) → bias hệ thống.
-> **Đã chốt forward pricing**: quy đổi tại giá đóng cửa ngày t. Khi đó `daily return = Unit Price_t/Unit Price_(t-1) − 1 = gain_t / NAV_đầu_t` = TWR sạch, **khớp với PnL tiền**.
+> ✅ **Chốt point B = HISTORIC pricing** (giá `t-1`) — **giữ theo BRD gốc + file mẫu**.
+> Hệ quả: `net_cashflow = ΔUnit × Unit Price_(t-1)` (nhất quán với cách phát unit).
+> ⚠️ %PnL hơi nhạy với cashflow trên ngày có nạp/rút (noise nhỏ ~±1pp), **NAV/tiền không đổi** — chấp nhận. (Forward pricing là lựa chọn thay thế đã cân nhắc nhưng KHÔNG dùng.)
 
 > ⚠️ **Implementation bắt buộc:** **Unit lưu full precision (thập phân)**, chỉ làm tròn khi hiển thị. Lưu integer → unit price drift sai. (Chứng minh: file mẫu hiển thị Unit=1,127 nhưng tính bằng 1,126.667 — xem §14.)
 
@@ -208,14 +208,14 @@ Tn (chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 | "% **tiền thật KH** lãi, có tính lúc nạp" | **MWR** (cái khác — chưa có) |
 | Cái thước/chỉ số nội bộ để tính | **unit price** |
 
-#### Một ví dụ — cùng 1 KH, cùng kỳ KT→ngày 7 (sample forward) cho ra cả 4 con số
+#### Một ví dụ — cùng 1 KH, cùng kỳ KT→ngày 7 (sample BRD historic) cho ra cả 4 con số
 
 | Con số | Giá trị | Loại |
 |---|---|---|
 | **PnL** | **+10,250,000 đ** | ① tiền cả kỳ |
 | **daily return** ngày 6 | **+25%** | ② % của 1 ngày |
-| **%return = %PnL = TWR** | **+89.87%** | ② = ③ % cả kỳ (UP_7/UP_0 − 1) |
-| **MWR** (nếu tính) | **< 89.87%** | ③ vì KH nạp phần lớn tiền MUỘN, không hưởng cú tăng đầu |
+| **%return = %PnL = TWR** | **+90.82%** | ② = ③ % cả kỳ (UP_7/UP_0 − 1 = 19,082/10,000−1) |
+| **MWR** (nếu tính) | **< 90.82%** | ③ vì KH nạp phần lớn tiền MUỘN, không hưởng cú tăng đầu |
 
 → Cùng một KH một kỳ vẫn có nhiều "con số" hợp lệ khác nhau — **vì chúng trả lời câu hỏi khác nhau.**
 
@@ -316,8 +316,8 @@ Index_t = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 | Khái niệm | Công thức |
 |---|---|
 | **Customer NAV** | SDI tính từ holdings + tiền của tiểu khoản (đã chuẩn hóa §2) |
-| **Customer Unit** | `Unit_(t-1) + CF_t / Customer Unit Price_t` (CF = nạp − rút của KH) |
-| **Customer Unit Price** | `(Customer NAV_cuối − CF) / Customer Unit_(t-1)` (forward, §4.1) |
+| **Customer Unit** | `Unit_(t-1) + CF_t / Customer Unit Price_(t-1)` (CF = nạp − rút của KH) |
+| **Customer Unit Price** | `Customer NAV_cuối / Customer Unit_t` (historic t-1, §4.1) |
 | **Customer %PnL** | TWR qua Customer Unit Price (⚠️ E: TWR vs MWR) |
 
 ### Hiệu suất SI tổng hợp (đường chart)
@@ -382,9 +382,9 @@ Giả định: 100 SI, KH active TB 5 SI, ~200.000 KH, 2.500 ngày.
 B1  Sync FO / ASSET / Market data
 B2  Tính NAV per (KH×SI)  (tài sản − phí; xử lý tiền pending; phí quản lý ACCRUE daily ⚠️ F)
 B3  PnL ngày = NAV cuối − đầu + ra − vào
-B4  Gom cashflow trong ngày (net CF)              ┐ forward pricing
-B5  Unit Price_t = (NAV cuối − CF)/Unit_(t-1)     │ chốt 1 lần EOD
-B6  ΔUnit, Unit (full precision)                  ┘ (§4.1)
+B4  Gom cashflow trong ngày (net CF)              ┐ historic pricing
+B5  ΔUnit = net CF / Unit Price_(t-1)             │ chốt 1 lần EOD
+B6  Unit = Unit_(t-1)+ΔUnit (full); UP_t = NAV/Unit ┘ (§4.1)
 B7  SI Unit Price tổng hợp = ΣNAV / ΣUnit
 B8  SI Index (EOD, weights net cuối ngày §6)
 B9  Push sang Asset (snapshot, holding, performance, index, customer position)
@@ -397,7 +397,7 @@ B9  Push sang Asset (snapshot, holding, performance, index, customer position)
 | Mã | Vấn đề | Trạng thái |
 |---|---|---|
 | **A** | Index khi rebalance | ✅ Chốt: EOD-only, hiệu lực tại close (§6.2) |
-| **B** | Định giá cashflow tại giá hôm qua | ✅ Chốt: **forward pricing, 1 lần EOD** (§4.1) |
+| **B** | Định giá ΔUnit | ✅ Chốt: **historic pricing (giá t-1), 1 lần EOD** — giữ theo BRD gốc + file mẫu (§4.1) |
 | **C** | "Lãi Infy" cash-in | ✅ Chốt: đúng là cash-in (§3) |
 | — | Unit lưu integer | ✅ Chốt: lưu **full precision** (§4.1) |
 | — | Pooled vs Segregated | ✅ Chốt: **SMA segregated + gộp lệnh** (§9) |
@@ -426,13 +426,13 @@ Tiền            = Tiền mặt + tiền bán chờ về + cổ tức tiền
 NAV             = Tổng tài sản − Phí phải trả
 Tổng vốn đầu tư  = Σ NAV vào − Σ NAV ra
 
-# UNIT per (KH × SI) — forward pricing, chốt EOD
+# UNIT per (KH × SI) — historic pricing (t-1), chốt EOD
 Unit Price_0    = 10.000
 Unit_0          = NAV_0 / 10.000
-CF_t            = NAV vào − NAV ra            (gom trong ngày)
-Unit Price_t    = (NAV cuối_t − CF_t) / Unit_(t-1)
-ΔUnit_t         = CF_t / Unit Price_t
+CF_t            = NAV vào − NAV ra            (net, gom trong ngày)
+ΔUnit_t         = CF_t / Unit Price_(t-1)     (giá hôm trước)
 Unit_t          = Unit_(t-1) + ΔUnit_t        (lưu full precision)
+Unit Price_t    = NAV cuối_t / Unit_t
 
 # HIỆU SUẤT (TG1)
 PnL ngày        = NAV cuối − NAV đầu + NAV ra − NAV vào
@@ -455,7 +455,7 @@ Index_t         = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 
 ## 14. WORKED EXAMPLE — verify file Excel "PnL danh mục KH" (per-KH)
 
-### 14.1 Bản gốc BRD (historic pricing, t-1) — tao verify từng ô: ĐÚNG theo công thức BRD
+### 14.1 Verify file mẫu (historic pricing t-1 — SPEC đã chốt): mọi ô ĐÚNG
 
 | Ngày | NAV | ra | vào | PnL | ΔUnit | Unit (hiển thị) | Unit Price |
 |---|---|---|---|---|---|---|---|
@@ -467,29 +467,16 @@ Index_t         = Index_(t-1) × Σ_i ( w_i × P_i,t / P_ref_i )
 | 6 | 25,000,000 | | | 5,000,000 | – | 1,336 | 18,708 |
 | 7 | 25,500,000 | | | 500,000 | – | 1,336 | 19,082 |
 
-- **Rounding:** Unit ngày 3 thật = 1,126.667 (hiển thị 1,127); UP = 18M/1,126.667 = 15,976 ✓ → phải lưu full precision.
-- **Bias historic (point B):** ngày 3 return tiền = 1.1M/15M = **7.33%**, nhưng UP return = 15,976/15,000−1 = **6.51%** → lệch 0.82đ% do quy đổi tại giá hôm qua khi có tiền vào lớn.
+- **ΔUnit ngày 3** = (2tr − 0.1tr) / UP₂(15,000) = **126.667**; Unit₃ = 1,126.667; UP₃ = 18M/1,126.667 = **15,976** ✓
+- **net_cashflow ngày 3** = ΔUnit × UP₂ = 126.667 × 15,000 = **1,900,000** ✓ (khớp vào − ra)
+- **Rounding:** Unit hiển thị 1,127 nhưng tính bằng **1,126.667** → bắt buộc **lưu full precision** (lưu integer → UP sai).
+- **Đặc tính historic (chấp nhận):** ngày có cashflow lớn, %UP (15,976/15,000−1 = 6.51%) ≠ %tiền (1.1M/15M = 7.33%) chênh nhẹ; **NAV/tiền vẫn đúng**.
 
-### 14.2 Sau khi chốt forward pricing (EOD) — chuỗi đúng
+### 14.2 Lỗi khung kỳ trong file mẫu (cần thống nhất mốc — O7)
 
-| Ngày | CF (net) | Unit Price | Unit (full) | Daily return | = PnL/NAV_đầu |
-|---|---|---|---|---|---|
-| KT | +10,000,000 | 10,000 | 1,000.000 | – | – |
-| 2 | 0 | 15,000 | 1,000.000 | +50.00% | 5M/10M ✓ |
-| 3 | +1,900,000 | **16,100** | 1,118.012 | **+7.33%** | 1.1M/15M ✓ |
-| 4 | +3,350,000 | 14,892 | 1,342.969 | −7.50% | −1.35M/18M ✓ |
-| 5 | 0 | 14,892 | 1,342.969 | 0% | ✓ |
-| 6 | 0 | 18,615 | 1,342.969 | +25.00% | 5M/20M ✓ |
-| 7 | 0 | 18,987 | 1,342.969 | +2.00% | 0.5M/25M ✓ |
-
-→ Forward pricing: mọi daily return = đúng PnL/NAV_đầu (TWR sạch). Ngày 3 ra **16,100** thay vì 15,976.
-
-### 14.3 Lỗi khung kỳ trong file mẫu (cần thống nhất)
-
-File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nhưng `PnL tiền ngày 3→7 = 5,250,000` (cộng cả PnL ngày 3).
-→ Hai ô khác mốc. Nhất quán phải là **một trong hai cặp**:
-- Từ **cuối ngày 3**: %PnL (forward) = 18,987/16,100−1 = **17.93%**, PnL tiền = **4,150,000**.
-- Từ **cuối ngày 2** (gồm ngày 3): %PnL = 18,987/15,000−1 = **26.58%**, PnL tiền = **5,250,000**.
+File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nhưng `PnL tiền ngày 3→7 = 5,250,000` (cộng cả PnL ngày 3) → **khác mốc**. Nhất quán phải là **một trong hai cặp**:
+- Từ **cuối ngày 3**: %PnL = 19,082/15,976 − 1 = **19.44%**, PnL tiền (ngày 4–7) = **4,150,000**.
+- Từ **cuối ngày 2** (gồm ngày 3): %PnL = 19,082/15,000 − 1 = **27.21%**, PnL tiền (ngày 3–7) = **5,250,000**.
 
 ---
 
@@ -551,7 +538,7 @@ File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nh�
 |---|---|---|---|
 | Unit | unit (shares) | `unit` | **NUMERIC full precision**, không integer |
 | Unit Price | unit price (NAV/share) | `unit_price` | thước đo TWR; T0=10000 |
-| Delta Unit | unit change | `delta_unit` | = net_cashflow / unit_price (forward) |
+| Delta Unit | unit change | `delta_unit` | = net_cashflow / unit_price_(t-1) (historic) |
 | PnL (tiền) | profit & loss | `pnl` / `daily_pnl` | ① TIỀN (VND) |
 | %PnL = %return | period return (TWR) | `return_pct` | ② % cả kỳ = `unit_price` cuối/đầu − 1 |
 | daily return | daily return | `daily_return` | ② % 1 ngày = TWR 1 ngày |
@@ -574,8 +561,8 @@ File mẫu: `%PnL ngày 3→7 = 19.44%` (gốc = UP cuối ngày 3 = 15,976) nh�
 
 | VN | English | code/term | Lưu ý |
 |---|---|---|---|
-| Định giá cuối ngày (chốt EOD) | forward pricing | `forward_pricing` | ✅ chốt |
-| Định giá theo giá hôm qua | historic pricing | `historic_pricing` | ❌ deprecated |
+| Định giá ΔUnit theo giá hôm trước | historic pricing | `historic_pricing` | ✅ chốt (BRD gốc) |
+| Định giá cuối ngày ex-cash | forward pricing | `forward_pricing` | đã cân nhắc, KHÔNG dùng |
 | Hạch toán ngày khớp | trade-date accounting | `trade_date_accounting` | ✅ |
 | Trích phí dồn ngày | accrual | `accrual` | điểm F |
 | Cản trở do tiền nhàn | cash drag | `cash_drag` | thật, per KH |
