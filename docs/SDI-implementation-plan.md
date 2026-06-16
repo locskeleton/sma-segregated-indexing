@@ -134,8 +134,9 @@ Index bắt buộc: `(customer_id, si_id, business_date)` trên các bảng cust
 
 ```
 NAV (per KH×SI)   = Tổng tài sản − phí phải trả        (Tổng tài sản = Tiền + CP, gồm cash)
-Mgmt fee          = thu THEO THÁNG tại ngày cố định    (#F TREO — chốt sau: F1 base snapshot/bình quân? F2 accrue daily?)
-                    [khuyến nghị: accrue daily vào phí phải trả + thu tháng; thu = cash↓ + payable↓ = NAV neutral]
+Mgmt fee accrue ngày t = NAV_t × mgmt_fee_rate / 365   (#F CHỐT: hạch toán THEO NGÀY trên NAV THẬT ngày đó — KHÔNG chia đều)
+                    → cộng dồn vào "phí phải trả"; THU theo tháng tại ngày cố định (cash↓ + payable↓ = NAV neutral)
+                    # mỗi ngày 1 số khác (theo NAV ngày đó); ngày nghỉ dùng NAV phiên gần nhất
 PnL ngày          = NAV cuối − NAV đầu + NAV ra − NAV vào
 Cổ tức            = income → vào Tiền (accrue ngày EX, #6), KHÔNG vào NAV vào
 
@@ -176,7 +177,7 @@ Index_0=1000 ; Index_t = Index_(t-1) × Σ_i (w_i × P_i,t / P_ref_i)
 B1  SYNC: FO (tài sản/holdings/tiền/phí), Market (giá, ref adj, VN-Index, CA), Allocation, Model weight
 B2  ÁP CORPORATE ACTION: cổ tức accrue ngày EX (#6); cập nhật holding lot khi CA cổ phiếu
 B3  DỰNG HOLDINGS per (KH×SI) từ lot events; mark-to-market = Σ(qty×close)
-B4  TÍNH NAV per (KH×SI): tài sản − phí phải trả; xử lý tiền pending [mgmt fee: #F treo — O9]
+B4  TÍNH NAV per (KH×SI): tài sản − phí phải trả; xử lý tiền pending [mgmt fee accrue = NAV_t×rate/365 vào payable — #F]
 B5  PnL ngày per KH
 B6  UNIT (historic #B): gom CF ngày → ΔUnit=CF/UnitPrice_(t-1) → Unit=Unit_(t-1)+ΔUnit (full) → UnitPrice_t=NAV/Unit → ghi sdi_unit_ledger nếu có thay đổi
 B7  SI TỔNG HỢP: SI NAV=ΣNAV, SI Unit=ΣUnit, SI Unit Price, daily_pnl/return → sdi_si_performance_daily
@@ -266,7 +267,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | ~~O6~~ | ✅ **ĐÃ CHỐT toàn bộ**: phát unit tại ngày nộp + clock từ ngày nộp + trade-date (§8 #4). **Độ trễ nộp→khớp KHÔNG ảnh hưởng** (tiền chờ = cash 0%, ngày phẳng ×1.0) → không cần hỏi FO. | (đóng) |
 | ~~O7~~ | ~~**[#5]** Mốc kỳ %PnL & PnL tiền?~~ → ✅ **ĐÃ CHỐT: GỒM ngày đầu range** — %PnL = UP[cuối]/UP[liền trước ngày đầu]−1; PnL tiền = Σ từ ngày đầu; cùng span. File mẫu trộn sai (§14.2). | (đóng) |
 | ~~O8~~ | ~~Phân loại nguồn tiền — FO có gắn nhãn?~~ → ✅ **FO có nhãn ĐỦ.** Action: sửa công thức — TỔNG tiền chỉ tính NAV; **CF lấy từ event nhãn DEPOSIT/SIP/WITHDRAW, KHÔNG từ Δ tổng tiền**; giữ cash sub-ledger typed (§3 glossary, §8 #11). | (đóng, đã sửa công thức) |
-| O9 | **[F]** Phí quản lý: (F1) base = AUM snapshot ngày thu hay AUM bình quân ngày? (F2) accrue daily vào payable hay chỉ lump tại ngày thu? Thu theo tháng tại ngày cố định đã rõ. | NAV/unit price, công bằng mid-month |
+| ~~O9~~ | ~~**[F]** Phí quản lý base/accrue?~~ → ✅ **ĐÃ CHỐT: accrue THEO NGÀY = NAV_t × rate/365** (trên NAV thật mỗi ngày, KHÔNG chia đều); cộng vào payable; thu theo tháng tại ngày cố định (NAV neutral). | (đóng) |
 
 > Ghi chú tuân thủ: các điểm #1-#8 (điều chỉnh) và #9-#12 (bổ sung) trong [glossary §12] đã được phản ánh vào schema/batch ở trên. Không cut item nào; phần phụ thuộc quyết định nghiệp vụ để ở §10 chờ BO, KHÔNG tự decide.
 ```

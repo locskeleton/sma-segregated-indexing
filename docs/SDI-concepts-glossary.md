@@ -22,7 +22,7 @@
 > - **E — CHỐT: implement CẢ TWR và MWR** (TWR = hiệu suất chiến lược + chart; MWR = "lợi suất của bạn", Modified Dietz). (§5.3, §5.4)
 > - **Lô lẻ (O5) — giải quyết**: lệnh đặt trực tiếp trên TK KH (không phân bổ) → không có bài toán lô lẻ; phần không khớp = tiền KH, SDI phản ánh qua NAV. (§9b)
 > - **O6 — CHỐT**: tiền chờ giải ngân = cash 0% (không biến động) → độ trễ nộp→khớp không ảnh hưởng tích lũy; engine tự xử lý. (§4/§2)
-> - Còn treo: **F** (accrue phí daily). (§12)
+> - **F — CHỐT**: phí quản lý **hạch toán theo ngày = NAV_t × rate/365** (trên NAV thật mỗi ngày, KHÔNG chia đều) → cộng vào phí phải trả; thu theo tháng tại ngày cố định. (§12)
 
 ---
 
@@ -429,7 +429,7 @@ Giả định: 100 SI, KH active TB 5 SI, ~200.000 KH, 2.500 ngày.
 
 ```
 B1  Sync FO / ASSET / Market data
-B2  Tính NAV per (KH×SI)  (tài sản − phí; xử lý tiền pending; phí quản lý ACCRUE daily ⚠️ F)
+B2  Tính NAV per (KH×SI)  (tài sản − phí phải trả; xử lý tiền pending; phí quản lý accrue = NAV_t×rate/365 vào payable — F)
 B3  PnL ngày = NAV cuối − đầu + ra − vào
 B4  Gom cashflow trong ngày (net CF)              ┐ historic pricing
 B5  ΔUnit = net CF / Unit Price_(t-1)             │ chốt 1 lần EOD
@@ -453,7 +453,7 @@ B9  Push sang Asset (snapshot, holding, performance, index, customer position)
 | — | Unit Price chung (plan §7) | ✅ Bỏ: dùng **per-KH** (§4.2, §8) |
 | **D** | TR (SI) vs PR (mẫu, VN-Index) | ✅ Chốt **GIỮ NGUYÊN (PR)** — mẫu vs VN-Index cùng cơ sở; gap KH-vs-benchmark chấp nhận vì UX (§7) |
 | **E** | TWR hiển thị như "% của KH" | ✅ Chốt: **implement CẢ TWR + MWR**, gán nhãn rõ (§5.3, §5.4) |
-| **F** | Phí quản lý cadence | ⚠️ **Treo — chốt sau.** Thu phí theo THÁNG tại ngày cố định (đã rõ). Cần chốt: (F1) phí tháng tính trên AUM snapshot ngày thu hay AUM bình quân ngày? (F2) SDI có accrue daily vào "phí phải trả" không? Khuyến nghị: **accrue daily + thu tháng** (NAV mượt, công bằng, khớp `NAV=tài sản−phí phải trả`) |
+| **F** | Phí quản lý cadence | ✅ **Chốt: hạch toán THEO NGÀY = `NAV_t × rate/365`** (trên NAV thật mỗi ngày, **KHÔNG chia đều** tổng tháng ra các ngày) → cộng dồn vào phí phải trả; **thu theo tháng tại ngày cố định** (cash↓ + payable↓ = NAV neutral). NAV = tài sản − phí phải trả. |
 | **O7** | %PnL vs PnL-tiền lệch khung kỳ (file mẫu sai) | ✅ Chốt: quy ước **GỒM ngày đầu range** — %PnL gốc = UP cuối ngày liền trước; cả 2 cùng span (§5.2, §14.2) |
 
 ### Bảng dữ liệu còn THIẾU
@@ -472,6 +472,7 @@ B9  Push sang Asset (snapshot, holding, performance, index, customer position)
 Tổng tài sản    = Tiền + Chứng khoán
 Chứng khoán     = Σ (KL × market price)
 Tiền            = Tiền mặt + tiền bán chờ về + cổ tức tiền
+Phí quản lý/ngày = NAV_t × rate / 365        (accrue THEO NGÀY vào phí phải trả; thu theo tháng — NAV neutral lúc thu)
 NAV             = Tổng tài sản − Phí phải trả
 Tổng vốn đầu tư  = Σ NAV vào − Σ NAV ra
 
