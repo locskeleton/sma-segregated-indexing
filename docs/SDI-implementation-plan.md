@@ -148,7 +148,8 @@ Unit Price_t = NAV cuối_t / Unit_t
 # hệ quả: net_cashflow = ΔUnit_t × Unit Price_(t-1)
 
 # %PnL (TWR) — compound theo range, lấy 2 đầu mút
-%PnL(range) = UnitPrice[ngày_cuối] / UnitPrice[ngày giao dịch LIỀN TRƯỚC ngày_đầu] − 1   (O7: GỒM ngày đầu range; = nhân dồn daily return; cùng span với PnL tiền)
+%PnL(range) = UP[ngày cuối] / UP[NGÀY MỐC] − 1   (O7: base = close NGÀY MỐC; return phủ các ngày SAU ngày mốc; cùng ngày mốc với PnL tiền)
+  # Ngày mốc per filter: YTD→close phiên cuối năm trước; 1M/3M/6M/1Y/3Y→close ngày N về trước; inception→ngày khởi tạo (10000)
 
 # MWR (#3, E chốt implement) — "lợi suất của bạn", per KH×SI per range
 # Modified Dietz (mặc định):

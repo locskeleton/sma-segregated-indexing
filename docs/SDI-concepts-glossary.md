@@ -240,18 +240,25 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 
 | Khái niệm | Công thức |
 |---|---|
-| **%PnL (TWR)** | `(Unit Price cuối kỳ / Unit Price đầu kỳ − 1) × 100%` |
+| **%PnL (TWR)** | `UP[ngày cuối] / UP[NGÀY MỐC] − 1` (xem định nghĩa "ngày mốc" dưới) |
 | **Daily return** | `Unit Price_t / Unit Price_(t-1) − 1` |
-| **YTD** | từ 01/01 năm hiện tại |
 
-> ✅ **O7 CHỐT — quy ước khung kỳ "GỒM ngày đầu range"** (chuẩn, = nhân dồn daily return của mọi ngày trong khoảng):
+> ✅ **O7 CHỐT — dùng "NGÀY MỐC" (base date), KHÔNG dùng "close đầu kỳ" (mơ hồ):**
 > ```
-> Range [ngày_đầu .. ngày_cuối]:
->   %PnL    = UP[ngày_cuối] / UP[ngày giao dịch LIỀN TRƯỚC ngày_đầu] − 1
->   PnL tiền = Σ daily_pnl từ ngày_đầu → ngày_cuối
+>   base       = giá đóng cửa (EOD) của NGÀY MỐC      ← gốc 0, KHÔNG nằm trong return
+>   %PnL       = UP[ngày cuối] / UP[NGÀY MỐC] − 1
+>   PnL tiền   = Σ daily_pnl các ngày SAU ngày mốc → ngày cuối
 > ```
-> Cả hai phủ **cùng span** (gồm ngày đầu). Telescoping: `%PnL = tích các daily return của mọi ngày trong range`.
-> ⚠️ **File mẫu SAI**: trộn %PnL=19.44% (bỏ daily return ngày 3) với PnL tiền=5,250,000 (gồm ngày 3) — xem §14.2. Theo quy ước chốt: range "ngày 3→7" → %PnL = **27.21%**, PnL tiền = **5,250,000** (cùng gồm ngày 3).
+> Cả hai **cùng ngày mốc** → cùng span. Telescoping: `%PnL = tích daily return các ngày SAU ngày mốc`.
+>
+> **Ngày mốc của từng filter (chuẩn):**
+> | Filter | Ngày mốc (base) | Return phủ |
+> |---|---|---|
+> | YTD | close phiên **cuối năm trước** (~31/12) | từ phiên đầu năm → nay |
+> | 1M / 3M / 6M / 1Y / 3Y | close ngày tương ứng **N về trước** | từ sau đó → nay |
+> | Từ đầu (inception) | close **ngày khởi tạo** (=10,000) | toàn bộ |
+>
+> ⚠️ **File mẫu SAI**: trộn %PnL=19.44% (ngày mốc = cuối ngày 3) với PnL tiền=5,250,000 (ngày mốc = cuối ngày 2) — xem §14.2. Đúng phải cùng 1 ngày mốc.
 
 ### 5.3 TWR vs MWR — ✅ điểm E CHỐT: implement CẢ HAI
 
@@ -479,7 +486,7 @@ Unit Price_t    = NAV cuối_t / Unit_t
 # HIỆU SUẤT (TG1)
 PnL ngày        = NAV cuối − NAV đầu + NAV ra − NAV vào
 PnL cả kỳ       = Σ PnL ngày
-%PnL (TWR)      = UP[cuối kỳ, EOD] / UP[EOD ngày LIỀN TRƯỚC ngày đầu kỳ] − 1   (close-to-close, GỒM ngày đầu — O7)
+%PnL (TWR)      = UP[ngày cuối, EOD] / UP[EOD NGÀY MỐC] − 1   (O7: ngày mốc = base; YTD→cuối năm trước, 1M/1Y→N về trước, inception→ngày khởi tạo)
 Daily return    = UP_t / UP_(t-1) − 1                              (đều là giá EOD; base = close hôm trước)
 MWR (Mod.Dietz) = (NAV cuối − NAV đầu − CF_ròng) / (NAV đầu + Σ w_i·CF_i)   — "lợi suất của bạn"; w_i=(T−t_i)/T
 
