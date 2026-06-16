@@ -212,6 +212,9 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_si_performance_daily`** (business_date, si_id PK; nav, unit, unit_price, daily_pnl, daily_return)
 - **`sdi_si_index_daily`** (business_date, si_id PK; index_value, daily_return)
 
+### Control / orchestration
+- **`sdi_eod_run`** (business_date, job PK; status[PENDING|RUNNING|DONE|FAILED], rows, started_at, ended_at, message) — theo dõi & resume batch EOD (§9.2).
+
 ### Customer-level: DERIVE on read
 NAV / Unit Price / TWR / MWR của KH theo ngày **không materialize** — derive từ holding lots × giá + unit ledger + cash events. Tiền KH(t) = Σ(cashflow + mua/bán execution + cổ tức + phí) tới ngày t. **Snapshot cuối tháng** để giới hạn replay; cache lazy cho KH hot.
 
@@ -229,20 +232,58 @@ Index: `(customer_id, si_id, business_date)` cho customer-level; `(si_id, busine
 
 ## 9. Batch EOD
 
+### 9.1 Công thức pipeline (mức tính toán)
 ```
-B1  Sync: FO (asset/holdings, execution feed, model_weight), Market (giá, ref adj, VN-Index, CA)
-B2  Áp Corporate Action: cổ tức accrue ngày EX; cập nhật holding lot (split/quyền) per KH
-B3  Dựng holdings per (KH×SI) từ lot events; mark-to-market = Σ(qty × close); reconcile vs FO
-B4  NAV per (KH×SI) = tài sản − custody_fee − mgmt_fee accrue(NAV_t×rate/365 vào payable); xử lý tiền pending
-B5  PnL ngày = NAV cuối − đầu + ra − vào
-B6  Unit (historic): ΔUnit = net CF / UnitPrice_(t-1); Unit = Unit_(t-1)+ΔUnit (full); UnitPrice_t = NAV/Unit
-B7  SI tổng hợp: SI NAV = ΣNAV, SI Unit = ΣUnit, SI UnitPrice, daily_pnl/return → sdi_si_performance_daily
-B8  SI Index: Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref → sdi_si_index_daily; ingest VN-Index
-B9  Push → Asset: asset_snapshot, holding_daily, si_performance, si_index, benchmark, unit_ledger
+NAV          = stock_value + cash − custody_fee − mgmt_fee_accrued
+PnL ngày     = NAV cuối − NAV đầu + NAV ra − NAV vào
+ΔUnit        = net CF / UnitPrice_(t-1) ; Unit = Unit_(t-1)+ΔUnit (full) ; UnitPrice = NAV/Unit
+SI NAV/Unit  = Σ per si ; SI UnitPrice = SI NAV / SI Unit
+SI Index_t   = Index_(t-1) × Σ w^(t)·P_t/P_ref
 ```
 
-- **Idempotent** (upsert theo PK). **Recompute/replay** từ event ledger (cashflow / execution / CA / price / model_weight).
-- SI NAV/Index tính ở mức SI-aggregate (Σ holdings per ticker × giá) — không iterate từng KH.
+### 9.2 Danh sách JOB chạy tuần tự cuối ngày
+
+Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạng thái vào `sdi_eod_run`. "SB" = set-based (không RBAR). "‖" = song song theo SI/hash.
+
+| # | Job | Phụ thuộc | Đọc | Ghi | SB | ‖ | Halt nếu lỗi |
+|---|---|---|---|---|---|---|---|
+| **J0** | `GATE` chờ nguồn sẵn sàng | — | cờ sẵn sàng FO/Market/model_weight @d | `sdi_eod_run` | – | – | ✅ (timeout→alert) |
+| **J1** | `STAGE` bulk load input | J0 | FO (holdings, execution), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
+| **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm/thiếu nhãn nguồn) |
+| **J3** | `APPLY_CA` corporate action | J2 | staging CA | position_holding (split/quyền), state.cash (cổ tức ex-date), holding_event | ✅ | ‖ | ✅ |
+| **J4** | `APPLY_EXEC` khớp lệnh | J3 | staging execution | position_holding (qty), state.cash (mua/bán trade-date), holding_event | ✅ | ‖ | ✅ |
+| **J5** | `APPLY_CASHFLOW` nạp/rút | J4 | cashflow event | state.cash, CF_t per vị thế | ✅ | ‖ | – |
+| **J6** | `ACCRUE_FEE` phí quản lý | J5 | state (NAV_prev) | state.payable += NAV_prev×rate/365 | ✅ | ‖ | – |
+| **J7** | `MTM` định giá lại toàn bộ | J4 | position_holding + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
+| **J8** | `CALC_NAV` | J6, J7 | stock_value, state.cash, phí | NAV per vị thế | ✅ | ‖ | – |
+| **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
+| **J10** | `CALC_UNIT` | J8 | CF_t, UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger | ✅ | ‖ | – |
+| **J11** | `SI_AGG` tổng hợp SI | J8, J10 | NAV/unit per vị thế | sdi_si_performance_daily | ✅ | ‖ | – |
+| **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
+| **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
+| **J14** | `BUILD_SNAPSHOT` | J8 | NAV, holdings, phí, components | sdi_asset_snapshot_daily, sdi_holding_daily (top20+mã khác) | ✅ | ‖ | – |
+| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit position_state; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
+| **J16** | `FINALIZE` | J15 | — | mark eod_run done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
+
+### 9.3 Thứ tự, song song & orchestration
+
+```
+J0 → J1 → J2 ─┬─ J3 → J4 ─┬─ J5 → J6 ─┐
+              │            └─ J7 ──────┴─ J8 → J9
+              │                              └─ J10 ─┐
+              │                                      └─ J11 → J13 ─┐
+              └─ J12 (độc lập, chạy song song) ───────────────────┤
+                                          J8 → J14 ───────────────┴─ J15 → J16
+```
+- **J12 (SI Index)** chỉ cần giá + model_weight → chạy **song song** toàn bộ nhánh customer (J3–J11).
+- **J3→J4→J5→J6 tuần tự** (cùng ghi `state` → tránh tranh chấp). **J7** chỉ cần holdings (sau J4) → chạy song song J5/J6.
+- **J7/J8/J9/J10/J14** chia **dải SI hoặc hash(customer_id)** chạy nhiều luồng.
+- **J13 RECONCILE là cổng**: lệch quá ngưỡng → **dừng, KHÔNG publish dữ liệu sai**, alert.
+- **Orchestration**: SQL Agent job chain hoặc orchestrator proc; mỗi job đọc/ghi `sdi_eod_run(business_date, job, status, rows, started, ended, message)`. Fail giữa chừng → **resume từ job lỗi** (idempotent).
+- **RCSI** bật → app đọc current snapshot không bị batch chặn; **J15 PUBLISH** (switch-in) là thao tác ngắn duy nhất ảnh hưởng đích.
+- **Roll-forward**: J3–J6 áp **delta** (chỉ vị thế có biến động); J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
+
+> Chi tiết kỹ thuật (columnstore, partition switch, runtime ~vài phút–15 phút, anti-patterns): [SDI-db-architecture.md](./SDI-db-architecture.md).
 
 ---
 
