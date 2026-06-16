@@ -279,7 +279,7 @@ J0 → J1 → J2 ─┬─ J3 → J4 ─┬─ J5 → J6 ─┐
 - **J3→J4→J5→J6 tuần tự** (cùng ghi `state` → tránh tranh chấp). **J7** chỉ cần holdings (sau J4) → chạy song song J5/J6.
 - **J7/J8/J9/J10/J14** chia **dải SI hoặc hash(customer_id)** chạy nhiều luồng.
 - **J13 RECONCILE là cổng**: lệch quá ngưỡng → **dừng, KHÔNG publish dữ liệu sai**, alert.
-- **Orchestration**: SQL Agent job chain hoặc orchestrator proc; mỗi job đọc/ghi `sdi_eod_run(business_date, job, status, rows, started, ended, message)`. Fail giữa chừng → **resume từ job lỗi** (idempotent).
+- **Thực thi ALL-IN-DB**: mỗi job = **1 stored proc** (set-based); **master proc `usp_eod_run @business_date`** gọi tuần tự + ghi `sdi_eod_run(business_date, job, status, rows, started, ended, message)`. **App/SQL Agent chỉ kích hoạt master proc** — không tính toán ở app. Fail giữa chừng → **resume từ job lỗi** (idempotent). Ingestion = proc `BULK INSERT`; API đọc = stored proc.
 - **RCSI** bật → app đọc current snapshot không bị batch chặn; **J15 PUBLISH** (switch-in) là thao tác ngắn duy nhất ảnh hưởng đích.
 - **Roll-forward**: J3–J6 áp **delta** (chỉ vị thế có biến động); J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
 
@@ -288,6 +288,8 @@ J0 → J1 → J2 ─┬─ J3 → J4 ─┬─ J5 → J6 ─┐
 ---
 
 ## 10. API cho Asset/SMO
+
+> Mỗi API = **app gọi 1 stored proc** (`usp_get_*`) — tính toán/derive trong DB; app chỉ trả JSON, không tính.
 
 | FR | API | Nguồn |
 |---|---|---|

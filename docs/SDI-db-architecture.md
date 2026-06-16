@@ -91,6 +91,21 @@ Hỗn hợp 3 cấp — KHÔNG phải tất cả khi tạo bảng:
 
 → **DBA lo hạ tầng 1 lần** (instance + database: RCSI, filegroups, compat, resource governor, partition function/scheme). **Dev viết trong DDL/batch** (columnstore, compression, index, tạo bảng trên scheme, partition switch). Partitioning = phối hợp DBA+Dev.
 
+### 4.2 Mô hình thực thi: ALL-IN-DB (app chỉ gọi proc)
+
+**Toàn bộ engine = stored procedure T-SQL trong DB.** App KHÔNG tính toán — chỉ gọi proc (execute batch + đọc dữ liệu).
+
+| Thành phần | Hiện thực |
+|---|---|
+| Mỗi job J0–J16 | 1 stored proc (set-based) |
+| Orchestration | master proc `usp_eod_run @business_date` gọi tuần tự + ghi `sdi_eod_run` (resume); App/SQL Agent chỉ kích hoạt |
+| Ingestion (feed FO/Market → staging) | proc `BULK INSERT` / `OPENROWSET` / external table — KHÔNG kéo qua app |
+| API đọc (SMO/Asset) | stored proc (`usp_get_*`); app gọi & trả JSON, không tính |
+| MWR Modified Dietz | set-based trong proc |
+| MWR XIRR (nếu cần, iterative) | **SQL CLR** (trong DB) — không tính ở app |
+
+→ App = thin client: `EXEC usp_eod_run` + `EXEC usp_get_*`. Không pull-compute-push.
+
 ---
 
 ## 5. Pipeline EOD — set-based (không RBAR)
