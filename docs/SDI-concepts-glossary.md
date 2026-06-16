@@ -21,7 +21,8 @@
 > - **D — CHỐT GIỮ NGUYÊN (PR, không đổi)**: danh mục mẫu (PR) vs VN-Index (PR) cùng cơ sở → đúng. Gap KH/SI (TR) vs benchmark (PR) **chấp nhận** vì user quen so với VN-Index. Known accepted artifact. (§7)
 > - **E — CHỐT: implement CẢ TWR và MWR** (TWR = hiệu suất chiến lược + chart; MWR = "lợi suất của bạn", Modified Dietz). (§5.3, §5.4)
 > - **Lô lẻ (O5) — giải quyết**: lệnh đặt trực tiếp trên TK KH (không phân bổ) → không có bài toán lô lẻ; phần không khớp = tiền KH, SDI phản ánh qua NAV. (§9b)
-> - Còn treo: **F** (accrue phí daily), **O6** độ trễ giải ngân (hỏi FO). (§12)
+> - **O6 — CHỐT**: tiền chờ giải ngân = cash 0% (không biến động) → độ trễ nộp→khớp không ảnh hưởng tích lũy; engine tự xử lý. (§4/§2)
+> - Còn treo: **F** (accrue phí daily). (§12)
 
 ---
 
@@ -102,8 +103,7 @@ Thứ tự: **Giá trị thành phần → Tổng tài sản → NAV**.
 
 > ✅ **Chốt:** NAV dùng cho tính hiệu suất **do SDI engine TÍNH**, KHÔNG đọc thẳng "giá trị thô của tiểu khoản".
 > Lý do: giá trị thô trộn **tiền chờ giải ngân (chưa đầu tư), tiền mua chờ khớp, tiền bán chờ về (T+)**, và **phí quản lý AUM do SDI tính** (chưa có trong số FO). Engine phải chuẩn hóa rồi mới ra NAV.
-> ✅ **Chốt methodology (O6):** tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock hiệu suất chạy từ ngày nộp. Mấy ngày chờ khớp → cash drag nằm trong tiểu khoản của **chính KH đó** (segregated → công bằng). **Trade-date accounting**: mua/bán ghi nhận tại ngày khớp (giá MP), tiền mua chờ khớp / bán chờ về tracked ở cash sub-ledger.
-> ⚠️ Còn hỏi: **FO** — nộp T → khớp T+? & cadence gom batch (độ lớn cash drag); **BO** — clock từ ngày nộp hay ngày khớp (khuyến nghị: ngày nộp).
+> ✅ **Chốt O6:** tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock từ ngày nộp. **Độ trễ nộp→khớp KHÔNG ảnh hưởng**: tiền chờ là **cash = 0% (không biến động)** → ngày phẳng nhân `×1.0`, tích lũy không đổi dù trễ T+1 hay T+5. Engine **tự xử lý** (cash earn 0), KHÔNG cần param độ trễ từ FO. **Trade-date accounting**: mua/bán ghi nhận tại ngày khớp (giá MP), tiền mua chờ khớp / bán chờ về ở cash sub-ledger.
 
 **FR-06 (báo cáo cấu phần tài sản)** — 3 nhóm: [A] Thông tin tài khoản (sức mua, tiền mặt/tài sản có thể rút, tiền mua CK, tiền bán chờ về, cổ tức tiền), [B] Tài sản thực tế (tiền, CK), [C] Khoản phải trả (phí phải trả). Vì tiểu khoản tách theo SI nên FR-06 per SI lấy từ FO hợp lý — nhưng cột NAV/phí cuối là **SDI tính**.
 
@@ -391,7 +391,7 @@ SI Unit Price = SI NAV / Σ Customer Unit   (asset-weighted, đại diện sản
 
 > **Execution feed từ FO là nguồn bắt buộc** để tính NAV per KH (giá MP = giá khớp thật, biết EOD).
 > ✅ **Lô lẻ (O5) — giải quyết:** vì lệnh đặt trực tiếp trên TK KH (không phân bổ), **không có bài toán chia lô lẻ**. Phần không khớp/không mua đủ → **vẫn là tiền của KH** (cash drag), SDI phản ánh tự nhiên qua NAV. Không cần logic riêng.
-> ⚠️ Còn hỏi FO: **độ trễ** (yêu cầu rebalance T → FO khớp T mấy?) — O6.
+> ✅ **Độ trễ (O6) — không ảnh hưởng:** tiền chờ = cash 0% → ngày phẳng, tích lũy không đổi dù khớp T+mấy. Không cần param độ trễ.
 
 ---
 

@@ -229,7 +229,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 1. **Làm tròn unit**: lưu full precision; reconcile `SI Unit = Σ Customer Unit` (định nghĩa, không tính 2 đường).
 2. **Reconciliation FO** (#9): Σ lots per ticker (SDI) vs holdings thật FO → break detection.
 3. **Lô lẻ / cash drag** (O5 ✅): lệnh trực tiếp trên TK KH (không phân bổ) → **không có bài toán lô lẻ**. Phần không khớp/không mua đủ → **tiền KH** → cash drag tự phản ánh qua NAV. SDI không cần logic riêng.
-4. **Độ trễ giải ngân** (O6 — methodology ✅ chốt): tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock từ ngày nộp; cash drag nằm trong tiểu khoản KH (segregated, công bằng). **Trade-date accounting** (ghi nhận tại ngày khớp MP, không đợi settle T+2; tiền mua chờ khớp / bán chờ về ở cash sub-ledger). ⚠️ Độ lớn trễ + cadence = hỏi FO; clock-start = xác nhận BO.
+4. **Độ trễ giải ngân** (O6 ✅ chốt): tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock từ ngày nộp. **Độ trễ nộp→khớp KHÔNG ảnh hưởng tích lũy** — tiền chờ = cash 0% (không biến động) → ngày phẳng ×1.0; engine tự xử lý, không cần param độ trễ. **Trade-date accounting** (ghi nhận tại ngày khớp MP, không đợi settle T+2; tiền mua chờ khớp / bán chờ về ở cash sub-ledger).
 5. **Thiếu/đến trễ giá**: thiếu close → dùng giá liền trước, log; backfill → trigger recompute.
 6. **Ngày không giao dịch**: range lấy điểm liền trước.
 7. **KH/SI khởi tạo giữa range**: gốc = join_date / inception (BR-03.3).
@@ -264,7 +264,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | O3 | **[#7]** Danh mục mẫu có giữ tiền không? → FO quyết (tính tỷ trọng). **SDI index đọc `model_weight` từ FO, xử lý cả 2** (có dòng CASH → `+w_cash×(1+r_cash)`; không → full CP). Chỉ cần FO xác nhận feed CÓ THỂ chứa dòng CASH + chốt `r_cash` (0 hay lãi suất) để test. | SDI robust 2 chiều |
 | ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance; FO đặt lệnh MP trực tiếp trên TK từng KH (không gom/phân bổ); SDI tiêu thụ execution feed.** (§9b) | (đóng) |
 | ~~O5~~ | ~~Lô lẻ: mua lô lẻ hay để dư tiền?~~ → ✅ **ĐÃ CHỐT: lệnh trực tiếp trên TK KH, không phân bổ → không có lô lẻ phân bổ; không khớp = tiền KH (cash drag tự phản ánh).** (§9b) | (đóng) |
-| O6 | Methodology ✅ **đã chốt** (phát unit tại ngày nộp + trade-date — §8 #4). Còn hỏi: **FO** nộp T→khớp T+? & cadence batch; **BO** clock từ ngày nộp hay ngày khớp (khuyến nghị: ngày nộp). | Cash drag, mốc hiệu suất |
+| ~~O6~~ | ✅ **ĐÃ CHỐT toàn bộ**: phát unit tại ngày nộp + clock từ ngày nộp + trade-date (§8 #4). **Độ trễ nộp→khớp KHÔNG ảnh hưởng** (tiền chờ = cash 0%, ngày phẳng ×1.0) → không cần hỏi FO. | (đóng) |
 | O7 | **[#5]** Mốc kỳ chuẩn cho %PnL & PnL tiền (đầu/cuối ngày biên)? | Báo cáo |
 | ~~O8~~ | ~~Phân loại nguồn tiền — FO có gắn nhãn?~~ → ✅ **FO có nhãn ĐỦ.** Action: sửa công thức — TỔNG tiền chỉ tính NAV; **CF lấy từ event nhãn DEPOSIT/SIP/WITHDRAW, KHÔNG từ Δ tổng tiền**; giữ cash sub-ledger typed (§3 glossary, §8 #11). | (đóng, đã sửa công thức) |
 | O9 | **[F]** Phí quản lý: (F1) base = AUM snapshot ngày thu hay AUM bình quân ngày? (F2) accrue daily vào payable hay chỉ lump tại ngày thu? Thu theo tháng tại ngày cố định đã rõ. | NAV/unit price, công bằng mid-month |
