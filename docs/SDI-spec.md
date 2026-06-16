@@ -261,6 +261,8 @@ B9  Push → Asset: asset_snapshot, holding_daily, si_performance, si_index, ben
 
 ## 11. Scale (100 SI, 200K KH × 5 SI, 10 năm)
 
+> Chi tiết kiến trúc DB + EOD ở quy mô lớn cho SQL Server: [SDI-db-architecture.md](./SDI-db-architecture.md) (roll-forward state, set-based, columnstore, partitioning).
+
 | Dữ liệu | Ước lượng |
 |---|---|
 | SI Index / Performance / Asset snapshot | ~250K dòng/loại |
