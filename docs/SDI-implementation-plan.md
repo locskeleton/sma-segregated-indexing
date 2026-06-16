@@ -9,20 +9,20 @@
 ## 1. Mục tiêu & phạm vi
 
 ### Trong phạm vi (SDI)
-- Ingest: FO (tài sản/holdings), Market data (giá, VN-Index, corporate action), Danh mục mẫu (weights), Allocation (phân bổ khớp lệnh).
+- Ingest: FO (tài sản/holdings + **execution feed** = kết quả khớp MP per TK), Market data (giá, VN-Index, corporate action), Danh mục mẫu (weights).
 - Tính: NAV per (KH×SI); Unit/Unit Price per KH (historic t-1, EOD); PnL; **TWR + MWR** (E chốt cả hai); SI tổng hợp; **SI Index** (danh mục mẫu); chuỗi benchmark (VN-Index PR).
 - Lưu: event-sourced ledger + chuỗi daily SI-level; derive customer-level on read.
 - Phục vụ: API cho Asset (nguồn duy nhất cho SMO) — FR-01…FR-06.
 - Batch EOD + khả năng recompute (replay).
 
 ### NGOÀI phạm vi (thuộc module khác)
-- **Sinh & khớp lệnh: thuộc FO** (đã chốt O4). Sau khi rebalance model, **SDI gửi yêu cầu rebalance sang FO**; **FO tự gom lệnh + đẩy lệnh MP vào sàn cho toàn bộ KH trong SI + allocate** về tiểu khoản. SDI **chỉ tiêu thụ kết quả execution** từ FO.
+- **Sinh & khớp lệnh: thuộc FO** (đã chốt O4). Sau khi rebalance model, **SDI gửi yêu cầu rebalance sang FO**; **FO đặt lệnh MP trực tiếp trên TK từng KH** (KHÔNG gom + phân bổ → không có lô lẻ phân bổ, O5). Khớp → cổ phiếu; không khớp → tiền KH. SDI **chỉ tiêu thụ execution feed** từ FO.
 - Tính toán tại SMO/Asset (cấm — chỉ đọc).
 
 ### Nguyên tắc
 1. **SSOT tại SDI**; Asset chỉ lưu kết quả; SMO chỉ đọc.
 2. **EOD là đơn vị tính**; chốt 1 lần cuối ngày.
-3. **Event sourcing**: lưu snapshot/cashflow/allocation/CA để tính lại.
+3. **Event sourcing**: lưu snapshot/cashflow/execution feed/CA để tính lại.
 4. **Derive > materialize** cho dữ liệu customer-level (tránh 2,5 tỷ dòng — §7).
 
 ---
@@ -38,8 +38,8 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
         ▼
 ┌─────────────────────────────┐         rebalance request
 │      SDI CALC ENGINE         │ ───────────────────────────►  FO
-│  B1 Sync → B2..B8 tính → B9  │   (FO gom lệnh + đẩy MP vào sàn
-│  Event ledger + Daily series │    cho toàn bộ KH + allocate → execution feed về SDI)
+│  B1 Sync → B2..B8 tính → B9  │   (FO đặt lệnh MP trực tiếp trên TK từng KH;
+│  Event ledger + Daily series │    khớp→CP / không→tiền → execution feed về SDI)
 └─────────────────────────────┘
         │ push (B9)
         ▼
@@ -103,7 +103,7 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 | amount | BIGINT | (+) vào, (−) ra |
 | created_time | TIMESTAMP | |
 
-**`sdi_rebalance_request`** (request_id PK; si_id, business_date, model_effective_date, type ENUM(REBALANCE, DEPLOY, REDEEM), status) — **SDI → FO** (output). SDI gửi yêu cầu; FO gom lệnh + đẩy MP + allocate (O4).
+**`sdi_rebalance_request`** (request_id PK; si_id, business_date, model_effective_date, type ENUM(REBALANCE, DEPLOY, REDEEM), status) — **SDI → FO** (output). SDI gửi yêu cầu; FO đặt lệnh MP **trực tiếp trên TK từng KH** (không gom/phân bổ — O4).
 **`sdi_execution_feed`** (exec_id PK; customer_id, si_id, ticker, side, qty, exec_price, business_date) — **FO → SDI** (ingest, source = FO). Kết quả khớp MP per tiểu khoản; giá MP là giá khớp thật trên sàn (biết sau khi khớp → EOD).
 **`sdi_customer_holding_event`** (event_id PK; customer_id, si_id, ticker, business_date, qty_delta, source ENUM(EXEC, CA, CLOSE)) — sổ cái lot, dựng từ execution feed + CA (derive holdings).
 
@@ -124,7 +124,7 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 
 | Bảng | Partition | Retention |
 |---|---|---|
-| sdi_cashflow_event, sdi_allocation, sdi_customer_holding_event, sdi_unit_ledger | **HASH(customer_id)** + range YEAR | 10 năm online |
+| sdi_cashflow_event, sdi_execution_feed, sdi_customer_holding_event, sdi_unit_ledger | **HASH(customer_id)** + range YEAR | 10 năm online |
 | sdi_*_daily (SI-level) | range YEAR | 10 năm online |
 | sdi_holding_daily | range YEAR | 2 năm online + 8 năm archive |
 | sdi_price_daily, sdi_benchmark_daily | range YEAR | 10 năm |
@@ -188,7 +188,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 
 **Tính chất:**
 - **Idempotent**: chạy lại 1 business_date → cùng kết quả (upsert theo PK).
-- **Recompute/replay**: xóa daily series từ ngày X → replay từ event ledger (cashflow/allocation/CA/price).
+- **Recompute/replay**: xóa daily series từ ngày X → replay từ event ledger (cashflow/execution feed/CA/price).
 - **Thứ tự phụ thuộc**: B6 cần B4; B7 cần B6; B8 độc lập B4-B7 (chỉ cần model weight + price).
 - **Reconciliation** (§8): sau B3, đối chiếu Σ lots per ticker vs holdings thật FO ở mức tài khoản → cảnh báo break.
 
@@ -214,12 +214,12 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | Bảng | Ước lượng | Chiến lược |
 |---|---|---|
 | sdi_si_*_daily | ~250K mỗi loại | materialize |
-| sdi_cashflow/allocation/holding event | ~100M+ | event-sourced, partition hash(customer_id) |
+| sdi_cashflow/execution_feed/holding event | ~100M+ | event-sourced, partition hash(customer_id) |
 | sdi_unit_ledger | ~120M (chỉ ngày thay đổi unit) | event-sourced |
 | **Customer NAV/unit_price daily** | ~2,5 tỷ nếu materialize | ❌ **DERIVE on read** (không lưu) |
 
 **Khóa của thiết kế scale:**
-- **SI NAV/Index/benchmark tính ở mức SI-aggregate** (Σ allocations per ticker × giá) → ~100×25 phép tính, không iterate 1M KH.
+- **SI NAV/Index/benchmark tính ở mức SI-aggregate** (Σ holdings per ticker × giá, từ execution feed) → ~100×25 phép tính, không iterate 1M KH.
 - **Customer NAV/% derive khi mở app**: lots KH (~20) × giá tại 2 đầu mút → rẻ per-request; cache lazy cho KH hot.
 - Tránh hoàn toàn bảng 2,5 tỷ dòng.
 
@@ -229,7 +229,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 
 1. **Làm tròn unit**: lưu full precision; reconcile `SI Unit = Σ Customer Unit` (định nghĩa, không tính 2 đường).
 2. **Reconciliation FO** (#9): Σ lots per ticker (SDI) vs holdings thật FO → break detection.
-3. **Lô lẻ / cash drag** (⚠️ chốt): KH nhỏ không mua đủ rổ → dư tiền → cash drag thật, phản ánh qua NAV.
+3. **Lô lẻ / cash drag** (O5 ✅): lệnh trực tiếp trên TK KH (không phân bổ) → **không có bài toán lô lẻ**. Phần không khớp/không mua đủ → **tiền KH** → cash drag tự phản ánh qua NAV. SDI không cần logic riêng.
 4. **Độ trễ giải ngân** (O6 — methodology ✅ chốt): tiền chờ giải ngân **vào NAV + phát unit NGAY tại ngày nộp** (giá t-1, historic); clock từ ngày nộp; cash drag nằm trong tiểu khoản KH (segregated, công bằng). **Trade-date accounting** (ghi nhận tại ngày khớp MP, không đợi settle T+2; tiền mua chờ khớp / bán chờ về ở cash sub-ledger). ⚠️ Độ lớn trễ + cadence = hỏi FO; clock-start = xác nhận BO.
 5. **Thiếu/đến trễ giá**: thiếu close → dùng giá liền trước, log; backfill → trigger recompute.
 6. **Ngày không giao dịch**: range lấy điểm liền trước.
@@ -263,8 +263,8 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 | ~~O1~~ | ~~**[D]** Benchmark TR/PR?~~ → ✅ **ĐÃ CHỐT: giữ VN-Index (PR)**, không dùng VN30TRI. Chấp nhận gap KH(TR)-vs-benchmark(PR) vì UX. | (đóng) |
 | ~~O2~~ | ~~**[E]** MWR cạnh TWR hay chỉ TWR?~~ → ✅ **ĐÃ CHỐT: implement CẢ HAI** (TWR=chiến lược/chart, MWR=lợi suất của bạn; Modified Dietz mặc định). §5.4 glossary, §4 plan. | (đóng) |
 | O3 | **[#7]** Danh mục mẫu có giữ tiền theo chiến lược không? | Công thức index |
-| ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance sang FO; FO gom lệnh + đẩy MP + allocate; SDI tiêu thụ execution feed.** (§9b) | (đóng) |
-| O5 | Lô lẻ: mua lô lẻ hay để dư tiền? | Cash drag, allocation |
+| ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance; FO đặt lệnh MP trực tiếp trên TK từng KH (không gom/phân bổ); SDI tiêu thụ execution feed.** (§9b) | (đóng) |
+| ~~O5~~ | ~~Lô lẻ: mua lô lẻ hay để dư tiền?~~ → ✅ **ĐÃ CHỐT: lệnh trực tiếp trên TK KH, không phân bổ → không có lô lẻ phân bổ; không khớp = tiền KH (cash drag tự phản ánh).** (§9b) | (đóng) |
 | O6 | Methodology ✅ **đã chốt** (phát unit tại ngày nộp + trade-date — §8 #4). Còn hỏi: **FO** nộp T→khớp T+? & cadence batch; **BO** clock từ ngày nộp hay ngày khớp (khuyến nghị: ngày nộp). | Cash drag, mốc hiệu suất |
 | O7 | **[#5]** Mốc kỳ chuẩn cho %PnL & PnL tiền (đầu/cuối ngày biên)? | Báo cáo |
 | ~~O8~~ | ~~Phân loại nguồn tiền — FO có gắn nhãn?~~ → ✅ **FO có nhãn ĐỦ.** Action: sửa công thức — TỔNG tiền chỉ tính NAV; **CF lấy từ event nhãn DEPOSIT/SIP/WITHDRAW, KHÔNG từ Δ tổng tiền**; giữ cash sub-ledger typed (§3 glossary, §8 #11). | (đóng, đã sửa công thức) |

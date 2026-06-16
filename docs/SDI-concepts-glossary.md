@@ -20,7 +20,8 @@
 > - **"Lãi Infy" = cash-in** (tiền KH bơm vào). (§3)
 > - **D — CHỐT GIỮ NGUYÊN (PR, không đổi)**: danh mục mẫu (PR) vs VN-Index (PR) cùng cơ sở → đúng. Gap KH/SI (TR) vs benchmark (PR) **chấp nhận** vì user quen so với VN-Index. Known accepted artifact. (§7)
 > - **E — CHỐT: implement CẢ TWR và MWR** (TWR = hiệu suất chiến lược + chart; MWR = "lợi suất của bạn", Modified Dietz). (§5.3, §5.4)
-> - Còn treo: **F** (accrue phí daily), chi tiết lô lẻ/độ trễ giải ngân. (§12)
+> - **Lô lẻ (O5) — giải quyết**: lệnh đặt trực tiếp trên TK KH (không phân bổ) → không có bài toán lô lẻ; phần không khớp = tiền KH, SDI phản ánh qua NAV. (§9b)
+> - Còn treo: **F** (accrue phí daily), **O6** độ trễ giải ngân (hỏi FO). (§12)
 
 ---
 
@@ -67,9 +68,9 @@ KH chuyển tiền vào tiểu khoản (theo SI)
         │
         ▼
 SDI rebalance model (weights mới)  ──yêu cầu rebalance──►  FO
-                                                            │ FO GOM lệnh toàn bộ KH trong SI
-                                                            │ FO đẩy lệnh MP vào sàn
-                                                            │ FO ALLOCATE khớp về từng tiểu khoản
+                                                            │ FO đặt lệnh MP TRỰC TIẾP trên
+                                                            │ TK từng KH (KHÔNG gom + phân bổ)
+                                                            │ khớp → cổ phiếu; không khớp → tiền KH
         ┌──── execution feed (mã, KL, giá khớp MP) ◄────────┘
         ▼
 Tiền + cổ phiếu nằm THẬT trong tiểu khoản KH (KH là chủ sở hữu)
@@ -79,7 +80,7 @@ SDI dựng holdings KH từ execution feed → tính NAV
 ```
 
 - **Custody = segregated**: tài sản tách bạch theo tiểu khoản, KH sở hữu hợp pháp.
-- **Execution = aggregated, do FO làm** (O4): SDI gửi yêu cầu rebalance; **FO tự gom lệnh + đẩy MP + allocate**. SDI **không sinh/khớp lệnh**, chỉ tiêu thụ execution feed.
+- **Execution = trực tiếp trên TK từng KH, do FO làm** (O4): SDI gửi yêu cầu rebalance; **FO đặt lệnh MP trực tiếp trên tài khoản từng KH** — **KHÔNG gom rồi phân bổ** → **không có vấn đề phân bổ lô lẻ**. Khớp → cổ phiếu; không khớp → vẫn là tiền của KH. SDI **không sinh/khớp lệnh**, chỉ tiêu thụ execution feed.
 - → KHÔNG phải pooled fund (không có quỹ gộp sở hữu chung). Xem §9.
 
 ---
@@ -156,7 +157,7 @@ Tn (HISTORIC pricing, chốt EOD, CF = NAV vào − NAV ra gom trong ngày):
 
 - File Excel mẫu (PnL danh mục KH) tính Unit Price **riêng từng KH** từ NAV + cashflow của KH đó → **chốt per-KH**.
 - ❌ Plan §7 ("mọi KH dùng SI Unit Price chung") **SAI** với mô hình SMA segregated → bỏ.
-- Mỗi KH có tracking error riêng (cash drag, lô lẻ, thời điểm vào batch) → phải phản ánh, không san đều.
+- Mỗi KH có tracking error riêng (cash drag do phần không khớp = tiền KH, thời điểm tham gia) → phải phản ánh, không san đều.
 
 ---
 
@@ -358,12 +359,12 @@ SI Unit Price = SI NAV / Σ Customer Unit   (asset-weighted, đại diện sản
 
 ---
 
-## 9. KIẾN TRÚC: SMA (segregated custody + gộp lệnh) ✅
+## 9. KIẾN TRÚC: SMA (segregated custody, lệnh trực tiếp trên TK KH) ✅
 
 | Khía cạnh | Kết luận |
 |---|---|
 | Sở hữu | Segregated — tiền/CP thật trong tiểu khoản KH |
-| Thực thi | Aggregated — gộp lệnh, phân bổ pro-rata |
+| Thực thi | FO đặt lệnh MP **trực tiếp trên TK từng KH** (không gom + phân bổ) → không có lô lẻ phân bổ |
 | NAV | SDI tính per (KH × SI); SI NAV = Σ KH |
 | Unit Price | **Per KH** (không chung) |
 | FR-06 | Per SI từ FO + NAV/phí do SDI tính |
@@ -377,12 +378,13 @@ Cầu nối TG2 (weights) → TG1 (tài khoản thật). **SDI KHÔNG sinh/khớ
 |---|---|---|
 | Đăng ký tham gia | SDI | KH đăng ký vào SI |
 | **Yêu cầu rebalance** | **SDI → FO** | SDI báo FO weights mới cần đạt |
-| Gom lệnh + đẩy MP + allocate | **FO** | FO tự thực hiện cho toàn bộ KH trong SI |
-| **Execution feed** | **FO → SDI** | Kết quả khớp MP per tiểu khoản (mã, KL, giá khớp) |
+| Đặt lệnh MP **trực tiếp trên TK từng KH** | **FO** | KHÔNG gom + phân bổ; khớp → CP, không khớp → tiền KH |
+| **Execution feed** | **FO → SDI** | Kết quả khớp MP per TK (mã, KL, giá khớp) |
 | Sổ cái holdings KH | SDI | Dựng từ execution feed + CA → mark-to-market NAV |
 
 > **Execution feed từ FO là nguồn bắt buộc** để tính NAV per KH (giá MP = giá khớp thật, biết EOD).
-> ⚠️ Còn chốt: **lô lẻ** (FO mua lô lẻ hay để dư tiền?), **độ trễ** (yêu cầu rebalance T → FO khớp T mấy?) — quyết định cash drag per KH (O5, O6).
+> ✅ **Lô lẻ (O5) — giải quyết:** vì lệnh đặt trực tiếp trên TK KH (không phân bổ), **không có bài toán chia lô lẻ**. Phần không khớp/không mua đủ → **vẫn là tiền của KH** (cash drag), SDI phản ánh tự nhiên qua NAV. Không cần logic riêng.
+> ⚠️ Còn hỏi FO: **độ trễ** (yêu cầu rebalance T → FO khớp T mấy?) — O6.
 
 ---
 
