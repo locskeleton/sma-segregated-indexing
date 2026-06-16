@@ -286,7 +286,7 @@ NAV_đầu·(1+r)^T + Σ_i CF_i·(1+r)^(T−t_i) = NAV_cuối
 
 > ⚠️ KHÔNG phải hiệu suất tiền thật của SI. Đây là **benchmark lý thuyết** của danh mục mẫu.
 > "Hiệu suất SI" (đường 1 chart) đến từ **Unit Price** (§4), không phải Index này.
-> **Nguồn weights:** `w_i` (và `w_cash` nếu có) lấy từ `model_weight` **do FO tính & feed về** — SDI chỉ đọc rồi tính index, KHÔNG tự quyết tỷ trọng.
+> **Nguồn weights:** `w_i` lấy từ `model_weight` **do FO tính & feed về** — SDI chỉ đọc rồi tính index, KHÔNG tự quyết tỷ trọng. **Danh mục mẫu LUÔN 100% cổ phiếu (Σ w_i = 100%, KHÔNG có cash — #7 chốt)** → index không có thành phần cash.
 
 ### 6.1 Công thức
 
@@ -383,7 +383,7 @@ SI Unit Price = SI NAV / Σ Customer Unit   (asset-weighted, đại diện sản
 |---|---|---|
 | Đăng ký tham gia | SDI | KH đăng ký vào SI |
 | **Yêu cầu rebalance (trigger)** | **SDI → FO** | Chỉ KÍCH HOẠT — **KHÔNG chứa weights** |
-| **Tính tỷ trọng danh mục mẫu** | **FO** | "Não" chiến lược (gồm cash nếu có) |
+| **Tính tỷ trọng danh mục mẫu** | **FO** | "Não" chiến lược (luôn 100% CP, không cash — #7) |
 | Đặt lệnh MP **trực tiếp trên TK từng KH** | **FO** | KHÔNG gom + phân bổ; khớp → CP, không khớp → tiền KH |
 | **`model_weight` feed** | **FO → SDI** | Cơ cấu mẫu FO đã tính → SDI dùng tính **index** |
 | **`execution` feed** | **FO → SDI** | Kết quả khớp MP per TK → SDI dùng tính **NAV** |

@@ -63,13 +63,11 @@ Market ─┤ (giá đóng cửa, giá ref điều chỉnh quyền, VN-Index, CA
 | inception_date | DATE | |
 | mgmt_fee_rate | NUMERIC | %/năm (mặc định, KH có thể override) |
 | benchmark_id | BIGINT | FK → benchmark (VN-Index PR — #D giữ PR) |
-| model_holds_cash | BOOL | điểm #7 — danh mục mẫu có giữ tiền không |
-
 **`sdi_model_weight`** — danh mục mẫu (điểm #10), **FO tính & feed về** (ingest), version theo ngày
 | cột | kiểu | ghi chú |
 |---|---|---|
 | si_id, effective_date, ticker (PK) | | weights net **hiệu lực tại close** |
-| target_weight | NUMERIC | Σ theo (si_id, effective_date) = 100% (CP) [+ cash nếu #7] |
+| target_weight | NUMERIC | Σ theo (si_id, effective_date) = 100% (CP) — **luôn 100% cổ phiếu, KHÔNG cash** (#7) |
 
 **`sdi_customer_si`** — cấu hình đầu tư KH (FR-04, điểm thiếu của plan)
 | cột | kiểu | ghi chú |
@@ -165,7 +163,7 @@ SI NAV = Σ Customer NAV ; SI Unit Price = SI NAV / Σ Customer Unit
 # SI INDEX (danh mục mẫu) — EOD, weights net cuối ngày (#8)
 Index_0=1000 ; Index_t = Index_(t-1) × Σ_i (w_i × P_i,t / P_ref_i)
   P_ref_i = close hôm trước | ref_price_adjusted khi có quyền
-  [+ w_cash × 1 nếu model_holds_cash = true, #7]
+  # danh mục mẫu LUÔN 100% cổ phiếu (Σ w_i = 100%, KHÔNG cash — #7 chốt)
   # PRICE RETURN — #D chốt GIỮ PR (KHÔNG reinvest cổ tức); so với VN-Index (PR) cùng cơ sở
 ```
 
@@ -261,7 +259,7 @@ B9  PUSH → ASSET: asset_snapshot, holding_daily, si_performance, si_index, ben
 |---|---|---|
 | ~~O1~~ | ~~**[D]** Benchmark TR/PR?~~ → ✅ **ĐÃ CHỐT: giữ VN-Index (PR)**, không dùng VN30TRI. Chấp nhận gap KH(TR)-vs-benchmark(PR) vì UX. | (đóng) |
 | ~~O2~~ | ~~**[E]** MWR cạnh TWR hay chỉ TWR?~~ → ✅ **ĐÃ CHỐT: implement CẢ HAI** (TWR=chiến lược/chart, MWR=lợi suất của bạn; Modified Dietz mặc định). §5.4 glossary, §4 plan. | (đóng) |
-| O3 | **[#7]** Danh mục mẫu có giữ tiền không? → FO quyết (tính tỷ trọng). **SDI index đọc `model_weight` từ FO, xử lý cả 2** (có dòng CASH → `+w_cash×(1+r_cash)`; không → full CP). Chỉ cần FO xác nhận feed CÓ THỂ chứa dòng CASH + chốt `r_cash` (0 hay lãi suất) để test. | SDI robust 2 chiều |
+| ~~O3~~ | ~~**[#7]** Danh mục mẫu có giữ tiền không?~~ → ✅ **ĐÃ CHỐT: KHÔNG. Danh mục mẫu luôn 100% cổ phiếu** → index full CP, không có thành phần cash. | (đóng) |
 | ~~O4~~ | ~~**[#9]** SDI sinh tập lệnh hay tiêu thụ?~~ → ✅ **ĐÃ CHỐT: SDI gửi yêu cầu rebalance; FO đặt lệnh MP trực tiếp trên TK từng KH (không gom/phân bổ); SDI tiêu thụ execution feed.** (§9b) | (đóng) |
 | ~~O5~~ | ~~Lô lẻ: mua lô lẻ hay để dư tiền?~~ → ✅ **ĐÃ CHỐT: lệnh trực tiếp trên TK KH, không phân bổ → không có lô lẻ phân bổ; không khớp = tiền KH (cash drag tự phản ánh).** (§9b) | (đóng) |
 | ~~O6~~ | ✅ **ĐÃ CHỐT toàn bộ**: phát unit tại ngày nộp + clock từ ngày nộp + trade-date (§8 #4). **Độ trễ nộp→khớp KHÔNG ảnh hưởng** (tiền chờ = cash 0%, ngày phẳng ×1.0) → không cần hỏi FO. | (đóng) |
