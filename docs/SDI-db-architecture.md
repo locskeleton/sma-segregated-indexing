@@ -248,7 +248,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_MASTER_PORTFOLIO_TICKER | (C_SI_ID, C_EFFECTIVE_DATE, C_TICKER) | composite natural |
 | T_PRICE_DAILY | (C_BUSINESS_DATE, C_TICKER) | composite natural |
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
-| T_BENCHMARK_DAILY | (C_BENCHMARK_ID, C_BUSINESS_DATE) | composite |
+| T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
 | T_CUSTOMER_HOLDING_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
 | T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (staging FO) |

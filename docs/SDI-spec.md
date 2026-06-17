@@ -193,14 +193,14 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38,10)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
 
 ### Master / cấu hình
-- **`sdi_master_portfolio`** (si_id PK; si_code, si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_id)
+- **`sdi_master_portfolio`** (si_id PK; si_code, si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — `benchmark_code` ('VNINDEX'…) trỏ benchmark đối chiếu (FR-03)
 - **`sdi_master_portfolio_ticker`** (si_id, effective_date, ticker PK; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
 - **`sdi_indexing_portfolio`** (customer_id, si_id PK; sub_account_no, join_date, status, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — cấu hình đầu tư KH (FR-04).
 
 ### Market data
 - **`sdi_price_daily`** (ticker, business_date PK; close_price, adjusted_ref_price)
 - **`sdi_corporate_action`** (ticker, ex_date, ca_type PK; ratio, cash_div_per_share, adjusted_ref_price)
-- **`sdi_benchmark_daily`** (benchmark_id, business_date PK; index_value) — VN-Index (price return)
+- **`sdi_benchmark_daily`** (benchmark_code, business_date PK; index_value) — chỉ số thị trường ngoài (VN-Index, price return), **nạp từ market data** (không do SDI tính). Key = code tự mô tả (giống ticker), không cần dimension riêng.
 
 ### FO sync (EOD) & cashflow
 - **`sdi_rebalance_request`** (request_id PK; si_id, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).
