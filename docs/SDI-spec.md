@@ -50,17 +50,16 @@ SDI: mirror holdings+cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, SI Inde
 
 ```
 Chứng khoán   = Σ (KL nắm giữ × market price)
-Tiền          = tiền mặt + tiền bán chờ về (T0+T1+T2) + cổ tức tiền
-Tổng tài sản   = Tiền + Chứng khoán
-Phí quản lý/ngày = NAV_t × mgmt_fee_rate / 365      (accrue THEO NGÀY trên NAV thật ngày đó)
-NAV           = Tổng tài sản − phí lưu ký (FO) − phí quản lý lũy kế (SDI accrue)
+Tiền (FO sync) = available cash FO đồng bộ EOD — ĐÃ NET phí QL + thuế GD + ghi nhận SIP
+NAV           = Chứng khoán + Tiền (FO sync)
 Tổng vốn đầu tư = Σ NAV vào − Σ NAV ra              (net cashflow lũy kế)
 ```
 
-- **NAV do SDI tính** — không đọc thô số dư tiểu khoản (số thô trộn tiền chờ giải ngân, tiền mua chờ khớp, tiền bán chờ về T+, và phí quản lý SDI chưa có trong số FO).
-- **Phí quản lý**: accrue mỗi ngày `NAV_t × rate/365` (mỗi ngày một số theo NAV ngày đó, KHÔNG chia đều) → cộng dồn vào "phí phải trả". **Thu theo tháng tại ngày cố định**: lúc thu `tiền↓ + phí phải trả↓` → NAV neutral (không tụt bậc). Ngày nghỉ dùng NAV phiên gần nhất.
-- **Phí lưu ký** từ FO; **phí quản lý** do SDI cộng thêm — không để trùng.
-- Phí phạt rút sớm: chi phí, KHÔNG tính vào cashflow.
+- **NAV = stock_value + FO cash.** FO đồng bộ available cash cuối ngày đã trừ sẵn mọi khoản FO hạch toán (phí quản lý danh mục, thuế/phí giao dịch) và đã phản ánh lệnh SIP. **SDI tuyệt đối KHÔNG accrue/trừ lại** các khoản này → tránh double-count (phương án A).
+- **FO cash là nguồn tiền DUY NHẤT.** SDI mirror số FO đẩy về, không tự cộng/trừ điều chỉnh; không suy cash từ Δ holdings.
+- **Phí quản lý + thuế GD**: do FO sở hữu & trừ vào cash khi book. SDI không có job accrue phí (J06 đã bỏ).
+- **`CF_t` chỉ lấy từ cashflow event** (nhãn DEPOSIT/SIP/WITHDRAW) — **không** suy từ Δ tổng tiền. Event phải khớp đúng ngày + số tiền với thời điểm FO phản ánh vào cash.
+- Phí phạt rút sớm: do FO trừ vào cash, KHÔNG tính vào cashflow.
 
 ### Cash sub-ledger (typed)
 Tổng tiền chỉ để tính NAV. Các thành phần tiền lưu **theo loại** (FO cấp nhãn) phục vụ 3 mục đích:
@@ -83,7 +82,7 @@ Tổng tiền chỉ để tính NAV. Các thành phần tiền lưu **theo loạ
 | **NAV vào** (`cash_in`) | tiền KH bơm vào: nộp lần đầu, nộp thêm, SIP, lãi Infy | external cashflow | ✅ |
 | **NAV ra** (`cash_out`) | tiền KH rút | external cashflow | ✅ |
 | **Income** | cổ tức/lãi do tài sản quỹ sinh ra | PnL (qua NAV) | ❌ |
-| **Chi phí** | phí quản lý, phí phạt rút sớm | giảm NAV | ❌ |
+| **Chi phí** | phí quản lý, thuế GD, phí phạt rút sớm | FO trừ vào cash (SDI không re-apply) | ❌ |
 
 - `net_cashflow (CF_t) = cash_in − cash_out` — **external, per (KH×SI), per ngày**, lấy từ event có nhãn.
 - **Cổ tức tiền mặt**: income — vào NAV qua thành phần Tiền, **accrue tại ngày EX** (ghi phải thu), tự động vào PnL. KHÔNG tag là cash_in.
@@ -215,7 +214,7 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_indexing_performance_daily`** (business_date, customer_id, si_id PK; nav, unit, unit_price, daily_pnl, daily_return) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải).
 
 ### Chuỗi daily SI-level (materialize, nhỏ)
-- **`sdi_asset_snapshot_daily`** (business_date, si_id PK; cash_balance, stock_value, cash_available, withdrawable_asset, buying_power, pending_buy, pending_sell, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav)
+- **`sdi_asset_snapshot_daily`** (business_date, si_id PK; cash_balance, stock_value, cash_available, withdrawable_asset, buying_power, pending_buy, pending_sell, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav) — `mgmt_fee_accrued`/`payable_fee` để FO báo cáo tham khảo (SDI không tự accrue); `nav = stock_value + cash`
 - **`sdi_holding_daily`** (business_date, si_id, ticker PK; quantity, market_price, market_value, weight) — top 20 + "mã khác"
 - **`sdi_si_performance_daily`** (business_date, si_id PK; nav, unit, unit_price, daily_pnl, daily_return)
 - **`sdi_si_index_daily`** (business_date, si_id PK; index_value, daily_return)
@@ -242,7 +241,7 @@ Index: `(customer_id, si_id, business_date)` cho customer-level; `(si_id, busine
 
 ### 9.1 Công thức pipeline (mức tính toán)
 ```
-NAV          = stock_value + cash − custody_fee − mgmt_fee_accrued
+NAV          = stock_value + cash (FO cash đã NET phí QL + thuế GD; SDI không trừ lại)
 PnL ngày     = NAV cuối − NAV đầu + NAV ra − NAV vào
 ΔUnit        = net CF / UnitPrice_(t-1) ; Unit = Unit_(t-1)+ΔUnit (full) ; UnitPrice = NAV/Unit
 SI NAV/Unit  = Σ per si ; SI UnitPrice = SI NAV / SI Unit
@@ -259,9 +258,9 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J1** | `STAGE` bulk load input | J0 | FO sync (holdings+cash), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
 | **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
 | **J1b** | `SYNC_FO` diff + mirror | J2 | sdi_fo_holding_sync, sdi_fo_cash_sync | **DIFF** → customer_holding_event (biến động NET); rồi **overwrite** indexing_portfolio_ticker + state.cash | ✅ | ‖ | ✅ |
-| **J6** | `ACCRUE_FEE` phí quản lý | J1b | state (NAV_prev) | state.payable += NAV_prev×rate/365 | ✅ | ‖ | – |
+| ~~J6~~ | ~~`ACCRUE_FEE`~~ **(ĐÃ BỎ)** | — | phí QL + thuế GD do FO trừ vào cash khi book; SDI không accrue lại (tránh double-count) | — | – | – | – |
 | **J7** | `MTM` định giá lại toàn bộ | J1b | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
-| **J8** | `CALC_NAV` | J6, J7 | stock_value, state.cash, phí | NAV per vị thế | ✅ | ‖ | – |
+| **J8** | `CALC_NAV` | J7 | stock_value, state.cash (FO) | NAV = stock_value + cash | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
 | **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger; **sdi_indexing_performance_daily** (lịch sử per-KH) | ✅ | ‖ | – |
 | **J11** | `SI_AGG` tổng hợp SI | J8, J10 | NAV/unit per vị thế | sdi_si_performance_daily | ✅ | ‖ | – |
@@ -274,21 +273,21 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 ### 9.3 Thứ tự, song song & orchestration
 
 ```
-J0 → J1 → J2 → J1b ─┬─ J6 ─┐
-                    └─ J7 ─┴─ J8 → J9
-                                 └─ J10 ─┐
-                                         └─ J11 → J13 ─┐
-              J2 ──► J12 (độc lập, song song) ─────────┤
-                                       J8 → J14 ───────┴─ J15 → J16
+J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
+                              └─ J10 ─┐
+                                      └─ J11 → J13 ─┐
+              J2 ──► J12 (độc lập, song song) ──────┤
+                                    J8 → J14 ───────┴─ J15 → J16
 ```
+(J6 ACCRUE_FEE đã bỏ — FO cash đã NET phí; NAV = stock + cash.)
 - **J1b SYNC_FO**: mirror holdings (overwrite) + cash từ FO snapshot → KHÔNG còn APPLY_CA/EXEC/CASHFLOW (FO đã phản ánh trade/cổ tức/split). CA chỉ dùng cho **J12 index**; cashflow event dùng cho **CF_t** (J9/J10).
 - **J12 (SI Index)** chỉ cần giá + model_weight → song song nhánh customer.
-- **J6/J7 sau J1b** (state cash + holdings đã sync); J7 song song J6.
+- **J7 sau J1b** (state cash + holdings đã sync); J8 NAV = stock + cash (không trừ phí).
 - **J7/J8/J9/J10/J14** chia **dải SI hoặc hash(customer_id)** chạy nhiều luồng.
 - **J13 RECONCILE là cổng**: lệch quá ngưỡng → **dừng, KHÔNG publish dữ liệu sai**, alert.
 - **Thực thi ALL-IN-DB**: mỗi job = **1 stored proc** (set-based); **master proc `usp_eod_run @business_date`** gọi tuần tự + ghi `sdi_eod_run(business_date, job, status, rows, started, ended, message)`. **App/SQL Agent chỉ kích hoạt master proc** — không tính toán ở app. Fail giữa chừng → **resume từ job lỗi** (idempotent). Ingestion = proc `BULK INSERT`; API đọc = stored proc.
 - **RCSI** bật → app đọc current snapshot không bị batch chặn; **J15 PUBLISH** (switch-in) là thao tác ngắn duy nhất ảnh hưởng đích.
-- **Roll-forward**: J3–J6 áp **delta** (chỉ vị thế có biến động); J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
+- **Roll-forward**: J1b áp **delta** (chỉ vị thế có biến động); J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
 
 > Chi tiết kỹ thuật (columnstore, partition switch, runtime ~vài phút–15 phút, anti-patterns): [SDI-db-architecture.md](./SDI-db-architecture.md).
 

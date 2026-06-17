@@ -117,17 +117,17 @@ Tất cả vào **staging** trước, validate, rồi **publish** (partition swi
 B1  STAGE input ngày @d: bulk insert price, FO holdings+cash sync, model_weight, CA, cashflow → staging (minimal logging)
 B1b SYNC_FO: mirror holdings (overwrite T_INDEXING_PORTFOLIO_TICKER) + cash (state) từ snapshot FO
 B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
-      - CA: MERGE holding (split/quyền đổi qty); cash (cổ tức) → state.cash
-      - Execution: MERGE holding (qty +/−); state.cash -/+ (mua/bán, trade-date)
-      - Cashflow: state.cash +/−; tính CF_t cho từng vị thế có nạp/rút
-      - Mgmt fee: state.payable += NAV_prev × rate/365   (1 UPDATE set-based)
+      - SYNC_FO đã overwrite holdings + cash từ snapshot FO (đã phản ánh trade/CA/cổ tức/SIP)
+      - DIFF snapshot → customer_holding_event (biến động NET trong ngày, để audit/tái dựng)
+      - Cashflow event: tính CF_t cho vị thế có nạp/rút (chỉ để đổi unit — KHÔNG cộng lại vào cash)
+      - (KHÔNG accrue phí: FO cash đã NET phí QL + thuế GD — tránh double-count)
 B3  MTM TOÀN BỘ (câu lệnh nặng nhất — set-based):
       INSERT #nav_today (customer_id, si_id, stock_value)
       SELECT h.customer_id, h.si_id, SUM(h.quantity * p.close_price)
       FROM   sdi_indexing_portfolio_ticker h
       JOIN   sdi_price_daily p ON p.ticker=h.ticker AND p.business_date=@d
       GROUP BY h.customer_id, h.si_id;        -- batch-mode (NCCI) trên 20M dòng
-B4  NAV = stock_value + state.cash − custody_fee − mgmt_fee_accrued     (1 UPDATE join)
+B4  NAV = stock_value + state.cash   (FO cash đã NET phí → không trừ lại)   (1 UPDATE join)
 B5  PnL ngày = NAV_today − NAV_prev + ra − vào                          (1 UPDATE)
 B6  UNIT: chỉ vị thế có CF_t:  ΔUnit = CF/unit_price_prev; unit += ΔUnit  (1 UPDATE)
       unit_price = NAV / unit   (mọi vị thế — 1 UPDATE)

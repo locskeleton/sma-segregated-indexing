@@ -2,8 +2,8 @@
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
   Mô hình roll-forward: T_POSITION_STATE (current) + áp delta ngày @d → tính lại.
-  Thứ tự (master SP_EOD_RUN): J05 → J03 → J06 → J04 → J07 → J11 → J12 → J13 → J14
-  (J05 cashflow chạy trước để tạo state cho KH mới; J03 CA dùng holdings trước trade.)
+  Thứ tự (master SP_EOD_RUN): J01_SYNC_FO → J07 → J11 → J12 → J13 → J14
+  (J06 fee đã bỏ — FO cash đã NET phí; NAV = stock + FO cash.)
 ==============================================================================*/
 SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
 GO
@@ -82,21 +82,8 @@ GO
 -- (ĐÃ BỎ J03 APPLY_CA & J04 APPLY_EXEC) — FO sync đã phản ánh cổ tức/split/trade vào cash+holdings.
 --   T_CORPORATE_ACTION chỉ còn dùng cho SI INDEX (điều chỉnh P_ref khi có quyền — J12).
 
-/*===========================================================================
-  J06 — ACCRUE MGMT FEE: payable += NAV_prev × rate/365  (hạch toán theo ngày)
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_ACCRUE_FEE @d DATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    UPDATE s SET C_PAYABLE_FEE = s.C_PAYABLE_FEE
-                 + s.C_LAST_NAV * (COALESCE(cs.C_MGMT_FEE_RATE, st.C_MGMT_FEE_RATE) / 365.0)
-    FROM T_POSITION_STATE s
-    JOIN T_MASTER_PORTFOLIO st ON st.C_SI_ID = s.C_SI_ID
-    LEFT JOIN T_INDEXING_PORTFOLIO cs ON cs.C_CUSTOMER_ID=s.C_CUSTOMER_ID AND cs.C_SI_ID=s.C_SI_ID
-    WHERE s.C_STATUS='ACTIVE';
-    -- THU phí: ngày thu tháng cố định → cash -= payable_mgmt; payable=0 (TODO: tách custody khỏi mgmt nếu cần)
-END
+-- (ĐÃ BỎ J06 ACCRUE_FEE) — phương án (A): phí quản lý + thuế GD do FO trừ vào cash khi book.
+--   FO cash đã NET → SDI KHÔNG accrue/trừ lại (tránh double-count). NAV = stock_value + FO_cash.
 GO
 
 /*===========================================================================
@@ -136,8 +123,8 @@ BEGIN
     ) m ON m.C_CUSTOMER_ID=w.C_CUSTOMER_ID AND m.C_SI_ID=w.C_SI_ID
     WHERE w.C_BUSINESS_DATE=@d;
 
-    -- J08 NAV = stock + cash − phí phải trả
-    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH - C_PAYABLE_FEE WHERE C_BUSINESS_DATE=@d;
+    -- J08 NAV = stock + cash (FO cash đã NET phí QL + thuế GD → SDI KHÔNG trừ lại, tránh double-count)
+    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH WHERE C_BUSINESS_DATE=@d;
 
     -- J09 PnL = NAV − NAV_prev + ra − vào
     UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@d;
@@ -335,7 +322,7 @@ BEGIN
     DECLARE @d DATE = @C_BUSINESS_DATE;
 
     EXEC SP_EOD_STEP @d, 'J01_SYNC_FO',  'SP_EOD_SYNC_FO';         -- mirror holdings+cash từ FO (overwrite)
-    EXEC SP_EOD_STEP @d, 'J06_FEE',      'SP_EOD_ACCRUE_FEE';
+    -- (ĐÃ BỎ J06_FEE) — phí QL + thuế GD do FO trừ vào cash khi book; SDI KHÔNG accrue lại (tránh double-count)
     EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';

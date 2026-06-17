@@ -33,17 +33,18 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J01 sync_fo (DIFF biến động/ngày → holding-event; mirror holdings+cash per-KH từ FO) → J06 fee → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
+`J01 sync_fo (DIFF biến động/ngày → holding-event; mirror holdings+cash per-KH từ FO) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
 (FO đồng bộ holdings+cash TỪNG KH cuối ngày — SDI không quản lý từng lệnh khớp. SDI diff snapshot→biến động net để audit/tái dựng. Cashflow event chỉ dùng cho CF_t.)
+(J06 ACCRUE_FEE đã bỏ — FO cash đã NET phí QL + thuế GD; **NAV = stock_value + FO cash**, SDI không accrue lại để tránh double-count.)
 
 ## Đã verify (SQL Server Express)
-Smoke 1 KH / 3 phiên — khớp kỳ vọng:
-| Phiên | NAV | Unit | Unit Price | SI Index |
-|---|---|---|---|---|
-| 02-01 | 10,000,000 | 1000 | 10,000 | 1000 |
-| 05-01 | 10,439,726.03 | 1000 | 10,439.73 | 1044 |
-| 06-01 | 10,759,440.01 | 1000 | 10,759.44 | 1078.8 |
+Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO cash, không accrue phí):
+| Phiên | NAV | Unit | Unit Price | Daily PnL | SI Index |
+|---|---|---|---|---|---|
+| 02-01 | 10,000,000 | 1000 | 10,000 | 0 | 1000 |
+| 05-01 | 10,440,000 | 1000 | 10,440 | 440,000 | 1044 |
+| 06-01 | 10,760,000 | 1000 | 10,760 | 320,000 | 1078.8 |
 
-27/27 job DONE, reconcile pass, re-run idempotent (không double-apply).
+18/18 job DONE (6 job × 3 phiên), reconcile pass, re-run idempotent (không double-apply).
 
-> Chưa implement (mở rộng): ingestion file FO → `T_FO_*_SYNC` (`BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), thu phí tháng, partition/columnstore prod (gồm `T_INDEXING_PERFORMANCE_DAILY` CCI).
+> Chưa implement (mở rộng): ingestion file FO → `T_FO_*_SYNC` (`BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), partition/columnstore prod (gồm `T_INDEXING_PERFORMANCE_DAILY` CCI).
