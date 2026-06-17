@@ -119,8 +119,17 @@ CREATE TABLE T_CASHFLOW_EVENT (
 );
 CREATE INDEX IX_CASHFLOW_EVENT_DATE ON T_CASHFLOW_EVENT (C_BUSINESS_DATE) INCLUDE (C_CUSTOMER_ID, C_SI_ID, C_EVENT_TYPE, C_AMOUNT);
 
--- (ĐÃ BỎ T_CUSTOMER_HOLDING_EVENT) — holdings không còn event-source ở SDI;
---   FO đồng bộ full snapshot (T_FO_HOLDING_SYNC) → SDI mirror vào T_INDEXING_PORTFOLIO_TICKER.
+-- Biến động holdings NET trong ngày: SDI DIFF snapshot FO hôm nay vs holdings hiện tại (hôm trước).
+--   Dùng cho AUDIT + tái dựng holdings lịch sử. qty_delta gộp cả trade + CA (net cuối ngày).
+CREATE TABLE T_CUSTOMER_HOLDING_EVENT (
+    C_BUSINESS_DATE  DATE            NOT NULL,
+    C_CUSTOMER_ID    BIGINT          NOT NULL,
+    C_SI_ID          BIGINT          NOT NULL,
+    C_TICKER         VARCHAR(20)     NOT NULL,
+    C_QTY_DELTA      DECIMAL(20,4)   NOT NULL,   -- today_qty − prev_qty
+    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CHE_SRC DEFAULT 'SYNC_DIFF',
+    CONSTRAINT PK_CUSTOMER_HOLDING_EVENT PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER)
+);
 
 -- Unit thay đổi (ghi dòng khi có cashflow)
 CREATE TABLE T_UNIT_LEDGER (

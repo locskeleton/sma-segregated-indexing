@@ -207,6 +207,7 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_rebalance_request`** (request_id PK; si_id, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).
 - **`sdi_fo_holding_sync`** (business_date, customer_id, si_id, ticker PK; quantity, avg_cost) — **FO → SDI EOD**: snapshot holdings toàn bộ TK (SDI mirror, overwrite). SDI KHÔNG quản lý từng lệnh khớp.
 - **`sdi_fo_cash_sync`** (business_date, customer_id, si_id PK; cash) — **FO → SDI EOD**: snapshot tiền (đã phản ánh trade/cổ tức/split/settlement).
+- **`sdi_customer_holding_event`** (business_date, customer_id, si_id, ticker PK; qty_delta, source) — **biến động NET trong ngày** do SDI **DIFF** snapshot FO hôm nay vs holdings hôm trước (per-KH). Audit + tái dựng holdings lịch sử. Sparse (chỉ mã có thay đổi).
 - **`sdi_cashflow_event`** (event_id PK; customer_id, si_id, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow; dùng cho **CF_t** (PnL/unit), KHÔNG cộng lại cash (cash từ FO sync).
 - **`sdi_unit_ledger`** (customer_id, si_id, business_date PK; cf_net, delta_unit, unit) — ghi dòng khi unit thay đổi (cashflow). Unit full precision.
 
@@ -257,7 +258,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J0** | `GATE` chờ nguồn sẵn sàng | — | cờ sẵn sàng FO/Market/model_weight @d | `sdi_eod_run` | – | – | ✅ (timeout→alert) |
 | **J1** | `STAGE` bulk load input | J0 | FO sync (holdings+cash), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
 | **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
-| **J1b** | `SYNC_FO` mirror holdings+cash | J2 | sdi_fo_holding_sync, sdi_fo_cash_sync | indexing_portfolio_ticker (**overwrite**), state.cash | ✅ | ‖ | ✅ |
+| **J1b** | `SYNC_FO` diff + mirror | J2 | sdi_fo_holding_sync, sdi_fo_cash_sync | **DIFF** → customer_holding_event (biến động NET); rồi **overwrite** indexing_portfolio_ticker + state.cash | ✅ | ‖ | ✅ |
 | **J6** | `ACCRUE_FEE` phí quản lý | J1b | state (NAV_prev) | state.payable += NAV_prev×rate/365 | ✅ | ‖ | – |
 | **J7** | `MTM` định giá lại toàn bộ | J1b | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J6, J7 | stock_value, state.cash, phí | NAV per vị thế | ✅ | ‖ | – |

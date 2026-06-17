@@ -41,7 +41,8 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 |---|---|---|---|
 | `sdi_position_state` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (customer_id, si_id), PAGE compression; cân nhắc memory-optimized |
 | `sdi_indexing_portfolio_ticker` | holdings hiện tại (mirror FO) | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
-| `sdi_fo_holding_sync` / `sdi_fo_cash_sync` | snapshot FO đồng bộ EOD | ~20M/ngày staging | rowstore, partition theo ngày/năm (truncate/switch sau khi mirror) |
+| `sdi_fo_holding_sync` / `sdi_fo_cash_sync` | snapshot FO đồng bộ EOD (per-KH) | ~20M/ngày staging | rowstore, partition theo ngày/năm |
+| `sdi_customer_holding_event` | biến động NET/ngày (DIFF snapshot) | sparse | **CCI**, partition năm — audit + tái dựng holdings |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_indexing_performance_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
@@ -251,6 +252,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
 | T_FO_HOLDING_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (staging FO) |
 | T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (staging FO) |
+| T_CUSTOMER_HOLDING_EVENT | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (DIFF net/ngày) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
 | T_INDEXING_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (history, CCI) |
 | T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |

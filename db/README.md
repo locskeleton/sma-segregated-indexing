@@ -33,8 +33,8 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J01 sync_fo (mirror holdings+cash từ FO) → J06 fee → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
-(SDI KHÔNG quản lý từng lệnh khớp — FO đồng bộ snapshot holdings+cash EOD. Cashflow event chỉ dùng cho CF_t.)
+`J01 sync_fo (DIFF biến động/ngày → holding-event; mirror holdings+cash per-KH từ FO) → J06 fee → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
+(FO đồng bộ holdings+cash TỪNG KH cuối ngày — SDI không quản lý từng lệnh khớp. SDI diff snapshot→biến động net để audit/tái dựng. Cashflow event chỉ dùng cho CF_t.)
 
 ## Đã verify (SQL Server Express)
 Smoke 1 KH / 3 phiên — khớp kỳ vọng:
