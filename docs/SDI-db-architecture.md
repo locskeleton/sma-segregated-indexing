@@ -236,6 +236,60 @@ Customer NAV lịch sử = **derive-on-read** → KHÔNG lưu → không có 2,5
 
 ---
 
+## 10b. Chiến lược Primary Key (chốt)
+
+### Quy tắc
+```
+Fact/event lớn, hot, columnstore        → BIGINT IDENTITY (surrogate)
+Master bị FK ref bởi bảng lớn           → BIGINT  (ĐỪNG GUID — sẽ lan 16B vào bảng lớn)
+Reference/daily có tổ hợp tự nhiên      → composite natural key (cột TYPED; API compose từ field)
+Nhạy cảm phơi id ra URL/API trực tiếp   → BIGINT nội bộ + cột GUID RANDOM nonclustered unique (public id)
+Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
+```
+- Composite natural key: để **các cột typed riêng** (DATE+BIGINT…), **KHÔNG nối chuỗi** (`"date_id"` → mất partition elimination, parse, nén kém). API cần token đơn thì **ghép/parse ở tầng API**, DB giữ cột riêng.
+- Leftmost-prefix: query phải có **cột dẫn đầu** mới seek; pattern khác → thêm nonclustered index.
+
+### Per-table
+| Bảng | PK | Loại |
+|---|---|---|
+| T_STRATEGY | C_SI_ID | BIGINT (bị ref rộng) |
+| T_CUSTOMER_SI | (C_CUSTOMER_ID, C_SI_ID) | composite typed |
+| T_MODEL_WEIGHT | (C_SI_ID, C_EFFECTIVE_DATE, C_TICKER) | composite natural |
+| T_PRICE_DAILY | (C_BUSINESS_DATE, C_TICKER) | composite natural |
+| T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
+| T_BENCHMARK_DAILY | (C_BENCHMARK_ID, C_BUSINESS_DATE) | composite |
+| T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
+| T_EXECUTION_FEED | C_EXEC_ID | BIGINT IDENTITY (fact/CCI) |
+| T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
+| T_CUSTOMER_HOLDING_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
+| T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |
+| T_POSITION_STATE | (C_CUSTOMER_ID, C_SI_ID) | composite typed (hot) |
+| T_POSITION_HOLDING | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
+| T_EOD_WORK | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite (transient) |
+| T_SI_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
+| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
+| T_HOLDING_DAILY | (C_BUSINESS_DATE, C_SI_ID, C_TICKER) | composite natural |
+| T_ASSET_SNAPSHOT_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
+| T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
+
+→ **Không bảng nào dùng GUID** vì master nhỏ đều bị bảng lớn FK-ref; bảng nhỏ còn lại đã có natural key.
+
+### Benchmark GUID vs BIGINT (đo thật, 500.000 dòng, SQL Server Express)
+| PK clustered | Insert (ms) | Size | Fragmentation | Page fill | NC index |
+|---|---|---|---|---|---|
+| BIGINT IDENTITY | 2,870 | 40.7 MB | 0.46% | 99.6% | 15.0 MB |
+| **GUID ngẫu nhiên** | 4,268 (**+49%**) | 64.1 MB (**+57%**) | **99.16%** | 69.2% | 18.9 MB (**+26%**) |
+| GUID tuần tự | 3,013 (+5%) | 44.4 MB (+9%) | 0.65% | 100% | 18.9 MB (+26%) |
+→ Random GUID PK: insert +49%, storage +57%, fragmentation ~99%, mỗi NC index +26%. Trên tỷ-dòng/columnstore còn tệ hơn. Seq GUID nhẹ hơn nhưng vẫn dưới BIGINT.
+
+### Bảo mật (IDOR / enumeration)
+- Vấn đề id số tăng dần **bị enumerate** là chuyện **EXPOSURE ở API**, không phải PK trong DB.
+- Giải: **BIGINT nội bộ (perf) + cột `C_PUBLIC_ID UNIQUEIDENTIFIER DEFAULT NEWID()` nonclustered unique** phơi ra API. Chỉ áp cho entity **lộ id ra URL**.
+- **Seq GUID KHÔNG chống enumeration** (đoán được) → public id phải **random (NEWID)**.
+- Root cause của IDOR = **authorization per-request** (OWASP); id opaque chỉ là defense-in-depth.
+
+---
+
 ## 11. Anti-patterns (CẤM)
 
 - ❌ **Cursor/WHILE loop** xử lý từng tiểu khoản trong EOD.
