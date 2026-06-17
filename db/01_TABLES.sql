@@ -86,18 +86,21 @@ CREATE TABLE T_REBALANCE_REQUEST (
     CONSTRAINT PK_REBALANCE_REQUEST PRIMARY KEY (C_REQUEST_ID)
 );
 
--- FO -> SDI : ĐỒNG BỘ EOD toàn bộ holdings + cash của tài khoản SDI.
+-- FO -> SDI : ĐỒNG BỘ EOD holdings (per-KH) = SNAPSHOT DATED thuần.
 --   SDI KHÔNG quản lý từng lệnh khớp (FO lo) → không có T_EXECUTION_FEED.
---   SDI dùng 2 bảng staging này làm nguồn trạng thái tài sản (OVERWRITE mỗi EOD).
-CREATE TABLE T_FO_HOLDING_SYNC (
+--   FO đổ snapshot holdings vào đây mỗi EOD; engine mirror sang current (overwrite).
+--   Cũng là nguồn AUDIT + tái dựng holdings lịch sử (THAY T_CUSTOMER_HOLDING_EVENT cũ).
+--   Biến động NET/ngày KHÔNG lưu sẵn — suy ra on-demand = qty(D) − qty(D-1) (LAG/self-join 2 snapshot).
+CREATE TABLE T_SI_POSITION_HOLDING_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUSTOMER_ID    BIGINT          NOT NULL,
     C_SI_ID          BIGINT          NOT NULL,
     C_TICKER         VARCHAR(20)     NOT NULL,
     C_QUANTITY       DECIMAL(20,4)   NOT NULL,
     C_AVG_COST       DECIMAL(18,4)   NULL,
-    CONSTRAINT PK_FO_HOLDING_SYNC PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER)
-);
+    CONSTRAINT PK_SI_POSITION_HOLDING_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER)
+) WITH (DATA_COMPRESSION = PAGE);
+-- Prod: CCI + partition theo năm (history ~20M/ngày).
 CREATE TABLE T_FO_CASH_SYNC (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUSTOMER_ID    BIGINT          NOT NULL,
@@ -119,17 +122,7 @@ CREATE TABLE T_CASHFLOW_EVENT (
 );
 CREATE INDEX IX_CASHFLOW_EVENT_DATE ON T_CASHFLOW_EVENT (C_BUSINESS_DATE) INCLUDE (C_CUSTOMER_ID, C_SI_ID, C_EVENT_TYPE, C_AMOUNT);
 
--- Biến động holdings NET trong ngày: SDI DIFF snapshot FO hôm nay vs holdings hiện tại (hôm trước).
---   Dùng cho AUDIT + tái dựng holdings lịch sử. qty_delta gộp cả trade + CA (net cuối ngày).
-CREATE TABLE T_CUSTOMER_HOLDING_EVENT (
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_CUSTOMER_ID    BIGINT          NOT NULL,
-    C_SI_ID          BIGINT          NOT NULL,
-    C_TICKER         VARCHAR(20)     NOT NULL,
-    C_QTY_DELTA      DECIMAL(20,4)   NOT NULL,   -- today_qty − prev_qty
-    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CHE_SRC DEFAULT 'SYNC_DIFF',
-    CONSTRAINT PK_CUSTOMER_HOLDING_EVENT PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER)
-);
+-- (T_CUSTOMER_HOLDING_EVENT đã BỎ — biến động/ngày suy ra từ snapshot T_SI_POSITION_HOLDING_DAILY khi cần.)
 
 -- Unit thay đổi (ghi dòng khi có cashflow)
 CREATE TABLE T_UNIT_LEDGER (
@@ -157,7 +150,7 @@ CREATE TABLE T_POSITION_STATE (
     CONSTRAINT PK_POSITION_STATE PRIMARY KEY (C_CUSTOMER_ID, C_SI_ID)
 ) WITH (DATA_COMPRESSION = PAGE);
 
--- Holdings hiện tại (~20M) — MIRROR từ FO sync (T_FO_HOLDING_SYNC), overwrite mỗi EOD.
+-- Holdings hiện tại (~20M) — MIRROR từ snapshot (T_SI_POSITION_HOLDING_DAILY), overwrite mỗi EOD.
 -- Prod: thêm NONCLUSTERED COLUMNSTORE cho MTM (HTAP)
 CREATE TABLE T_INDEXING_PORTFOLIO_TICKER (
     C_CUSTOMER_ID    BIGINT          NOT NULL,

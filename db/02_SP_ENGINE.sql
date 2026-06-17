@@ -49,25 +49,13 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- 0. DIFF per-KH: snapshot hôm nay (n) vs holdings hiện tại = hôm trước (o) → biến động NET → audit/lịch sử
-    DELETE FROM T_CUSTOMER_HOLDING_EVENT WHERE C_BUSINESS_DATE=@d;
-    INSERT INTO T_CUSTOMER_HOLDING_EVENT (C_BUSINESS_DATE,C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QTY_DELTA,C_SOURCE)
-    SELECT @d,
-           COALESCE(n.C_CUSTOMER_ID,o.C_CUSTOMER_ID),
-           COALESCE(n.C_SI_ID,o.C_SI_ID),
-           COALESCE(n.C_TICKER,o.C_TICKER),
-           COALESCE(n.C_QUANTITY,0) - COALESCE(o.C_QUANTITY,0),
-           'SYNC_DIFF'
-    FROM (SELECT * FROM T_FO_HOLDING_SYNC WHERE C_BUSINESS_DATE=@d) n
-    FULL OUTER JOIN T_INDEXING_PORTFOLIO_TICKER o
-      ON o.C_CUSTOMER_ID=n.C_CUSTOMER_ID AND o.C_SI_ID=n.C_SI_ID AND o.C_TICKER=n.C_TICKER
-    WHERE COALESCE(n.C_QUANTITY,0) <> COALESCE(o.C_QUANTITY,0);   -- chỉ ghi mã có thay đổi
-
-    -- 1. holdings hiện tại = mirror full snapshot FO (per-KH)
+    -- holdings hiện tại = mirror snapshot FO @d (per-KH). Snapshot dated giữ trong
+    -- T_SI_POSITION_HOLDING_DAILY → nguồn audit + tái dựng lịch sử. Biến động NET/ngày
+    -- suy ra ON-DEMAND khi report cần = qty(D) − qty(D-1) (LAG/self-join), KHÔNG lưu sẵn.
     TRUNCATE TABLE T_INDEXING_PORTFOLIO_TICKER;
     INSERT INTO T_INDEXING_PORTFOLIO_TICKER (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
     SELECT C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
-    FROM T_FO_HOLDING_SYNC WHERE C_BUSINESS_DATE=@d;
+    FROM T_SI_POSITION_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
 
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_POSITION_STATE AS s

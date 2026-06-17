@@ -41,8 +41,8 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 |---|---|---|---|
 | `sdi_position_state` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (customer_id, si_id), PAGE compression; cân nhắc memory-optimized |
 | `sdi_indexing_portfolio_ticker` | holdings hiện tại (mirror FO) | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
-| `sdi_fo_holding_sync` / `sdi_fo_cash_sync` | snapshot FO đồng bộ EOD (per-KH) | ~20M/ngày staging | rowstore, partition theo ngày/năm |
-| `sdi_customer_holding_event` | biến động NET/ngày (DIFF snapshot) | sparse | **CCI**, partition năm — audit + tái dựng holdings |
+| `sdi_si_position_holding_daily` | snapshot holdings DATED (per-KH) | ~20M/ngày | **CCI**, partition năm — nguồn current mirror + audit + tái dựng holdings (thay customer_holding_event; biến động suy ra on-demand) |
+| `sdi_fo_cash_sync` | snapshot tiền FO đồng bộ EOD (per-KH) | ~20M/ngày staging | rowstore, partition theo ngày/năm |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_indexing_performance_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
@@ -115,10 +115,10 @@ Tất cả vào **staging** trước, validate, rồi **publish** (partition swi
 
 ```
 B1  STAGE input ngày @d: bulk insert price, FO holdings+cash sync, model_weight, CA, cashflow → staging (minimal logging)
-B1b SYNC_FO: mirror holdings (overwrite T_INDEXING_PORTFOLIO_TICKER) + cash (state) từ snapshot FO
+B1b SYNC_FO: mirror holdings (overwrite T_INDEXING_PORTFOLIO_TICKER) + cash (state) từ snapshot sdi_si_position_holding_daily
 B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
       - SYNC_FO đã overwrite holdings + cash từ snapshot FO (đã phản ánh trade/CA/cổ tức/SIP)
-      - DIFF snapshot → customer_holding_event (biến động NET trong ngày, để audit/tái dựng)
+      - Biến động holdings NET/ngày (audit/tái dựng) suy ra on-demand = qty(D)−qty(D-1) từ snapshot dated, KHÔNG lưu cột
       - Cashflow event: tính CF_t cho vị thế có nạp/rút (chỉ để đổi unit — KHÔNG cộng lại vào cash)
       - (KHÔNG accrue phí: FO cash đã NET phí QL + thuế GD — tránh double-count)
 B3  MTM TOÀN BỘ (câu lệnh nặng nhất — set-based):
@@ -250,9 +250,8 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
 | T_BENCHMARK_DAILY | (C_BENCHMARK_ID, C_BUSINESS_DATE) | composite |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
-| T_FO_HOLDING_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (staging FO) |
+| T_SI_POSITION_HOLDING_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
 | T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (staging FO) |
-| T_CUSTOMER_HOLDING_EVENT | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (DIFF net/ngày) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
 | T_INDEXING_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (history, CCI) |
 | T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |
