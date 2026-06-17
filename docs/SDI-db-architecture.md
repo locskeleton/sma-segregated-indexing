@@ -39,8 +39,8 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 
 | Bảng | Vai trò | Quy mô | Lưu trữ |
 |---|---|---|---|
-| `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (customer_id, si_id), PAGE compression; cân nhắc memory-optimized |
-| `sdi_indexing_portfolio_ticker` | holdings hiện tại (mirror FO) | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
+| `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (cust_code, si_id), PAGE compression; cân nhắc memory-optimized |
+| `sdi_indexing_portfolio_ticker` | holdings hiện tại (mirror FO) | ~20M | **rowstore** clustered (cust_code, si_id, ticker) + **NCCI** (HTAP) cho MTM |
 | `sdi_customer_holding_daily` | snapshot holdings DATED (per-KH) | ~20M/ngày | **CCI**, partition năm — nguồn current mirror + audit + tái dựng holdings (thay customer_holding_event; biến động suy ra on-demand) |
 | `sdi_fo_cash_sync` | snapshot tiền FO đồng bộ EOD (per-KH) | ~20M/ngày staging | rowstore, partition theo ngày/năm |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
@@ -122,11 +122,11 @@ B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
       - Cashflow event: tính CF_t cho vị thế có nạp/rút (chỉ để đổi unit — KHÔNG cộng lại vào cash)
       - (KHÔNG accrue phí: FO cash đã NET phí QL + thuế GD — tránh double-count)
 B3  MTM TOÀN BỘ (câu lệnh nặng nhất — set-based):
-      INSERT #nav_today (customer_id, si_id, stock_value)
-      SELECT h.customer_id, h.si_id, SUM(h.quantity * p.close_price)
+      INSERT #nav_today (cust_code, si_id, stock_value)
+      SELECT h.cust_code, h.si_id, SUM(h.quantity * p.close_price)
       FROM   sdi_indexing_portfolio_ticker h
       JOIN   sdi_price_daily p ON p.ticker=h.ticker AND p.business_date=@d
-      GROUP BY h.customer_id, h.si_id;        -- batch-mode (NCCI) trên 20M dòng
+      GROUP BY h.cust_code, h.si_id;        -- batch-mode (NCCI) trên 20M dòng
 B4  NAV = stock_value + state.cash   (FO cash đã NET phí → không trừ lại)   (1 UPDATE join)
 B5  PnL ngày = NAV_today − NAV_prev + ra − vào                          (1 UPDATE)
 B6  UNIT: chỉ vị thế có CF_t:  ΔUnit = CF/unit_price_prev; unit += ΔUnit  (1 UPDATE)
@@ -148,7 +148,7 @@ B9  PUBLISH: cập nhật sdi_customer_nav_current (current); SWITCH/MERGE SI-le
 
 ## 6. Song song hóa & cửa sổ EOD
 
-- **Độc lập theo SI**: vị thế của 1 SI không ảnh hưởng SI khác (chỉ chung giá). → chia batch theo **dải SI** hoặc **hash(customer_id)** chạy song song N luồng.
+- **Độc lập theo SI**: vị thế của 1 SI không ảnh hưởng SI khác (chỉ chung giá). → chia batch theo **dải SI** hoặc **hash(cust_code)** chạy song song N luồng.
 - **MAXDOP** cho câu MTM/aggregate (để engine parallel intra-query); **Resource Governor** cấp pool riêng cho batch đêm.
 - **Partition-aligned**: xử lý từng partition độc lập → switch-in song song.
 
@@ -182,7 +182,7 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 
 ### 7.3 Customer daily perf — BẮT BUỘC materialize (do FO-sync)
 FO sync overwrite holdings → không event-source → derive-on-read lịch sử **không khả thi** → **phải materialize** `sdi_customer_nav_daily`:
-- Lưu CCI, **partition hash(customer_id) + năm** (hoặc **ordered CCI** theo (customer_id, business_date)) để segment-elimination khi đọc 1 KH. Tránh nonclustered rowstore index trên 2,5 tỷ (phình ~trăm GB).
+- Lưu CCI, **partition hash(cust_code) + năm** (hoặc **ordered CCI** theo (cust_code, business_date)) để segment-elimination khi đọc 1 KH. Tránh nonclustered rowstore index trên 2,5 tỷ (phình ~trăm GB).
 - EOD: bulk ~1M dòng/ngày vào CCI (rẻ). Đọc chart KH: đọc thẳng (nhanh).
 - **Giảm tải**: lấy điểm **thưa (tuần/tháng)** thay vì daily, hoặc chỉ lưu cột `unit_price` (+nav) — narrow CCI nén rất tốt.
 
@@ -191,9 +191,9 @@ FO sync overwrite holdings → không event-source → derive-on-read lịch s�
 ## 8. Indexing & thiết kế khóa
 
 - **Khóa clustering**: dùng khóa **hẹp, tăng dần, không GUID** (GUID ngẫu nhiên → page split, fragmentation). Dùng `BIGINT IDENTITY` hoặc khóa tự nhiên hẹp.
-- `sdi_customer_nav_current`: clustered PK `(customer_id, si_id)` — point update/lookup.
-- `sdi_indexing_portfolio_ticker`: clustered `(customer_id, si_id, ticker)` + **NCCI** (cho B3).
-- Event ledger (CCI): partition `(business_date)`; CCI tự lo, thêm **nonclustered rowstore** `(customer_id, si_id, business_date)` nếu cần truy vết theo KH.
+- `sdi_customer_nav_current`: clustered PK `(cust_code, si_id)` — point update/lookup.
+- `sdi_indexing_portfolio_ticker`: clustered `(cust_code, si_id, ticker)` + **NCCI** (cho B3).
+- Event ledger (CCI): partition `(business_date)`; CCI tự lo, thêm **nonclustered rowstore** `(cust_code, si_id, business_date)` nếu cần truy vết theo KH.
 - SI-level daily: clustered `(si_id, business_date)`.
 - `sdi_price_daily`: clustered `(business_date, ticker)` — nhỏ, cache buffer pool.
 - **Avoid**: index thừa trên bảng ghi nóng (chậm insert); EAV; nvarchar(max) trong fact.
@@ -243,26 +243,26 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 ### Per-table
 | Bảng | PK | Loại |
 |---|---|---|
-| T_MASTER_PORTFOLIO | C_SI_ID | BIGINT (bị ref rộng) |
-| T_INDEXING_PORTFOLIO | (C_CUSTOMER_ID, C_SI_ID) | composite typed |
-| T_MASTER_PORTFOLIO_TICKER | (C_SI_ID, C_EFFECTIVE_DATE, C_TICKER) | composite natural |
+| T_MASTER_PORTFOLIO | PK_SI_ID | BIGINT (bị ref rộng) |
+| T_INDEXING_PORTFOLIO | (FK_CUST_CODE, FK_SI_ID) | composite typed |
+| T_MASTER_PORTFOLIO_TICKER | (FK_SI_ID, C_EFFECTIVE_DATE, C_TICKER) | composite natural |
 | T_PRICE_DAILY | (C_BUSINESS_DATE, C_TICKER) | composite natural |
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
 | T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
-| T_CUSTOMER_HOLDING_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
-| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (staging FO) |
+| T_CUSTOMER_HOLDING_DAILY | (C_BUSINESS_DATE, FK_CUST_CODE, FK_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
+| T_FO_CASH_SYNC | (C_BUSINESS_DATE, FK_CUST_CODE, FK_SI_ID) | composite natural (staging FO) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
-| T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (history, CCI) |
+| T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, FK_CUST_CODE, FK_SI_ID) | composite natural (history, CCI) |
 | T_CUSTOMER_FEE_INCOME | C_EVENT_ID | BIGINT IDENTITY (sparse: cổ tức/phí per-KH) |
-| T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |
-| T_CUSTOMER_NAV_CURRENT | (C_CUSTOMER_ID, C_SI_ID) | composite typed (hot) |
-| T_INDEXING_PORTFOLIO_TICKER | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
-| T_EOD_WORK | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite (transient) |
-| T_SI_NAV_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural (composition + NAV + hiệu suất) |
-| T_SI_NAV_CURRENT | (C_SI_ID) | typed (current cấp SI, ~100 dòng) |
-| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
-| T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, C_SI_ID, C_TICKER) | composite natural |
+| T_UNIT_LEDGER | (FK_CUST_CODE, FK_SI_ID, C_BUSINESS_DATE) | composite natural |
+| T_CUSTOMER_NAV_CURRENT | (FK_CUST_CODE, FK_SI_ID) | composite typed (hot) |
+| T_INDEXING_PORTFOLIO_TICKER | (FK_CUST_CODE, FK_SI_ID, C_TICKER) | composite typed |
+| T_EOD_WORK | (C_BUSINESS_DATE, FK_CUST_CODE, FK_SI_ID) | composite (transient) |
+| T_SI_NAV_DAILY | (C_BUSINESS_DATE, FK_SI_ID) | composite natural (composition + NAV + hiệu suất) |
+| T_SI_NAV_CURRENT | (FK_SI_ID) | typed (current cấp SI, ~100 dòng) |
+| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, FK_SI_ID) | composite natural |
+| T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, FK_SI_ID, C_TICKER) | composite natural |
 | T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
 
 → **Không bảng nào dùng GUID** vì master nhỏ đều bị bảng lớn FK-ref; bảng nhỏ còn lại đã có natural key.
