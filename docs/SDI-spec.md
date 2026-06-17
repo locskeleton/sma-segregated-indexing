@@ -266,7 +266,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | sdi_si_holding_daily (top20+mã khác) | ✅ | ‖ | – |
-| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit position_state; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
+| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit customer_nav_current; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark eod_run done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
 ### 9.3 Thứ tự, song song & orchestration

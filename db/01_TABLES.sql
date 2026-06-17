@@ -136,18 +136,20 @@ CREATE TABLE T_UNIT_LEDGER (
 );
 
 /*------------------------------------------- CURRENT STATE (roll-forward) -----*/
--- 1 dòng/tiểu khoản — cập nhật tại chỗ mỗi EOD
-CREATE TABLE T_POSITION_STATE (
+-- NAV/state HIỆN TẠI per tiểu khoản (KH×SI) — 1 dòng, cập nhật tại chỗ mỗi EOD.
+-- Cache hot cho roll-forward + đọc current nhanh (≠ T_CUSTOMER_NAV_DAILY = lịch sử).
+-- Cấp SI không có bản current riêng (query T_SI_NAV_DAILY ngày mới nhất — ~250K dòng, rẻ).
+CREATE TABLE T_CUSTOMER_NAV_CURRENT (
     C_CUSTOMER_ID      BIGINT        NOT NULL,
     C_SI_ID            BIGINT        NOT NULL,
-    C_UNIT             DECIMAL(38,10) NOT NULL CONSTRAINT DF_PS_UNIT DEFAULT 0,
-    C_CASH             DECIMAL(20,4)  NOT NULL CONSTRAINT DF_PS_CASH DEFAULT 0,
-    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_PS_PAY DEFAULT 0, -- phí quản lý lũy kế (accrue)
-    C_LAST_NAV         DECIMAL(20,4)  NOT NULL CONSTRAINT DF_PS_NAV DEFAULT 0,
+    C_UNIT             DECIMAL(38,10) NOT NULL CONSTRAINT DF_CNC_UNIT DEFAULT 0,
+    C_CASH             DECIMAL(20,4)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,
+    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0, -- phí quản lý lũy kế (accrue)
+    C_LAST_NAV         DECIMAL(20,4)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,
     C_LAST_UNIT_PRICE  DECIMAL(28,10) NULL,
-    C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_PS_STATUS DEFAULT 'ACTIVE',
+    C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- vòng đời tiểu khoản: ACTIVE | CLOSED…
     C_LAST_BUSINESS_DATE DATE         NULL,
-    CONSTRAINT PK_POSITION_STATE PRIMARY KEY (C_CUSTOMER_ID, C_SI_ID)
+    CONSTRAINT PK_CUSTOMER_NAV_CURRENT PRIMARY KEY (C_CUSTOMER_ID, C_SI_ID)
 ) WITH (DATA_COMPRESSION = PAGE);
 
 -- Holdings hiện tại (~20M) — MIRROR từ snapshot (T_CUSTOMER_HOLDING_DAILY), overwrite mỗi EOD.

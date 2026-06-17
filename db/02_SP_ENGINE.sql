@@ -1,7 +1,7 @@
 /*==============================================================================
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
-  Mô hình roll-forward: T_POSITION_STATE (current) + áp delta ngày @d → tính lại.
+  Mô hình roll-forward: T_CUSTOMER_NAV_CURRENT (current) + áp delta ngày @d → tính lại.
   Thứ tự (master SP_EOD_RUN): J01_SYNC_FO → J07 → J11 → J12 → J13 → J14
   (J06 fee đã bỏ — FO cash đã NET phí; NAV = stock + FO cash.)
 ==============================================================================*/
@@ -58,7 +58,7 @@ BEGIN
     FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
 
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
-    MERGE T_POSITION_STATE AS s
+    MERGE T_CUSTOMER_NAV_CURRENT AS s
     USING (SELECT C_CUSTOMER_ID,C_SI_ID,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
     ON s.C_CUSTOMER_ID=f.C_CUSTOMER_ID AND s.C_SI_ID=f.C_SI_ID
     WHEN MATCHED THEN UPDATE SET C_CASH = f.C_CASH
@@ -87,7 +87,7 @@ BEGIN
     -- seed từ state (đã áp delta cash/payable; last_nav/last_up = hôm qua)
     INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_CUSTOMER_ID,C_SI_ID,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
     SELECT @d,C_CUSTOMER_ID,C_SI_ID,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT
-    FROM T_POSITION_STATE WHERE C_STATUS='ACTIVE';
+    FROM T_CUSTOMER_NAV_CURRENT WHERE C_STATUS='ACTIVE';
 
     -- CF của ngày (cho PnL & unit)
     UPDATE w SET w.C_CF_IN = cf.CF_IN, w.C_CF_OUT = cf.CF_OUT
@@ -137,7 +137,7 @@ BEGIN
         s.C_LAST_NAV          = w.C_NAV,
         s.C_LAST_UNIT_PRICE   = w.C_UNIT_PRICE,
         s.C_LAST_BUSINESS_DATE= @d
-    FROM T_POSITION_STATE s
+    FROM T_CUSTOMER_NAV_CURRENT s
     JOIN T_EOD_WORK w ON w.C_CUSTOMER_ID=s.C_CUSTOMER_ID AND w.C_SI_ID=s.C_SI_ID AND w.C_BUSINESS_DATE=@d;
 
     -- unit ledger (chỉ ngày có cashflow)

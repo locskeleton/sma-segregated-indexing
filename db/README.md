@@ -5,7 +5,7 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 ## Naming convention
 | Đối tượng | Quy ước |
 |---|---|
-| Bảng | `T_` + UPPERCASE (vd `T_POSITION_STATE`) |
+| Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
 | Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`) |
 | Primary key | `PK_<table>` |
 | Foreign key | **KHÔNG hard-set constraint** — chỉ NAMING `FK_<child>__<parent>` trong comment để tham chiếu |
