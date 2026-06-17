@@ -156,26 +156,30 @@ END
 GO
 
 /*===========================================================================
-  J11 — SI AGGREGATE → T_SI_PERFORMANCE_DAILY
+  J11 — SI AGGREGATE → T_NAV_DAILY (composition tài sản + NAV + hiệu suất, 1 bảng)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@d);
-    DELETE FROM T_SI_PERFORMANCE_DAILY WHERE C_BUSINESS_DATE=@d;
+    DELETE FROM T_NAV_DAILY WHERE C_BUSINESS_DATE=@d;
 
     ;WITH agg AS (
-        SELECT C_SI_ID, SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL
+        SELECT C_SI_ID,
+               SUM(C_CASH) AS CASH, SUM(C_STOCK_VALUE) AS STOCK, SUM(C_PAYABLE_FEE) AS PAY,
+               SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL
         FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d GROUP BY C_SI_ID
     )
-    INSERT INTO T_SI_PERFORMANCE_DAILY (C_BUSINESS_DATE,C_SI_ID,C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
-    SELECT @d, a.C_SI_ID, a.NAV, a.UNT,
+    INSERT INTO T_NAV_DAILY (C_BUSINESS_DATE,C_SI_ID,C_CASH,C_STOCK_VALUE,C_PAYABLE_FEE,C_TOTAL_ASSET,
+                             C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+    SELECT @d, a.C_SI_ID, a.CASH, a.STOCK, a.PAY, a.CASH+a.STOCK,
+           a.NAV, a.UNT,
            CASE WHEN a.UNT>0 THEN a.NAV/a.UNT END,
            a.PNL,
            CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END
     FROM agg a
-    LEFT JOIN T_SI_PERFORMANCE_DAILY prev ON prev.C_SI_ID=a.C_SI_ID AND prev.C_BUSINESS_DATE=@prev;
+    LEFT JOIN T_NAV_DAILY prev ON prev.C_SI_ID=a.C_SI_ID AND prev.C_BUSINESS_DATE=@prev;
 END
 GO
 
@@ -230,9 +234,9 @@ BEGIN
     WHERE C_BUSINESS_DATE=@d AND (C_NAV < 0 OR (C_UNIT<=0 AND C_NAV>0));
     IF @bad > 0
         THROW 50013, 'RECONCILE: phát hiện vị thế NAV âm hoặc unit<=0 với NAV>0.', 1;
-    -- Σ customer NAV per SI khớp T_SI_PERFORMANCE (derive cùng nguồn → phải khớp)
+    -- Σ customer NAV per SI khớp T_NAV_DAILY (derive cùng nguồn → phải khớp)
     SELECT @bad = COUNT(*)
-    FROM T_SI_PERFORMANCE_DAILY p
+    FROM T_NAV_DAILY p
     JOIN (SELECT C_SI_ID, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d GROUP BY C_SI_ID) a
       ON a.C_SI_ID=p.C_SI_ID AND p.C_BUSINESS_DATE=@d
     WHERE ABS(p.C_NAV - a.NAV) > 1;   -- ngưỡng làm tròn 1 VND
@@ -242,7 +246,8 @@ END
 GO
 
 /*===========================================================================
-  J14 — SNAPSHOT: T_SI_HOLDING_DAILY (SI aggregate) + T_ASSET_SNAPSHOT_DAILY
+  J14 — SNAPSHOT: T_SI_HOLDING_DAILY (SI aggregate holdings + tỷ trọng)
+         (composition tài sản + NAV đã gộp về T_NAV_DAILY ở J11)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @d DATE
 AS
@@ -264,13 +269,7 @@ BEGIN
            CASE WHEN SUM(v.MV) OVER (PARTITION BY v.C_SI_ID) > 0
                 THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_SI_ID) END
     FROM val v;
-
-    -- snapshot tài sản cấp SI
-    DELETE FROM T_ASSET_SNAPSHOT_DAILY WHERE C_BUSINESS_DATE=@d;
-    INSERT INTO T_ASSET_SNAPSHOT_DAILY (C_BUSINESS_DATE,C_SI_ID,C_CASH,C_STOCK_VALUE,C_PAYABLE_FEE,C_TOTAL_ASSET,C_NAV)
-    SELECT @d, C_SI_ID, SUM(C_CASH), SUM(C_STOCK_VALUE), SUM(C_PAYABLE_FEE),
-           SUM(C_CASH+C_STOCK_VALUE), SUM(C_NAV)
-    FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d GROUP BY C_SI_ID;
+    -- (composition tài sản + NAV cấp SI: đã ghi T_NAV_DAILY ở J11_SI_AGG)
 END
 GO
 

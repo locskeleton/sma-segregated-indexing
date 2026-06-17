@@ -203,16 +203,7 @@ CREATE TABLE T_INDEXING_PERFORMANCE_DAILY (
 );
 
 /*------------------------------------------------ SI-LEVEL DAILY (output) -----*/
-CREATE TABLE T_SI_PERFORMANCE_DAILY (
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_SI_ID          BIGINT          NOT NULL,
-    C_NAV            DECIMAL(20,4)   NOT NULL,
-    C_UNIT           DECIMAL(38,10)  NOT NULL,
-    C_UNIT_PRICE     DECIMAL(28,10)  NULL,
-    C_DAILY_PNL      DECIMAL(20,4)   NOT NULL,
-    C_DAILY_RETURN   DECIMAL(18,10)  NULL,
-    CONSTRAINT PK_SI_PERFORMANCE_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID)
-);
+-- (T_SI_PERFORMANCE_DAILY đã GỘP vào T_NAV_DAILY: nav/unit/unit_price/daily_pnl/daily_return.)
 
 CREATE TABLE T_SI_INDEX_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
@@ -233,18 +224,27 @@ CREATE TABLE T_SI_HOLDING_DAILY (
     CONSTRAINT PK_SI_HOLDING_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID, C_TICKER)
 );
 
-CREATE TABLE T_ASSET_SNAPSHOT_DAILY (
+-- NAV cấp SI/ngày — NGUỒN NAV SI-level DUY NHẤT (gộp composition tài sản + hiệu suất).
+-- Trước rải ở T_ASSET_SNAPSHOT_DAILY (cash/stock/phí/total/nav) + T_SI_PERFORMANCE_DAILY
+-- (nav/unit/unit_price/pnl/return) — cùng grain (date×si), NAV trùng → gộp về 1 bảng.
+CREATE TABLE T_NAV_DAILY (
     C_BUSINESS_DATE    DATE          NOT NULL,
     C_SI_ID            BIGINT        NOT NULL,
+    -- composition tài sản
     C_CASH             DECIMAL(20,4) NOT NULL,
     C_STOCK_VALUE      DECIMAL(20,4) NOT NULL,
     C_CASH_DIVIDEND    DECIMAL(20,4) NULL,
     C_CUSTODY_FEE      DECIMAL(20,4) NULL,
-    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,
+    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue)
     C_PAYABLE_FEE      DECIMAL(20,6) NULL,
     C_TOTAL_ASSET      DECIMAL(20,4) NOT NULL,
-    C_NAV              DECIMAL(20,4) NOT NULL,
-    CONSTRAINT PK_ASSET_SNAPSHOT_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID)
+    -- NAV + hiệu suất
+    C_NAV              DECIMAL(20,4)  NOT NULL,
+    C_UNIT             DECIMAL(38,10) NOT NULL,
+    C_UNIT_PRICE       DECIMAL(28,10) NULL,
+    C_DAILY_PNL        DECIMAL(20,4)  NOT NULL,
+    C_DAILY_RETURN     DECIMAL(18,10) NULL,
+    CONSTRAINT PK_NAV_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID)
 );
 
 /*------------------------------------------------ CONTROL / ORCHESTRATION -----*/

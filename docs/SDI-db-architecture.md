@@ -46,9 +46,8 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_indexing_performance_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
-| `sdi_si_performance_daily` | SI-level daily | ~250K | rowstore, partition năm |
+| `sdi_nav_daily` (SI) | NAV SI-level daily: composition + NAV + hiệu suất (gộp asset_snapshot + si_performance) | ~250K | rowstore, partition năm |
 | `sdi_si_index_daily` / `sdi_benchmark_daily` | index daily | ~250K | rowstore |
-| `sdi_asset_snapshot_daily` (SI) | snapshot SI | ~250K | rowstore |
 | `sdi_price_daily` | giá EOD | ~4M | rowstore, index (business_date, ticker) — nhỏ, cache RAM |
 | `sdi_indexing_performance_daily` | customer perf daily (lịch sử) | ~2,5 tỷ | **CCI**, partition (xem §7) |
 
@@ -133,7 +132,7 @@ B6  UNIT: chỉ vị thế có CF_t:  ΔUnit = CF/unit_price_prev; unit += ΔUni
       unit_price = NAV / unit   (mọi vị thế — 1 UPDATE)
       → INSERT sdi_unit_ledger các dòng có ΔUnit ≠ 0
 B7  SI AGGREGATE (set-based):
-      SI NAV = Σ NAV, SI Unit = Σ unit per si_id → sdi_si_performance_daily
+      SI cash/stock/NAV/unit = Σ per si_id → sdi_nav_daily (composition + NAV + hiệu suất)
 B8  SI INDEX: Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 SI × ~25 mã — nhẹ) → sdi_si_index_daily
 B9  PUBLISH: cập nhật sdi_position_state (current); SWITCH/MERGE SI-level vào bảng đích;
       push delta sang Asset (current snapshot, không append toàn lịch sử)
@@ -258,10 +257,9 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_POSITION_STATE | (C_CUSTOMER_ID, C_SI_ID) | composite typed (hot) |
 | T_INDEXING_PORTFOLIO_TICKER | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
 | T_EOD_WORK | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite (transient) |
-| T_SI_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
+| T_NAV_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural (composition + NAV + hiệu suất) |
 | T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
 | T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, C_SI_ID, C_TICKER) | composite natural |
-| T_ASSET_SNAPSHOT_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
 | T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
 
 → **Không bảng nào dùng GUID** vì master nhỏ đều bị bảng lớn FK-ref; bảng nhỏ còn lại đã có natural key.

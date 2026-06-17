@@ -213,9 +213,8 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_indexing_performance_daily`** (business_date, customer_id, si_id PK; nav, unit, unit_price, daily_pnl, daily_return) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải).
 
 ### Chuỗi daily SI-level (materialize, nhỏ)
-- **`sdi_asset_snapshot_daily`** (business_date, si_id PK; cash_balance, stock_value, cash_available, withdrawable_asset, buying_power, pending_buy, pending_sell, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav) — `mgmt_fee_accrued`/`payable_fee` để FO báo cáo tham khảo (SDI không tự accrue); `nav = stock_value + cash`
+- **`sdi_nav_daily`** (business_date, si_id PK; cash, stock_value, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav, unit, unit_price, daily_pnl, daily_return) — **NGUỒN NAV SI-level DUY NHẤT** (gộp asset_snapshot composition + si_performance — cùng grain, NAV trùng). `nav = stock_value + cash`; `mgmt_fee_accrued`/`payable_fee` để FO báo cáo tham khảo (SDI không tự accrue).
 - **`sdi_si_holding_daily`** (business_date, si_id, ticker PK; quantity, market_price, market_value, weight) — top 20 + "mã khác"
-- **`sdi_si_performance_daily`** (business_date, si_id PK; nav, unit, unit_price, daily_pnl, daily_return)
 - **`sdi_si_index_daily`** (business_date, si_id PK; index_value, daily_return)
 
 ### Control / orchestration
@@ -262,10 +261,10 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J8** | `CALC_NAV` | J7 | stock_value, state.cash (FO) | NAV = stock_value + cash | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
 | **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger; **sdi_indexing_performance_daily** (lịch sử per-KH) | ✅ | ‖ | – |
-| **J11** | `SI_AGG` tổng hợp SI | J8, J10 | NAV/unit per vị thế | sdi_si_performance_daily | ✅ | ‖ | – |
+| **J11** | `SI_AGG` tổng hợp SI | J8, J10 | cash/stock/NAV/unit per vị thế | **sdi_nav_daily** (composition + NAV + hiệu suất) | ✅ | ‖ | – |
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
-| **J14** | `BUILD_SNAPSHOT` | J8 | NAV, holdings, phí, components | sdi_asset_snapshot_daily, sdi_si_holding_daily (top20+mã khác) | ✅ | ‖ | – |
+| **J14** | `BUILD_SNAPSHOT` | J8 | holdings | sdi_si_holding_daily (top20+mã khác) | ✅ | ‖ | – |
 | **J15** | `PUBLISH` | J13, J14 | staging/đích | commit position_state; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark eod_run done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
@@ -298,12 +297,12 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 
 | FR | API | Nguồn |
 |---|---|---|
-| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_si_performance + derive customer NAV |
-| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + asset_snapshot |
-| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | si_performance (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
+| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_nav_daily + derive customer NAV |
+| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + sdi_nav_daily |
+| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | sdi_nav_daily (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
 | FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_indexing_portfolio |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_si_holding_daily (top20 + mã khác) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_asset_snapshot_daily |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_nav_daily |
 
 ---
 
