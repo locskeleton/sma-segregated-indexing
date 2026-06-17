@@ -150,7 +150,7 @@ Modified Dietz (mặc định):
 XIRR (tùy chọn, chính xác):  giải r:  NAV_đầu·(1+r)^T + Σ CF_i·(1+r)^(T−t_i) = NAV_cuối
 ```
 - Hiển thị period return (không annualize trừ khi yêu cầu). Mẫu số ≈ 0 → trả null.
-- Tính on-read: NAV 2 đầu mút (từ `sdi_indexing_performance_daily`) + cashflow events trong range.
+- Tính on-read: NAV 2 đầu mút (từ `sdi_customer_nav_daily`) + cashflow events trong range.
 
 ### SI tổng hợp (đường "Hiệu suất SI" trên chart)
 ```
@@ -207,13 +207,14 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_customer_holding_daily`** (business_date, customer_id, si_id, ticker PK; quantity, avg_cost) — **FO → SDI EOD**: snapshot holdings DATED toàn bộ TK (SDI mirror sang current, overwrite). Kiêm AUDIT + tái dựng holdings lịch sử (THAY `sdi_customer_holding_event` cũ). Biến động NET/ngày suy ra on-demand = qty(D)−qty(D-1) (LAG), KHÔNG lưu cột. SDI KHÔNG quản lý từng lệnh khớp.
 - **`sdi_fo_cash_sync`** (business_date, customer_id, si_id PK; cash) — **FO → SDI EOD**: snapshot tiền (đã phản ánh trade/cổ tức/split/settlement).
 - **`sdi_cashflow_event`** (event_id PK; customer_id, si_id, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow; dùng cho **CF_t** (PnL/unit), KHÔNG cộng lại cash (cash từ FO sync).
+- **`sdi_customer_fee_income`** (event_id PK; business_date, customer_id, si_id, type[DIVIDEND|CUSTODY_FEE|MGMT_FEE], ticker, amount, source, created_time) — **FO đẩy cổ tức + phí per-KH (sparse)**. Dòng tiền/sự kiện ngoài, KHÔNG derive được → capture lúc phát sinh cho **báo cáo tài sản FR-06**. J11 SUM lên `cash_dividend`/`custody_fee`/`mgmt_fee_accrued` của `sdi_si_nav_daily`. **KHÔNG ảnh hưởng NAV** (phương án A).
 - **`sdi_unit_ledger`** (customer_id, si_id, business_date PK; cf_net, delta_unit, unit) — ghi dòng khi unit thay đổi (cashflow). Unit full precision.
 
 ### Per-KH daily performance (LỊCH SỬ — materialize)
-- **`sdi_indexing_performance_daily`** (business_date, customer_id, si_id PK; nav, unit, unit_price, daily_pnl, daily_return) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải).
+- **`sdi_customer_nav_daily`** (business_date, customer_id, si_id PK; nav, unit, unit_price, daily_pnl, daily_return) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải).
 
 ### Chuỗi daily SI-level (materialize, nhỏ)
-- **`sdi_nav_daily`** (business_date, si_id PK; cash, stock_value, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav, unit, unit_price, daily_pnl, daily_return) — **NGUỒN NAV SI-level DUY NHẤT** (gộp asset_snapshot composition + si_performance — cùng grain, NAV trùng). `nav = stock_value + cash`; `mgmt_fee_accrued`/`payable_fee` để FO báo cáo tham khảo (SDI không tự accrue).
+- **`sdi_si_nav_daily`** (business_date, si_id PK; cash, stock_value, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav, unit, unit_price, daily_pnl, daily_return) — **NGUỒN NAV SI-level DUY NHẤT** (gộp asset_snapshot composition + si_performance — cùng grain, NAV trùng). `nav = stock_value + cash`; `mgmt_fee_accrued`/`payable_fee` để FO báo cáo tham khảo (SDI không tự accrue).
 - **`sdi_si_holding_daily`** (business_date, si_id, ticker PK; quantity, market_price, market_value, weight) — top 20 + "mã khác"
 - **`sdi_si_index_daily`** (business_date, si_id PK; index_value, daily_return)
 
@@ -221,7 +222,7 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 - **`sdi_eod_run`** (business_date, job PK; status[PENDING|RUNNING|DONE|FAILED], rows, started_at, ended_at, message) — theo dõi & resume batch EOD (§9.2).
 
 ### Customer-level: MATERIALIZE (do FO-sync)
-NAV/Unit Price/PnL theo ngày của KH được **lưu vào `sdi_indexing_performance_daily`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.
+NAV/Unit Price/PnL theo ngày của KH được **lưu vào `sdi_customer_nav_daily`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.
 
 ### Partition & retention
 
@@ -260,8 +261,8 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J7** | `MTM` định giá lại toàn bộ | J1b | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J7 | stock_value, state.cash (FO) | NAV = stock_value + cash | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
-| **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger; **sdi_indexing_performance_daily** (lịch sử per-KH) | ✅ | ‖ | – |
-| **J11** | `SI_AGG` tổng hợp SI | J8, J10 | cash/stock/NAV/unit per vị thế | **sdi_nav_daily** (composition + NAV + hiệu suất) | ✅ | ‖ | – |
+| **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger; **sdi_customer_nav_daily** (lịch sử per-KH) | ✅ | ‖ | – |
+| **J11** | `SI_AGG` tổng hợp SI | J8, J10 | cash/stock/NAV/unit per vị thế + sdi_customer_fee_income | **sdi_si_nav_daily** (composition + NAV + hiệu suất + cổ tức/phí Σ từ ledger) | ✅ | ‖ | – |
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | sdi_si_holding_daily (top20+mã khác) | ✅ | ‖ | – |
@@ -297,12 +298,12 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 
 | FR | API | Nguồn |
 |---|---|---|
-| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_nav_daily + derive customer NAV |
-| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + sdi_nav_daily |
-| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | sdi_nav_daily (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
+| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_si_nav_daily + derive customer NAV |
+| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + sdi_si_nav_daily |
+| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | sdi_si_nav_daily (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
 | FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_indexing_portfolio |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_si_holding_daily (top20 + mã khác) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_nav_daily |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_customer_nav_daily (NAV) + sdi_customer_fee_income (cổ tức/phí) + cash/stock reconstruct (fo_cash_sync + holding×giá) |
 
 ---
 
@@ -315,7 +316,7 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 | SI Index / Performance / Asset snapshot | ~250K dòng/loại |
 | Cashflow / execution / holding event | ~100M+ |
 | Unit ledger | ~120M |
-| Customer NAV/UP/% daily | **materialize** `sdi_indexing_performance_daily` (~2,5 tỷ, CCI) — bắt buộc do FO-sync |
+| Customer NAV/UP/% daily | **materialize** `sdi_customer_nav_daily` (~2,5 tỷ, CCI) — bắt buộc do FO-sync |
 
 Customer NAV: derive từ lots (~20/KH) × giá tại 2 đầu mút → rẻ per-request. SI-level tính aggregate. Không materialize daily per-customer.
 

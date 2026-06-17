@@ -185,12 +185,13 @@ CREATE TABLE T_EOD_WORK (
     CONSTRAINT PK_EOD_WORK PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
 );
 
-/*--------------- PER-KH DAILY PERFORMANCE (lịch sử — cần cho chart FR-03) -----*/
--- Vì FO chỉ sync snapshot (overwrite) → holdings KHÔNG còn event-source → KHÔNG derive
--- được NAV/unit_price quá khứ. Phải MATERIALIZE perf per (KH×SI) mỗi ngày để vẽ chart KH.
+/*--------------- PER-KH NAV DAILY (lịch sử — cần cho chart FR-03) -------------*/
+-- NAV/hiệu suất theo (KH×SI×ngày). Vì FO chỉ sync snapshot (overwrite) → holdings KHÔNG
+-- còn event-source → KHÔNG derive được NAV/unit_price quá khứ → phải MATERIALIZE mỗi ngày.
 -- Quy mô ~2,5 tỷ dòng/10 năm → prod: CLUSTERED COLUMNSTORE + partition (xem SDI-db-architecture).
--- (Có thể giảm tải: lấy điểm thưa tuần/tháng, hoặc chỉ lưu unit_price.)
-CREATE TABLE T_INDEXING_PERFORMANCE_DAILY (
+-- (Giảm tải: điểm thưa tuần/tháng, hoặc chỉ lưu unit_price.)
+-- Composition cash/stock + cổ tức/phí per-KH KHÔNG ở đây (sparse → T_CUSTOMER_FEE_INCOME; cash/stock reconstruct).
+CREATE TABLE T_CUSTOMER_NAV_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUSTOMER_ID    BIGINT          NOT NULL,
     C_SI_ID          BIGINT          NOT NULL,
@@ -199,11 +200,30 @@ CREATE TABLE T_INDEXING_PERFORMANCE_DAILY (
     C_UNIT_PRICE     DECIMAL(28,10)  NULL,
     C_DAILY_PNL      DECIMAL(20,4)   NOT NULL,
     C_DAILY_RETURN   DECIMAL(18,10)  NULL,
-    CONSTRAINT PK_INDEXING_PERFORMANCE_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
+    CONSTRAINT PK_CUSTOMER_NAV_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
 );
 
+-- Sổ cái CỔ TỨC + PHÍ per (KH×SI), SPARSE (chỉ ghi khi có sự kiện) — FO đẩy về.
+-- KHÔNG derive được từ NAV/holdings (dòng tiền/sự kiện ngoài) → phải capture lúc phát sinh
+-- cho báo cáo tài sản FR-06. SI-level: J11 SUM bảng này → cash_dividend/custody_fee/mgmt_fee_accrued
+-- của T_SI_NAV_DAILY. (KHÔNG ảnh hưởng NAV — phương án A: FO cash đã NET; đây là thông tin tham khảo.)
+CREATE TABLE T_CUSTOMER_FEE_INCOME (
+    C_EVENT_ID       BIGINT IDENTITY(1,1) NOT NULL,
+    C_BUSINESS_DATE  DATE            NOT NULL,
+    C_CUSTOMER_ID    BIGINT          NOT NULL,
+    C_SI_ID          BIGINT          NOT NULL,
+    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND | CUSTODY_FEE | MGMT_FEE
+    C_TICKER         VARCHAR(20)     NULL,      -- mã (cho DIVIDEND); NULL cho phí cấp tài khoản
+    C_AMOUNT         DECIMAL(20,4)   NOT NULL,  -- luôn dương; ý nghĩa theo C_TYPE
+    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CFI_SRC DEFAULT 'FO',
+    C_CREATED_TIME   DATETIME2       NOT NULL CONSTRAINT DF_CFI_CREATED DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_CUSTOMER_FEE_INCOME PRIMARY KEY (C_EVENT_ID)
+);
+CREATE INDEX IX_CUSTOMER_FEE_INCOME_DATE ON T_CUSTOMER_FEE_INCOME (C_BUSINESS_DATE)
+    INCLUDE (C_CUSTOMER_ID, C_SI_ID, C_TYPE, C_AMOUNT);
+
 /*------------------------------------------------ SI-LEVEL DAILY (output) -----*/
--- (T_SI_PERFORMANCE_DAILY đã GỘP vào T_NAV_DAILY: nav/unit/unit_price/daily_pnl/daily_return.)
+-- (T_SI_PERFORMANCE_DAILY đã GỘP vào T_SI_NAV_DAILY: nav/unit/unit_price/daily_pnl/daily_return.)
 
 CREATE TABLE T_SI_INDEX_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
@@ -224,10 +244,10 @@ CREATE TABLE T_SI_HOLDING_DAILY (
     CONSTRAINT PK_SI_HOLDING_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID, C_TICKER)
 );
 
--- NAV cấp SI/ngày — NGUỒN NAV SI-level DUY NHẤT (gộp composition tài sản + hiệu suất).
--- Trước rải ở T_ASSET_SNAPSHOT_DAILY (cash/stock/phí/total/nav) + T_SI_PERFORMANCE_DAILY
--- (nav/unit/unit_price/pnl/return) — cùng grain (date×si), NAV trùng → gộp về 1 bảng.
-CREATE TABLE T_NAV_DAILY (
+-- NAV cấp SI/ngày — NGUỒN NAV SI-level DUY NHẤT (composition tài sản + hiệu suất).
+-- Gộp từ T_ASSET_SNAPSHOT_DAILY + T_SI_PERFORMANCE_DAILY cũ (cùng grain date×si).
+-- cash_dividend/custody_fee/mgmt_fee_accrued = J11 SUM từ T_CUSTOMER_FEE_INCOME (per-KH) lên SI.
+CREATE TABLE T_SI_NAV_DAILY (
     C_BUSINESS_DATE    DATE          NOT NULL,
     C_SI_ID            BIGINT        NOT NULL,
     -- composition tài sản
@@ -244,7 +264,7 @@ CREATE TABLE T_NAV_DAILY (
     C_UNIT_PRICE       DECIMAL(28,10) NULL,
     C_DAILY_PNL        DECIMAL(20,4)  NOT NULL,
     C_DAILY_RETURN     DECIMAL(18,10) NULL,
-    CONSTRAINT PK_NAV_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID)
+    CONSTRAINT PK_SI_NAV_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_SI_ID)
 );
 
 /*------------------------------------------------ CONTROL / ORCHESTRATION -----*/

@@ -65,4 +65,4 @@ Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO c
 
 18/18 job DONE (6 job × 3 phiên), reconcile pass, re-run idempotent (không double-apply).
 
-> Chưa implement (mở rộng): ingestion file FO → `T_CUSTOMER_HOLDING_DAILY` + `T_FO_CASH_SYNC` (`BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), partition/columnstore prod (gồm `T_INDEXING_PERFORMANCE_DAILY` CCI).
+> Chưa implement (mở rộng): ingestion file FO → `T_CUSTOMER_HOLDING_DAILY` + `T_FO_CASH_SYNC` + `T_CUSTOMER_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), partition/columnstore prod (gồm `T_CUSTOMER_NAV_DAILY` CCI).
