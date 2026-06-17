@@ -194,9 +194,9 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38,10)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
 
 ### Master / cấu hình
-- **`sdi_strategy`** (si_id PK; si_code, si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_id)
-- **`sdi_model_weight`** (si_id, effective_date, ticker PK; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
-- **`sdi_customer_si`** (customer_id, si_id PK; sub_account_no, join_date, status, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — cấu hình đầu tư KH (FR-04).
+- **`sdi_master_portfolio`** (si_id PK; si_code, si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_id)
+- **`sdi_master_portfolio_ticker`** (si_id, effective_date, ticker PK; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
+- **`sdi_indexing_portfolio`** (customer_id, si_id PK; sub_account_no, join_date, status, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — cấu hình đầu tư KH (FR-04).
 
 ### Market data
 - **`sdi_price_daily`** (ticker, business_date PK; close_price, adjusted_ref_price)
@@ -300,7 +300,7 @@ J0 → J1 → J2 ─┬─ J3 → J4 ─┬─ J5 → J6 ─┐
 | FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_si_performance + derive customer NAV |
 | FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + asset_snapshot |
 | FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | si_performance (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
-| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_customer_si |
+| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_indexing_portfolio |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_holding_daily (top20 + mã khác) |
 | FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_asset_snapshot_daily |
 
