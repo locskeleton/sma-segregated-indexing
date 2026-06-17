@@ -157,6 +157,7 @@ GO
 
 /*===========================================================================
   J11 — SI AGGREGATE → T_SI_NAV_DAILY (composition + NAV + hiệu suất + cổ tức/phí)
+         + upsert T_SI_NAV_CURRENT (snapshot current cấp SI cho serving)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @d DATE
 AS
@@ -190,6 +191,18 @@ BEGIN
     FROM agg a
     LEFT JOIN fee f ON f.C_SI_ID=a.C_SI_ID
     LEFT JOIN T_SI_NAV_DAILY prev ON prev.C_SI_ID=a.C_SI_ID AND prev.C_BUSINESS_DATE=@prev;
+
+    -- current cấp SI (overwrite) — đọc nhanh "toàn bộ quỹ hiện tại", khỏi WHERE date=MAX
+    MERGE T_SI_NAV_CURRENT AS t
+    USING (SELECT C_SI_ID,C_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_NAV,C_UNIT,C_UNIT_PRICE,C_BUSINESS_DATE
+           FROM T_SI_NAV_DAILY WHERE C_BUSINESS_DATE=@d) s
+    ON t.C_SI_ID=s.C_SI_ID
+    WHEN MATCHED THEN UPDATE SET
+        t.C_CASH=s.C_CASH, t.C_STOCK_VALUE=s.C_STOCK_VALUE, t.C_TOTAL_ASSET=s.C_TOTAL_ASSET,
+        t.C_LAST_NAV=s.C_NAV, t.C_UNIT=s.C_UNIT, t.C_LAST_UNIT_PRICE=s.C_UNIT_PRICE,
+        t.C_LAST_BUSINESS_DATE=s.C_BUSINESS_DATE
+    WHEN NOT MATCHED THEN INSERT (C_SI_ID,C_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_LAST_NAV,C_UNIT,C_LAST_UNIT_PRICE,C_LAST_BUSINESS_DATE)
+        VALUES (s.C_SI_ID,s.C_CASH,s.C_STOCK_VALUE,s.C_TOTAL_ASSET,s.C_NAV,s.C_UNIT,s.C_UNIT_PRICE,s.C_BUSINESS_DATE);
 END
 GO
 
