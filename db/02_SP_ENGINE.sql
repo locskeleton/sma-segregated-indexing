@@ -189,7 +189,8 @@ BEGIN
     -- J09 PnL = NAV − NAV_prev + ra − vào
     UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@d;
 
-    -- J10 Unit (historic: ΔUnit = CF/UnitPrice_(t-1)); init khi unit_prev=0 → unit=NAV/10000, UP=10000
+    -- J10 Unit: ΔUnit = CF/UnitPrice_(t-1) (giả định cashflow đầu ngày + tham gia đầu tư → giá quy đổi = NAV/unit đầu ngày = UP cuối ngày trước; TWR sạch, không bias)
+    --           init khi unit_prev=0 → unit=NAV/10000, UP=10000
     UPDATE T_EOD_WORK SET
         C_DELTA_UNIT = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
                             THEN (C_NAV/10000.0) - C_UNIT_PREV

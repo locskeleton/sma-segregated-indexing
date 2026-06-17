@@ -90,9 +90,11 @@ Tổng tiền chỉ để tính NAV. Các thành phần tiền lưu **theo loạ
 
 ---
 
-## 5. Unit & Unit Price (historic pricing)
+## 5. Unit & Unit Price
 
 Mỗi tiểu khoản có chuỗi NAV & cashflow riêng → **Unit & Unit Price riêng**.
+
+**Giả định khử dòng tiền:** nạp/rút coi như **phát sinh ĐẦU ngày** và **tham gia đầu tư trong ngày**. Khi đó giá quy đổi tại thời điểm tiền vào = NAV/unit đầu ngày = **Unit Price ngày hôm trước (t-1)**.
 
 ```
 T0 (ngày tham gia):
@@ -101,11 +103,13 @@ T0 (ngày tham gia):
 
 Tn (chốt EOD):
    CF_t        = cash_in − cash_out                 (net, gom trong ngày)
-   ΔUnit_t     = CF_t / Unit Price_(t-1)            (giá ngày HÔM TRƯỚC)
+   ΔUnit_t     = CF_t / Unit Price_(t-1)            (giá ĐẦU ngày = cuối ngày trước)
    Unit_t      = Unit_(t-1) + ΔUnit_t
    Unit Price_t = NAV cuối_t / Unit_t
 ```
 
+- **Vì sao chia UP_(t-1) là đúng (không bias):** dưới giả định trên, rút gọn cho `Unit Price_t = Unit Price_(t-1) × (1 + r_t)` → **daily return = r_t (lợi suất tài sản thật), độc lập cashflow** = TWR sạch. Cashflow chỉ đổi **số unit** (ΔUnit), không đổi **tỷ lệ giá unit** giữa 2 ngày.
+- **Hệ quả (telescoping):** `%PnL = Π(UP_t/UP_(t-1)) − 1 = UP_cuối/UP_đầu − 1` → tính bằng **nhân dồn daily return** hay **tỷ lệ 2 đầu mút** đều **cho cùng kết quả, kể cả có nạp/rút** (chính nhờ khử cashflow vào unit).
 - **Unit lưu full precision** (`NUMERIC(38,10)`); chỉ làm tròn khi hiển thị.
 - Hệ quả: `net_cashflow = ΔUnit × Unit Price_(t-1)`.
 - **Đóng & mở lại vị thế**: khi `Unit` về 0 (rút toàn bộ) → vị thế đóng. Lần nộp mới khởi tạo lại như T0 (`Unit = CF/10.000`, `Unit Price = 10.000`). Hiệu suất tính theo từng vị thế.
