@@ -27,7 +27,7 @@ Bổ trợ cho [SDI-spec.md](./SDI-spec.md). Tập trung: chịu tải dữ li�
 Giữ **trạng thái hiện tại** (current state), mỗi EOD chỉ **áp delta của ngày** rồi định giá lại. KHÔNG dựng lại NAV từ đầu lịch sử mỗi ngày.
 
 - `sdi_position_state` — 1 dòng/vị thế (unit, cash, last_nav, last_unit_price) → ~1M dòng, **update tại chỗ**.
-- `sdi_position_holding` — 1 dòng/(vị thế × mã) (quantity, avg_cost) → ~20M dòng, update incremental.
+- `sdi_indexing_portfolio_ticker` — 1 dòng/(vị thế × mã) (quantity, avg_cost) → ~20M dòng, update incremental.
 - Event ledger (cashflow, execution, CA) chỉ **append**; dùng để recompute khi cần.
 
 ### 2.2 SET-BASED — không RBAR
@@ -40,7 +40,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | Bảng | Vai trò | Quy mô | Lưu trữ |
 |---|---|---|---|
 | `sdi_position_state` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (customer_id, si_id), PAGE compression; cân nhắc memory-optimized |
-| `sdi_position_holding` | holdings hiện tại | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
+| `sdi_indexing_portfolio_ticker` | holdings hiện tại | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_execution_feed` | khớp lệnh MP từ FO | ~lớn | **CCI**, partition theo năm |
 | `sdi_customer_holding_event` | sổ cái lot delta | ~lớn | **CCI**, partition theo năm |
@@ -61,7 +61,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 |---|---|---|
 | **Table Partitioning** (partition function/scheme) | mọi bảng lớn theo `business_date`/năm | quản lý, archive, partition elimination khi query |
 | **Clustered Columnstore (CCI)** | event ledger, history, position_daily | nén ~10×, **batch-mode** → aggregate nhanh 10–100× |
-| **Nonclustered Columnstore (NCCI)** trên rowstore | `sdi_position_holding` (HTAP) | vừa update OLTP vừa MTM analytic nhanh |
+| **Nonclustered Columnstore (NCCI)** trên rowstore | `sdi_indexing_portfolio_ticker` (HTAP) | vừa update OLTP vừa MTM analytic nhanh |
 | **Partition SWITCH** | nạp & archive | nạp/đẩy partition **tức thời** (metadata-only), không ghi lại dữ liệu |
 | **Batch-mode on rowstore** (2019+, compat 150) | aggregate rowstore không cần columnstore | tăng tốc GROUP BY |
 | **RCSI / SNAPSHOT isolation** | batch không chặn app đọc | EOD chạy song song với SMO đọc |
@@ -122,7 +122,7 @@ B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
 B3  MTM TOÀN BỘ (câu lệnh nặng nhất — set-based):
       INSERT #nav_today (customer_id, si_id, stock_value)
       SELECT h.customer_id, h.si_id, SUM(h.quantity * p.close_price)
-      FROM   sdi_position_holding h
+      FROM   sdi_indexing_portfolio_ticker h
       JOIN   sdi_price_daily p ON p.ticker=h.ticker AND p.business_date=@d
       GROUP BY h.customer_id, h.si_id;        -- batch-mode (NCCI) trên 20M dòng
 B4  NAV = stock_value + state.cash − custody_fee − mgmt_fee_accrued     (1 UPDATE join)
@@ -194,7 +194,7 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 
 - **Khóa clustering**: dùng khóa **hẹp, tăng dần, không GUID** (GUID ngẫu nhiên → page split, fragmentation). Dùng `BIGINT IDENTITY` hoặc khóa tự nhiên hẹp.
 - `sdi_position_state`: clustered PK `(customer_id, si_id)` — point update/lookup.
-- `sdi_position_holding`: clustered `(customer_id, si_id, ticker)` + **NCCI** (cho B3).
+- `sdi_indexing_portfolio_ticker`: clustered `(customer_id, si_id, ticker)` + **NCCI** (cho B3).
 - Event ledger (CCI): partition `(business_date)`; CCI tự lo, thêm **nonclustered rowstore** `(customer_id, si_id, business_date)` nếu cần truy vết theo KH.
 - SI-level daily: clustered `(si_id, business_date)`.
 - `sdi_price_daily`: clustered `(business_date, ticker)` — nhỏ, cache buffer pool.
@@ -220,7 +220,7 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 | Bảng | Dòng | Sau nén |
 |---|---|---|
 | position_state (rowstore PAGE) | 1M | ~vài trăm MB |
-| position_holding (rowstore + NCCI) | 20M | ~vài GB |
+| indexing_portfolio_ticker (rowstore + NCCI) | 20M | ~vài GB |
 | event ledger (CCI) | ~300M | ~chục GB |
 | SI-level daily (rowstore) | ~1M | ~nhỏ |
 | **TỔNG mặc định** | | **~vài chục GB** ✅ |
@@ -264,7 +264,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CUSTOMER_HOLDING_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
 | T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |
 | T_POSITION_STATE | (C_CUSTOMER_ID, C_SI_ID) | composite typed (hot) |
-| T_POSITION_HOLDING | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
+| T_INDEXING_PORTFOLIO_TICKER | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
 | T_EOD_WORK | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite (transient) |
 | T_SI_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
 | T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_ID) | composite natural |
@@ -305,7 +305,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 
 ## 12. Tóm tắt quyết định kiến trúc
 
-1. **Roll-forward state** (`position_state` 1M + `position_holding` 20M), KHÔNG replay mỗi ngày.
+1. **Roll-forward state** (`position_state` 1M + `indexing_portfolio_ticker` 20M), KHÔNG replay mỗi ngày.
 2. **EOD set-based**: ~10 câu lệnh; nặng nhất = MTM 20M dòng (1 câu, CCI batch-mode).
 3. **Columnstore** (CCI/NCCI) cho fact/history + **partition theo năm** + **partition switch** nạp/archive.
 4. **Customer daily NAV: derive-on-read mặc định** (+ snapshot cuối tháng); materialize CCI chỉ khi cần.

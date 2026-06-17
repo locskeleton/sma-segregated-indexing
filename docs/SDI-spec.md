@@ -254,11 +254,11 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J0** | `GATE` chờ nguồn sẵn sàng | — | cờ sẵn sàng FO/Market/model_weight @d | `sdi_eod_run` | – | – | ✅ (timeout→alert) |
 | **J1** | `STAGE` bulk load input | J0 | FO (holdings, execution), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
 | **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm/thiếu nhãn nguồn) |
-| **J3** | `APPLY_CA` corporate action | J2 | staging CA | position_holding (split/quyền), state.cash (cổ tức ex-date), holding_event | ✅ | ‖ | ✅ |
-| **J4** | `APPLY_EXEC` khớp lệnh | J3 | staging execution | position_holding (qty), state.cash (mua/bán trade-date), holding_event | ✅ | ‖ | ✅ |
+| **J3** | `APPLY_CA` corporate action | J2 | staging CA | indexing_portfolio_ticker (split/quyền), state.cash (cổ tức ex-date), holding_event | ✅ | ‖ | ✅ |
+| **J4** | `APPLY_EXEC` khớp lệnh | J3 | staging execution | indexing_portfolio_ticker (qty), state.cash (mua/bán trade-date), holding_event | ✅ | ‖ | ✅ |
 | **J5** | `APPLY_CASHFLOW` nạp/rút | J4 | cashflow event | state.cash, CF_t per vị thế | ✅ | ‖ | – |
 | **J6** | `ACCRUE_FEE` phí quản lý | J5 | state (NAV_prev) | state.payable += NAV_prev×rate/365 | ✅ | ‖ | – |
-| **J7** | `MTM` định giá lại toàn bộ | J4 | position_holding + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
+| **J7** | `MTM` định giá lại toàn bộ | J4 | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J6, J7 | stock_value, state.cash, phí | NAV per vị thế | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
 | **J10** | `CALC_UNIT` | J8 | CF_t, UnitPrice_prev | ΔUnit/Unit/UnitPrice; sdi_unit_ledger | ✅ | ‖ | – |
