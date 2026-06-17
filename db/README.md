@@ -6,9 +6,9 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Đối tượng | Quy ước |
 |---|---|
 | Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
-| Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`). Cột entity-id: `PK_` (PK ở bảng gốc) / `FK_` (ref ở bảng khác) — vd `PK_SI_ID`@master, `FK_SI_ID`, `FK_CUST_CODE` |
+| Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`, `C_CUST_CODE`). Riêng entity-id `SI_ID`: `PK_SI_ID`@master / `FK_SI_ID` ở bảng khác |
 | Primary key | constraint `PK_<table>` |
-| Foreign key | **KHÔNG hard-set constraint** — cột FK tự đánh dấu prefix `FK_` (+ comment `FK_<child>__<parent>` khi cần) |
+| Foreign key | **KHÔNG hard-set constraint** — FK SI_ID đánh dấu prefix `FK_` (+ comment `FK_<child>__<parent>` khi cần) |
 | Stored procedure | `SP_` |
 | Function | `UDF_` |
 
