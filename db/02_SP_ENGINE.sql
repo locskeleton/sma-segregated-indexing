@@ -50,12 +50,12 @@ BEGIN
     SET NOCOUNT ON;
 
     -- holdings hiện tại = mirror snapshot FO @d (per-KH). Snapshot dated giữ trong
-    -- T_SI_POSITION_HOLDING_DAILY → nguồn audit + tái dựng lịch sử. Biến động NET/ngày
+    -- T_CUSTOMER_HOLDING_DAILY → nguồn audit + tái dựng lịch sử. Biến động NET/ngày
     -- suy ra ON-DEMAND khi report cần = qty(D) − qty(D-1) (LAG/self-join), KHÔNG lưu sẵn.
     TRUNCATE TABLE T_INDEXING_PORTFOLIO_TICKER;
     INSERT INTO T_INDEXING_PORTFOLIO_TICKER (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
     SELECT C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
-    FROM T_SI_POSITION_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
+    FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
 
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_POSITION_STATE AS s
@@ -242,14 +242,14 @@ END
 GO
 
 /*===========================================================================
-  J14 — SNAPSHOT: T_HOLDING_DAILY (SI aggregate) + T_ASSET_SNAPSHOT_DAILY
+  J14 — SNAPSHOT: T_SI_HOLDING_DAILY (SI aggregate) + T_ASSET_SNAPSHOT_DAILY
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
     -- holdings cấp SI + tỷ trọng
-    DELETE FROM T_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
+    DELETE FROM T_SI_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
     ;WITH sih AS (
         SELECT h.C_SI_ID, h.C_TICKER, SUM(h.C_QUANTITY) AS QTY
         FROM T_INDEXING_PORTFOLIO_TICKER h GROUP BY h.C_SI_ID, h.C_TICKER
@@ -259,7 +259,7 @@ BEGIN
                sih.QTY*p.C_CLOSE_PRICE AS MV
         FROM sih JOIN T_PRICE_DAILY p ON p.C_TICKER=sih.C_TICKER AND p.C_BUSINESS_DATE=@d
     )
-    INSERT INTO T_HOLDING_DAILY (C_BUSINESS_DATE,C_SI_ID,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT)
+    INSERT INTO T_SI_HOLDING_DAILY (C_BUSINESS_DATE,C_SI_ID,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT)
     SELECT @d, v.C_SI_ID, v.C_TICKER, v.QTY, v.C_CLOSE_PRICE, v.MV,
            CASE WHEN SUM(v.MV) OVER (PARTITION BY v.C_SI_ID) > 0
                 THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_SI_ID) END
