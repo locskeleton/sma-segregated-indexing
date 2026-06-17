@@ -33,7 +33,8 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J05 cashflow → J03 CA → J04 exec → J06 fee → J07 compute (MTM→NAV→PnL→Unit, roll-forward) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
+`J01 sync_fo (mirror holdings+cash từ FO) → J06 fee → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
+(SDI KHÔNG quản lý từng lệnh khớp — FO đồng bộ snapshot holdings+cash EOD. Cashflow event chỉ dùng cho CF_t.)
 
 ## Đã verify (SQL Server Express)
 Smoke 1 KH / 3 phiên — khớp kỳ vọng:
@@ -45,4 +46,4 @@ Smoke 1 KH / 3 phiên — khớp kỳ vọng:
 
 27/27 job DONE, reconcile pass, re-run idempotent (không double-apply).
 
-> Chưa implement (mở rộng): J01 ingestion (`BULK INSERT` proc), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), thu phí tháng, partition/columnstore prod.
+> Chưa implement (mở rộng): ingestion file FO → `T_FO_*_SYNC` (`BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), thu phí tháng, partition/columnstore prod (gồm `T_INDEXING_PERFORMANCE_DAILY` CCI).

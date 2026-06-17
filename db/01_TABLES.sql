@@ -86,19 +86,25 @@ CREATE TABLE T_REBALANCE_REQUEST (
     CONSTRAINT PK_REBALANCE_REQUEST PRIMARY KEY (C_REQUEST_ID)
 );
 
--- FO -> SDI : kết quả khớp MP per tiểu khoản
-CREATE TABLE T_EXECUTION_FEED (
-    C_EXEC_ID        BIGINT IDENTITY(1,1) NOT NULL,
+-- FO -> SDI : ĐỒNG BỘ EOD toàn bộ holdings + cash của tài khoản SDI.
+--   SDI KHÔNG quản lý từng lệnh khớp (FO lo) → không có T_EXECUTION_FEED.
+--   SDI dùng 2 bảng staging này làm nguồn trạng thái tài sản (OVERWRITE mỗi EOD).
+CREATE TABLE T_FO_HOLDING_SYNC (
+    C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUSTOMER_ID    BIGINT          NOT NULL,
     C_SI_ID          BIGINT          NOT NULL,
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_SIDE           VARCHAR(4)      NOT NULL,  -- BUY | SELL
-    C_QTY            DECIMAL(20,4)   NOT NULL,
-    C_EXEC_PRICE     DECIMAL(18,4)   NOT NULL,
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    CONSTRAINT PK_EXECUTION_FEED PRIMARY KEY (C_EXEC_ID)
+    C_QUANTITY       DECIMAL(20,4)   NOT NULL,
+    C_AVG_COST       DECIMAL(18,4)   NULL,
+    CONSTRAINT PK_FO_HOLDING_SYNC PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER)
 );
-CREATE INDEX IX_EXECUTION_FEED_DATE ON T_EXECUTION_FEED (C_BUSINESS_DATE) INCLUDE (C_CUSTOMER_ID, C_SI_ID, C_TICKER, C_SIDE, C_QTY, C_EXEC_PRICE);
+CREATE TABLE T_FO_CASH_SYNC (
+    C_BUSINESS_DATE  DATE            NOT NULL,
+    C_CUSTOMER_ID    BIGINT          NOT NULL,
+    C_SI_ID          BIGINT          NOT NULL,
+    C_CASH           DECIMAL(20,4)   NOT NULL,    -- tổng tiền tài khoản (FO đã phản ánh trade/cổ tức/settlement)
+    CONSTRAINT PK_FO_CASH_SYNC PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
+);
 
 -- External cashflow (KHÔNG chứa income)
 CREATE TABLE T_CASHFLOW_EVENT (
@@ -113,17 +119,8 @@ CREATE TABLE T_CASHFLOW_EVENT (
 );
 CREATE INDEX IX_CASHFLOW_EVENT_DATE ON T_CASHFLOW_EVENT (C_BUSINESS_DATE) INCLUDE (C_CUSTOMER_ID, C_SI_ID, C_EVENT_TYPE, C_AMOUNT);
 
--- Sổ cái lot delta (dựng từ execution + CA)
-CREATE TABLE T_CUSTOMER_HOLDING_EVENT (
-    C_EVENT_ID       BIGINT IDENTITY(1,1) NOT NULL,
-    C_CUSTOMER_ID    BIGINT          NOT NULL,
-    C_SI_ID          BIGINT          NOT NULL,
-    C_TICKER         VARCHAR(20)     NOT NULL,
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_QTY_DELTA      DECIMAL(20,4)   NOT NULL,
-    C_SOURCE         VARCHAR(10)     NOT NULL,  -- EXEC | CA | CLOSE
-    CONSTRAINT PK_CUSTOMER_HOLDING_EVENT PRIMARY KEY (C_EVENT_ID)
-);
+-- (ĐÃ BỎ T_CUSTOMER_HOLDING_EVENT) — holdings không còn event-source ở SDI;
+--   FO đồng bộ full snapshot (T_FO_HOLDING_SYNC) → SDI mirror vào T_INDEXING_PORTFOLIO_TICKER.
 
 -- Unit thay đổi (ghi dòng khi có cashflow)
 CREATE TABLE T_UNIT_LEDGER (
@@ -151,7 +148,8 @@ CREATE TABLE T_POSITION_STATE (
     CONSTRAINT PK_POSITION_STATE PRIMARY KEY (C_CUSTOMER_ID, C_SI_ID)
 ) WITH (DATA_COMPRESSION = PAGE);
 
--- Holdings hiện tại (~20M). Prod: thêm NONCLUSTERED COLUMNSTORE cho MTM (HTAP)
+-- Holdings hiện tại (~20M) — MIRROR từ FO sync (T_FO_HOLDING_SYNC), overwrite mỗi EOD.
+-- Prod: thêm NONCLUSTERED COLUMNSTORE cho MTM (HTAP)
 CREATE TABLE T_INDEXING_PORTFOLIO_TICKER (
     C_CUSTOMER_ID    BIGINT          NOT NULL,
     C_SI_ID          BIGINT          NOT NULL,
@@ -183,6 +181,23 @@ CREATE TABLE T_EOD_WORK (
     C_UNIT            DECIMAL(38,10) NOT NULL DEFAULT 0,
     C_UNIT_PRICE      DECIMAL(28,10) NULL,
     CONSTRAINT PK_EOD_WORK PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
+);
+
+/*--------------- PER-KH DAILY PERFORMANCE (lịch sử — cần cho chart FR-03) -----*/
+-- Vì FO chỉ sync snapshot (overwrite) → holdings KHÔNG còn event-source → KHÔNG derive
+-- được NAV/unit_price quá khứ. Phải MATERIALIZE perf per (KH×SI) mỗi ngày để vẽ chart KH.
+-- Quy mô ~2,5 tỷ dòng/10 năm → prod: CLUSTERED COLUMNSTORE + partition (xem SDI-db-architecture).
+-- (Có thể giảm tải: lấy điểm thưa tuần/tháng, hoặc chỉ lưu unit_price.)
+CREATE TABLE T_INDEXING_PERFORMANCE_DAILY (
+    C_BUSINESS_DATE  DATE            NOT NULL,
+    C_CUSTOMER_ID    BIGINT          NOT NULL,
+    C_SI_ID          BIGINT          NOT NULL,
+    C_NAV            DECIMAL(20,4)   NOT NULL,
+    C_UNIT           DECIMAL(38,10)  NOT NULL,
+    C_UNIT_PRICE     DECIMAL(28,10)  NULL,
+    C_DAILY_PNL      DECIMAL(20,4)   NOT NULL,
+    C_DAILY_RETURN   DECIMAL(18,10)  NULL,
+    CONSTRAINT PK_INDEXING_PERFORMANCE_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID)
 );
 
 /*------------------------------------------------ SI-LEVEL DAILY (output) -----*/

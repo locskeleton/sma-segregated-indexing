@@ -40,18 +40,18 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | Bảng | Vai trò | Quy mô | Lưu trữ |
 |---|---|---|---|
 | `sdi_position_state` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (customer_id, si_id), PAGE compression; cân nhắc memory-optimized |
-| `sdi_indexing_portfolio_ticker` | holdings hiện tại | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
+| `sdi_indexing_portfolio_ticker` | holdings hiện tại (mirror FO) | ~20M | **rowstore** clustered (customer_id, si_id, ticker) + **NCCI** (HTAP) cho MTM |
+| `sdi_fo_holding_sync` / `sdi_fo_cash_sync` | snapshot FO đồng bộ EOD | ~20M/ngày staging | rowstore, partition theo ngày/năm (truncate/switch sau khi mirror) |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
-| `sdi_execution_feed` | khớp lệnh MP từ FO | ~lớn | **CCI**, partition theo năm |
-| `sdi_customer_holding_event` | sổ cái lot delta | ~lớn | **CCI**, partition theo năm |
+| `sdi_indexing_performance_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
 | `sdi_si_performance_daily` | SI-level daily | ~250K | rowstore, partition năm |
 | `sdi_si_index_daily` / `sdi_benchmark_daily` | index daily | ~250K | rowstore |
 | `sdi_asset_snapshot_daily` (SI) | snapshot SI | ~250K | rowstore |
 | `sdi_price_daily` | giá EOD | ~4M | rowstore, index (business_date, ticker) — nhỏ, cache RAM |
-| `sdi_position_daily` (TÙY CHỌN) | customer NAV daily lịch sử | ~2,5 tỷ | **CCI**, partition (xem §7) |
+| `sdi_indexing_performance_daily` | customer perf daily (lịch sử) | ~2,5 tỷ | **CCI**, partition (xem §7) |
 
-**Quyết định customer daily NAV:** **KHÔNG materialize 2,5 tỷ dòng mặc định.** Giữ `position_state` (current, ~1M) + event ledger; **derive lịch sử khi cần** (chart) + **snapshot cuối tháng** giới hạn replay. Chỉ bật `sdi_position_daily` (CCI) nếu đo thấy độ trễ đọc chart không đạt (xem §7.3).
+**Quyết định customer daily perf (đổi do FO-sync):** vì FO đồng bộ **snapshot overwrite** → holdings KHÔNG còn event-source → **KHÔNG derive được NAV/unit_price quá khứ** → **BẮT BUỘC materialize** `sdi_indexing_performance_daily` (nav/unit/unit_price/day) để vẽ chart FR-03. Giảm tải: lấy **điểm thưa (tuần/tháng)** hoặc chỉ lưu `unit_price`. Lưu CCI + partition (§7.3).
 
 ---
 
@@ -113,7 +113,8 @@ Hỗn hợp 3 cấp — KHÔNG phải tất cả khi tạo bảng:
 Tất cả vào **staging** trước, validate, rồi **publish** (partition switch/MERGE). Idempotent + resumable.
 
 ```
-B1  STAGE input ngày @d: bulk insert price, execution feed, model_weight, CA → bảng staging (minimal logging)
+B1  STAGE input ngày @d: bulk insert price, FO holdings+cash sync, model_weight, CA, cashflow → staging (minimal logging)
+B1b SYNC_FO: mirror holdings (overwrite T_INDEXING_PORTFOLIO_TICKER) + cash (state) từ snapshot FO
 B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
       - CA: MERGE holding (split/quyền đổi qty); cash (cổ tức) → state.cash
       - Execution: MERGE holding (qty +/−); state.cash -/+ (mua/bán, trade-date)
@@ -178,15 +179,11 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 - Holdings: 2 năm online (SSD) + 8 năm archive (HDD/đọc nguội).
 - Nạp EOD: bulk vào **staging cùng filegroup + cùng index + CHECK constraint khớp biên** → `SWITCH` vào partition đích → tức thời, không khóa bảng lớn.
 
-### 7.3 Customer daily NAV — 2 phương án (chọn theo đo đạc)
-| | A. Derive-on-read (mặc định) | B. Materialize CCI |
-|---|---|---|
-| Lưu | current snapshot + event + snapshot cuối tháng | `sdi_position_daily` CCI ~2,5 tỷ (nén ~10×) |
-| EOD | nhẹ (không append 1M/ngày) | +bulk 1M/ngày vào CCI (rẻ) |
-| Đọc chart KH | derive (replay trong tháng) — vài chục ms | đọc thẳng — nhanh |
-| Khuyến nghị | **dùng trước**; chart lấy điểm thưa (tuần/tháng) | bật nếu đo thấy đọc không đạt SLA |
-
-> Nếu chọn B: partition theo **hash(customer_id) + năm**, hoặc **ordered CCI** theo (customer_id, business_date) để segment-elimination khi đọc 1 KH. Tránh nonclustered rowstore index trên 2,5 tỷ (phình ~trăm GB).
+### 7.3 Customer daily perf — BẮT BUỘC materialize (do FO-sync)
+FO sync overwrite holdings → không event-source → derive-on-read lịch sử **không khả thi** → **phải materialize** `sdi_indexing_performance_daily`:
+- Lưu CCI, **partition hash(customer_id) + năm** (hoặc **ordered CCI** theo (customer_id, business_date)) để segment-elimination khi đọc 1 KH. Tránh nonclustered rowstore index trên 2,5 tỷ (phình ~trăm GB).
+- EOD: bulk ~1M dòng/ngày vào CCI (rẻ). Đọc chart KH: đọc thẳng (nhanh).
+- **Giảm tải**: lấy điểm **thưa (tuần/tháng)** thay vì daily, hoặc chỉ lưu cột `unit_price` (+nav) — narrow CCI nén rất tốt.
 
 ---
 
@@ -216,23 +213,16 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 
 > **Nén LÀM GIẢM dung lượng, không tăng** (CCI ~10×, PAGE ~2–4×). Mọi con số dưới là **sau nén**.
 
-### Thiết kế MẶC ĐỊNH (khuyến nghị — KHÔNG có bảng 2,5 tỷ)
 | Bảng | Dòng | Sau nén |
 |---|---|---|
 | position_state (rowstore PAGE) | 1M | ~vài trăm MB |
 | indexing_portfolio_ticker (rowstore + NCCI) | 20M | ~vài GB |
-| event ledger (CCI) | ~300M | ~chục GB |
+| event ledger (cashflow/unit_ledger, CCI) | ~240M | ~chục GB |
 | SI-level daily (rowstore) | ~1M | ~nhỏ |
-| **TỔNG mặc định** | | **~vài chục GB** ✅ |
+| **`indexing_performance_daily` (CCI)** | **~2,5 tỷ** | **~100–300 GB** (bắt buộc — do FO-sync, xem §7.3) |
 
-Customer NAV lịch sử = **derive-on-read** → KHÔNG lưu → không có 2,5 tỷ dòng.
-
-### TÙY CHỌN (chỉ bật nếu đo thấy đọc chart chậm — KHÔNG mặc định)
-| Bảng | Dòng | Không nén | Sau nén CCI |
-|---|---|---|---|
-| position_daily | 2,5 tỷ | ~1–3 TB | ~100–300 GB |
-
-→ Bảng 2,5 tỷ là **phương án opt-in**; nén ~10× là thứ kéo nó từ TB về trăm GB (đặt ở filegroup archive). **Mặc định không tạo nó** → DB chỉ ~chục GB.
+> Nén ~10× kéo bảng perf từ ~1–3 TB về ~100–300 GB. **Giảm**: lấy điểm thưa (tuần/tháng) hoặc chỉ lưu `unit_price` (+nav) → narrow CCI còn nhỏ hơn nhiều. Đặt partition cũ ở filegroup archive.
+> Lưu ý: trước đây có thể derive-on-read (event-source); sau khi đổi sang **FO sync snapshot** thì **bắt buộc** materialize bảng này.
 
 ---
 
@@ -259,9 +249,10 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
 | T_BENCHMARK_DAILY | (C_BENCHMARK_ID, C_BUSINESS_DATE) | composite |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
-| T_EXECUTION_FEED | C_EXEC_ID | BIGINT IDENTITY (fact/CCI) |
+| T_FO_HOLDING_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite natural (staging FO) |
+| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (staging FO) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
-| T_CUSTOMER_HOLDING_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
+| T_INDEXING_PERFORMANCE_DAILY | (C_BUSINESS_DATE, C_CUSTOMER_ID, C_SI_ID) | composite natural (history, CCI) |
 | T_UNIT_LEDGER | (C_CUSTOMER_ID, C_SI_ID, C_BUSINESS_DATE) | composite natural |
 | T_POSITION_STATE | (C_CUSTOMER_ID, C_SI_ID) | composite typed (hot) |
 | T_INDEXING_PORTFOLIO_TICKER | (C_CUSTOMER_ID, C_SI_ID, C_TICKER) | composite typed |
@@ -297,7 +288,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 - ❌ **Scalar UDF** trong câu set-based (1 lần/dòng → giết batch; nếu phải, dùng inline TVF hoặc 2019+ scalar inlining).
 - ❌ **GUID ngẫu nhiên làm clustered key** trên bảng lớn (fragmentation, page split).
 - ❌ Nonclustered rowstore index nặng trên bảng tỷ-dòng (phình + chậm ghi) — ưu tiên columnstore + partition elimination.
-- ❌ Materialize 2,5 tỷ dòng khi chưa cần.
+- ❌ Lưu daily HOLDINGS snapshot per-KH (~50 tỷ) — thay vào đó materialize daily PERF (~2,5 tỷ, nhỏ hơn nhiều).
 - ❌ `MERGE` trên bảng cực lớn không partition-aligned (dễ chậm/deadlock) — tách INSERT/UPDATE hoặc switch.
 - ❌ Index thừa trên bảng ghi nóng làm chậm bulk insert EOD.
 
@@ -308,7 +299,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 1. **Roll-forward state** (`position_state` 1M + `indexing_portfolio_ticker` 20M), KHÔNG replay mỗi ngày.
 2. **EOD set-based**: ~10 câu lệnh; nặng nhất = MTM 20M dòng (1 câu, CCI batch-mode).
 3. **Columnstore** (CCI/NCCI) cho fact/history + **partition theo năm** + **partition switch** nạp/archive.
-4. **Customer daily NAV: derive-on-read mặc định** (+ snapshot cuối tháng); materialize CCI chỉ khi cần.
+4. **Customer daily perf: materialize** `indexing_performance_daily` (CCI, partition) — bắt buộc do FO-sync overwrite (không event-source được); giảm tải bằng điểm thưa / chỉ unit_price.
 5. **Song song theo SI/hash**, MAXDOP, Resource Governor; **RCSI** để không chặn app.
 6. **Idempotent + resumable + reconcile** trước khi publish.
 7. EOD ước ~vài phút–15 phút (vs hàng giờ nếu RBAR).

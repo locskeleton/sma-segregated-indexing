@@ -40,94 +40,32 @@ END
 GO
 
 /*===========================================================================
-  J05 — APPLY CASHFLOW  (tạo state cho KH mới + cộng net cashflow vào cash)
+  J01b — SYNC FO: mirror holdings + cash từ snapshot FO (OVERWRITE trạng thái tài sản)
+         SDI KHÔNG event-source execution; FO đã phản ánh trade/cổ tức/split/settlement.
+         Cashflow (nạp/rút) vẫn lấy từ T_CASHFLOW_EVENT — chỉ dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_APPLY_CASHFLOW @d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_SYNC_FO @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
-    ;WITH cf AS (
-        SELECT C_CUSTOMER_ID, C_SI_ID,
-               SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END) AS CF_NET
-        FROM T_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@d
-        GROUP BY C_CUSTOMER_ID, C_SI_ID
-    )
+    -- holdings hiện tại = mirror full snapshot FO
+    TRUNCATE TABLE T_INDEXING_PORTFOLIO_TICKER;
+    INSERT INTO T_INDEXING_PORTFOLIO_TICKER (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
+    SELECT C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
+    FROM T_FO_HOLDING_SYNC WHERE C_BUSINESS_DATE=@d;
+
+    -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_POSITION_STATE AS s
-    USING cf ON s.C_CUSTOMER_ID=cf.C_CUSTOMER_ID AND s.C_SI_ID=cf.C_SI_ID
-    WHEN MATCHED THEN UPDATE SET C_CASH = s.C_CASH + cf.CF_NET
+    USING (SELECT C_CUSTOMER_ID,C_SI_ID,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
+    ON s.C_CUSTOMER_ID=f.C_CUSTOMER_ID AND s.C_SI_ID=f.C_SI_ID
+    WHEN MATCHED THEN UPDATE SET C_CASH = f.C_CASH
     WHEN NOT MATCHED THEN INSERT (C_CUSTOMER_ID,C_SI_ID,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS)
-        VALUES (cf.C_CUSTOMER_ID,cf.C_SI_ID,0,cf.CF_NET,0,0,NULL,'ACTIVE');
+        VALUES (f.C_CUSTOMER_ID,f.C_SI_ID,0,f.C_CASH,0,0,NULL,'ACTIVE');
 END
 GO
 
-/*===========================================================================
-  J03 — APPLY CORPORATE ACTION (cổ tức tiền → cash income; split/stock-div → qty)
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_APPLY_CA @d DATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    -- cổ tức tiền mặt: income → cộng vào cash (KHÔNG phải cashflow)
-    UPDATE s SET C_CASH = s.C_CASH + d.DIV
-    FROM T_POSITION_STATE s
-    JOIN (
-        SELECT h.C_CUSTOMER_ID, h.C_SI_ID, SUM(h.C_QUANTITY * ca.C_CASH_DIV_PER_SHARE) AS DIV
-        FROM T_INDEXING_PORTFOLIO_TICKER h
-        JOIN T_CORPORATE_ACTION ca ON ca.C_TICKER=h.C_TICKER AND ca.C_EX_DATE=@d AND ca.C_CA_TYPE='CASH_DIV'
-        GROUP BY h.C_CUSTOMER_ID, h.C_SI_ID
-    ) d ON d.C_CUSTOMER_ID=s.C_CUSTOMER_ID AND d.C_SI_ID=s.C_SI_ID;
-
-    -- split / cổ tức cổ phiếu: điều chỉnh khối lượng (ratio = new/old)
-    INSERT INTO T_CUSTOMER_HOLDING_EVENT (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_BUSINESS_DATE,C_QTY_DELTA,C_SOURCE)
-    SELECT h.C_CUSTOMER_ID,h.C_SI_ID,h.C_TICKER,@d, h.C_QUANTITY*(ca.C_RATIO-1), 'CA'
-    FROM T_INDEXING_PORTFOLIO_TICKER h
-    JOIN T_CORPORATE_ACTION ca ON ca.C_TICKER=h.C_TICKER AND ca.C_EX_DATE=@d AND ca.C_CA_TYPE IN ('SPLIT','STOCK_DIV');
-
-    UPDATE h SET C_QUANTITY = h.C_QUANTITY * ca.C_RATIO
-    FROM T_INDEXING_PORTFOLIO_TICKER h
-    JOIN T_CORPORATE_ACTION ca ON ca.C_TICKER=h.C_TICKER AND ca.C_EX_DATE=@d AND ca.C_CA_TYPE IN ('SPLIT','STOCK_DIV');
-END
-GO
-
-/*===========================================================================
-  J04 — APPLY EXECUTION (trade-date): holdings qty + cash mua/bán
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_APPLY_EXEC @d DATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    -- holdings
-    ;WITH e AS (
-        SELECT C_CUSTOMER_ID, C_SI_ID, C_TICKER,
-               SUM(CASE WHEN C_SIDE='BUY' THEN C_QTY ELSE -C_QTY END) AS QTY_DELTA
-        FROM T_EXECUTION_FEED WHERE C_BUSINESS_DATE=@d
-        GROUP BY C_CUSTOMER_ID, C_SI_ID, C_TICKER
-    )
-    MERGE T_INDEXING_PORTFOLIO_TICKER AS h
-    USING e ON h.C_CUSTOMER_ID=e.C_CUSTOMER_ID AND h.C_SI_ID=e.C_SI_ID AND h.C_TICKER=e.C_TICKER
-    WHEN MATCHED THEN UPDATE SET C_QUANTITY = h.C_QUANTITY + e.QTY_DELTA
-    WHEN NOT MATCHED THEN INSERT (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_QUANTITY)
-        VALUES (e.C_CUSTOMER_ID,e.C_SI_ID,e.C_TICKER,e.QTY_DELTA);
-
-    -- holding events
-    INSERT INTO T_CUSTOMER_HOLDING_EVENT (C_CUSTOMER_ID,C_SI_ID,C_TICKER,C_BUSINESS_DATE,C_QTY_DELTA,C_SOURCE)
-    SELECT C_CUSTOMER_ID,C_SI_ID,C_TICKER,@d,
-           SUM(CASE WHEN C_SIDE='BUY' THEN C_QTY ELSE -C_QTY END),'EXEC'
-    FROM T_EXECUTION_FEED WHERE C_BUSINESS_DATE=@d
-    GROUP BY C_CUSTOMER_ID,C_SI_ID,C_TICKER;
-
-    -- cash: BUY giảm tiền (qty*price), SELL tăng tiền
-    UPDATE s SET C_CASH = s.C_CASH - x.NET_BUY
-    FROM T_POSITION_STATE s
-    JOIN (
-        SELECT C_CUSTOMER_ID, C_SI_ID,
-               SUM(CASE WHEN C_SIDE='BUY' THEN C_QTY*C_EXEC_PRICE ELSE -C_QTY*C_EXEC_PRICE END) AS NET_BUY
-        FROM T_EXECUTION_FEED WHERE C_BUSINESS_DATE=@d GROUP BY C_CUSTOMER_ID,C_SI_ID
-    ) x ON x.C_CUSTOMER_ID=s.C_CUSTOMER_ID AND x.C_SI_ID=s.C_SI_ID;
-
-    DELETE FROM T_INDEXING_PORTFOLIO_TICKER WHERE C_QUANTITY = 0;
-END
-GO
+-- (ĐÃ BỎ J03 APPLY_CA & J04 APPLY_EXEC) — FO sync đã phản ánh cổ tức/split/trade vào cash+holdings.
+--   T_CORPORATE_ACTION chỉ còn dùng cho SI INDEX (điều chỉnh P_ref khi có quyền — J12).
 
 /*===========================================================================
   J06 — ACCRUE MGMT FEE: payable += NAV_prev × rate/365  (hạch toán theo ngày)
@@ -217,6 +155,13 @@ BEGIN
     INSERT INTO T_UNIT_LEDGER (C_CUSTOMER_ID,C_SI_ID,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
     SELECT C_CUSTOMER_ID,C_SI_ID,@d,(C_CF_IN-C_CF_OUT),C_DELTA_UNIT,C_UNIT
     FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d AND (C_CF_IN-C_CF_OUT)<>0;
+
+    -- LỊCH SỬ per-KH (vì holdings không còn event-source → phải materialize để vẽ chart FR-03)
+    DELETE FROM T_INDEXING_PERFORMANCE_DAILY WHERE C_BUSINESS_DATE=@d;
+    INSERT INTO T_INDEXING_PERFORMANCE_DAILY (C_BUSINESS_DATE,C_CUSTOMER_ID,C_SI_ID,C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+    SELECT @d, C_CUSTOMER_ID, C_SI_ID, C_NAV, C_UNIT, C_UNIT_PRICE, C_DAILY_PNL,
+           CASE WHEN C_LAST_UNIT_PRICE>0 THEN C_UNIT_PRICE/C_LAST_UNIT_PRICE - 1 END
+    FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
 END
 GO
 
@@ -374,11 +319,9 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     DECLARE @d DATE = @C_BUSINESS_DATE;
 
-    EXEC SP_EOD_STEP @d, 'J05_CASHFLOW', 'SP_EOD_APPLY_CASHFLOW';  -- tạo state KH mới
-    EXEC SP_EOD_STEP @d, 'J03_CA',       'SP_EOD_APPLY_CA';        -- cổ tức/split (holdings trước trade)
-    EXEC SP_EOD_STEP @d, 'J04_EXEC',     'SP_EOD_APPLY_EXEC';
+    EXEC SP_EOD_STEP @d, 'J01_SYNC_FO',  'SP_EOD_SYNC_FO';         -- mirror holdings+cash từ FO (overwrite)
     EXEC SP_EOD_STEP @d, 'J06_FEE',      'SP_EOD_ACCRUE_FEE';
-    EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward
+    EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
     EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
