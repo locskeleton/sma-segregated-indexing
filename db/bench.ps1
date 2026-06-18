@@ -70,12 +70,13 @@ SELECT
   MAX(CASE WHEN C_JOB='J12_SI_INDEX'  THEN DATEDIFF(MILLISECOND,C_STARTED_AT,C_ENDED_AT) END),
   MAX(CASE WHEN C_JOB='J13_RECONCILE' THEN DATEDIFF(MILLISECOND,C_STARTED_AT,C_ENDED_AT) END),
   MAX(CASE WHEN C_JOB='J14_SNAPSHOT'  THEN DATEDIFF(MILLISECOND,C_STARTED_AT,C_ENDED_AT) END),
+  MAX(CASE WHEN C_JOB='J14B_HIST'     THEN DATEDIFF(MILLISECOND,C_STARTED_AT,C_ENDED_AT) END),
   SUM(CASE WHEN C_STATUS<>'DONE' THEN 1 ELSE 0 END)
 FROM T_EOD_RUN WHERE C_BUSINESS_DATE='$BusinessDate';
 "@
 $rowOut = Invoke-Sql -Query $pivot -Raw | Where-Object { $_ -match '\d' } | Select-Object -First 1
 $f = $rowOut -split ','
-$total,$j01,$j07,$j11,$j12,$j13,$j14,$nbad = $f
+$total,$j01,$j07,$j11,$j12,$j13,$j14,$j14b,$nbad = $f
 if ([int]$nbad -ne 0) { throw "Found $nbad job(s) not DONE - bench invalid, not writing history." }
 
 # 5. git context
@@ -87,16 +88,17 @@ try {
 $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
 # 6. append CSV (write header if missing)
-$header = 'timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_ms,J11_ms,J12_ms,J13_ms,J14_ms'
+$header = 'timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_ms,J11_ms,J12_ms,J13_ms,J14_ms,J14B_ms'
 if (-not (Test-Path $HistoryFile)) { Set-Content -Path $HistoryFile -Value $header -Encoding utf8 }
-$line = '{0},{1},"{2}",{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}' -f `
-        $ts,$commit,$subject,$Scale,$nCust,$nPos,$total,$j01,$j07,$j11,$j12,$j13,$j14
+$line = '{0},{1},"{2}",{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}' -f `
+        $ts,$commit,$subject,$Scale,$nCust,$nPos,$total,$j01,$j07,$j11,$j12,$j13,$j14,$j14b
 Add-Content -Path $HistoryFile -Value $line -Encoding utf8
 
 # 7. summary
 Write-Host "`n== RESULT (ms) ==" -ForegroundColor Green
 Write-Host ("  J01_SYNC_FO={0}  J07_COMPUTE(MTM)={1}  J11_SI_AGG={2}" -f $j01,$j07,$j11)
 Write-Host ("  J12_SI_INDEX={0}  J13_RECONCILE={1}  J14_SNAPSHOT={2}" -f $j12,$j13,$j14)
+Write-Host ("  J14B_HIST(interval)={0}  <- DIFF current vs open-rows (job nang nhat)" -f $j14b) -ForegroundColor Yellow
 Write-Host ("  TOTAL={0} ms  |  commit {1}" -f $total,$commit) -ForegroundColor Yellow
 Write-Host ("  -> appended: {0}" -f $HistoryFile)
 

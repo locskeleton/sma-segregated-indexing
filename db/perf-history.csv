@@ -1,3 +1,4 @@
-timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_ms,J11_ms,J12_ms,J13_ms,J14_ms
-2026-06-18T05:16:40Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,20439,364,8369,90,31,115,955
-2026-06-18T05:17:27Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,19856,317,7791,65,14,88,991
+timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_ms,J11_ms,J12_ms,J13_ms,J14_ms,J14B_ms
+2026-06-18T05:16:40Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,20439,364,8369,90,31,115,955,10515
+2026-06-18T05:17:27Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,19856,317,7791,65,14,88,991,10590
+2026-06-18T05:33:11Z,285e0e2,"docs: sua claim thoi gian J14b + log perf-history (bench medium)",small,1000,60000,1682,59,664,61,28,26,52,792
