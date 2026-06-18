@@ -41,7 +41,7 @@ BEGIN
 
     SELECT  ip.C_SI_ACCOUNT,         -- mã sub-account (đơn vị customer-level)
             ip.C_MASTER_CODE,        -- master KH đầu tư
-            mp.C_SI_NAME,
+            mp.C_MASTER_NAME,
             ip.C_STATUS,
             ip.C_JOIN_DATE,
             nc.C_UNIT,
@@ -202,7 +202,7 @@ BEGIN
 
     SELECT  ip.PK_INDEXING_PORTFOLIO AS C_SUBACCOUNT_PK_ID,
             ip.C_SI_ACCOUNT,
-            mp.C_MASTER_CODE, mp.C_SI_NAME, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
+            mp.C_MASTER_CODE, mp.C_MASTER_NAME, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
             ip.C_CUST_CODE,
             ip.C_SUB_ACCOUNT_NO,
             ip.C_JOIN_DATE,
