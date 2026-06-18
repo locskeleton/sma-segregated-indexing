@@ -297,16 +297,16 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 
 ## 10. API cho Asset/SMO
 
-> Mỗi API = **app gọi 1 stored proc** (`usp_get_*`) — tính toán/derive trong DB; app chỉ trả JSON, không tính.
+> Mỗi API = **app gọi 1 stored proc** (`SP_GET_*`, xem `db/05_API.sql`) — tính/derive trong DB; app chỉ trả JSON, không tính. Định danh public: KH=`C_CUST_CODE`, SI=`C_PK_ID` (GUID, IDOR-safe → proc resolve `PK_SI_ID`).
 
-| FR | API | Nguồn |
-|---|---|---|
-| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | sum sdi_si_nav_daily + derive customer NAV |
-| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | derive customer NAV/PnL + TWR + MWR + sdi_si_nav_daily |
-| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | sdi_si_nav_daily (TR) + si_index (PR) + benchmark VN-Index (PR), 2 đầu mút/range |
-| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | sdi_indexing_portfolio |
-| FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | sdi_si_holding_daily (top20 + mã khác) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | sdi_customer_nav_daily (NAV) + sdi_customer_fee_income (cổ tức/phí) + cash/stock reconstruct (customer_cash_hist + holding_hist×giá theo interval) |
+| FR | API | Proc | Nguồn |
+|---|---|---|---|
+| FR-01 Tổng quan đa SI | GET /customer/{id}/si-overview | `SP_GET_SI_OVERVIEW` | sum sdi_si_nav_daily + derive customer NAV (current từ customer_nav_current) |
+| FR-02 Chi tiết 1 SI | GET /customer/{id}/si/{si} | `SP_GET_SI_DETAIL` | derive customer NAV/PnL + TWR + MWR + sdi_si_nav_daily |
+| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | `SP_GET_SI_PERFORMANCE` | sdi_si_nav_daily (TR) + si_index (PR) + benchmark VN-Index (PR), chuỗi [mốc..cuối] |
+| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | `SP_GET_SI_INFO` | sdi_indexing_portfolio + master |
+| FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | `SP_GET_SI_HOLDINGS` | **holdings CURRENT của KH** (indexing_portfolio_ticker × giá mới nhất) top20 + "OTHER" — sản phẩm segregated nên đọc holdings KH (≠ SI-aggregate sdi_si_holding_daily) |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | sdi_customer_nav_daily (NAV) + sdi_customer_fee_income (cổ tức/phí) + cash/stock reconstruct (customer_cash_hist + holding_hist×giá theo interval) |
 
 ---
 

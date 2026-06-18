@@ -16,9 +16,11 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 ```
 01_TABLES.sql      -- DDL bảng (T_/C_/PK_, PAGE compression; prod: + partition/columnstore)
 02_SP_ENGINE.sql   -- engine core: UDF + SP_EOD_* + master SP_EOD_RUN + dispatcher SP_EOD_STEP
-03_SMOKE.sql       -- smoke test (1 SI, 1 KH, 3 phiên) — verify số đúng
+05_API.sql         -- read API: UDF_RANGE_CUTOFF + SP_GET_* (FR-01..06) cho Asset/SMO
+03_SMOKE.sql       -- smoke test (1 SI, 1 KH, 4 phiên) — verify số đúng
 04_BENCH.sql       -- (benchmark) seed dataset lớn theo scale + chạy EOD — dùng qua bench.ps1
 ```
+(`05_API.sql` chạy sau `02` — read-only, không cần cho EOD/bench; cần cho API.)
 (Tùy chọn `00_INFRA.sql` — DBA: filegroups, partition function/scheme, RCSI, resource governor — xem `docs/SDI-db-architecture.md`.)
 
 ## Benchmark perf (theo dõi regression sau refactor)
@@ -65,4 +67,18 @@ Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO c
 
 28/28 job DONE (7 job × 4 phiên — gồm J14b history), reconcile pass, re-run idempotent (không double-apply). Interval verify: holding bất biến 4 phiên = 1 dòng (no-dup); rebalance phiên 07 (BBB 80000→90000) đóng dòng cũ + mở dòng mới; reconstruct @05 & @07 đúng.
 
-> Chưa implement (mở rộng): ingestion file FO → `T_INDEXING_PORTFOLIO_TICKER` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_CUSTOMER_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, read procs `SP_GET_*` (FR-01..06), MWR (Modified Dietz set-based / XIRR qua SQL CLR), partition/columnstore prod (gồm `T_CUSTOMER_NAV_DAILY` CCI + interval hist partition theo `valid_from`).
+## Read API — `05_API.sql` (FR-01..06)
+Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. Định danh public: KH = `C_CUST_CODE`; SI = `C_PK_ID` (GUID, IDOR-safe) → proc resolve sang `PK_SI_ID`.
+
+| FR | Proc | Tham số | Trả về |
+|---|---|---|---|
+| FR-01 | `SP_GET_SI_OVERVIEW` | cust | RS1 breakdown từng SI (current NAV/UP + %return inception); RS2 tổng KH (ΣNAV, Σcash) |
+| FR-02 | `SP_GET_SI_DETAIL` | cust, si_pk_id, range | current + **TWR** (qua unit_price) + **MWR** (Modified Dietz) + PnL kỳ; RS2 SI-level mới nhất |
+| FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_pk_id, range | chuỗi ngày [mốc..cuối]: unit_price KH + SI UP (TR) + SI index (PR) + benchmark (PR) — app rebase |
+| FR-04 | `SP_GET_SI_INFO` | cust, si_pk_id | config tiểu khoản + master (mgmt fee effective) |
+| FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_pk_id, top=20 | holdings current KH định giá giá mới nhất, top-N + dòng `OTHER` |
+| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_pk_id, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí |
+
+`range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
+
+> Chưa implement (mở rộng): ingestion file FO → `T_INDEXING_PORTFOLIO_TICKER` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_CUSTOMER_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_CUSTOMER_NAV_DAILY` CCI + interval hist partition theo `valid_from`).
