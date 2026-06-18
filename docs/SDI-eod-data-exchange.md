@@ -61,7 +61,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
 | 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_id, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
-| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. Archive sang `sdi_customer_holding_daily` (rolling 1 tháng) qua **J16 droppable** — EOD core không phụ thuộc. |
+| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. Archive sang `sdi_customer_holding_daily` (rolling 1 tháng) qua **J14b droppable** — EOD core không phụ thuộc. |
 | 4 | **Cash snapshot** | `sdi_fo_cash_sync` | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT. |
 | 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_id, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
 | 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_id, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
@@ -146,7 +146,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 ## 5. Quy tắc hợp đồng (contract)
 
 1. **Snapshot overwrite, idempotent:** FO nạp toàn bộ holdings THẲNG vào current + cash mỗi EOD; chạy lại 1 ngày cho cùng kết quả (overwrite, không cộng dồn).
-8. **Holdings history tách rời:** archive sang `T_CUSTOMER_HOLDING_DAILY` (rolling 1 tháng) qua J16 droppable — EOD core chỉ đọc current; bỏ bảng/J16 không ảnh hưởng EOD.
+8. **Holdings history tách rời:** archive sang `T_CUSTOMER_HOLDING_DAILY` (rolling 1 tháng) qua J14b droppable — EOD core chỉ đọc current; bỏ bảng/J14b không ảnh hưởng EOD.
 2. **FO cash là nguồn tiền duy nhất, đã NET** phí QL + thuế GD + SIP → SDI không re-apply.
 3. **Biến động holdings/ngày** SDI suy ra on-demand (qty(D)−qty(D-1)), KHÔNG cần FO gửi delta.
 4. **Cổ tức/phí & cashflow là sự kiện sparse** — FO chỉ gửi khi phát sinh; capture đúng ngày + số tiền khớp thời điểm FO ghi vào cash.
