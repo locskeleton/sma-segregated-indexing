@@ -56,7 +56,7 @@ EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
 `J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
-(J06 ACCRUE_FEE đã bỏ — FO cash đã NET phí QL + thuế GD; **NAV = stock_value + FO cash**, SDI không accrue lại để tránh double-count.)
+(J06 phí QL = **TOGGLE** qua `T_SDI_CONFIG.C_ENABLE_MGMT_FEE_ACCRUAL`. **OFF mặc định**: FO cash đã NET phí QL + thuế GD → **NAV = stock + FO cash** (tránh double-count). **ON**: SDI accrue payable ngày trong J07 + lệnh thu cuối tháng `T_SI_FEE_SCHEDULE` → FO cắt → settle; **NAV = stock + cash − payable** (net phí). Thuế GD luôn FO net.)
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
 FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):

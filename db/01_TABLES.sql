@@ -240,9 +240,10 @@ CREATE TABLE T_SI_NAV_BALANCE (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_NAV            DECIMAL(20,0)   NOT NULL,
+    C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV NET phí (= gross − payable). Khi accrual OFF: payable=0 ⇒ = gross
+    C_PAYABLE_FEE    DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_NAV_BAL_PAY DEFAULT 0,  -- phí QL accrued chưa thu @ngày; NAV_gross = C_NAV + C_PAYABLE_FEE
     C_UNIT           DECIMAL(18,6)  NOT NULL,
-    C_UNIT_PRICE     DECIMAL(18,6)  NULL,
+    C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- unit price NET phí
     C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,
     C_DAILY_RETURN   DECIMAL(10,6)  NULL,
     CONSTRAINT PK_SI_NAV_BALANCE_ID PRIMARY KEY CLUSTERED (C_NAV_BALANCE_ID),
@@ -258,7 +259,7 @@ CREATE TABLE T_SI_FEE_INCOME (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND | CUSTODY_FEE | MGMT_FEE
+    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND | CUSTODY_FEE  (phí QL → T_SI_FEE_SCHEDULE, SDI-owned)
     C_TICKER         VARCHAR(20)     NULL,
     C_AMOUNT         DECIMAL(20,0)   NOT NULL,
     C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CFI_SRC DEFAULT 'FO',
@@ -271,6 +272,34 @@ CREATE INDEX IX_SI_FEE_INCOME_DATE ON T_SI_FEE_INCOME (C_BUSINESS_DATE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_TYPE, C_AMOUNT);
 CREATE UNIQUE INDEX UQ_SI_FEE_INCOME_SRCEVT ON T_SI_FEE_INCOME (C_SOURCE_EVENT_ID)
     WHERE C_SOURCE_EVENT_ID IS NOT NULL;
+
+-- SỔ THU PHÍ QUẢN LÝ (SDI-owned, KHÁC T_SI_FEE_INCOME của FO). SDI accrue ngày → cuối kỳ
+-- ra lệnh thu sang FO; FO cắt cash + xác nhận EXECUTED → SDI settle (giảm payable). 1 charge/tiểu khoản/kỳ.
+-- Vòng đời status: PENDING (đã tạo) → INSTRUCTED (đã bắn FO) → EXECUTED (FO đã cắt) → SETTLED (đã giảm payable).
+CREATE TABLE T_SI_FEE_SCHEDULE (
+    C_FEE_SCHEDULE_ID BIGINT IDENTITY(1,1) NOT NULL,
+    PK_SI_FEE_SCHEDULE UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_SCHEDULE_PKID DEFAULT NEWID(),
+    C_SI_ACCOUNT     VARCHAR(20)   NOT NULL,
+    C_CUST_CODE      VARCHAR(10)   NOT NULL,
+    C_MASTER_CODE    VARCHAR(20)   NOT NULL,
+    C_PERIOD         CHAR(6)       NOT NULL,        -- 'YYYYMM' kỳ tính phí (arrears: tháng vừa kết thúc)
+    C_PERIOD_START   DATE          NOT NULL,
+    C_PERIOD_END     DATE          NOT NULL,
+    C_DUE_DATE       DATE          NOT NULL,        -- ngày ra lệnh thu (cuối kỳ)
+    C_AVG_AUM        DECIMAL(20,0) NULL,            -- AUM trung bình kỳ (thông tin; = amount / (rate × kỳ/daycount))
+    C_FEE_RATE       DECIMAL(10,6) NOT NULL,        -- rate hiệu lực snapshot lúc tạo
+    C_AMOUNT         DECIMAL(20,0) NOT NULL,        -- số ra lệnh thu = payable tích luỹ kỳ (= rate × AUM_TB × kỳ)
+    C_STATUS         VARCHAR(12)   NOT NULL CONSTRAINT DF_SI_FEE_SCH_STATUS DEFAULT 'PENDING',
+    C_INSTRUCTED_DATE DATE         NULL,
+    C_EXECUTED_DATE  DATE          NULL,            -- ngày FO xác nhận cắt → settle vào ngày này
+    C_SETTLED_DATE   DATE          NULL,
+    C_CREATED_TIME   DATETIME      NOT NULL CONSTRAINT DF_SI_FEE_SCH_CREATED DEFAULT GETDATE(),
+    CONSTRAINT PK_SI_FEE_SCHEDULE_ID PRIMARY KEY CLUSTERED (C_FEE_SCHEDULE_ID),
+    CONSTRAINT UQ_SI_FEE_SCHEDULE_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_SCHEDULE),
+    CONSTRAINT UQ_SI_FEE_SCHEDULE_NK UNIQUE (C_SI_ACCOUNT, C_PERIOD)   -- 1 charge / tiểu khoản / kỳ (idempotent)
+);
+CREATE INDEX IX_SI_FEE_SCHEDULE_SETTLE ON T_SI_FEE_SCHEDULE (C_STATUS, C_EXECUTED_DATE)
+    INCLUDE (C_SI_ACCOUNT, C_AMOUNT);
 
 /*------------------------------------------------ MASTER-LEVEL DAILY (output) -*/
 CREATE TABLE T_MASTER_INDEX_DAILY (
@@ -345,4 +374,16 @@ CREATE TABLE T_EOD_RUN (
     CONSTRAINT PK_EOD_RUN PRIMARY KEY CLUSTERED (PK_EOD_RUN),
     CONSTRAINT UQ_EOD_RUN_NK UNIQUE (C_BUSINESS_DATE, C_JOB)
 );
+
+-- CONFIG engine (singleton 1 dòng). Cờ + tham số toggleable cho BRD chưa chốt.
+-- Phí QL accrual: MẶC ĐỊNH OFF (=0) → pipeline hiện tại KHÔNG đổi (payable=0, NAV=gross).
+CREATE TABLE T_SDI_CONFIG (
+    C_ID                        TINYINT     NOT NULL CONSTRAINT DF_SDI_CONFIG_ID  DEFAULT 1,
+    C_ENABLE_MGMT_FEE_ACCRUAL   BIT         NOT NULL CONSTRAINT DF_SDI_CFG_FEEON  DEFAULT 0,        -- 0=OFF (phương án A) | 1=accrue daily
+    C_FEE_DAY_COUNT             SMALLINT    NOT NULL CONSTRAINT DF_SDI_CFG_DAYCNT DEFAULT 365,      -- mẫu số rate/ngày
+    C_FEE_AUM_BASIS             VARCHAR(10) NOT NULL CONSTRAINT DF_SDI_CFG_BASIS  DEFAULT 'GROSS',  -- GROSS = (stock+cash); (mở rộng: NET_PREV)
+    CONSTRAINT PK_SDI_CONFIG PRIMARY KEY (C_ID),
+    CONSTRAINT CK_SDI_CONFIG_SINGLETON CHECK (C_ID = 1)
+);
+INSERT INTO T_SDI_CONFIG (C_ID) VALUES (1);   -- seed: accrual OFF
 GO

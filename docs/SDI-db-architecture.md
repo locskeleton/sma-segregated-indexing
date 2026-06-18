@@ -132,7 +132,9 @@ J07_COMPUTE   (câu nặng nhất) MTM TOÀN BỘ + NAV + PnL + Unit, roll-forwa
       NAV = stock_value + state.cash (FO cash đã NET phí → KHÔNG trừ lại)
       PnL ngày = NAV_today − NAV_prev + ra − vào
       UNIT: vị thế có CF_t → ΔUnit = CF/unit_price_prev; unit_price = NAV/unit → INSERT T_SI_UNIT_LEDGER (ΔUnit≠0)
-      (KHÔNG accrue phí: FO cash đã NET phí QL + thuế GD — tránh double-count)
+      [J06 phí QL — TOGGLE T_SDI_CONFIG] ON: payable += AUM×rate/daycount (accrue ngày) +
+        settle khi FO cắt + charge cuối tháng (T_SI_FEE_SCHEDULE); NAV = stock+cash−payable.
+        OFF (mặc định): bỏ qua, FO net phí, NAV = stock+cash. Thuế GD luôn FO net.
 J11_SI_AGG    Σ per master (C_MASTER_CODE) → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất); upsert T_MASTER_NAV_CURRENT
 J12_SI_INDEX  Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 master × ~25 mã — nhẹ) → T_MASTER_INDEX_DAILY
 J13_RECONCILE đối soát Σ holding qty (SDI) vs FO → bảng break; CHẶN snapshot nếu lệch quá ngưỡng
@@ -264,8 +266,10 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CORPORATE_ACTION | PK_… (GUID) | (clustered) | (C_TICKER,C_EX_DATE,C_CA_TYPE) |
 | T_BENCHMARK_DAILY | PK_… (GUID) | (clustered) | (C_BENCHMARK_CODE,C_BUSINESS_DATE) |
 | T_SI_FEE_INCOME | PK_… (GUID) | (clustered) | (C_EVENT_ID) + filtered-unique (C_SOURCE_EVENT_ID) |
+| **T_SI_FEE_SCHEDULE** (sổ thu phí QL) | C_FEE_SCHEDULE_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_PERIOD) |
 | T_MASTER_NAV_BALANCE / _INDEX_DAILY / _HOLDING_BALANCE / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
 | T_EOD_RUN | PK_EOD_RUN (GUID) | (clustered) | (C_BUSINESS_DATE,C_JOB) |
+| T_SDI_CONFIG (singleton) | C_ID=1 (natural) | — | — |
 
 → **Đo thật (medium 1,25M, SQL Express — thời điểm interval-insert CÒN là job EOD `J14b`):** GUID-clustered MỌI bảng = **~40s**; mixed (perf-clustered cho 8 bảng nóng + GUID nonclustered) = **~32s**; baseline không GUID = **~20s**. Driver chi phí ~2× = **chỉ mục GUID nonclustered (NEWID random) phải maintain khi insert khối lớn** vào history. **Lưu ý:** interval-insert nay đã **chuyển sang INGEST (per-event Kafka)** → overhead GUID này áp ở **ingest-time, KHÔNG trong EOD core** (EOD nhẹ hơn nhiều). Tất cả vẫn << SLA 10 phút ⇒ chấp nhận để mọi row addressable qua API/UI.
 → Muốn giảm overhead GUID ở history: bỏ GUID ở `holding_hist`/`cash_hist` (API FR-06 địa chỉ theo `C_SI_ACCOUNT`+asOf, KHÔNG cần GUID per-row của history) — để ngỏ, chưa làm.
