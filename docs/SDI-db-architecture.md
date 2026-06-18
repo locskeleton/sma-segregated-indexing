@@ -245,30 +245,31 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 ### Per-table
 | Bảng | PK | Loại |
 |---|---|---|
-| T_MASTER_PORTFOLIO | PK_SI_ID | BIGINT (bị ref rộng) |
-| T_INDEXING_PORTFOLIO | (C_CUST_CODE, FK_SI_ID) | composite typed |
-| T_MASTER_PORTFOLIO_TICKER | (FK_SI_ID, C_EFFECTIVE_DATE, C_TICKER) | composite natural |
+| T_MASTER_PORTFOLIO | C_SI_CODE | VARCHAR (PK + khóa public; bị ref rộng — các bảng FK theo C_SI_CODE) |
+| T_INDEXING_PORTFOLIO | (C_CUST_CODE, C_SI_CODE) | composite natural (+ PK_INDEXING_PORTFOLIO GUID UNIQUE) |
+| T_MASTER_PORTFOLIO_TICKER | (C_SI_CODE, C_EFFECTIVE_DATE, C_TICKER) | composite natural (+ PK_MASTER_PORTFOLIO_TICKER GUID UNIQUE) |
 | T_PRICE_DAILY | (C_BUSINESS_DATE, C_TICKER) | composite natural |
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
 | T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
-| T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
-| T_CUSTOMER_HOLDING_HIST | (C_CUST_CODE, FK_SI_ID, C_TICKER, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
-| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (feed transient) |
-| T_CUSTOMER_CASH_HIST | (C_CUST_CODE, FK_SI_ID, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
+| T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY (+ PK_REBALANCE_REQUEST GUID UNIQUE) |
+| T_CUSTOMER_HOLDING_HIST | (C_CUST_CODE, C_SI_CODE, C_TICKER, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
+| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite natural (feed transient) |
+| T_CUSTOMER_CASH_HIST | (C_CUST_CODE, C_SI_CODE, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
-| T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (history, CCI) |
+| T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite natural (history, CCI) |
 | T_CUSTOMER_FEE_INCOME | C_EVENT_ID | BIGINT IDENTITY (sparse: cổ tức/phí per-KH) |
-| T_UNIT_LEDGER | (C_CUST_CODE, FK_SI_ID, C_BUSINESS_DATE) | composite natural |
-| T_CUSTOMER_NAV_CURRENT | (C_CUST_CODE, FK_SI_ID) | composite typed (hot) |
-| T_INDEXING_PORTFOLIO_TICKER | (C_CUST_CODE, FK_SI_ID, C_TICKER) | composite typed |
-| T_EOD_WORK | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite (transient) |
-| T_SI_NAV_DAILY | (C_BUSINESS_DATE, FK_SI_ID) | composite natural (composition + NAV + hiệu suất) |
-| T_SI_NAV_CURRENT | (FK_SI_ID) | typed (current cấp SI, ~100 dòng) |
-| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, FK_SI_ID) | composite natural |
-| T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, FK_SI_ID, C_TICKER) | composite natural |
+| T_UNIT_LEDGER | (C_CUST_CODE, C_SI_CODE, C_BUSINESS_DATE) | composite natural |
+| T_CUSTOMER_NAV_CURRENT | (C_CUST_CODE, C_SI_CODE) | composite typed (hot) |
+| T_INDEXING_PORTFOLIO_TICKER | (C_CUST_CODE, C_SI_CODE, C_TICKER) | composite typed |
+| T_EOD_WORK | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite (transient) |
+| T_SI_NAV_DAILY | (C_BUSINESS_DATE, C_SI_CODE) | composite natural (composition + NAV + hiệu suất) |
+| T_SI_NAV_CURRENT | (C_SI_CODE) | typed (current cấp SI, ~100 dòng) |
+| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_CODE) | composite natural |
+| T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, C_SI_CODE, C_TICKER) | composite natural |
 | T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
 
-→ **GUID `C_PK_ID` (NEWID, UNIQUE NONCLUSTERED) — chỉ ở 4 bảng ENTITY/quản-lý:** `T_MASTER_PORTFOLIO`, `T_MASTER_PORTFOLIO_TICKER`, `T_INDEXING_PORTFOLIO`, `T_REBALANCE_REQUEST` — làm **khóa duy nhất cho API/UI** (IDOR-safe). **Cluster vẫn theo PK natural** (GUID nonclustered) → đo medium 1,25M: EOD **+~0%** (entity không ghi trong EOD).
+→ **SI key = `C_SI_CODE`** (mã SI, VARCHAR): PK của `T_MASTER_PORTFOLIO` + khóa public (IDOR-safe vì là mã nghiệp vụ, không int tuần tự); mọi bảng tham chiếu master theo `C_SI_CODE`. Đánh đổi: join key VARCHAR (cùng `C_CUST_CODE`) trên hot path → EOD chậm hơn BIGINT (chấp nhận, ưu tiên nhất quán/đọc được).
+→ **GUID surrogate `PK_<table>` (NEWID, UNIQUE NONCLUSTERED) — ở 3 bảng cần khóa public per-row:** `T_MASTER_PORTFOLIO_TICKER`, `T_INDEXING_PORTFOLIO`, `T_REBALANCE_REQUEST` — khóa duy nhất cho API/UI. **Cluster vẫn theo PK natural** (GUID nonclustered) → đo medium 1,25M: EOD **+~0%** (entity không ghi trong EOD). `T_MASTER_PORTFOLIO` không cần GUID (C_SI_CODE đã là khóa public).
 
 → Bảng **volume-lớn** (history/hist-interval/work/daily) **KHÔNG GUID** — không address per-row qua API, và đo thật thêm GUID mọi bảng = **+18% (NEWSEQUENTIALID) ~ +34% (NEWID)** EOD (chi phí dồn vào chỉ mục GUID khi insert khối lớn). Cluster trên natural/date đã tối ưu → **KHÔNG cần cột BIGINT-cluster riêng** (BIGINT-cluster chỉ liên quan nếu cluster TRÊN GUID — không làm).
 

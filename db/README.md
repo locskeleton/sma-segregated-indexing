@@ -6,9 +6,10 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Đối tượng | Quy ước |
 |---|---|
 | Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
-| Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`, `C_CUST_CODE`). Riêng entity-id `SI_ID`: `PK_SI_ID`@master / `FK_SI_ID` ở bảng khác |
-| Primary key | constraint `PK_<table>` |
-| Foreign key | **KHÔNG hard-set constraint** — FK SI_ID đánh dấu prefix `FK_` (+ comment `FK_<child>__<parent>` khi cần) |
+| Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`, `C_CUST_CODE`). Khóa nghiệp vụ giữ `C_`: **`C_SI_CODE`** (mã SI = PK của `T_MASTER_PORTFOLIO`; các bảng khác tham chiếu master theo `C_SI_CODE`), `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
+| Khóa surrogate public (GUID, IDOR-safe) | `PK_<table>` ở bảng GỐC (vd `PK_MASTER_PORTFOLIO_TICKER`, `PK_INDEXING_PORTFOLIO`) / `FK_<table>` khi tham chiếu ở bảng khác. `T_MASTER_PORTFOLIO` KHÔNG có surrogate — `C_SI_CODE` là khóa public luôn |
+| Primary key | constraint `PK_<table>` (bảng có cả natural composite + surrogate → natural đặt `PK_<table>_NK`) |
+| Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_SI_CODE` → master; `FK_<table>` → surrogate) |
 | Stored procedure | `SP_` |
 | Function | `UDF_` |
 
@@ -68,16 +69,16 @@ Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO c
 28/28 job DONE (7 job × 4 phiên — gồm J14b history), reconcile pass, re-run idempotent (không double-apply). Interval verify: holding bất biến 4 phiên = 1 dòng (no-dup); rebalance phiên 07 (BBB 80000→90000) đóng dòng cũ + mở dòng mới; reconstruct @05 & @07 đúng.
 
 ## Read API — `05_API.sql` (FR-01..06)
-Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. Định danh public: KH = `C_CUST_CODE`; SI = `C_PK_ID` (GUID, IDOR-safe) → proc resolve sang `PK_SI_ID`.
+Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. Định danh public: KH = `C_CUST_CODE`; SI = `C_SI_CODE` (mã SI, PK master, IDOR-safe).
 
 | FR | Proc | Tham số | Trả về |
 |---|---|---|---|
 | FR-01 | `SP_GET_SI_OVERVIEW` | cust | RS1 breakdown từng SI (current NAV/UP + %return inception); RS2 tổng KH (ΣNAV, Σcash) |
-| FR-02 | `SP_GET_SI_DETAIL` | cust, si_pk_id, range | current + **TWR** (qua unit_price) + **MWR** (Modified Dietz) + PnL kỳ; RS2 SI-level mới nhất |
-| FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_pk_id, range | chuỗi ngày [mốc..cuối]: unit_price KH + SI UP (TR) + SI index (PR) + benchmark (PR) — app rebase |
-| FR-04 | `SP_GET_SI_INFO` | cust, si_pk_id | config tiểu khoản + master (mgmt fee effective) |
-| FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_pk_id, top=20 | holdings current KH định giá giá mới nhất, top-N + dòng `OTHER` |
-| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_pk_id, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí |
+| FR-02 | `SP_GET_SI_DETAIL` | cust, si_code, range | current + **TWR** (qua unit_price) + **MWR** (Modified Dietz) + PnL kỳ; RS2 SI-level mới nhất |
+| FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_code, range | chuỗi ngày [mốc..cuối]: unit_price KH + SI UP (TR) + SI index (PR) + benchmark (PR) — app rebase |
+| FR-04 | `SP_GET_SI_INFO` | cust, si_code | config tiểu khoản + master (mgmt fee effective) |
+| FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_code, top=20 | holdings current KH định giá giá mới nhất, top-N + dòng `OTHER` |
+| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_code, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí |
 
 `range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 

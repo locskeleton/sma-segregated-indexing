@@ -193,7 +193,7 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38,10)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
 
 ### Master / cấu hình
-- **`sdi_master_portfolio`** (si_id PK; si_code, si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — `benchmark_code` ('VNINDEX'…) trỏ benchmark đối chiếu (FR-03)
+- **`sdi_master_portfolio`** (**si_code PK** — mã SI là khóa chính + khóa public, KHÔNG surrogate; si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — các bảng khác tham chiếu master theo `si_code`; `benchmark_code` ('VNINDEX'…) trỏ benchmark đối chiếu (FR-03)
 - **`sdi_master_portfolio_ticker`** (si_id, effective_date, ticker PK; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
 - **`sdi_indexing_portfolio`** (cust_code, si_id PK; sub_account_no, join_date, status, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — cấu hình đầu tư KH (FR-04).
 
@@ -297,7 +297,7 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 
 ## 10. API cho Asset/SMO
 
-> Mỗi API = **app gọi 1 stored proc** (`SP_GET_*`, xem `db/05_API.sql`) — tính/derive trong DB; app chỉ trả JSON, không tính. Định danh public: KH=`C_CUST_CODE`, SI=`C_PK_ID` (GUID, IDOR-safe → proc resolve `PK_SI_ID`).
+> Mỗi API = **app gọi 1 stored proc** (`SP_GET_*`, xem `db/05_API.sql`) — tính/derive trong DB; app chỉ trả JSON, không tính. Định danh public: KH=`C_CUST_CODE`, SI=`C_SI_CODE` (mã SI = PK master, IDOR-safe — không phải int tuần tự).
 
 | FR | API | Proc | Nguồn |
 |---|---|---|---|

@@ -6,8 +6,7 @@ GO
   6 proc đọc cho FR-01..FR-06 (SDI-spec §10). App chỉ serialize JSON, KHÔNG tính.
   Định danh public:
     - KH:  C_CUST_CODE VARCHAR(10) (mã KH, dùng xuyên sub-system — không phải int tuần tự)
-    - SI:  C_SI_PK_ID UNIQUEIDENTIFIER = T_MASTER_PORTFOLIO.C_PK_ID (khóa public IDOR-safe).
-           Proc resolve → PK_SI_ID (BIGINT) để join nội bộ.
+    - SI:  C_SI_CODE VARCHAR(20) = T_MASTER_PORTFOLIO.C_SI_CODE (PK + khóa public, IDOR-safe).
   Read-only: KHÔNG ghi bảng. T0 unit price = 10.000 (gốc inception).
 ==============================================================================*/
 
@@ -41,9 +40,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    SELECT  mp.C_PK_ID                AS C_SI_PK_ID,
-            mp.PK_SI_ID               AS FK_SI_ID,
-            mp.C_SI_CODE,
+    SELECT  mp.C_SI_CODE,
             mp.C_SI_NAME,
             ip.C_STATUS,
             ip.C_JOIN_DATE,
@@ -54,8 +51,8 @@ BEGIN
             nc.C_LAST_BUSINESS_DATE,
             CAST(nc.C_LAST_UNIT_PRICE / 10000.0 - 1 AS DECIMAL(18,10)) AS C_RETURN_INCEPTION
     FROM        T_INDEXING_PORTFOLIO   ip
-    JOIN        T_MASTER_PORTFOLIO     mp ON mp.PK_SI_ID = ip.FK_SI_ID
-    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.FK_SI_ID = ip.FK_SI_ID
+    JOIN        T_MASTER_PORTFOLIO     mp ON mp.C_SI_CODE = ip.C_SI_CODE
+    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.C_SI_CODE = ip.C_SI_CODE
     WHERE  ip.C_CUST_CODE = @C_CUST_CODE
     ORDER BY nc.C_LAST_NAV DESC;
 
@@ -64,7 +61,7 @@ BEGIN
             SUM(nc.C_LAST_NAV)    AS C_TOTAL_NAV,
             SUM(nc.C_CASH)        AS C_TOTAL_CASH
     FROM        T_INDEXING_PORTFOLIO   ip
-    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.FK_SI_ID = ip.FK_SI_ID
+    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.C_SI_CODE = ip.C_SI_CODE
     WHERE  ip.C_CUST_CODE = @C_CUST_CODE;
 END
 GO
@@ -77,34 +74,34 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_DETAIL
     @C_CUST_CODE VARCHAR(10),
-    @C_SI_PK_ID  UNIQUEIDENTIFIER,
+    @C_SI_CODE   VARCHAR(20),
     @RANGE       VARCHAR(20) = 'INCEPTION'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @sid BIGINT = (SELECT PK_SI_ID FROM T_MASTER_PORTFOLIO WHERE C_PK_ID = @C_SI_PK_ID);
-    IF @sid IS NULL BEGIN RAISERROR('SI not found for given C_SI_PK_ID',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE)
+        BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,4), @base_up DECIMAL(28,10),
             @end_nav  DECIMAL(20,4), @end_up  DECIMAL(28,10);
 
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
 
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
 
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
         SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-         WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid;
+         WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
 
     SELECT @base_nav = C_NAV, @base_up = C_UNIT_PRICE FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE = @base;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE = @base;
     SELECT @end_nav = C_NAV, @end_up = C_UNIT_PRICE FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE = @end;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE = @end;
 
     -- MWR Modified Dietz: cần lịch phiên (T_PRICE_DAILY distinct date) cho trọng số w_i
     DECLARE @T INT, @cf_net DECIMAL(20,4) = 0, @weighted DECIMAL(38,10) = 0;
@@ -118,7 +115,7 @@ BEGIN
         SELECT C_BUSINESS_DATE bd,
                CASE WHEN C_EVENT_TYPE = 'WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END cf
         FROM T_CASHFLOW_EVENT
-        WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid
+        WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE
           AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
     ), flow_w AS (   -- t_i = số phiên từ mốc tới flow (subquery tính ở select-list, KHÔNG trong SUM)
         SELECT f.cf, (SELECT COUNT(*) FROM cal WHERE cal.d <= f.bd) AS ti
@@ -130,9 +127,7 @@ BEGIN
 
     DECLARE @denom DECIMAL(38,10) = @base_nav + @weighted;
 
-    SELECT  mp.C_PK_ID            AS C_SI_PK_ID,
-            mp.PK_SI_ID           AS FK_SI_ID,
-            mp.C_SI_CODE, mp.C_SI_NAME,
+    SELECT  mp.C_SI_CODE, mp.C_SI_NAME,
             @RANGE                AS C_RANGE,
             @base                 AS C_BASE_DATE,
             @end                  AS C_END_DATE,
@@ -154,13 +149,13 @@ BEGIN
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
                  ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(18,10)) END AS C_MWR_PCT
     FROM       T_MASTER_PORTFOLIO     mp
-    LEFT JOIN  T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = @C_CUST_CODE AND nc.FK_SI_ID = @sid
-    WHERE mp.PK_SI_ID = @sid;
+    LEFT JOIN  T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = @C_CUST_CODE AND nc.C_SI_CODE = @C_SI_CODE
+    WHERE mp.C_SI_CODE = @C_SI_CODE;
 
     -- RS2: SI-level mới nhất (đường "Hiệu suất SI" tham chiếu)
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
                  C_TOTAL_ASSET, C_CASH, C_STOCK_VALUE
-    FROM T_SI_NAV_DAILY WHERE FK_SI_ID = @sid ORDER BY C_BUSINESS_DATE DESC;
+    FROM T_SI_NAV_DAILY WHERE C_SI_CODE = @C_SI_CODE ORDER BY C_BUSINESS_DATE DESC;
 END
 GO
 
@@ -171,26 +166,26 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_PERFORMANCE
     @C_CUST_CODE VARCHAR(10),
-    @C_SI_PK_ID  UNIQUEIDENTIFIER,
+    @C_SI_CODE   VARCHAR(20),
     @RANGE       VARCHAR(20) = '1Y'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @sid BIGINT = (SELECT PK_SI_ID FROM T_MASTER_PORTFOLIO WHERE C_PK_ID = @C_SI_PK_ID);
-    IF @sid IS NULL BEGIN RAISERROR('SI not found for given C_SI_PK_ID',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE)
+        BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
-    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE PK_SI_ID = @sid);
+    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
 
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-     WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
         SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-         WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid;
+         WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
 
     SELECT  cd.C_BUSINESS_DATE,
             cd.C_UNIT_PRICE          AS C_CUST_UNIT_PRICE,   -- TWR KH
@@ -198,10 +193,10 @@ BEGIN
             si.C_INDEX_VALUE         AS C_SI_INDEX,          -- PR danh mục mẫu
             bm.C_INDEX_VALUE         AS C_BENCHMARK          -- PR benchmark ngoài
     FROM        T_CUSTOMER_NAV_DAILY cd
-    LEFT JOIN   T_SI_NAV_DAILY       sd ON sd.FK_SI_ID = @sid AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    LEFT JOIN   T_SI_INDEX_DAILY     si ON si.FK_SI_ID = @sid AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    LEFT JOIN   T_SI_NAV_DAILY       sd ON sd.C_SI_CODE = @C_SI_CODE AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    LEFT JOIN   T_SI_INDEX_DAILY     si ON si.C_SI_CODE = @C_SI_CODE AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     LEFT JOIN   T_BENCHMARK_DAILY    bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    WHERE  cd.C_CUST_CODE = @C_CUST_CODE AND cd.FK_SI_ID = @sid
+    WHERE  cd.C_CUST_CODE = @C_CUST_CODE AND cd.C_SI_CODE = @C_SI_CODE
       AND  cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
     ORDER BY cd.C_BUSINESS_DATE;
 END
@@ -212,17 +207,15 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_INFO
     @C_CUST_CODE VARCHAR(10),
-    @C_SI_PK_ID  UNIQUEIDENTIFIER
+    @C_SI_CODE   VARCHAR(20)
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @sid BIGINT = (SELECT PK_SI_ID FROM T_MASTER_PORTFOLIO WHERE C_PK_ID = @C_SI_PK_ID);
-    IF @sid IS NULL BEGIN RAISERROR('SI not found for given C_SI_PK_ID',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE)
+        BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
-    SELECT  ip.C_PK_ID            AS C_SUBACCOUNT_PK_ID,
-            mp.C_PK_ID            AS C_SI_PK_ID,
-            mp.PK_SI_ID           AS FK_SI_ID,
+    SELECT  ip.PK_INDEXING_PORTFOLIO AS C_SUBACCOUNT_PK_ID,
             mp.C_SI_CODE, mp.C_SI_NAME, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
             ip.C_CUST_CODE,
             ip.C_SUB_ACCOUNT_NO,
@@ -234,8 +227,8 @@ BEGIN
             ip.C_MIN_INVEST,
             COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) AS C_MGMT_FEE_RATE_EFFECTIVE
     FROM       T_INDEXING_PORTFOLIO ip
-    JOIN       T_MASTER_PORTFOLIO   mp ON mp.PK_SI_ID = ip.FK_SI_ID
-    WHERE ip.C_CUST_CODE = @C_CUST_CODE AND ip.FK_SI_ID = @sid;
+    JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_SI_CODE = ip.C_SI_CODE
+    WHERE ip.C_CUST_CODE = @C_CUST_CODE AND ip.C_SI_CODE = @C_SI_CODE;
 END
 GO
 
@@ -246,14 +239,14 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_HOLDINGS
     @C_CUST_CODE VARCHAR(10),
-    @C_SI_PK_ID  UNIQUEIDENTIFIER,
+    @C_SI_CODE   VARCHAR(20),
     @TOP         INT = 20
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @sid BIGINT = (SELECT PK_SI_ID FROM T_MASTER_PORTFOLIO WHERE C_PK_ID = @C_SI_PK_ID);
-    IF @sid IS NULL BEGIN RAISERROR('SI not found for given C_SI_PK_ID',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE)
+        BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
@@ -262,7 +255,7 @@ BEGIN
                t.C_QUANTITY * p.C_CLOSE_PRICE AS mv
         FROM       T_INDEXING_PORTFOLIO_TICKER t
         JOIN       T_PRICE_DAILY p ON p.C_TICKER = t.C_TICKER AND p.C_BUSINESS_DATE = @pd
-        WHERE  t.C_CUST_CODE = @C_CUST_CODE AND t.FK_SI_ID = @sid
+        WHERE  t.C_CUST_CODE = @C_CUST_CODE AND t.C_SI_CODE = @C_SI_CODE
     ), tot AS (SELECT SUM(mv) smv FROM h),
        ranked AS (SELECT h.*, ROW_NUMBER() OVER (ORDER BY mv DESC) rn FROM h)
     SELECT C_TICKER, C_QUANTITY, C_CLOSE_PRICE AS C_MARKET_PRICE, mv AS C_MARKET_VALUE,
@@ -285,23 +278,23 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_ASSET_REPORT
     @C_CUST_CODE VARCHAR(10),
-    @C_SI_PK_ID  UNIQUEIDENTIFIER,
+    @C_SI_CODE   VARCHAR(20),
     @ASOF        DATE = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @sid BIGINT = (SELECT PK_SI_ID FROM T_MASTER_PORTFOLIO WHERE C_PK_ID = @C_SI_PK_ID);
-    IF @sid IS NULL BEGIN RAISERROR('SI not found for given C_SI_PK_ID',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_SI_CODE = @C_SI_CODE)
+        BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
     IF @ASOF IS NULL
         SELECT @ASOF = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_DAILY
-         WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid;
+         WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
 
     -- cash reconstruct (interval)
     DECLARE @cash DECIMAL(20,4) = (
         SELECT C_CASH FROM T_CUSTOMER_CASH_HIST
-        WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid
+        WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE
           AND C_VALID_FROM <= @ASOF AND (C_VALID_TO > @ASOF OR C_VALID_TO IS NULL));
 
     -- stock reconstruct (interval × giá gần nhất ≤ asOf)
@@ -311,12 +304,11 @@ BEGIN
         OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
                      WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @ASOF
                      ORDER BY C_BUSINESS_DATE DESC) px
-        WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.FK_SI_ID = @sid
+        WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.C_SI_CODE = @C_SI_CODE
           AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL));
 
     -- RS1: summary
     SELECT  @ASOF                  AS C_ASOF,
-            mp.C_PK_ID             AS C_SI_PK_ID,
             mp.C_SI_CODE,
             nd.C_NAV,
             nd.C_UNIT,
@@ -328,16 +320,16 @@ BEGIN
             fi.C_CUM_CUSTODY_FEE,
             fi.C_CUM_MGMT_FEE
     FROM        T_MASTER_PORTFOLIO mp
-    LEFT JOIN   T_CUSTOMER_NAV_DAILY nd ON nd.C_CUST_CODE = @C_CUST_CODE AND nd.FK_SI_ID = @sid
+    LEFT JOIN   T_CUSTOMER_NAV_DAILY nd ON nd.C_CUST_CODE = @C_CUST_CODE AND nd.C_SI_CODE = @C_SI_CODE
                                        AND nd.C_BUSINESS_DATE = @ASOF
     OUTER APPLY (
         SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_CUM_DIVIDEND,
                 SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_CUM_CUSTODY_FEE,
                 SUM(CASE WHEN C_TYPE = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_CUM_MGMT_FEE
         FROM T_CUSTOMER_FEE_INCOME
-        WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE <= @ASOF
+        WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE <= @ASOF
     ) fi
-    WHERE mp.PK_SI_ID = @sid;
+    WHERE mp.C_SI_CODE = @C_SI_CODE;
 
     -- RS2: holdings reconstruct @asOf
     SELECT  h.C_TICKER, h.C_QUANTITY,
@@ -349,14 +341,14 @@ BEGIN
     OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
                  WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @ASOF
                  ORDER BY C_BUSINESS_DATE DESC) px
-    WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.FK_SI_ID = @sid
+    WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.C_SI_CODE = @C_SI_CODE
       AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL)
     ORDER BY C_MARKET_VALUE DESC;
 
     -- RS3: chi tiết cổ tức/phí ≤ asOf (sparse)
     SELECT C_BUSINESS_DATE, C_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
     FROM T_CUSTOMER_FEE_INCOME
-    WHERE C_CUST_CODE = @C_CUST_CODE AND FK_SI_ID = @sid AND C_BUSINESS_DATE <= @ASOF
+    WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE <= @ASOF
     ORDER BY C_BUSINESS_DATE DESC, C_TYPE;
 END
 GO
