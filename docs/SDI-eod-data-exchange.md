@@ -62,7 +62,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 |---|---|---|---|---|
 | 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_id, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
 | 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. Archive sang `sdi_customer_holding_daily` (rolling 1 tháng) qua **J14b droppable** — EOD core không phụ thuộc. |
-| 4 | **Cash snapshot** | `sdi_fo_cash_sync` | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT. |
+| 4 | **Cash snapshot** | `sdi_customer_cash_daily` | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT; rolling **1 tháng** (J14b purge), không full history. |
 | 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_id, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
 | 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_id, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 

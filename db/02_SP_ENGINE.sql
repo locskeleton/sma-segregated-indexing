@@ -52,7 +52,7 @@ BEGIN
     -- Holdings: FO đã nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current) ở bước STAGE → KHÔNG mirror.
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_CUSTOMER_NAV_CURRENT AS s
-    USING (SELECT C_CUST_CODE,FK_SI_ID,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
+    USING (SELECT C_CUST_CODE,FK_SI_ID,C_CASH FROM T_CUSTOMER_CASH_DAILY WHERE C_BUSINESS_DATE=@d) f
     ON s.C_CUST_CODE=f.C_CUST_CODE AND s.FK_SI_ID=f.FK_SI_ID
     WHEN MATCHED THEN UPDATE SET C_CASH = f.C_CASH
     WHEN NOT MATCHED THEN INSERT (C_CUST_CODE,FK_SI_ID,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS)
@@ -68,9 +68,9 @@ GO
 GO
 
 /*===========================================================================
-  J14b — ARCHIVE_HOLDING (DROPPABLE): snapshot current → T_CUSTOMER_HOLDING_DAILY[@d],
-        giữ rolling 1 THÁNG. CHỈ phục vụ report/tái tạo history — KHÔNG job core nào đọc.
-        Bỏ proc này + xoá khỏi SP_EOD_RUN = bỏ bảng daily, EOD core KHÔNG đổi.
+  J14b — ARCHIVE + RETENTION 1M: snapshot holdings current → T_CUSTOMER_HOLDING_DAILY[@d] (droppable);
+        + PURGE rolling 1 THÁNG cho holdings & cash daily. CHỈ phục vụ report/tái tạo — KHÔNG core nào đọc.
+        Bỏ archive holdings ⇒ EOD core KHÔNG đổi. (Cash daily KHÔNG droppable: là nguồn cash cho SYNC_FO.)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_ARCHIVE_HOLDING @d DATE
 AS
@@ -80,7 +80,8 @@ BEGIN
     INSERT INTO T_CUSTOMER_HOLDING_DAILY (C_BUSINESS_DATE,C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
     SELECT @d, C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
     FROM T_INDEXING_PORTFOLIO_TICKER;
-    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- giữ ~1 tháng
+    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- holdings giữ ~1 tháng
+    DELETE FROM T_CUSTOMER_CASH_DAILY    WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- cash giữ ~1 tháng (FO đẩy @d, đây chỉ purge cũ)
 END
 GO
 

@@ -113,12 +113,16 @@ CREATE TABLE T_CUSTOMER_HOLDING_DAILY (
     CONSTRAINT PK_CUSTOMER_HOLDING_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID, C_TICKER)
 ) WITH (DATA_COMPRESSION = PAGE);
 -- Prod: CCI + partition theo năm (history ~20M/ngày).
-CREATE TABLE T_FO_CASH_SYNC (
+-- Snapshot TIỀN per-KH dated (đối xứng T_CUSTOMER_HOLDING_DAILY) — giữ ROLLING 1 THÁNG (J14b purge), KHÔNG full history.
+--   FO đẩy cash @d vào đây; SYNC_FO đọc dòng @d → MERGE state.cash. Cũng là history 1M cho audit/tái tạo + FR-06.
+--   Lưu ý: cash "current" nằm trong T_CUSTOMER_NAV_CURRENT (state) → bảng này VỪA là nguồn cash cho EOD (đọc @d)
+--   VỪA là history 1M, nên KHÔNG droppable hoàn toàn như holdings archive (engine cần input cash).
+CREATE TABLE T_CUSTOMER_CASH_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUST_CODE     VARCHAR(10)     NOT NULL,
     FK_SI_ID          BIGINT          NOT NULL,
     C_CASH           DECIMAL(20,4)   NOT NULL,    -- tổng tiền tài khoản (FO đã phản ánh trade/cổ tức/settlement)
-    CONSTRAINT PK_FO_CASH_SYNC PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID)
+    CONSTRAINT PK_CUSTOMER_CASH_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID)
 );
 
 -- External cashflow (KHÔNG chứa income)

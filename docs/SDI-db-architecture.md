@@ -42,7 +42,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (cust_code, si_id), PAGE compression; cân nhắc memory-optimized |
 | `sdi_indexing_portfolio_ticker` | holdings hiện tại — **đích FO nạp thẳng** | ~20M | **rowstore** clustered (cust_code, si_id, ticker) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
 | `sdi_customer_holding_daily` | **ARCHIVE** holdings DATED, **rolling 1 tháng** | ~20M × ~21 (cap) | **CCI**, partition tháng — J14b copy từ current + purge; **droppable**, KHÔNG trong EOD core; chỉ audit/tái tạo 1M |
-| `sdi_fo_cash_sync` | snapshot tiền FO đồng bộ EOD (per-KH) | ~20M/ngày staging | rowstore, partition theo ngày/năm |
+| `sdi_customer_cash_daily` | snapshot tiền per-KH dated, **rolling 1 tháng** (J14b purge) | ~20M × ~21 (cap) | rowstore, partition tháng — nguồn cash SYNC_FO @d + history 1M (đối xứng holding_daily) |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_customer_nav_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
@@ -252,7 +252,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
 | T_CUSTOMER_HOLDING_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
-| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (staging FO) |
+| T_CUSTOMER_CASH_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (cash snapshot, rolling 1M) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
 | T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (history, CCI) |
 | T_CUSTOMER_FEE_INCOME | C_EVENT_ID | BIGINT IDENTITY (sparse: cổ tức/phí per-KH) |
