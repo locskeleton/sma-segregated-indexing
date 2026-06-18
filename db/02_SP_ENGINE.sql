@@ -1,3 +1,6 @@
+SET QUOTED_IDENTIFIER ON;  -- procs ghi/đọc bảng có filtered index → cần QI ON lúc CREATE PROC
+SET ANSI_NULLS ON;
+GO
 /*==============================================================================
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
@@ -41,7 +44,7 @@ GO
 
 /*===========================================================================
   J01b — SYNC FO: cash → state. Holdings do FO nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current)
-         ở bước STAGE → SYNC_FO KHÔNG mirror → EOD core KHÔNG phụ thuộc T_CUSTOMER_HOLDING_DAILY.
+         ở bước STAGE → SYNC_FO KHÔNG mirror → EOD core KHÔNG phụ thuộc T_CUSTOMER_HOLDING_HIST.
          Cashflow lấy từ T_CASHFLOW_EVENT — chỉ dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SYNC_FO @d DATE
@@ -52,7 +55,7 @@ BEGIN
     -- Holdings: FO đã nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current) ở bước STAGE → KHÔNG mirror.
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_CUSTOMER_NAV_CURRENT AS s
-    USING (SELECT C_CUST_CODE,FK_SI_ID,C_CASH FROM T_CUSTOMER_CASH_DAILY WHERE C_BUSINESS_DATE=@d) f
+    USING (SELECT C_CUST_CODE,FK_SI_ID,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
     ON s.C_CUST_CODE=f.C_CUST_CODE AND s.FK_SI_ID=f.FK_SI_ID
     WHEN MATCHED THEN UPDATE SET C_CASH = f.C_CASH
     WHEN NOT MATCHED THEN INSERT (C_CUST_CODE,FK_SI_ID,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS)
@@ -68,20 +71,43 @@ GO
 GO
 
 /*===========================================================================
-  J14b — ARCHIVE + RETENTION 1M: snapshot holdings current → T_CUSTOMER_HOLDING_DAILY[@d] (droppable);
-        + PURGE rolling 1 THÁNG cho holdings & cash daily. CHỈ phục vụ report/tái tạo — KHÔNG core nào đọc.
-        Bỏ archive holdings ⇒ EOD core KHÔNG đổi. (Cash daily KHÔNG droppable: là nguồn cash cho SYNC_FO.)
+  J14b — HISTORY (INTERVAL): maintain T_CUSTOMER_HOLDING_HIST + T_CUSTOMER_CASH_HIST.
+        DIFF current vs open-row → ĐÓNG (valid_to=@d) dòng đổi/biến mất, MỞ (valid_from=@d) dòng mới/đổi.
+        FULL history, KHÔNG trùng lặp (ngày không biến động → 0 ghi). Idempotent (re-run = no-op).
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_ARCHIVE_HOLDING @d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_HISTORY @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
-    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;          -- idempotent re-run
-    INSERT INTO T_CUSTOMER_HOLDING_DAILY (C_BUSINESS_DATE,C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
-    SELECT @d, C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
-    FROM T_INDEXING_PORTFOLIO_TICKER;
-    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- holdings giữ ~1 tháng
-    DELETE FROM T_CUSTOMER_CASH_DAILY    WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- cash giữ ~1 tháng (FO đẩy @d, đây chỉ purge cũ)
+
+    /* ---- HOLDINGS: DIFF current (T_INDEXING_PORTFOLIO_TICKER) vs open-row ---- */
+    -- ĐÓNG open-row có qty/avg_cost ĐỔI hoặc mã BIẾN MẤT khỏi current
+    UPDATE h SET C_VALID_TO=@d
+    FROM T_CUSTOMER_HOLDING_HIST h
+    LEFT JOIN T_INDEXING_PORTFOLIO_TICKER c
+      ON c.C_CUST_CODE=h.C_CUST_CODE AND c.FK_SI_ID=h.FK_SI_ID AND c.C_TICKER=h.C_TICKER
+    WHERE h.C_VALID_TO IS NULL
+      AND ( c.C_CUST_CODE IS NULL
+         OR c.C_QUANTITY <> h.C_QUANTITY
+         OR ISNULL(c.C_AVG_COST,-1) <> ISNULL(h.C_AVG_COST,-1) );
+    -- MỞ dòng mới cho mã trong current chưa có open-row khớp y hệt (mã mới / vừa đổi)
+    INSERT INTO T_CUSTOMER_HOLDING_HIST (C_CUST_CODE,FK_SI_ID,C_TICKER,C_VALID_FROM,C_VALID_TO,C_QUANTITY,C_AVG_COST)
+    SELECT c.C_CUST_CODE,c.FK_SI_ID,c.C_TICKER,@d,NULL,c.C_QUANTITY,c.C_AVG_COST
+    FROM T_INDEXING_PORTFOLIO_TICKER c
+    WHERE NOT EXISTS (SELECT 1 FROM T_CUSTOMER_HOLDING_HIST h
+        WHERE h.C_VALID_TO IS NULL AND h.C_CUST_CODE=c.C_CUST_CODE AND h.FK_SI_ID=c.FK_SI_ID AND h.C_TICKER=c.C_TICKER
+          AND h.C_QUANTITY=c.C_QUANTITY AND ISNULL(h.C_AVG_COST,-1)=ISNULL(c.C_AVG_COST,-1));
+
+    /* ---- CASH: DIFF state.cash (T_CUSTOMER_NAV_CURRENT) vs open-row ---- */
+    UPDATE h SET C_VALID_TO=@d
+    FROM T_CUSTOMER_CASH_HIST h
+    JOIN T_CUSTOMER_NAV_CURRENT s ON s.C_CUST_CODE=h.C_CUST_CODE AND s.FK_SI_ID=h.FK_SI_ID
+    WHERE h.C_VALID_TO IS NULL AND s.C_CASH <> h.C_CASH;
+    INSERT INTO T_CUSTOMER_CASH_HIST (C_CUST_CODE,FK_SI_ID,C_VALID_FROM,C_VALID_TO,C_CASH)
+    SELECT s.C_CUST_CODE,s.FK_SI_ID,@d,NULL,s.C_CASH
+    FROM T_CUSTOMER_NAV_CURRENT s
+    WHERE NOT EXISTS (SELECT 1 FROM T_CUSTOMER_CASH_HIST h
+        WHERE h.C_VALID_TO IS NULL AND h.C_CUST_CODE=s.C_CUST_CODE AND h.FK_SI_ID=s.FK_SI_ID AND h.C_CASH=s.C_CASH);
 END
 GO
 
@@ -350,7 +376,7 @@ BEGIN
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
     EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
     EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
-    EXEC SP_EOD_STEP @d, 'J14B_ARCHIVE', 'SP_EOD_ARCHIVE_HOLDING'; -- DROPPABLE: archive holdings 1M (core không phụ thuộc)
+    EXEC SP_EOD_STEP @d, 'J14B_HIST',    'SP_EOD_HISTORY';         -- interval history holding+cash (full, no-dup); core không phụ thuộc
     -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
 END
 GO

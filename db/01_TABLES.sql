@@ -1,3 +1,6 @@
+SET QUOTED_IDENTIFIER ON;  -- bắt buộc cho filtered index (open-row); sqlcmd mặc định OFF
+SET ANSI_NULLS ON;
+GO
 /*==============================================================================
   SDI MODULE — TABLES (SQL Server)
   Naming convention:
@@ -99,31 +102,45 @@ CREATE TABLE T_REBALANCE_REQUEST (
     CONSTRAINT UQ_REBALANCE_REQUEST_PKID UNIQUE NONCLUSTERED (C_PK_ID)
 );
 
--- ARCHIVE holdings (per-KH) — snapshot DATED, giữ ROLLING ~1 THÁNG (J16 copy từ current + purge).
---   KHÔNG phải đích FO, KHÔNG nguồn của EOD core (MTM/agg đọc T_INDEXING_PORTFOLIO_TICKER).
---   CHỈ phục vụ report/tái tạo history + audit. Bỏ bảng này (+ J16) ⇒ EOD core KHÔNG đổi.
---   Biến động NET/ngày suy ra on-demand = qty(D)−qty(D-1) (LAG/self-join) trong cửa sổ 1 tháng.
-CREATE TABLE T_CUSTOMER_HOLDING_DAILY (
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_CUST_CODE     VARCHAR(10)     NOT NULL,
-    FK_SI_ID          BIGINT          NOT NULL,
+-- HOLDINGS HISTORY theo KHOẢNG hiệu lực (INTERVAL/temporal) — FULL history, KHÔNG trùng lặp.
+--   1 dòng/(KH,SI,mã) chỉ ghi khi qty/avg_cost ĐỔI: valid_from..valid_to (NULL=open). Bất biến N năm = 1 dòng.
+--   J14b maintain bằng DIFF current (T_INDEXING_PORTFOLIO_TICKER) vs open-row (close mã đổi/biến mất, open mã mới/đổi).
+--   Reconstruct ngày D: WHERE C_VALID_FROM<=D AND (C_VALID_TO>D OR C_VALID_TO IS NULL).
+CREATE TABLE T_CUSTOMER_HOLDING_HIST (
+    C_CUST_CODE      VARCHAR(10)     NOT NULL,
+    FK_SI_ID         BIGINT          NOT NULL,
     C_TICKER         VARCHAR(20)     NOT NULL,
+    C_VALID_FROM     DATE            NOT NULL,
+    C_VALID_TO       DATE            NULL,        -- NULL = đang hiệu lực (open)
     C_QUANTITY       DECIMAL(20,4)   NOT NULL,
     C_AVG_COST       DECIMAL(18,4)   NULL,
-    CONSTRAINT PK_CUSTOMER_HOLDING_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID, C_TICKER)
+    CONSTRAINT PK_CUSTOMER_HOLDING_HIST PRIMARY KEY (C_CUST_CODE, FK_SI_ID, C_TICKER, C_VALID_FROM)
 ) WITH (DATA_COMPRESSION = PAGE);
--- Prod: CCI + partition theo năm (history ~20M/ngày).
--- Snapshot TIỀN per-KH dated (đối xứng T_CUSTOMER_HOLDING_DAILY) — giữ ROLLING 1 THÁNG (J14b purge), KHÔNG full history.
---   FO đẩy cash @d vào đây; SYNC_FO đọc dòng @d → MERGE state.cash. Cũng là history 1M cho audit/tái tạo + FR-06.
---   Lưu ý: cash "current" nằm trong T_CUSTOMER_NAV_CURRENT (state) → bảng này VỪA là nguồn cash cho EOD (đọc @d)
---   VỪA là history 1M, nên KHÔNG droppable hoàn toàn như holdings archive (engine cần input cash).
-CREATE TABLE T_CUSTOMER_CASH_DAILY (
+CREATE INDEX IX_CUSTOMER_HOLDING_HIST_OPEN ON T_CUSTOMER_HOLDING_HIST (C_CUST_CODE, FK_SI_ID, C_TICKER)
+    INCLUDE (C_QUANTITY, C_AVG_COST) WHERE C_VALID_TO IS NULL;
+-- Prod: CCI + partition theo năm(valid_from) cho bảng HIST.
+-- FO cash FEED (today): FO đẩy cash @d; SYNC_FO MERGE → state.cash. SHORT-retention (KHÔNG phải history).
+CREATE TABLE T_FO_CASH_SYNC (
     C_BUSINESS_DATE  DATE            NOT NULL,
-    C_CUST_CODE     VARCHAR(10)     NOT NULL,
-    FK_SI_ID          BIGINT          NOT NULL,
-    C_CASH           DECIMAL(20,4)   NOT NULL,    -- tổng tiền tài khoản (FO đã phản ánh trade/cổ tức/settlement)
-    CONSTRAINT PK_CUSTOMER_CASH_DAILY PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID)
+    C_CUST_CODE      VARCHAR(10)     NOT NULL,
+    FK_SI_ID         BIGINT          NOT NULL,
+    C_CASH           DECIMAL(20,4)   NOT NULL,    -- tổng tiền (FO đã NET phí/thuế/SIP)
+    CONSTRAINT PK_FO_CASH_SYNC PRIMARY KEY (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID)
 );
+
+-- CASH HISTORY theo KHOẢNG hiệu lực (INTERVAL) — FULL history, KHÔNG trùng lặp (đối xứng holding_hist).
+--   J14b maintain bằng DIFF state.cash (T_CUSTOMER_NAV_CURRENT) vs open-row.
+--   Reconstruct ngày D: WHERE C_VALID_FROM<=D AND (C_VALID_TO>D OR C_VALID_TO IS NULL).
+CREATE TABLE T_CUSTOMER_CASH_HIST (
+    C_CUST_CODE      VARCHAR(10)     NOT NULL,
+    FK_SI_ID         BIGINT          NOT NULL,
+    C_VALID_FROM     DATE            NOT NULL,
+    C_VALID_TO       DATE            NULL,        -- NULL = đang hiệu lực (open)
+    C_CASH           DECIMAL(20,4)   NOT NULL,
+    CONSTRAINT PK_CUSTOMER_CASH_HIST PRIMARY KEY (C_CUST_CODE, FK_SI_ID, C_VALID_FROM)
+) WITH (DATA_COMPRESSION = PAGE);
+CREATE INDEX IX_CUSTOMER_CASH_HIST_OPEN ON T_CUSTOMER_CASH_HIST (C_CUST_CODE, FK_SI_ID)
+    INCLUDE (C_CASH) WHERE C_VALID_TO IS NULL;
 
 -- External cashflow (KHÔNG chứa income)
 CREATE TABLE T_CASHFLOW_EVENT (
@@ -138,7 +155,7 @@ CREATE TABLE T_CASHFLOW_EVENT (
 );
 CREATE INDEX IX_CASHFLOW_EVENT_DATE ON T_CASHFLOW_EVENT (C_BUSINESS_DATE) INCLUDE (C_CUST_CODE, FK_SI_ID, C_EVENT_TYPE, C_AMOUNT);
 
--- (T_CUSTOMER_HOLDING_EVENT đã BỎ — biến động/ngày suy ra từ snapshot T_CUSTOMER_HOLDING_DAILY khi cần.)
+-- (T_CUSTOMER_HOLDING_EVENT đã BỎ — lịch sử holdings ở T_CUSTOMER_HOLDING_HIST (interval).)
 
 -- Unit thay đổi (ghi dòng khi có cashflow)
 CREATE TABLE T_UNIT_LEDGER (
@@ -169,7 +186,7 @@ CREATE TABLE T_CUSTOMER_NAV_CURRENT (
 ) WITH (DATA_COMPRESSION = PAGE);
 
 -- Holdings HIỆN TẠI (~20M) — FO nạp THẲNG mỗi EOD (overwrite). NGUỒN DUY NHẤT cho EOD core (MTM/agg).
--- (Archive lịch sử = T_CUSTOMER_HOLDING_DAILY, do J16 copy ra; KHÔNG nằm trong luồng core.)
+-- (Lịch sử = T_CUSTOMER_HOLDING_HIST interval, J14b maintain bằng DIFF; KHÔNG nằm trong luồng core.)
 -- Prod: thêm NONCLUSTERED COLUMNSTORE cho MTM (HTAP)
 CREATE TABLE T_INDEXING_PORTFOLIO_TICKER (
     C_CUST_CODE     VARCHAR(10)     NOT NULL,

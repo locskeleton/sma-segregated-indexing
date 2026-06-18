@@ -41,8 +41,9 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 |---|---|---|---|
 | `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (cust_code, si_id), PAGE compression; cân nhắc memory-optimized |
 | `sdi_indexing_portfolio_ticker` | holdings hiện tại — **đích FO nạp thẳng** | ~20M | **rowstore** clustered (cust_code, si_id, ticker) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
-| `sdi_customer_holding_daily` | **ARCHIVE** holdings DATED, **rolling 1 tháng** | ~20M × ~21 (cap) | **CCI**, partition tháng — J14b copy từ current + purge; **droppable**, KHÔNG trong EOD core; chỉ audit/tái tạo 1M |
-| `sdi_customer_cash_daily` | snapshot tiền per-KH dated, **rolling 1 tháng** (J14b purge) | ~20M × ~21 (cap) | rowstore, partition tháng — nguồn cash SYNC_FO @d + history 1M (đối xứng holding_daily) |
+| `sdi_customer_holding_hist` | **HISTORY holdings INTERVAL** (valid_from..valid_to), full + no-dup | ~20M + Δ/ngày | **CCI**, partition năm(valid_from) — J14b DIFF current→close/open; holding bất biến = 1 dòng; **droppable**, KHÔNG trong EOD core |
+| `sdi_fo_cash_sync` | **feed tiền FO @d** (transient, short-retention) | ~1M/ngày | rowstore — nguồn cash SYNC_FO @d; KHÔNG history |
+| `sdi_customer_cash_hist` | **HISTORY cash INTERVAL**, full + no-dup | ~1M + Δ/ngày | rowstore/CCI, partition năm(valid_from) — J14b DIFF state.cash→close/open (đối xứng holding_hist) |
 | `sdi_cashflow_event` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `sdi_customer_nav_daily` | **lịch sử perf per-KH** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `sdi_unit_ledger` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
@@ -116,7 +117,7 @@ Tất cả vào **staging** trước, validate, rồi **publish** (partition swi
 ```
 B1  STAGE input ngày @d: bulk insert price, FO holdings+cash sync, model_weight, CA, cashflow → staging (minimal logging)
 B1b SYNC_FO: cash → state (holdings: FO nạp THẲNG T_INDEXING_PORTFOLIO_TICKER ở STAGE, KHÔNG mirror).
-B14b ARCHIVE (droppable): copy current → sdi_customer_holding_daily + purge >1 tháng. Bỏ = EOD core không đổi.
+B14b HISTORY (droppable): DIFF current vs dòng open → đóng dòng đổi/biến mất + mở dòng mới trong sdi_customer_holding_hist & sdi_customer_cash_hist (interval, full history, no-dup). Bỏ = EOD core không đổi.
 B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
       - SYNC_FO đã overwrite holdings + cash từ snapshot FO (đã phản ánh trade/CA/cổ tức/SIP)
       - Biến động holdings NET/ngày (audit/tái dựng) suy ra on-demand = qty(D)−qty(D-1) từ snapshot dated, KHÔNG lưu cột
@@ -251,8 +252,9 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
 | T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
 | T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY |
-| T_CUSTOMER_HOLDING_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID, C_TICKER) | composite natural (snapshot FO dated) |
-| T_CUSTOMER_CASH_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (cash snapshot, rolling 1M) |
+| T_CUSTOMER_HOLDING_HIST | (C_CUST_CODE, FK_SI_ID, C_TICKER, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
+| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (feed transient) |
+| T_CUSTOMER_CASH_HIST | (C_CUST_CODE, FK_SI_ID, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
 | T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
 | T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, FK_SI_ID) | composite natural (history, CCI) |
 | T_CUSTOMER_FEE_INCOME | C_EVENT_ID | BIGINT IDENTITY (sparse: cổ tức/phí per-KH) |
@@ -268,7 +270,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 
 → **GUID `C_PK_ID` (NEWID, UNIQUE NONCLUSTERED) — chỉ ở 4 bảng ENTITY/quản-lý:** `T_MASTER_PORTFOLIO`, `T_MASTER_PORTFOLIO_TICKER`, `T_INDEXING_PORTFOLIO`, `T_REBALANCE_REQUEST` — làm **khóa duy nhất cho API/UI** (IDOR-safe). **Cluster vẫn theo PK natural** (GUID nonclustered) → đo medium 1,25M: EOD **+~0%** (entity không ghi trong EOD).
 
-→ Bảng **volume-lớn** (history/archive/work/daily) **KHÔNG GUID** — không address per-row qua API, và đo thật thêm GUID mọi bảng = **+18% (NEWSEQUENTIALID) ~ +34% (NEWID)** EOD (chi phí dồn vào chỉ mục GUID khi insert khối lớn: J14b archive 1,25M tăng gấp đôi). Cluster trên natural/date đã tối ưu → **KHÔNG cần cột BIGINT-cluster riêng** (BIGINT-cluster chỉ liên quan nếu cluster TRÊN GUID — không làm).
+→ Bảng **volume-lớn** (history/hist-interval/work/daily) **KHÔNG GUID** — không address per-row qua API, và đo thật thêm GUID mọi bảng = **+18% (NEWSEQUENTIALID) ~ +34% (NEWID)** EOD (chi phí dồn vào chỉ mục GUID khi insert khối lớn). Cluster trên natural/date đã tối ưu → **KHÔNG cần cột BIGINT-cluster riêng** (BIGINT-cluster chỉ liên quan nếu cluster TRÊN GUID — không làm).
 
 ### Benchmark GUID vs BIGINT (đo thật, 500.000 dòng, SQL Server Express)
 | PK clustered | Insert (ms) | Size | Fragmentation | Page fill | NC index |

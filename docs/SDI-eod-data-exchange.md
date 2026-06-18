@@ -61,8 +61,8 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
 | 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_id, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
-| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. Archive sang `sdi_customer_holding_daily` (rolling 1 tháng) qua **J14b droppable** — EOD core không phụ thuộc. |
-| 4 | **Cash snapshot** | `sdi_customer_cash_daily` | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT; rolling **1 tháng** (J14b purge), không full history. |
+| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. **J14b droppable** DIFF current → `sdi_customer_holding_hist` (interval, full history, no-dup) — EOD core không phụ thuộc. |
+| 4 | **Cash snapshot** | `sdi_fo_cash_sync` (feed @d) | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT (transient feed); J14b DIFF state.cash → `sdi_customer_cash_hist` (interval, full history, no-dup). |
 | 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_id, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
 | 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_id, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 
@@ -83,7 +83,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | 8c | **SI series ngày** | `sdi_si_nav_daily`, `sdi_si_index_daily` | nav/unit/up/pnl/return + index_value (PR) | Append dòng SI của ngày @d (nhỏ). |
 | 9 | **Lịch sử KH (API pull)** | `sdi_customer_nav_daily`, `sdi_si_holding_daily`, `sdi_customer_fee_income` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`usp_get_*`) on-demand — **KHÔNG** push bulk lịch sử. |
 
-> **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `customer_nav_daily` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings history chỉ **archive rolling 1 tháng** (droppable, không trong EOD core).
+> **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `customer_nav_daily` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) qua J14b droppable — không trong EOD core.
 
 ---
 
@@ -146,7 +146,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 ## 5. Quy tắc hợp đồng (contract)
 
 1. **Snapshot overwrite, idempotent:** FO nạp toàn bộ holdings THẲNG vào current + cash mỗi EOD; chạy lại 1 ngày cho cùng kết quả (overwrite, không cộng dồn).
-8. **Holdings history tách rời:** archive sang `T_CUSTOMER_HOLDING_DAILY` (rolling 1 tháng) qua J14b droppable — EOD core chỉ đọc current; bỏ bảng/J14b không ảnh hưởng EOD.
+8. **Holdings/cash history tách rời (interval):** J14b droppable DIFF current → `T_CUSTOMER_HOLDING_HIST` & `T_CUSTOMER_CASH_HIST` (SCD-2 valid_from/valid_to, **full history BẮT BUỘC, no-dup**) — EOD core chỉ đọc current; bỏ J14b không ảnh hưởng EOD (history dừng cập nhật).
 2. **FO cash là nguồn tiền duy nhất, đã NET** phí QL + thuế GD + SIP → SDI không re-apply.
 3. **Biến động holdings/ngày** SDI suy ra on-demand (qty(D)−qty(D-1)), KHÔNG cần FO gửi delta.
 4. **Cổ tức/phí & cashflow là sự kiện sparse** — FO chỉ gửi khi phát sinh; capture đúng ngày + số tiền khớp thời điểm FO ghi vào cash.
