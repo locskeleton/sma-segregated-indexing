@@ -39,8 +39,8 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 
 | Bảng | Vai trò | Quy mô | Lưu trữ |
 |---|---|---|---|
-| `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (cust_code, si_id), PAGE compression; cân nhắc memory-optimized |
-| `sdi_indexing_portfolio_ticker` | holdings hiện tại — **đích FO nạp thẳng** | ~20M | **rowstore** clustered (cust_code, si_id, ticker) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
+| `sdi_customer_nav_current` | trạng thái hiện tại/vị thế | ~1M | **rowstore**, clustered PK (cust_code, si_code), PAGE compression; cân nhắc memory-optimized |
+| `sdi_indexing_portfolio_ticker` | holdings hiện tại — **đích FO nạp thẳng** | ~20M | **rowstore** clustered (cust_code, si_code, ticker) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
 | `sdi_customer_holding_hist` | **HISTORY holdings INTERVAL** (valid_from..valid_to), full + no-dup | ~20M + Δ/ngày | **CCI**, partition năm(valid_from) — J14b DIFF current→close/open; holding bất biến = 1 dòng; **droppable**, KHÔNG trong EOD core |
 | `sdi_fo_cash_sync` | **feed tiền FO @d** (transient, short-retention) | ~1M/ngày | rowstore — nguồn cash SYNC_FO @d; KHÔNG history |
 | `sdi_customer_cash_hist` | **HISTORY cash INTERVAL**, full + no-dup | ~1M + Δ/ngày | rowstore/CCI, partition năm(valid_from) — J14b DIFF state.cash→close/open (đối xứng holding_hist) |
@@ -124,18 +124,18 @@ B2  ÁP DELTA vào state (incremental — chỉ vị thế có biến động):
       - Cashflow event: tính CF_t cho vị thế có nạp/rút (chỉ để đổi unit — KHÔNG cộng lại vào cash)
       - (KHÔNG accrue phí: FO cash đã NET phí QL + thuế GD — tránh double-count)
 B3  MTM TOÀN BỘ (câu lệnh nặng nhất — set-based):
-      INSERT #nav_today (cust_code, si_id, stock_value)
-      SELECT h.cust_code, h.si_id, SUM(h.quantity * p.close_price)
+      INSERT #nav_today (cust_code, si_code, stock_value)
+      SELECT h.cust_code, h.si_code, SUM(h.quantity * p.close_price)
       FROM   sdi_indexing_portfolio_ticker h
       JOIN   sdi_price_daily p ON p.ticker=h.ticker AND p.business_date=@d
-      GROUP BY h.cust_code, h.si_id;        -- batch-mode (NCCI) trên 20M dòng
+      GROUP BY h.cust_code, h.si_code;        -- batch-mode (NCCI) trên 20M dòng
 B4  NAV = stock_value + state.cash   (FO cash đã NET phí → không trừ lại)   (1 UPDATE join)
 B5  PnL ngày = NAV_today − NAV_prev + ra − vào                          (1 UPDATE)
 B6  UNIT: chỉ vị thế có CF_t:  ΔUnit = CF/unit_price_prev; unit += ΔUnit  (1 UPDATE)
       unit_price = NAV / unit   (mọi vị thế — 1 UPDATE)
       → INSERT sdi_unit_ledger các dòng có ΔUnit ≠ 0
 B7  SI AGGREGATE (set-based):
-      SI cash/stock/NAV/unit = Σ per si_id → sdi_si_nav_daily (composition + NAV + hiệu suất); upsert sdi_si_nav_current
+      SI cash/stock/NAV/unit = Σ per si_code → sdi_si_nav_daily (composition + NAV + hiệu suất); upsert sdi_si_nav_current
 B8  SI INDEX: Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 SI × ~25 mã — nhẹ) → sdi_si_index_daily
 B9  PUBLISH: cập nhật sdi_customer_nav_current (current); SWITCH/MERGE SI-level vào bảng đích;
       push delta sang Asset (current snapshot, không append toàn lịch sử)
@@ -193,10 +193,10 @@ FO sync overwrite holdings → không event-source → derive-on-read lịch s�
 ## 8. Indexing & thiết kế khóa
 
 - **Khóa clustering**: dùng khóa **hẹp, tăng dần, không GUID** (GUID ngẫu nhiên → page split, fragmentation). Dùng `BIGINT IDENTITY` hoặc khóa tự nhiên hẹp.
-- `sdi_customer_nav_current`: clustered PK `(cust_code, si_id)` — point update/lookup.
-- `sdi_indexing_portfolio_ticker`: clustered `(cust_code, si_id, ticker)` + **NCCI** (cho B3).
-- Event ledger (CCI): partition `(business_date)`; CCI tự lo, thêm **nonclustered rowstore** `(cust_code, si_id, business_date)` nếu cần truy vết theo KH.
-- SI-level daily: clustered `(si_id, business_date)`.
+- `sdi_customer_nav_current`: clustered PK `(cust_code, si_code)` — point update/lookup.
+- `sdi_indexing_portfolio_ticker`: clustered `(cust_code, si_code, ticker)` + **NCCI** (cho B3).
+- Event ledger (CCI): partition `(business_date)`; CCI tự lo, thêm **nonclustered rowstore** `(cust_code, si_code, business_date)` nếu cần truy vết theo KH.
+- SI-level daily: clustered `(si_code, business_date)`.
 - `sdi_price_daily`: clustered `(business_date, ticker)` — nhỏ, cache buffer pool.
 - **Avoid**: index thừa trên bảng ghi nóng (chậm insert); EAV; nvarchar(max) trong fact.
 

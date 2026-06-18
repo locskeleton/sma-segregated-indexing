@@ -54,17 +54,17 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 | # | Luồng | Bảng/payload | Trường | Tần suất |
 |---|---|---|---|---|
-| 1 | **Rebalance trigger** | `sdi_rebalance_request` | request_id, si_id, business_date, type[REBALANCE\|DEPLOY\|REDEEM], status | **SPARSE** — chỉ khi cần tái cân bằng/giải ngân/rút. KHÔNG chứa weights (FO tự tính). |
+| 1 | **Rebalance trigger** | `sdi_rebalance_request` | request_id, si_code, business_date, type[REBALANCE\|DEPLOY\|REDEEM], status | **SPARSE** — chỉ khi cần tái cân bằng/giải ngân/rút. KHÔNG chứa weights (FO tự tính). |
 
 ### B. FO → SDI (feed EOD)
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_id, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
-| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_id, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. **J14b droppable** DIFF current → `sdi_customer_holding_hist` (interval, full history, no-dup) — EOD core không phụ thuộc. |
-| 4 | **Cash snapshot** | `sdi_fo_cash_sync` (feed @d) | business_date, cust_code, si_id, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT (transient feed); J14b DIFF state.cash → `sdi_customer_cash_hist` (interval, full history, no-dup). |
-| 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_id, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
-| 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_id, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
+| 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_code, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
+| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_code, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. **J14b droppable** DIFF current → `sdi_customer_holding_hist` (interval, full history, no-dup) — EOD core không phụ thuộc. |
+| 4 | **Cash snapshot** | `sdi_fo_cash_sync` (feed @d) | business_date, cust_code, si_code, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT (transient feed); J14b DIFF state.cash → `sdi_customer_cash_hist` (interval, full history, no-dup). |
+| 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_code, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
+| 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_code, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 
 ### C. Market data → SDI (feed EOD)
 
@@ -78,8 +78,8 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 8a | **Current snapshot KH** | `sdi_customer_nav_current` | cust_code, si_id, unit, cash, last_nav, last_unit_price, status, last_business_date | Push **current/delta** (1 dòng/tiểu khoản). |
-| 8b | **Current snapshot SI** | `sdi_si_nav_current` | si_id, cash, stock_value, total_asset, last_nav, unit, last_unit_price | Push current toàn quỹ (overview/AUM). |
+| 8a | **Current snapshot KH** | `sdi_customer_nav_current` | cust_code, si_code, unit, cash, last_nav, last_unit_price, status, last_business_date | Push **current/delta** (1 dòng/tiểu khoản). |
+| 8b | **Current snapshot SI** | `sdi_si_nav_current` | si_code, cash, stock_value, total_asset, last_nav, unit, last_unit_price | Push current toàn quỹ (overview/AUM). |
 | 8c | **SI series ngày** | `sdi_si_nav_daily`, `sdi_si_index_daily` | nav/unit/up/pnl/return + index_value (PR) | Append dòng SI của ngày @d (nhỏ). |
 | 9 | **Lịch sử KH (API pull)** | `sdi_customer_nav_daily`, `sdi_si_holding_daily`, `sdi_customer_fee_income` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`usp_get_*`) on-demand — **KHÔNG** push bulk lịch sử. |
 
