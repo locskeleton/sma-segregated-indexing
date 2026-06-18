@@ -7,3 +7,4 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-18T07:06:13Z,d89ebae,"docs: dong nhat SI key = si_code (bo het si_id) trong toan bo docs",medium,10000,1250000,32022,613,7107,127,41,126,1089,22919
 2026-06-18T12:55:17Z,93ca0eb,"rename(db): T_*_NAV_DAILY/T_SI_HOLDING_DAILY -> _BALANCE",medium,10000,1250000,47766,1413,17649,243,49,227,1460,26725
 2026-06-18T13:12:51Z,e01760b,"refactor(db): chuan hoa DECIMAL theo loai",medium,10000,1250000,11398,NULL,8906,158,37,156,1879,NULL
+2026-06-18T14:03:27Z,f31a69f,"feat(db): Kafka ingest per-KH (forward) — SP_INGEST_CUSTOMER + tai cau truc EOD",medium,10000,1250000,11190,NULL,8669,162,30,141,1899,NULL

@@ -41,7 +41,9 @@ SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, 
 | Công cụ | Unit price (NAV per share) | Index (weights × giá) |
 | Hiển thị | "Lợi suất của bạn" / "Hiệu suất SI" | "Danh mục mẫu", "VN-Index" trên chart FR-03 |
 
-- **Tiểu khoản** = đơn vị nhỏ nhất = một **(customer × SI)**. Một KH có nhiều tiểu khoản.
+- **Hai cấp (đính chính thuật ngữ):** **MASTER** = danh mục mẫu/chiến lược (mã `C_MASTER_CODE`). **SUB-ACCOUNT (tiểu khoản)** = KH đầu tư 1 master → được cấp 1 sub-account, định danh `C_SI_CODE` (sub-index, customer-level), 1:1 với (KH×master).
+- **Tiểu khoản** = đơn vị nhỏ nhất = một **(customer × MASTER)** = 1 sub-account (`C_SI_CODE`). Một KH có nhiều tiểu khoản (mỗi master 1 cái).
+  > ⚠️ Phần prose còn lại dùng "SI" theo nghĩa CŨ (= master/chiến lược). Trong DB: master = `C_MASTER_CODE`; bảng tổng hợp đã đổi `T_SI_*` → `T_MASTER_*`. Sweep toàn bộ thuật ngữ "SI" trong docs = việc riêng (chưa làm).
 - Hiệu suất tính **per (KH × SI)**; SI-level = tổng hợp các KH.
 
 ---
@@ -193,7 +195,7 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix `sdi_`. **Quy chuẩn kiểu:** Tiền VND & quantity = `DECIMAL(20,0)` (không thập phân); giá = `DECIMAL(18,4)`; % / return / fee_rate = `DECIMAL(10,6)`; unit & unit_price = `DECIMAL(18,6)`; weight = `DECIMAL(12,8)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
 
 ### Master / cấu hình
-- **`sdi_master_portfolio`** (**si_code PK** — mã SI là khóa chính + khóa public, KHÔNG surrogate; si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — các bảng khác tham chiếu master theo `si_code`; `benchmark_code` ('VNINDEX'…) trỏ benchmark đối chiếu (FR-03)
+- **`sdi_master_portfolio`** (**master_code PK** — mã danh mục MASTER, khóa chính + khóa public, KHÔNG surrogate; name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — các bảng khác tham chiếu master theo `master_code`; bảng tổng hợp master-level: `master_nav_balance`/`master_holding_balance`/`master_index_daily`/`master_nav_current`. **Sub-account** (`sdi_indexing_portfolio`): có `si_code` (sub-index) + `master_code` + cust_code.
 - **`sdi_master_portfolio_ticker`** (si_code, effective_date, ticker PK; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
 - **`sdi_indexing_portfolio`** (cust_code, si_code PK; sub_account_no, join_date, status, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — cấu hình đầu tư KH (FR-04).
 

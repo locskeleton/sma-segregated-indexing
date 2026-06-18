@@ -6,10 +6,11 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Đối tượng | Quy ước |
 |---|---|
 | Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
-| Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`, `C_CUST_CODE`). Khóa nghiệp vụ giữ `C_`: **`C_SI_CODE`** (mã SI = PK của `T_MASTER_PORTFOLIO`; các bảng khác tham chiếu master theo `C_SI_CODE`), `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
-| Khóa public (GUID `PK_<table>`, NEWID, IDOR-safe) | Mọi bảng (trừ master + `T_EOD_WORK` transient) có cột GUID `PK_<table>` cho API/UI. **Bảng lớn/ghi-nóng:** GUID `UNIQUE NONCLUSTERED` (`UQ_<table>_PKID`), clustered theo khóa perf. **Bảng nhỏ:** GUID làm clustered PK luôn. `T_MASTER_PORTFOLIO`: `C_SI_CODE` là khóa public |
+| Cột | `C_` + UPPERCASE. Khóa nghiệp vụ giữ `C_`. **Hai cấp:** `C_MASTER_CODE` = mã **MASTER** (danh mục mẫu/chiến lược, PK `T_MASTER_PORTFOLIO`; mọi bảng tham chiếu master theo cột này); `C_SI_CODE` = mã **SUB-ACCOUNT** (sub-index, **customer-level**, sinh khi KH đầu tư 1 master, 1:1 với (KH×master)) — chỉ ở `T_INDEXING_PORTFOLIO`. Cùng `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
+| Hai cấp dữ liệu | **MASTER-level**: `T_MASTER_PORTFOLIO(_TICKER)`, `T_MASTER_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_NAV_CURRENT` (key `C_MASTER_CODE`). **SUB-ACCOUNT/customer-level**: holdings/cash/nav/hist… key `(C_CUST_CODE, C_MASTER_CODE)` (= 1 sub-account); `T_INDEXING_PORTFOLIO` = bảng sub-account (có `C_SI_CODE`) |
+| Khóa public (GUID `PK_<table>`, NEWID, IDOR-safe) | Mọi bảng (trừ master + `T_EOD_WORK` transient) có cột GUID `PK_<table>` cho API/UI. **Bảng lớn/ghi-nóng:** GUID `UNIQUE NONCLUSTERED` (`UQ_<table>_PKID`), clustered theo khóa perf. **Bảng nhỏ:** GUID làm clustered PK luôn. `T_MASTER_PORTFOLIO`: `C_MASTER_CODE` là khóa public |
 | Clustered PK theo tải | append-fact lớn → **BIGINT IDENTITY** `C_<table>_ID` (`PK_<table>_ID`); point-access/join → **natural** (`PK_<table>_NK`); nhỏ → GUID (`PK_<table>`). Natural giữ `UQ_<table>_NK` cho idempotency |
-| Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_SI_CODE` → master; `FK_<table>` → surrogate) |
+| Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_MASTER_CODE` → master; `FK_<table>` → surrogate) |
 | Stored procedure | `SP_` |
 | Function | `UDF_` |
 
