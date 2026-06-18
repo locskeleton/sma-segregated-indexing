@@ -16,8 +16,8 @@ DELETE FROM T_PRICE_DAILY; DELETE FROM T_MASTER_PORTFOLIO_TICKER; DELETE FROM T_
 -- master + config tiểu khoản (signup; KHÔNG qua Kafka)
 INSERT INTO T_MASTER_PORTFOLIO (C_MASTER_CODE,C_SI_NAME,C_STATUS,C_INCEPTION_DATE,C_MGMT_FEE_RATE,C_BENCHMARK_CODE)
 VALUES ('SDI01',N'Demo','ACTIVE','2026-01-02',0.01,'VNINDEX');
-INSERT INTO T_INDEXING_PORTFOLIO (C_CUST_CODE,C_MASTER_CODE,C_SI_CODE,C_JOIN_DATE,C_STATUS,C_MGMT_FEE_RATE)
-VALUES ('KH00001001','SDI01','SUB00001001','2026-01-02','ACTIVE',0.01);  -- sub-account SI code = SUB00001001
+INSERT INTO T_INDEXING_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS,C_MGMT_FEE_RATE)
+VALUES ('SUB00001001','KH00001001','SDI01','2026-01-02','ACTIVE',0.01);  -- sub-account = SUB00001001
 INSERT INTO T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES
  ('SDI01','2026-01-02','AAA',0.60),('SDI01','2026-01-02','BBB',0.40);
 
@@ -28,25 +28,25 @@ INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_CLOSE_PRICE) VALUES
  ('AAA','2026-01-07',110),('BBB','2026-01-07',52);
 
 -- KH nạp 10,000,000 ngày 02 (cashflow nạp/rút = SDI-side → ghi thẳng, KHÔNG qua Kafka)
-INSERT INTO T_CASHFLOW_EVENT (C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT)
-VALUES ('KH00001001','SDI01','2026-01-02','INITIAL',10000000);
+INSERT INTO T_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT)
+VALUES ('SUB00001001','KH00001001','SDI01','2026-01-02','INITIAL',10000000);
 
 /*--- Phiên 02: ingest (cash 0, holdings AAA 60000 / BBB 80000) rồi EOD ---*/
-EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-02","sub_accounts":[{"si_code":"SDI01","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-02","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
 EXEC SP_EOD_RUN '2026-01-02';
 
 /*--- Phiên 05: holdings KHÔNG đổi → ingest no-dup interval ---*/
-EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-05","sub_accounts":[{"si_code":"SDI01","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-05","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
 EXEC SP_EOD_RUN '2026-01-05';
 
 /*--- Phiên 06: cổ tức + phí (event có event_id). Gọi 2 LẦN (Kafka redelivery) → cash/holdings no-op + fee DEDUP ---*/
-DECLARE @ev06 NVARCHAR(MAX) = N'{"cust_code":"KH00001001","business_date":"2026-01-06","sub_accounts":[{"si_code":"SDI01","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[{"event_id":"FO-D06-1","type":"DIVIDEND","ticker":"AAA","amount":50000},{"event_id":"FO-D06-2","type":"CUSTODY_FEE","amount":1000}]}]}';
+DECLARE @ev06 NVARCHAR(MAX) = N'{"cust_code":"KH00001001","business_date":"2026-01-06","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[{"event_id":"FO-D06-1","type":"DIVIDEND","ticker":"AAA","amount":50000},{"event_id":"FO-D06-2","type":"CUSTODY_FEE","amount":1000}]}]}';
 EXEC SP_INGEST_CUSTOMER @ev06;
 EXEC SP_INGEST_CUSTOMER @ev06;   -- redelivery: phải no-op, fee KHÔNG nhân đôi
 EXEC SP_EOD_RUN '2026-01-06';
 
 /*--- Phiên 07: BBB tái cân bằng 80000→90000 (FO gửi holdings mới) → interval close/open ---*/
-EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-07","sub_accounts":[{"si_code":"SDI01","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":90000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-07","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":90000,"avg_cost":50}],"fees":[]}]}';
 EXEC SP_EOD_RUN '2026-01-07';
 
 /*------------------------------------------------- KẾT QUẢ & KỲ VỌNG --------*/
@@ -96,12 +96,12 @@ SELECT C_STATUS, COUNT(*) AS N FROM T_EOD_RUN GROUP BY C_STATUS;   -- KỲ VỌN
 
 PRINT '--- GUARD 1: event QUÁ KHỨ (business_date 06 < watermark 07) phải bị CHẶN ---';
 BEGIN TRY
-    EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-06","sub_accounts":[{"si_code":"SDI01","cash":999,"holdings":[],"fees":[]}]}';
+    EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-06","sub_accounts":[{"si_account":"SUB00001001","cash":999,"holdings":[],"fees":[]}]}';
     PRINT '  !!! LỖI: KHÔNG chặn event quá khứ';
 END TRY BEGIN CATCH PRINT '  OK đã chặn: '+ERROR_MESSAGE(); END CATCH;
 
 PRINT '--- GUARD 2: GATE thiếu data (thêm tiểu khoản chưa ingest) phải CHẶN ---';
-INSERT INTO T_INDEXING_PORTFOLIO (C_CUST_CODE,C_MASTER_CODE,C_SI_CODE,C_JOIN_DATE,C_STATUS) VALUES ('KH00009999','SDI01','SUB00009999','2026-01-07','ACTIVE');
+INSERT INTO T_INDEXING_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS) VALUES ('SUB00009999','KH00009999','SDI01','2026-01-07','ACTIVE');
 BEGIN TRY
     EXEC SP_EOD_GATE '2026-01-07';   -- expected=2, received=1 (KH mới chưa ingest)
     PRINT '  !!! LỖI: GATE không chặn khi thiếu data';

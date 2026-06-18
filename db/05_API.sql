@@ -5,14 +5,13 @@ GO
   SDI MODULE — READ API (SQL Server)  | ALL-IN-DB: mỗi API = app EXEC 1 proc
   6 proc đọc cho FR-01..FR-06 (SDI-spec §10). App chỉ serialize JSON, KHÔNG tính.
   Định danh public:
-    - KH:  C_CUST_CODE VARCHAR(10) (mã KH, dùng xuyên sub-system — không phải int tuần tự)
-    - SI:  C_MASTER_CODE VARCHAR(20) = T_MASTER_PORTFOLIO.C_MASTER_CODE (PK + khóa public, IDOR-safe).
-  Read-only: KHÔNG ghi bảng. T0 unit price = 10.000 (gốc inception).
+    - KH:  C_CUST_CODE VARCHAR(10).
+    - SUB-ACCOUNT: C_SI_ACCOUNT VARCHAR(20) (mã sub-account, customer-level, = đơn vị API).
+      Master suy từ sub-account (T_INDEXING_PORTFOLIO). Mọi bảng customer-level khóa theo C_SI_ACCOUNT.
+  Read-only. T0 unit price = 10.000.
 ==============================================================================*/
 
-/*---------------------------------------------- UDF: range filter → ngày cutoff
-  Trả ngày calendar mốc cho range so với @end. NULL = INCEPTION/khác (caller dùng
-  ngày sớm nhất). Ngày mốc THỰC = phiên gần nhất <= cutoff (xử lý ở proc).        */
+/*---------------------------------------------- UDF: range filter → ngày cutoff */
 CREATE OR ALTER FUNCTION UDF_RANGE_CUTOFF (@end DATE, @range VARCHAR(20))
 RETURNS DATE
 AS
@@ -24,15 +23,15 @@ BEGIN
         WHEN '1Y'  THEN DATEADD(YEAR,  -1, @end)
         WHEN '3Y'  THEN DATEADD(YEAR,  -3, @end)
         WHEN 'YTD' THEN DATEFROMPARTS(YEAR(@end) - 1, 12, 31)
-        ELSE NULL   -- INCEPTION / không nhận dạng → caller lấy ngày sớm nhất
+        ELSE NULL
     END;
 END
 GO
 
 /*===========================================================================
-  FR-01 — GET /customer/{id}/si-overview : tổng quan đa SI của 1 KH
-    RS1: breakdown từng SI (current NAV/unit_price + %return inception)
-    RS2: tổng hợp toàn KH (Σ NAV, Σ cash, số SI)
+  FR-01 — GET /customer/{id}/si-overview : tổng quan các sub-account của 1 KH
+    RS1: breakdown từng sub-account (current NAV/unit_price + %return inception)
+    RS2: tổng hợp toàn KH (Σ NAV, Σ cash, số sub-account)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_OVERVIEW
     @C_CUST_CODE VARCHAR(10)
@@ -40,8 +39,8 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    SELECT  ip.C_SI_CODE,            -- mã sub-account (sub-index, customer-level)
-            mp.C_MASTER_CODE,        -- master KH đầu tư
+    SELECT  ip.C_SI_ACCOUNT,         -- mã sub-account (đơn vị customer-level)
+            ip.C_MASTER_CODE,        -- master KH đầu tư
             mp.C_SI_NAME,
             ip.C_STATUS,
             ip.C_JOIN_DATE,
@@ -53,7 +52,7 @@ BEGIN
             CAST(nc.C_LAST_UNIT_PRICE / 10000.0 - 1 AS DECIMAL(10,6)) AS C_RETURN_INCEPTION
     FROM        T_INDEXING_PORTFOLIO   ip
     JOIN        T_MASTER_PORTFOLIO     mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.C_MASTER_CODE = ip.C_MASTER_CODE
+    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
     WHERE  ip.C_CUST_CODE = @C_CUST_CODE
     ORDER BY nc.C_LAST_NAV DESC;
 
@@ -62,47 +61,43 @@ BEGIN
             SUM(nc.C_LAST_NAV)    AS C_TOTAL_NAV,
             SUM(nc.C_CASH)        AS C_TOTAL_CASH
     FROM        T_INDEXING_PORTFOLIO   ip
-    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.C_MASTER_CODE = ip.C_MASTER_CODE
+    LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
     WHERE  ip.C_CUST_CODE = @C_CUST_CODE;
 END
 GO
 
 /*===========================================================================
-  FR-02 — GET /customer/{id}/si/{si} : chi tiết 1 SI
-    Current NAV/unit + TWR (qua unit_price) + MWR (Modified Dietz) theo range.
-    Ngày mốc = phiên gần nhất <= cutoff(range); nếu KH tham gia sau → ngày sớm nhất.
-    RS1: 1 dòng current + range metrics.   RS2: dòng SI-level mới nhất (tham chiếu).
+  FR-02 — GET /customer/{id}/si/{si_account} : chi tiết 1 sub-account
+    Current NAV/unit + TWR (unit_price) + MWR (Modified Dietz) theo range.
+    RS1: current + range metrics. RS2: dòng master-level mới nhất (tham chiếu).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_DETAIL
-    @C_CUST_CODE VARCHAR(10),
-    @C_MASTER_CODE   VARCHAR(20),
-    @RANGE       VARCHAR(20) = 'INCEPTION'
+    @C_CUST_CODE  VARCHAR(10),
+    @C_SI_ACCOUNT VARCHAR(20),
+    @RANGE        VARCHAR(20) = 'INCEPTION'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
-        BEGIN RAISERROR('SI not found for given C_MASTER_CODE',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_INDEXING_PORTFOLIO
+                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
             @end_nav  DECIMAL(20,0), @end_up  DECIMAL(18,6);
 
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE;
-
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
-
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-         WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
 
     SELECT @base_nav = C_NAV, @base_up = C_UNIT_PRICE FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE = @base;
+     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE = @base;
     SELECT @end_nav = C_NAV, @end_up = C_UNIT_PRICE FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE = @end;
+     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE = @end;
 
     -- MWR Modified Dietz: cần lịch phiên (T_PRICE_DAILY distinct date) cho trọng số w_i
     DECLARE @T INT, @cf_net DECIMAL(20,0) = 0, @weighted DECIMAL(18,6) = 0;
@@ -116,11 +111,9 @@ BEGIN
         SELECT C_BUSINESS_DATE bd,
                CASE WHEN C_EVENT_TYPE = 'WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END cf
         FROM T_CASHFLOW_EVENT
-        WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE
-          AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
-    ), flow_w AS (   -- t_i = số phiên từ mốc tới flow (subquery tính ở select-list, KHÔNG trong SUM)
-        SELECT f.cf, (SELECT COUNT(*) FROM cal WHERE cal.d <= f.bd) AS ti
-        FROM flows f
+        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
+    ), flow_w AS (
+        SELECT f.cf, (SELECT COUNT(*) FROM cal WHERE cal.d <= f.bd) AS ti FROM flows f
     )
     SELECT @cf_net   = ISNULL(SUM(cf), 0),
            @weighted = ISNULL(SUM(cf * (@T - ti) * 1.0 / NULLIF(@T,0)), 0)
@@ -128,100 +121,92 @@ BEGIN
 
     DECLARE @denom DECIMAL(18,6) = @base_nav + @weighted;
 
-    SELECT  mp.C_MASTER_CODE, mp.C_SI_NAME,
-            @RANGE                AS C_RANGE,
-            @base                 AS C_BASE_DATE,
-            @end                  AS C_END_DATE,
-            @base_nav             AS C_BASE_NAV,
-            @base_up              AS C_BASE_UNIT_PRICE,
-            @end_nav              AS C_END_NAV,
-            @end_up               AS C_END_UNIT_PRICE,
-            nc.C_LAST_NAV         AS C_CURRENT_NAV,
-            nc.C_LAST_UNIT_PRICE  AS C_CURRENT_UNIT_PRICE,
-            nc.C_UNIT             AS C_CURRENT_UNIT,
+    SELECT  @C_SI_ACCOUNT          AS C_SI_ACCOUNT,
+            @master                AS C_MASTER_CODE,
+            @RANGE                 AS C_RANGE,
+            @base                  AS C_BASE_DATE,
+            @end                   AS C_END_DATE,
+            @base_nav              AS C_BASE_NAV,
+            @base_up               AS C_BASE_UNIT_PRICE,
+            @end_nav               AS C_END_NAV,
+            @end_up                AS C_END_UNIT_PRICE,
+            nc.C_LAST_NAV          AS C_CURRENT_NAV,
+            nc.C_LAST_UNIT_PRICE   AS C_CURRENT_UNIT_PRICE,
+            nc.C_UNIT              AS C_CURRENT_UNIT,
             nc.C_LAST_BUSINESS_DATE AS C_CURRENT_DATE,
-            -- TWR (hiệu suất chiến lược): unit_price cuối / unit_price mốc − 1
             CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
                  ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
-            -- PnL tiền cả kỳ = tử số Modified Dietz
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
-            @cf_net               AS C_CF_NET,
-            -- MWR (lợi suất của bạn): mẫu ≈ 0 hoặc kỳ rỗng → NULL
+            @cf_net                AS C_CF_NET,
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
                  ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT
-    FROM       T_MASTER_PORTFOLIO     mp
-    LEFT JOIN  T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = @C_CUST_CODE AND nc.C_MASTER_CODE = @C_MASTER_CODE
-    WHERE mp.C_MASTER_CODE = @C_MASTER_CODE;
+    FROM T_CUSTOMER_NAV_CURRENT nc WHERE nc.C_SI_ACCOUNT=@C_SI_ACCOUNT;
 
-    -- RS2: SI-level mới nhất (đường "Hiệu suất SI" tham chiếu)
+    -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu)
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
                  C_TOTAL_ASSET, C_CASH, C_STOCK_VALUE
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @C_MASTER_CODE ORDER BY C_BUSINESS_DATE DESC;
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
 END
 GO
 
 /*===========================================================================
-  FR-03 — GET /customer/{id}/si/{si}/performance?range= : chart so sánh
-    Chuỗi ngày trong [mốc, cuối]: unit_price KH (TWR) + SI unit_price (TR)
-    + SI index (PR) + benchmark (PR). App rebase về dòng đầu (= ngày mốc).
+  FR-03 — GET /customer/{id}/si/{si_account}/performance?range= : chart so sánh
+    Chuỗi ngày [mốc..cuối]: unit_price sub-account (TWR) + master unit_price (TR)
+    + master index (PR) + benchmark (PR). App rebase về dòng đầu.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_PERFORMANCE
-    @C_CUST_CODE VARCHAR(10),
-    @C_MASTER_CODE   VARCHAR(20),
-    @RANGE       VARCHAR(20) = '1Y'
+    @C_CUST_CODE  VARCHAR(10),
+    @C_SI_ACCOUNT VARCHAR(20),
+    @RANGE        VARCHAR(20) = '1Y'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
-        BEGIN RAISERROR('SI not found for given C_MASTER_CODE',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_INDEXING_PORTFOLIO
+                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
 
-    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE);
+    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
 
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE;
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-     WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-         WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
 
     SELECT  cd.C_BUSINESS_DATE,
-            cd.C_UNIT_PRICE          AS C_CUST_UNIT_PRICE,   -- TWR KH
-            sd.C_UNIT_PRICE          AS C_SI_UNIT_PRICE,     -- TR cấp SI
-            si.C_INDEX_VALUE         AS C_SI_INDEX,          -- PR danh mục mẫu
+            cd.C_UNIT_PRICE          AS C_CUST_UNIT_PRICE,   -- TWR sub-account
+            sd.C_UNIT_PRICE          AS C_MASTER_UNIT_PRICE, -- TR master
+            si.C_INDEX_VALUE         AS C_MASTER_INDEX,      -- PR danh mục mẫu
             bm.C_INDEX_VALUE         AS C_BENCHMARK          -- PR benchmark ngoài
     FROM        T_CUSTOMER_NAV_BALANCE cd
-    LEFT JOIN   T_MASTER_NAV_BALANCE       sd ON sd.C_MASTER_CODE = @C_MASTER_CODE AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    LEFT JOIN   T_MASTER_INDEX_DAILY     si ON si.C_MASTER_CODE = @C_MASTER_CODE AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    LEFT JOIN   T_BENCHMARK_DAILY    bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    WHERE  cd.C_CUST_CODE = @C_CUST_CODE AND cd.C_MASTER_CODE = @C_MASTER_CODE
-      AND  cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
+    LEFT JOIN   T_MASTER_NAV_BALANCE   sd ON sd.C_MASTER_CODE = @master AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    LEFT JOIN   T_MASTER_INDEX_DAILY   si ON si.C_MASTER_CODE = @master AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    LEFT JOIN   T_BENCHMARK_DAILY      bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    WHERE  cd.C_SI_ACCOUNT=@C_SI_ACCOUNT AND cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
     ORDER BY cd.C_BUSINESS_DATE;
 END
 GO
 
 /*===========================================================================
-  FR-04 — GET /customer/{id}/si/{si}/info : thông tin đầu tư (config tiểu khoản)
+  FR-04 — GET /customer/{id}/si/{si_account}/info : thông tin đầu tư sub-account
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_INFO
-    @C_CUST_CODE VARCHAR(10),
-    @C_MASTER_CODE   VARCHAR(20)
+    @C_CUST_CODE  VARCHAR(10),
+    @C_SI_ACCOUNT VARCHAR(20)
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
-        BEGIN RAISERROR('SI not found for given C_MASTER_CODE',16,1); RETURN; END
-
     SELECT  ip.PK_INDEXING_PORTFOLIO AS C_SUBACCOUNT_PK_ID,
-            ip.C_SI_CODE,            -- mã sub-account (sub-index, customer-level)
+            ip.C_SI_ACCOUNT,
             mp.C_MASTER_CODE, mp.C_SI_NAME, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
             ip.C_CUST_CODE,
             ip.C_SUB_ACCOUNT_NO,
             ip.C_JOIN_DATE,
+            ip.C_CLOSE_DATE,
             ip.C_STATUS,
             ip.C_INITIAL_AMOUNT,
             ip.C_SIP_AMOUNT,
@@ -230,25 +215,24 @@ BEGIN
             COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) AS C_MGMT_FEE_RATE_EFFECTIVE
     FROM       T_INDEXING_PORTFOLIO ip
     JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    WHERE ip.C_CUST_CODE = @C_CUST_CODE AND ip.C_MASTER_CODE = @C_MASTER_CODE;
+    WHERE ip.C_CUST_CODE = @C_CUST_CODE AND ip.C_SI_ACCOUNT = @C_SI_ACCOUNT;
 END
 GO
 
 /*===========================================================================
-  FR-05 — GET /customer/{id}/si/{si}/holdings : holdings hiện tại top-N + "OTHER"
-    Sản phẩm SEGREGATED → KH sở hữu cổ phiếu thật ⇒ đọc holdings CURRENT của KH
-    (T_INDEXING_PORTFOLIO_TICKER) định giá theo giá mới nhất. (≠ SI-aggregate.)
+  FR-05 — GET /customer/{id}/si/{si_account}/holdings : holdings hiện tại top-N + "OTHER"
+    Holdings CURRENT của sub-account (T_INDEXING_PORTFOLIO_TICKER) × giá mới nhất.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_HOLDINGS
-    @C_CUST_CODE VARCHAR(10),
-    @C_MASTER_CODE   VARCHAR(20),
-    @TOP         INT = 20
+    @C_CUST_CODE  VARCHAR(10),
+    @C_SI_ACCOUNT VARCHAR(20),
+    @TOP          INT = 20
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
-        BEGIN RAISERROR('SI not found for given C_MASTER_CODE',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_INDEXING_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE)
+        BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
 
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
@@ -257,7 +241,7 @@ BEGIN
                t.C_QUANTITY * p.C_CLOSE_PRICE AS mv
         FROM       T_INDEXING_PORTFOLIO_TICKER t
         JOIN       T_PRICE_DAILY p ON p.C_TICKER = t.C_TICKER AND p.C_BUSINESS_DATE = @pd
-        WHERE  t.C_CUST_CODE = @C_CUST_CODE AND t.C_MASTER_CODE = @C_MASTER_CODE
+        WHERE  t.C_SI_ACCOUNT = @C_SI_ACCOUNT
     ), tot AS (SELECT SUM(mv) smv FROM h),
        ranked AS (SELECT h.*, ROW_NUMBER() OVER (ORDER BY mv DESC) rn FROM h)
     SELECT C_TICKER, C_QUANTITY, C_CLOSE_PRICE AS C_MARKET_PRICE, mv AS C_MARKET_VALUE,
@@ -273,45 +257,42 @@ END
 GO
 
 /*===========================================================================
-  FR-06 — GET /customer/{id}/si/{si}/asset-report : báo cáo tài sản tại @ASOF
-    Reconstruct theo INTERVAL: cash (cash_hist) + stock (holding_hist × giá ≤ asOf).
-    RS1: summary (nav, cash, stock, total, unit, cổ tức/phí lũy kế).
-    RS2: holdings reconstruct @asOf.   RS3: chi tiết cổ tức/phí ≤ asOf.
+  FR-06 — GET /customer/{id}/si/{si_account}/asset-report : báo cáo tài sản @ASOF
+    Reconstruct INTERVAL: cash (cash_hist) + stock (holding_hist × giá ≤ asOf).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_ASSET_REPORT
-    @C_CUST_CODE VARCHAR(10),
-    @C_MASTER_CODE   VARCHAR(20),
-    @ASOF        DATE = NULL
+    @C_CUST_CODE  VARCHAR(10),
+    @C_SI_ACCOUNT VARCHAR(20),
+    @ASOF         DATE = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
-        BEGIN RAISERROR('SI not found for given C_MASTER_CODE',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_INDEXING_PORTFOLIO
+                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
 
     IF @ASOF IS NULL
-        SELECT @ASOF = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
-         WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE;
+        SELECT @ASOF = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
 
-    -- cash reconstruct (interval)
     DECLARE @cash DECIMAL(20,0) = (
         SELECT C_CASH FROM T_CUSTOMER_CASH_HIST
-        WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE
+        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT
           AND C_VALID_FROM <= @ASOF AND (C_VALID_TO > @ASOF OR C_VALID_TO IS NULL));
 
-    -- stock reconstruct (interval × giá gần nhất ≤ asOf)
     DECLARE @stock DECIMAL(20,0) = (
         SELECT SUM(h.C_QUANTITY * px.C_CLOSE_PRICE)
         FROM T_CUSTOMER_HOLDING_HIST h
         OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
                      WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @ASOF
                      ORDER BY C_BUSINESS_DATE DESC) px
-        WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.C_MASTER_CODE = @C_MASTER_CODE
+        WHERE h.C_SI_ACCOUNT=@C_SI_ACCOUNT
           AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL));
 
     -- RS1: summary
     SELECT  @ASOF                  AS C_ASOF,
-            mp.C_MASTER_CODE,
+            @C_SI_ACCOUNT          AS C_SI_ACCOUNT,
+            @master                AS C_MASTER_CODE,
             nd.C_NAV,
             nd.C_UNIT,
             nd.C_UNIT_PRICE,
@@ -321,17 +302,15 @@ BEGIN
             fi.C_CUM_DIVIDEND,
             fi.C_CUM_CUSTODY_FEE,
             fi.C_CUM_MGMT_FEE
-    FROM        T_MASTER_PORTFOLIO mp
-    LEFT JOIN   T_CUSTOMER_NAV_BALANCE nd ON nd.C_CUST_CODE = @C_CUST_CODE AND nd.C_MASTER_CODE = @C_MASTER_CODE
-                                       AND nd.C_BUSINESS_DATE = @ASOF
+    FROM (SELECT 1 x) z
+    LEFT JOIN   T_CUSTOMER_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@C_SI_ACCOUNT AND nd.C_BUSINESS_DATE = @ASOF
     OUTER APPLY (
         SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_CUM_DIVIDEND,
                 SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_CUM_CUSTODY_FEE,
                 SUM(CASE WHEN C_TYPE = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_CUM_MGMT_FEE
         FROM T_CUSTOMER_FEE_INCOME
-        WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE <= @ASOF
-    ) fi
-    WHERE mp.C_MASTER_CODE = @C_MASTER_CODE;
+        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
+    ) fi;
 
     -- RS2: holdings reconstruct @asOf
     SELECT  h.C_TICKER, h.C_QUANTITY,
@@ -343,14 +322,14 @@ BEGIN
     OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
                  WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @ASOF
                  ORDER BY C_BUSINESS_DATE DESC) px
-    WHERE h.C_CUST_CODE = @C_CUST_CODE AND h.C_MASTER_CODE = @C_MASTER_CODE
+    WHERE h.C_SI_ACCOUNT=@C_SI_ACCOUNT
       AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL)
     ORDER BY C_MARKET_VALUE DESC;
 
     -- RS3: chi tiết cổ tức/phí ≤ asOf (sparse)
     SELECT C_BUSINESS_DATE, C_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
     FROM T_CUSTOMER_FEE_INCOME
-    WHERE C_CUST_CODE = @C_CUST_CODE AND C_MASTER_CODE = @C_MASTER_CODE AND C_BUSINESS_DATE <= @ASOF
+    WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
     ORDER BY C_BUSINESS_DATE DESC, C_TYPE;
 END
 GO

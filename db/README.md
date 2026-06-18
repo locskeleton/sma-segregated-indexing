@@ -6,8 +6,8 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Đối tượng | Quy ước |
 |---|---|
 | Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
-| Cột | `C_` + UPPERCASE. Khóa nghiệp vụ giữ `C_`. **Hai cấp:** `C_MASTER_CODE` = mã **MASTER** (danh mục mẫu/chiến lược, PK `T_MASTER_PORTFOLIO`; mọi bảng tham chiếu master theo cột này); `C_SI_CODE` = mã **SUB-ACCOUNT** (sub-index, **customer-level**, sinh khi KH đầu tư 1 master, 1:1 với (KH×master)) — chỉ ở `T_INDEXING_PORTFOLIO`. Cùng `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
-| Hai cấp dữ liệu | **MASTER-level**: `T_MASTER_PORTFOLIO(_TICKER)`, `T_MASTER_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_NAV_CURRENT` (key `C_MASTER_CODE`). **SUB-ACCOUNT/customer-level**: holdings/cash/nav/hist… key `(C_CUST_CODE, C_MASTER_CODE)` (= 1 sub-account); `T_INDEXING_PORTFOLIO` = bảng sub-account (có `C_SI_CODE`) |
+| Cột | `C_` + UPPERCASE. **Hai cấp:** `C_MASTER_CODE` = mã **MASTER** (danh mục mẫu/chiến lược, PK `T_MASTER_PORTFOLIO`); `C_SI_ACCOUNT` = mã **SUB-ACCOUNT** (= CUST_CODE+đuôi, customer-level, sinh khi KH đầu tư 1 master). Close+reopen master ⇒ sub-account MỚI (mã khác) → 1 KH có NHIỀU sub-account/master theo thời gian (tối đa 1 ACTIVE). Cùng `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
+| Hai cấp dữ liệu | **MASTER-level** (key `C_MASTER_CODE`): `T_MASTER_PORTFOLIO(_TICKER)`, `T_MASTER_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_NAV_CURRENT`. **SUB-ACCOUNT/customer-level** (key `C_SI_ACCOUNT`, giữ `C_CUST_CODE`+`C_MASTER_CODE` denormalized): holdings/cash/nav/hist/cashflow/fee/work. `T_INDEXING_PORTFOLIO` = bảng sub-account (`C_SI_ACCOUNT` UNIQUE + filtered-unique ACTIVE per (cust,master) + `C_CLOSE_DATE`) |
 | Khóa public (GUID `PK_<table>`, NEWID, IDOR-safe) | Mọi bảng (trừ master + `T_EOD_WORK` transient) có cột GUID `PK_<table>` cho API/UI. **Bảng lớn/ghi-nóng:** GUID `UNIQUE NONCLUSTERED` (`UQ_<table>_PKID`), clustered theo khóa perf. **Bảng nhỏ:** GUID làm clustered PK luôn. `T_MASTER_PORTFOLIO`: `C_MASTER_CODE` là khóa public |
 | Clustered PK theo tải | append-fact lớn → **BIGINT IDENTITY** `C_<table>_ID` (`PK_<table>_ID`); point-access/join → **natural** (`PK_<table>_NK`); nhỏ → GUID (`PK_<table>`). Natural giữ `UQ_<table>_NK` cho idempotency |
 | Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_MASTER_CODE` → master; `FK_<table>` → surrogate) |
@@ -78,16 +78,16 @@ Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO c
 28/28 job DONE (7 job × 4 phiên — gồm J14b history), reconcile pass, re-run idempotent (không double-apply). Interval verify: holding bất biến 4 phiên = 1 dòng (no-dup); rebalance phiên 07 (BBB 80000→90000) đóng dòng cũ + mở dòng mới; reconstruct @05 & @07 đúng.
 
 ## Read API — `05_API.sql` (FR-01..06)
-Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. Định danh public: KH = `C_CUST_CODE`; SI = `C_SI_CODE` (mã SI, PK master, IDOR-safe).
+Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. Định danh: KH = `C_CUST_CODE`; đơn vị = **`C_SI_ACCOUNT`** (sub-account). Master suy từ sub-account.
 
 | FR | Proc | Tham số | Trả về |
 |---|---|---|---|
-| FR-01 | `SP_GET_SI_OVERVIEW` | cust | RS1 breakdown từng SI (current NAV/UP + %return inception); RS2 tổng KH (ΣNAV, Σcash) |
-| FR-02 | `SP_GET_SI_DETAIL` | cust, si_code, range | current + **TWR** (qua unit_price) + **MWR** (Modified Dietz) + PnL kỳ; RS2 SI-level mới nhất |
-| FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_code, range | chuỗi ngày [mốc..cuối]: unit_price KH + SI UP (TR) + SI index (PR) + benchmark (PR) — app rebase |
-| FR-04 | `SP_GET_SI_INFO` | cust, si_code | config tiểu khoản + master (mgmt fee effective) |
-| FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_code, top=20 | holdings current KH định giá giá mới nhất, top-N + dòng `OTHER` |
-| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_code, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí |
+| FR-01 | `SP_GET_SI_OVERVIEW` | cust | RS1 breakdown từng sub-account (si_account, master, current NAV/UP + %return inception); RS2 tổng KH |
+| FR-02 | `SP_GET_SI_DETAIL` | cust, si_account, range | current + **TWR** (unit_price) + **MWR** (Modified Dietz) + PnL kỳ; RS2 master-level mới nhất |
+| FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_account, range | chuỗi ngày: unit_price sub-account + master UP (TR) + master index (PR) + benchmark (PR) |
+| FR-04 | `SP_GET_SI_INFO` | cust, si_account | config sub-account + master (mgmt fee effective) |
+| FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_account, top=20 | holdings current sub-account định giá mới nhất, top-N + `OTHER` |
+| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết |
 
 `range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 
