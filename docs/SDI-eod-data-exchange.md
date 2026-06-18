@@ -12,8 +12,8 @@ Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống c�
 |---|---|
 | **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ phí QL + thuế GD vào cash). **Nguồn sự thật về holdings + cash + cổ tức/phí + cashflow.** |
 | **Market data** | Cấp giá EOD, corporate action, chỉ số benchmark (VN-Index…). (Nguồn riêng, không phải FO.) |
-| **SDI** | Nhận holdings (FO nạp THẲNG vào current) + cash từ FO → tính NAV, Unit/Unit Price, PnL, TWR, MWR, SI Index. KHÔNG quản lý từng lệnh khớp, KHÔNG accrue phí. → đẩy kết quả sang Asset. |
-| **Asset** | Nhận current snapshot + chuỗi SI từ SDI; phục vụ **SMO** đọc/hiển thị (read-only, không tính). |
+| **SDI** | Nhận holdings (FO nạp THẲNG vào current) + cash từ FO → tính NAV, Unit/Unit Price, PnL, TWR, MWR, Master Index. KHÔNG quản lý từng lệnh khớp, KHÔNG accrue phí. → đẩy kết quả sang Asset. |
+| **Asset** | Nhận current snapshot + chuỗi master từ SDI; phục vụ **SMO** đọc/hiển thị (read-only, không tính). |
 | **SMO** | Tầng hiển thị, đọc qua Asset. |
 
 **Nguyên tắc nền:** FO đồng bộ **snapshot overwrite** mỗi EOD (không event-source từng lệnh). `NAV = stock_value + FO cash`; FO cash **đã NET** phí QL + thuế GD + SIP → SDI tuyệt đối không trừ lại (tránh double-count).
@@ -38,7 +38,7 @@ Mkt ──(7) giá EOD + corporate action + benchmark ────────�
         │  INGEST (Kafka per-KH, NGOÀI EOD): SP_INGEST_CUSTOMER → overwrite current
         │       holdings+cash + maintain interval hist + cổ tức/phí
         │  SDI EOD (SP_EOD_RUN): J0 GATE → J07 COMPUTE (MTM→NAV→PnL→Unit)
-        │       → J11 SI agg → J12 Index → J13 RECONCILE (cổng) → J14 snapshot (push Asset)
+        │       → J11 master agg → J12 Index → J13 RECONCILE (cổng) → J14 snapshot (push Asset)
         ▼
 SDI ──(8) current snapshot + master series ────────────────────────▶ Asset ──▶ SMO
 SDI ──(9) (API pull) customer NAV/holdings lịch sử theo yêu cầu ◀───── Asset

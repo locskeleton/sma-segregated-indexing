@@ -93,13 +93,13 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 ## 6. Tham chiếu prod thực (200K KH, S₀≈1M tiểu khoản, H₀≈25M holdings)
 | | flat | đều | nóng |
 |---|---:|---:|---:|
-| `si_nav_balance` rows 1Y | ~252M | ~315M | ~516M |
+| `T_SI_NAV_BALANCE` rows 1Y | ~252M | ~315M | ~516M |
 | 10 năm | ~2,5 tỷ | ~3,1 tỷ | ~5,2 tỷ |
-| `si_holding_hist` 10Y (churn 4/y) | ~1,0 tỷ | (theo KH cuối) | ~1,3 tỷ |
-| `si_holding_hist` 10Y (churn 12/y) | ~3,0 tỷ | — | — |
-| Dung lượng nav_balance 10y nén | ~30 GB | ~40 | ~65 |
+| `T_SI_HOLDING_HIST` 10Y (churn 4/y) | ~1,0 tỷ | (theo KH cuối) | ~1,3 tỷ |
+| `T_SI_HOLDING_HIST` 10Y (churn 12/y) | ~3,0 tỷ | — | — |
+| Dung lượng `T_SI_NAV_BALANCE` 10y nén | ~30 GB | ~40 | ~65 |
 
-> `si_nav_balance` 10 năm ~2,5 tỷ (khớp [SDI-spec §11]) — khối lớn nhất, cần partition/CCI/điểm thưa. `si_holding_hist` full history nhưng nhờ interval chỉ ~1 tỷ (churn 4/y) thay vì ~63 tỷ nếu snapshot dated → tiết kiệm ~98%, vẫn đủ tái dựng mọi ngày.
+> `T_SI_NAV_BALANCE` 10 năm ~2,5 tỷ (khớp [SDI-spec §11]) — khối lớn nhất, cần partition/CCI/điểm thưa. `T_SI_HOLDING_HIST` full history nhưng nhờ interval chỉ ~1 tỷ (churn 4/y) thay vì ~63 tỷ nếu snapshot dated → tiết kiệm ~98%, vẫn đủ tái dựng mọi ngày.
 
 ---
 
@@ -115,6 +115,6 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 ## 8. Giả định & lưu ý
 - Bytes/row + tỷ lệ nén là ước lượng raw.
 - Churn 4/y (rebalance quý) là giả định trung tâm; nạp/rút/SIP/cổ tức-reinvest làm tăng churn — thay số thật vào `H₀ × churn × năm`.
-- Sparse (cashflow, cổ tức/phí, unit_ledger) chưa gộp — theo lịch sự kiện, thường << nav_balance.
+- Sparse (`T_SI_CASHFLOW_EVENT`, cổ tức/phí, `T_SI_UNIT_LEDGER`) chưa gộp — theo lịch sự kiện, thường << `T_SI_NAV_BALANCE`.
 - "đều/nóng" minh hoạ tăng trưởng KH; thay tốc độ thật để ra số chính xác.
 - Interval lưu **full history vĩnh viễn** (compliance) — partition năm theo `valid_from` + filegroup nóng/lạnh (2 năm SSD + cũ HDD) thay cho purge.

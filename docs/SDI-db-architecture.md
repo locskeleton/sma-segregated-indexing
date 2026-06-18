@@ -218,7 +218,7 @@ FO sync overwrite holdings → không event-source → derive-on-read lịch s�
 |---|---|---|
 | T_SI_NAV_CURRENT (rowstore PAGE) | 1M | ~vài trăm MB |
 | T_SI_PORTFOLIO_HOLDING (rowstore + NCCI) | 20M | ~vài GB |
-| event ledger (cashflow/unit_ledger, CCI) | ~240M | ~chục GB |
+| event ledger (T_SI_CASHFLOW_EVENT/T_SI_UNIT_LEDGER, CCI) | ~240M | ~chục GB |
 | master-level daily (rowstore) | ~1M | ~nhỏ |
 | **`T_SI_NAV_BALANCE` (CCI)** | **~2,5 tỷ** | **~100–300 GB** (bắt buộc — do FO-sync, xem §7.3) |
 
