@@ -16,7 +16,7 @@ FO: tính tỷ trọng danh mục mẫu  +  đặt lệnh MP TRỰC TIẾP trên
     (không gom + phân bổ; khớp → cổ phiếu, không khớp → tiền của KH)
         │ feed EOD: model_weight + ĐỒNG BỘ holdings+cash toàn bộ TK (SDI không quản lý từng lệnh khớp)
         ▼
-SDI: mirror holdings+cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, SI Index  →  push Asset  →  SMO (read-only)
+SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, SI Index  →  push Asset  →  SMO (read-only)
 ```
 
 | Việc | Chủ |
@@ -204,7 +204,7 @@ Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38
 
 ### FO sync (EOD) & cashflow
 - **`sdi_rebalance_request`** (request_id PK; si_id, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).
-- **`sdi_customer_holding_daily`** (business_date, cust_code, si_id, ticker PK; quantity, avg_cost) — **FO → SDI EOD**: snapshot holdings DATED toàn bộ TK (SDI mirror sang current, overwrite). Kiêm AUDIT + tái dựng holdings lịch sử (THAY `sdi_customer_holding_event` cũ). Biến động NET/ngày suy ra on-demand = qty(D)−qty(D-1) (LAG), KHÔNG lưu cột. SDI KHÔNG quản lý từng lệnh khớp.
+- **`sdi_customer_holding_daily`** (business_date, cust_code, si_id, ticker PK; quantity, avg_cost) — **ARCHIVE** holdings DATED, **rolling 1 tháng** (J14b copy từ current + purge, **droppable**). FO nạp holdings THẲNG vào `sdi_indexing_portfolio_ticker` (current), KHÔNG vào bảng này → **EOD core KHÔNG phụ thuộc**. Chỉ AUDIT + tái tạo history 1M; biến động on-demand qty(D)−qty(D-1) trong cửa sổ 1 tháng.
 - **`sdi_fo_cash_sync`** (business_date, cust_code, si_id PK; cash) — **FO → SDI EOD**: snapshot tiền (đã phản ánh trade/cổ tức/split/settlement).
 - **`sdi_cashflow_event`** (event_id PK; cust_code, si_id, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow; dùng cho **CF_t** (PnL/unit), KHÔNG cộng lại cash (cash từ FO sync).
 - **`sdi_customer_fee_income`** (event_id PK; business_date, cust_code, si_id, type[DIVIDEND|CUSTODY_FEE|MGMT_FEE], ticker, amount, source, created_time) — **FO đẩy cổ tức + phí per-KH (sparse)**. Dòng tiền/sự kiện ngoài, KHÔNG derive được → capture lúc phát sinh cho **báo cáo tài sản FR-06**. J11 SUM lên `cash_dividend`/`custody_fee`/`mgmt_fee_accrued` của `sdi_si_nav_daily`. **KHÔNG ảnh hưởng NAV** (phương án A).
@@ -257,7 +257,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J0** | `GATE` chờ nguồn sẵn sàng | — | cờ sẵn sàng FO/Market/model_weight @d | `sdi_eod_run` | – | – | ✅ (timeout→alert) |
 | **J1** | `STAGE` bulk load input | J0 | FO sync (holdings+cash), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
 | **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
-| **J1b** | `SYNC_FO` mirror | J2 | sdi_customer_holding_daily, sdi_fo_cash_sync | **overwrite** indexing_portfolio_ticker + state.cash từ snapshot @d (biến động/ngày suy ra on-demand từ snapshot, không lưu) | ✅ | ‖ | ✅ |
+| **J1b** | `SYNC_FO` (cash) | J2 | sdi_fo_cash_sync (holdings: FO nạp thẳng `indexing_portfolio_ticker` ở STAGE) | state.cash + tạo state KH mới (**KHÔNG mirror holdings**) | ✅ | ‖ | ✅ |
 | ~~J6~~ | ~~`ACCRUE_FEE`~~ **(ĐÃ BỎ)** | — | phí QL + thuế GD do FO trừ vào cash khi book; SDI không accrue lại (tránh double-count) | — | – | – | – |
 | **J7** | `MTM` định giá lại toàn bộ | J1b | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J7 | stock_value, state.cash (FO) | NAV = stock_value + cash | ✅ | ‖ | – |
@@ -267,6 +267,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | sdi_si_holding_daily (top20+mã khác) | ✅ | ‖ | – |
+| **J14b** | `ARCHIVE_HOLDING` **(DROPPABLE)** | J1b | indexing_portfolio_ticker (current) | sdi_customer_holding_daily (rolling 1 tháng) + purge | ✅ | ‖ | – |
 | **J15** | `PUBLISH` | J13, J14 | staging/đích | commit customer_nav_current; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark eod_run done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
@@ -280,14 +281,14 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
                                     J8 → J14 ───────┴─ J15 → J16
 ```
 (J6 ACCRUE_FEE đã bỏ — FO cash đã NET phí; NAV = stock + cash.)
-- **J1b SYNC_FO**: mirror holdings (overwrite) + cash từ FO snapshot → KHÔNG còn APPLY_CA/EXEC/CASHFLOW (FO đã phản ánh trade/cổ tức/split). CA chỉ dùng cho **J12 index**; cashflow event dùng cho **CF_t** (J9/J10).
+- **J1b SYNC_FO**: chỉ cash → state (holdings FO nạp THẲNG current ở STAGE, KHÔNG mirror) → KHÔNG còn APPLY_CA/EXEC/CASHFLOW (FO đã phản ánh trade/cổ tức/split). CA chỉ dùng cho **J12 index**; cashflow event dùng cho **CF_t** (J9/J10).
 - **J12 (SI Index)** chỉ cần giá + model_weight → song song nhánh customer.
 - **J7 sau J1b** (state cash + holdings đã sync); J8 NAV = stock + cash (không trừ phí).
 - **J7/J8/J9/J10/J14** chia **dải SI hoặc hash(cust_code)** chạy nhiều luồng.
 - **J13 RECONCILE là cổng**: lệch quá ngưỡng → **dừng, KHÔNG publish dữ liệu sai**, alert.
 - **Thực thi ALL-IN-DB**: mỗi job = **1 stored proc** (set-based); **master proc `usp_eod_run @business_date`** gọi tuần tự + ghi `sdi_eod_run(business_date, job, status, rows, started, ended, message)`. **App/SQL Agent chỉ kích hoạt master proc** — không tính toán ở app. Fail giữa chừng → **resume từ job lỗi** (idempotent). Ingestion = proc `BULK INSERT`; API đọc = stored proc.
 - **RCSI** bật → app đọc current snapshot không bị batch chặn; **J15 PUBLISH** (switch-in) là thao tác ngắn duy nhất ảnh hưởng đích.
-- **Roll-forward**: J1b áp **delta** (chỉ vị thế có biến động); J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
+- **Roll-forward**: holdings = FO snapshot full vào current; **state** (cash/NAV/unit) roll-forward tại chỗ; J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
 
 > Chi tiết kỹ thuật (columnstore, partition switch, runtime ~vài phút–15 phút, anti-patterns): [SDI-db-architecture.md](./SDI-db-architecture.md).
 

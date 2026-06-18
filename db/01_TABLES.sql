@@ -91,11 +91,10 @@ CREATE TABLE T_REBALANCE_REQUEST (
     CONSTRAINT PK_REBALANCE_REQUEST PRIMARY KEY (C_REQUEST_ID)
 );
 
--- FO -> SDI : ĐỒNG BỘ EOD holdings (per-KH) = SNAPSHOT DATED thuần.
---   SDI KHÔNG quản lý từng lệnh khớp (FO lo) → không có T_EXECUTION_FEED.
---   FO đổ snapshot holdings vào đây mỗi EOD; engine mirror sang current (overwrite).
---   Cũng là nguồn AUDIT + tái dựng holdings lịch sử (THAY T_CUSTOMER_HOLDING_EVENT cũ).
---   Biến động NET/ngày KHÔNG lưu sẵn — suy ra on-demand = qty(D) − qty(D-1) (LAG/self-join 2 snapshot).
+-- ARCHIVE holdings (per-KH) — snapshot DATED, giữ ROLLING ~1 THÁNG (J16 copy từ current + purge).
+--   KHÔNG phải đích FO, KHÔNG nguồn của EOD core (MTM/agg đọc T_INDEXING_PORTFOLIO_TICKER).
+--   CHỈ phục vụ report/tái tạo history + audit. Bỏ bảng này (+ J16) ⇒ EOD core KHÔNG đổi.
+--   Biến động NET/ngày suy ra on-demand = qty(D)−qty(D-1) (LAG/self-join) trong cửa sổ 1 tháng.
 CREATE TABLE T_CUSTOMER_HOLDING_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_CUST_CODE     VARCHAR(10)     NOT NULL,
@@ -157,7 +156,8 @@ CREATE TABLE T_CUSTOMER_NAV_CURRENT (
     CONSTRAINT PK_CUSTOMER_NAV_CURRENT PRIMARY KEY (C_CUST_CODE, FK_SI_ID)
 ) WITH (DATA_COMPRESSION = PAGE);
 
--- Holdings hiện tại (~20M) — MIRROR từ snapshot (T_CUSTOMER_HOLDING_DAILY), overwrite mỗi EOD.
+-- Holdings HIỆN TẠI (~20M) — FO nạp THẲNG mỗi EOD (overwrite). NGUỒN DUY NHẤT cho EOD core (MTM/agg).
+-- (Archive lịch sử = T_CUSTOMER_HOLDING_DAILY, do J16 copy ra; KHÔNG nằm trong luồng core.)
 -- Prod: thêm NONCLUSTERED COLUMNSTORE cho MTM (HTAP)
 CREATE TABLE T_INDEXING_PORTFOLIO_TICKER (
     C_CUST_CODE     VARCHAR(10)     NOT NULL,

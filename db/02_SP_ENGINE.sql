@@ -40,23 +40,16 @@ END
 GO
 
 /*===========================================================================
-  J01b — SYNC FO: mirror holdings + cash từ snapshot FO (OVERWRITE trạng thái tài sản)
-         SDI KHÔNG event-source execution; FO đã phản ánh trade/cổ tức/split/settlement.
-         Cashflow (nạp/rút) vẫn lấy từ T_CASHFLOW_EVENT — chỉ dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash.
+  J01b — SYNC FO: cash → state. Holdings do FO nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current)
+         ở bước STAGE → SYNC_FO KHÔNG mirror → EOD core KHÔNG phụ thuộc T_CUSTOMER_HOLDING_DAILY.
+         Cashflow lấy từ T_CASHFLOW_EVENT — chỉ dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SYNC_FO @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- holdings hiện tại = mirror snapshot FO @d (per-KH). Snapshot dated giữ trong
-    -- T_CUSTOMER_HOLDING_DAILY → nguồn audit + tái dựng lịch sử. Biến động NET/ngày
-    -- suy ra ON-DEMAND khi report cần = qty(D) − qty(D-1) (LAG/self-join), KHÔNG lưu sẵn.
-    TRUNCATE TABLE T_INDEXING_PORTFOLIO_TICKER;
-    INSERT INTO T_INDEXING_PORTFOLIO_TICKER (C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
-    SELECT C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
-    FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
-
+    -- Holdings: FO đã nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current) ở bước STAGE → KHÔNG mirror.
     -- cash = overwrite vào state; tạo state cho tiểu khoản mới
     MERGE T_CUSTOMER_NAV_CURRENT AS s
     USING (SELECT C_CUST_CODE,FK_SI_ID,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
@@ -72,6 +65,23 @@ GO
 
 -- (ĐÃ BỎ J06 ACCRUE_FEE) — phương án (A): phí quản lý + thuế GD do FO trừ vào cash khi book.
 --   FO cash đã NET → SDI KHÔNG accrue/trừ lại (tránh double-count). NAV = stock_value + FO_cash.
+GO
+
+/*===========================================================================
+  J14b — ARCHIVE_HOLDING (DROPPABLE): snapshot current → T_CUSTOMER_HOLDING_DAILY[@d],
+        giữ rolling 1 THÁNG. CHỈ phục vụ report/tái tạo history — KHÔNG job core nào đọc.
+        Bỏ proc này + xoá khỏi SP_EOD_RUN = bỏ bảng daily, EOD core KHÔNG đổi.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_ARCHIVE_HOLDING @d DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;          -- idempotent re-run
+    INSERT INTO T_CUSTOMER_HOLDING_DAILY (C_BUSINESS_DATE,C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST)
+    SELECT @d, C_CUST_CODE,FK_SI_ID,C_TICKER,C_QUANTITY,C_AVG_COST
+    FROM T_INDEXING_PORTFOLIO_TICKER;
+    DELETE FROM T_CUSTOMER_HOLDING_DAILY WHERE C_BUSINESS_DATE < DATEADD(MONTH,-1,@d);  -- giữ ~1 tháng
+END
 GO
 
 /*===========================================================================
@@ -331,13 +341,15 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     DECLARE @d DATE = @C_BUSINESS_DATE;
 
-    EXEC SP_EOD_STEP @d, 'J01_SYNC_FO',  'SP_EOD_SYNC_FO';         -- mirror holdings+cash từ FO (overwrite)
+    -- (STAGE: FO nạp holdings THẲNG vào T_INDEXING_PORTFOLIO_TICKER trước khi gọi proc này)
+    EXEC SP_EOD_STEP @d, 'J01_SYNC_FO',  'SP_EOD_SYNC_FO';         -- cash → state (holdings đã ở current)
     -- (ĐÃ BỎ J06_FEE) — phí QL + thuế GD do FO trừ vào cash khi book; SDI KHÔNG accrue lại (tránh double-count)
     EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
     EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
     EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
+    EXEC SP_EOD_STEP @d, 'J14B_ARCHIVE', 'SP_EOD_ARCHIVE_HOLDING'; -- DROPPABLE: archive holdings 1M (core không phụ thuộc)
     -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
 END
 GO
