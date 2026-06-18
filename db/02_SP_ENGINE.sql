@@ -184,8 +184,8 @@ BEGIN
     FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d AND (C_CF_IN-C_CF_OUT)<>0;
 
     -- LỊCH SỬ per-KH (vì holdings không còn event-source → phải materialize để vẽ chart FR-03)
-    DELETE FROM T_CUSTOMER_NAV_DAILY WHERE C_BUSINESS_DATE=@d;
-    INSERT INTO T_CUSTOMER_NAV_DAILY (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE,C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+    DELETE FROM T_CUSTOMER_NAV_BALANCE WHERE C_BUSINESS_DATE=@d;
+    INSERT INTO T_CUSTOMER_NAV_BALANCE (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE,C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
     SELECT @d, C_CUST_CODE, C_SI_CODE, C_NAV, C_UNIT, C_UNIT_PRICE, C_DAILY_PNL,
            CASE WHEN C_LAST_UNIT_PRICE>0 THEN C_UNIT_PRICE/C_LAST_UNIT_PRICE - 1 END
     FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
@@ -193,7 +193,7 @@ END
 GO
 
 /*===========================================================================
-  J11 — SI AGGREGATE → T_SI_NAV_DAILY (composition + NAV + hiệu suất + cổ tức/phí)
+  J11 — SI AGGREGATE → T_SI_NAV_BALANCE (composition + NAV + hiệu suất + cổ tức/phí)
          + upsert T_SI_NAV_CURRENT (snapshot current cấp SI cho serving)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @d DATE
@@ -201,7 +201,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@d);
-    DELETE FROM T_SI_NAV_DAILY WHERE C_BUSINESS_DATE=@d;
+    DELETE FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@d;
 
     ;WITH agg AS (
         SELECT C_SI_CODE,
@@ -216,7 +216,7 @@ BEGIN
                SUM(CASE WHEN C_TYPE='MGMT_FEE'    THEN C_AMOUNT ELSE 0 END) AS MGMT
         FROM T_CUSTOMER_FEE_INCOME WHERE C_BUSINESS_DATE=@d GROUP BY C_SI_CODE
     )
-    INSERT INTO T_SI_NAV_DAILY (C_BUSINESS_DATE,C_SI_CODE,C_CASH,C_STOCK_VALUE,
+    INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_CODE,C_CASH,C_STOCK_VALUE,
                              C_CASH_DIVIDEND,C_CUSTODY_FEE,C_MGMT_FEE_ACCRUED,C_PAYABLE_FEE,C_TOTAL_ASSET,
                              C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
     SELECT @d, a.C_SI_CODE, a.CASH, a.STOCK,
@@ -227,12 +227,12 @@ BEGIN
            CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END
     FROM agg a
     LEFT JOIN fee f ON f.C_SI_CODE=a.C_SI_CODE
-    LEFT JOIN T_SI_NAV_DAILY prev ON prev.C_SI_CODE=a.C_SI_CODE AND prev.C_BUSINESS_DATE=@prev;
+    LEFT JOIN T_SI_NAV_BALANCE prev ON prev.C_SI_CODE=a.C_SI_CODE AND prev.C_BUSINESS_DATE=@prev;
 
     -- current cấp SI (overwrite) — đọc nhanh "toàn bộ quỹ hiện tại", khỏi WHERE date=MAX
     MERGE T_SI_NAV_CURRENT AS t
     USING (SELECT C_SI_CODE,C_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_NAV,C_UNIT,C_UNIT_PRICE,C_BUSINESS_DATE
-           FROM T_SI_NAV_DAILY WHERE C_BUSINESS_DATE=@d) s
+           FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@d) s
     ON t.C_SI_CODE=s.C_SI_CODE
     WHEN MATCHED THEN UPDATE SET
         t.C_CASH=s.C_CASH, t.C_STOCK_VALUE=s.C_STOCK_VALUE, t.C_TOTAL_ASSET=s.C_TOTAL_ASSET,
@@ -294,9 +294,9 @@ BEGIN
     WHERE C_BUSINESS_DATE=@d AND (C_NAV < 0 OR (C_UNIT<=0 AND C_NAV>0));
     IF @bad > 0
         THROW 50013, 'RECONCILE: phát hiện vị thế NAV âm hoặc unit<=0 với NAV>0.', 1;
-    -- Σ customer NAV per SI khớp T_SI_NAV_DAILY (derive cùng nguồn → phải khớp)
+    -- Σ customer NAV per SI khớp T_SI_NAV_BALANCE (derive cùng nguồn → phải khớp)
     SELECT @bad = COUNT(*)
-    FROM T_SI_NAV_DAILY p
+    FROM T_SI_NAV_BALANCE p
     JOIN (SELECT C_SI_CODE, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d GROUP BY C_SI_CODE) a
       ON a.C_SI_CODE=p.C_SI_CODE AND p.C_BUSINESS_DATE=@d
     WHERE ABS(p.C_NAV - a.NAV) > 1;   -- ngưỡng làm tròn 1 VND
@@ -306,15 +306,15 @@ END
 GO
 
 /*===========================================================================
-  J14 — SNAPSHOT: T_SI_HOLDING_DAILY (SI aggregate holdings + tỷ trọng)
-         (composition tài sản + NAV đã gộp về T_SI_NAV_DAILY ở J11)
+  J14 — SNAPSHOT: T_SI_HOLDING_BALANCE (SI aggregate holdings + tỷ trọng)
+         (composition tài sản + NAV đã gộp về T_SI_NAV_BALANCE ở J11)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
     -- holdings cấp SI + tỷ trọng
-    DELETE FROM T_SI_HOLDING_DAILY WHERE C_BUSINESS_DATE=@d;
+    DELETE FROM T_SI_HOLDING_BALANCE WHERE C_BUSINESS_DATE=@d;
     ;WITH sih AS (
         SELECT h.C_SI_CODE, h.C_TICKER, SUM(h.C_QUANTITY) AS QTY
         FROM T_INDEXING_PORTFOLIO_TICKER h GROUP BY h.C_SI_CODE, h.C_TICKER
@@ -324,12 +324,12 @@ BEGIN
                sih.QTY*p.C_CLOSE_PRICE AS MV
         FROM sih JOIN T_PRICE_DAILY p ON p.C_TICKER=sih.C_TICKER AND p.C_BUSINESS_DATE=@d
     )
-    INSERT INTO T_SI_HOLDING_DAILY (C_BUSINESS_DATE,C_SI_CODE,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT)
+    INSERT INTO T_SI_HOLDING_BALANCE (C_BUSINESS_DATE,C_SI_CODE,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT)
     SELECT @d, v.C_SI_CODE, v.C_TICKER, v.QTY, v.C_CLOSE_PRICE, v.MV,
            CASE WHEN SUM(v.MV) OVER (PARTITION BY v.C_SI_CODE) > 0
                 THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_SI_CODE) END
     FROM val v;
-    -- (composition tài sản + NAV cấp SI: đã ghi T_SI_NAV_DAILY ở J11_SI_AGG)
+    -- (composition tài sản + NAV cấp SI: đã ghi T_SI_NAV_BALANCE ở J11_SI_AGG)
 END
 GO
 

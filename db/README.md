@@ -82,4 +82,4 @@ Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. 
 
 `range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 
-> Chưa implement (mở rộng): ingestion file FO → `T_INDEXING_PORTFOLIO_TICKER` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_CUSTOMER_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_CUSTOMER_NAV_DAILY` CCI + interval hist partition theo `valid_from`).
+> Chưa implement (mở rộng): ingestion file FO → `T_INDEXING_PORTFOLIO_TICKER` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_CUSTOMER_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_CUSTOMER_NAV_BALANCE` CCI + interval hist partition theo `valid_from`).

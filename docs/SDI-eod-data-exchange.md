@@ -80,10 +80,10 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 |---|---|---|---|---|
 | 8a | **Current snapshot KH** | `sdi_customer_nav_current` | cust_code, si_code, unit, cash, last_nav, last_unit_price, status, last_business_date | Push **current/delta** (1 dòng/tiểu khoản). |
 | 8b | **Current snapshot SI** | `sdi_si_nav_current` | si_code, cash, stock_value, total_asset, last_nav, unit, last_unit_price | Push current toàn quỹ (overview/AUM). |
-| 8c | **SI series ngày** | `sdi_si_nav_daily`, `sdi_si_index_daily` | nav/unit/up/pnl/return + index_value (PR) | Append dòng SI của ngày @d (nhỏ). |
-| 9 | **Lịch sử KH (API pull)** | `sdi_customer_nav_daily`, `sdi_si_holding_daily`, `sdi_customer_fee_income` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`usp_get_*`) on-demand — **KHÔNG** push bulk lịch sử. |
+| 8c | **SI series ngày** | `sdi_si_nav_balance`, `sdi_si_index_daily` | nav/unit/up/pnl/return + index_value (PR) | Append dòng SI của ngày @d (nhỏ). |
+| 9 | **Lịch sử KH (API pull)** | `sdi_customer_nav_balance`, `sdi_si_holding_balance`, `sdi_customer_fee_income` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`usp_get_*`) on-demand — **KHÔNG** push bulk lịch sử. |
 
-> **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `customer_nav_daily` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) qua J14b droppable — không trong EOD core.
+> **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `customer_nav_balance` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) qua J14b droppable — không trong EOD core.
 
 ---
 
