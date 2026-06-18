@@ -49,7 +49,7 @@ BEGIN
             nc.C_LAST_NAV,
             nc.C_LAST_UNIT_PRICE,
             nc.C_LAST_BUSINESS_DATE,
-            CAST(nc.C_LAST_UNIT_PRICE / 10000.0 - 1 AS DECIMAL(18,10)) AS C_RETURN_INCEPTION
+            CAST(nc.C_LAST_UNIT_PRICE / 10000.0 - 1 AS DECIMAL(10,6)) AS C_RETURN_INCEPTION
     FROM        T_INDEXING_PORTFOLIO   ip
     JOIN        T_MASTER_PORTFOLIO     mp ON mp.C_SI_CODE = ip.C_SI_CODE
     LEFT JOIN   T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = ip.C_CUST_CODE AND nc.C_SI_CODE = ip.C_SI_CODE
@@ -84,8 +84,8 @@ BEGIN
         BEGIN RAISERROR('SI not found for given C_SI_CODE',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    DECLARE @base_nav DECIMAL(20,4), @base_up DECIMAL(28,10),
-            @end_nav  DECIMAL(20,4), @end_up  DECIMAL(28,10);
+    DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
+            @end_nav  DECIMAL(20,0), @end_up  DECIMAL(18,6);
 
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_CUSTOMER_NAV_BALANCE
      WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
@@ -104,7 +104,7 @@ BEGIN
      WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE AND C_BUSINESS_DATE = @end;
 
     -- MWR Modified Dietz: cần lịch phiên (T_PRICE_DAILY distinct date) cho trọng số w_i
-    DECLARE @T INT, @cf_net DECIMAL(20,4) = 0, @weighted DECIMAL(38,10) = 0;
+    DECLARE @T INT, @cf_net DECIMAL(20,0) = 0, @weighted DECIMAL(18,6) = 0;
     SELECT @T = COUNT(*) FROM (SELECT DISTINCT C_BUSINESS_DATE FROM T_PRICE_DAILY
                                WHERE C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end) c;
 
@@ -125,7 +125,7 @@ BEGIN
            @weighted = ISNULL(SUM(cf * (@T - ti) * 1.0 / NULLIF(@T,0)), 0)
     FROM flow_w;
 
-    DECLARE @denom DECIMAL(38,10) = @base_nav + @weighted;
+    DECLARE @denom DECIMAL(18,6) = @base_nav + @weighted;
 
     SELECT  mp.C_SI_CODE, mp.C_SI_NAME,
             @RANGE                AS C_RANGE,
@@ -141,13 +141,13 @@ BEGIN
             nc.C_LAST_BUSINESS_DATE AS C_CURRENT_DATE,
             -- TWR (hiệu suất chiến lược): unit_price cuối / unit_price mốc − 1
             CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
-                 ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(18,10)) END AS C_TWR_PCT,
+                 ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
             -- PnL tiền cả kỳ = tử số Modified Dietz
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
             @cf_net               AS C_CF_NET,
             -- MWR (lợi suất của bạn): mẫu ≈ 0 hoặc kỳ rỗng → NULL
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
-                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(18,10)) END AS C_MWR_PCT
+                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT
     FROM       T_MASTER_PORTFOLIO     mp
     LEFT JOIN  T_CUSTOMER_NAV_CURRENT nc ON nc.C_CUST_CODE = @C_CUST_CODE AND nc.C_SI_CODE = @C_SI_CODE
     WHERE mp.C_SI_CODE = @C_SI_CODE;
@@ -292,13 +292,13 @@ BEGIN
          WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE;
 
     -- cash reconstruct (interval)
-    DECLARE @cash DECIMAL(20,4) = (
+    DECLARE @cash DECIMAL(20,0) = (
         SELECT C_CASH FROM T_CUSTOMER_CASH_HIST
         WHERE C_CUST_CODE = @C_CUST_CODE AND C_SI_CODE = @C_SI_CODE
           AND C_VALID_FROM <= @ASOF AND (C_VALID_TO > @ASOF OR C_VALID_TO IS NULL));
 
     -- stock reconstruct (interval × giá gần nhất ≤ asOf)
-    DECLARE @stock DECIMAL(20,4) = (
+    DECLARE @stock DECIMAL(20,0) = (
         SELECT SUM(h.C_QUANTITY * px.C_CLOSE_PRICE)
         FROM T_CUSTOMER_HOLDING_HIST h
         OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY

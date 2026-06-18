@@ -109,7 +109,7 @@ Tn (chốt EOD):
 
 - **Vì sao chia UP_(t-1) là đúng (không bias):** dưới giả định trên, rút gọn cho `Unit Price_t = Unit Price_(t-1) × (1 + r_t)` → **daily return = r_t (lợi suất tài sản thật), độc lập cashflow** = TWR sạch. Cashflow chỉ đổi **số unit** (ΔUnit), không đổi **tỷ lệ giá unit** giữa 2 ngày.
 - **Hệ quả (telescoping):** `%PnL = Π(UP_t/UP_(t-1)) − 1 = UP_cuối/UP_đầu − 1` → tính bằng **nhân dồn daily return** hay **tỷ lệ 2 đầu mút** đều **cho cùng kết quả, kể cả có nạp/rút** (chính nhờ khử cashflow vào unit).
-- **Unit lưu full precision** (`NUMERIC(38,10)`); chỉ làm tròn khi hiển thị.
+- **Unit lưu `DECIMAL(18,6)`** (6 lẻ đủ cho TWR; unit = NAV/unit_price nên lẻ); chỉ làm tròn khi hiển thị.
 - Hệ quả: `net_cashflow = ΔUnit × Unit Price_(t-1)`.
 - **Đóng & mở lại vị thế**: khi `Unit` về 0 (rút toàn bộ) → vị thế đóng. Lần nộp mới khởi tạo lại như T0 (`Unit = CF/10.000`, `Unit Price = 10.000`). Hiệu suất tính theo từng vị thế.
 
@@ -190,7 +190,7 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 
 ## 8. Kiến trúc dữ liệu
 
-Prefix `sdi_`. Tiền `BIGINT` (VND); tỷ lệ/giá `NUMERIC`; unit `NUMERIC(38,10)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
+Prefix `sdi_`. **Quy chuẩn kiểu:** Tiền VND & quantity = `DECIMAL(20,0)` (không thập phân); giá = `DECIMAL(18,4)`; % / return / fee_rate = `DECIMAL(10,6)`; unit & unit_price = `DECIMAL(18,6)`; weight = `DECIMAL(12,8)`. Entity = `si` (`sdi_` chỉ là prefix hệ thống).
 
 ### Master / cấu hình
 - **`sdi_master_portfolio`** (**si_code PK** — mã SI là khóa chính + khóa public, KHÔNG surrogate; si_name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — các bảng khác tham chiếu master theo `si_code`; `benchmark_code` ('VNINDEX'…) trỏ benchmark đối chiếu (FR-03)

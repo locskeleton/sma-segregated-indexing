@@ -13,7 +13,7 @@
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 DECLARE @nCust INT = $(NCUST), @nSi INT = $(NSI), @nTick INT = $(NTICK);
 DECLARE @d DATE = '$(DT)';
-DECLARE @price DECIMAL(18,4) = 10000, @qty DECIMAL(20,4) = 100;
+DECLARE @price DECIMAL(18,4) = 10000, @qty DECIMAL(20,0) = 100;
 
 PRINT CONCAT('BENCH seed: nCust=',@nCust,' nSi=',@nSi,' nTick=',@nTick,
              ' → subaccount=',@nCust*@nSi,' holdings=',@nCust*@nSi*@nTick,' @ ',CONVERT(VARCHAR,@d,23));

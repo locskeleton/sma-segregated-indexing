@@ -5,3 +5,4 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-18T06:21:16Z,54b600d,"feat(db): read API procs SP_GET_* (FR-01..06) + UDF_RANGE_CUTOFF",medium,10000,1250000,20359,405,8109,84,31,92,1000,10638
 2026-06-18T06:50:45Z,d89ebae,"docs: dong nhat SI key = si_code (bo het si_id) trong toan bo docs",medium,10000,1250000,39785,916,7997,126,46,132,1112,29456
 2026-06-18T07:06:13Z,d89ebae,"docs: dong nhat SI key = si_code (bo het si_id) trong toan bo docs",medium,10000,1250000,32022,613,7107,127,41,126,1089,22919
+2026-06-18T12:55:17Z,93ca0eb,"rename(db): T_*_NAV_DAILY/T_SI_HOLDING_DAILY -> _BALANCE",medium,10000,1250000,47766,1413,17649,243,49,227,1460,26725
