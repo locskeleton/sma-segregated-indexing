@@ -266,7 +266,9 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, FK_SI_ID, C_TICKER) | composite natural |
 | T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
 
-→ **Không bảng nào dùng GUID** vì master nhỏ đều bị bảng lớn FK-ref; bảng nhỏ còn lại đã có natural key.
+→ **GUID `C_PK_ID` (NEWID, UNIQUE NONCLUSTERED) — chỉ ở 4 bảng ENTITY/quản-lý:** `T_MASTER_PORTFOLIO`, `T_MASTER_PORTFOLIO_TICKER`, `T_INDEXING_PORTFOLIO`, `T_REBALANCE_REQUEST` — làm **khóa duy nhất cho API/UI** (IDOR-safe). **Cluster vẫn theo PK natural** (GUID nonclustered) → đo medium 1,25M: EOD **+~0%** (entity không ghi trong EOD).
+
+→ Bảng **volume-lớn** (history/archive/work/daily) **KHÔNG GUID** — không address per-row qua API, và đo thật thêm GUID mọi bảng = **+18% (NEWSEQUENTIALID) ~ +34% (NEWID)** EOD (chi phí dồn vào chỉ mục GUID khi insert khối lớn: J14b archive 1,25M tăng gấp đôi). Cluster trên natural/date đã tối ưu → **KHÔNG cần cột BIGINT-cluster riêng** (BIGINT-cluster chỉ liên quan nếu cluster TRÊN GUID — không làm).
 
 ### Benchmark GUID vs BIGINT (đo thật, 500.000 dòng, SQL Server Express)
 | PK clustered | Insert (ms) | Size | Fragmentation | Page fill | NC index |
