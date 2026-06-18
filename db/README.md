@@ -7,8 +7,8 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 |---|---|
 | Bảng | `T_` + UPPERCASE (vd `T_CUSTOMER_NAV_CURRENT`) |
 | Cột | `C_` + UPPERCASE (vd `C_BUSINESS_DATE`, `C_CUST_CODE`). Khóa nghiệp vụ giữ `C_`: **`C_SI_CODE`** (mã SI = PK của `T_MASTER_PORTFOLIO`; các bảng khác tham chiếu master theo `C_SI_CODE`), `C_CUST_CODE`, `C_TICKER`, `C_BENCHMARK_CODE` |
-| Khóa surrogate public (GUID, IDOR-safe) | `PK_<table>` ở bảng GỐC (vd `PK_MASTER_PORTFOLIO_TICKER`, `PK_INDEXING_PORTFOLIO`) / `FK_<table>` khi tham chiếu ở bảng khác. `T_MASTER_PORTFOLIO` KHÔNG có surrogate — `C_SI_CODE` là khóa public luôn |
-| Primary key | constraint `PK_<table>` (bảng có cả natural composite + surrogate → natural đặt `PK_<table>_NK`) |
+| Khóa public (GUID `PK_<table>`, NEWID, IDOR-safe) | Mọi bảng (trừ master + `T_EOD_WORK` transient) có cột GUID `PK_<table>` cho API/UI. **Bảng lớn/ghi-nóng:** GUID `UNIQUE NONCLUSTERED` (`UQ_<table>_PKID`), clustered theo khóa perf. **Bảng nhỏ:** GUID làm clustered PK luôn. `T_MASTER_PORTFOLIO`: `C_SI_CODE` là khóa public |
+| Clustered PK theo tải | append-fact lớn → **BIGINT IDENTITY** `C_<table>_ID` (`PK_<table>_ID`); point-access/join → **natural** (`PK_<table>_NK`); nhỏ → GUID (`PK_<table>`). Natural giữ `UQ_<table>_NK` cho idempotency |
 | Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_SI_CODE` → master; `FK_<table>` → surrogate) |
 | Stored procedure | `SP_` |
 | Function | `UDF_` |

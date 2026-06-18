@@ -243,35 +243,36 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 - Leftmost-prefix: query phải có **cột dẫn đầu** mới seek; pattern khác → thêm nonclustered index.
 
 ### Per-table
-| Bảng | PK | Loại |
-|---|---|---|
-| T_MASTER_PORTFOLIO | C_SI_CODE | VARCHAR (PK + khóa public; bị ref rộng — các bảng FK theo C_SI_CODE) |
-| T_INDEXING_PORTFOLIO | (C_CUST_CODE, C_SI_CODE) | composite natural (+ PK_INDEXING_PORTFOLIO GUID UNIQUE) |
-| T_MASTER_PORTFOLIO_TICKER | (C_SI_CODE, C_EFFECTIVE_DATE, C_TICKER) | composite natural (+ PK_MASTER_PORTFOLIO_TICKER GUID UNIQUE) |
-| T_PRICE_DAILY | (C_BUSINESS_DATE, C_TICKER) | composite natural |
-| T_CORPORATE_ACTION | (C_TICKER, C_EX_DATE, C_CA_TYPE) | composite natural (optional: + C_CA_ID surrogate, composite→UNIQUE) |
-| T_BENCHMARK_DAILY | (C_BENCHMARK_CODE, C_BUSINESS_DATE) | composite natural (code tự mô tả, như ticker) |
-| T_REBALANCE_REQUEST | C_REQUEST_ID | BIGINT IDENTITY (+ PK_REBALANCE_REQUEST GUID UNIQUE) |
-| T_CUSTOMER_HOLDING_HIST | (C_CUST_CODE, C_SI_CODE, C_TICKER, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
-| T_FO_CASH_SYNC | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite natural (feed transient) |
-| T_CUSTOMER_CASH_HIST | (C_CUST_CODE, C_SI_CODE, C_VALID_FROM) | composite natural (interval/SCD-2; +filtered IX WHERE valid_to IS NULL) |
-| T_CASHFLOW_EVENT | C_EVENT_ID | BIGINT IDENTITY (fact/CCI) |
-| T_CUSTOMER_NAV_DAILY | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite natural (history, CCI) |
-| T_CUSTOMER_FEE_INCOME | C_EVENT_ID | BIGINT IDENTITY (sparse: cổ tức/phí per-KH) |
-| T_UNIT_LEDGER | (C_CUST_CODE, C_SI_CODE, C_BUSINESS_DATE) | composite natural |
-| T_CUSTOMER_NAV_CURRENT | (C_CUST_CODE, C_SI_CODE) | composite typed (hot) |
-| T_INDEXING_PORTFOLIO_TICKER | (C_CUST_CODE, C_SI_CODE, C_TICKER) | composite typed |
-| T_EOD_WORK | (C_BUSINESS_DATE, C_CUST_CODE, C_SI_CODE) | composite (transient) |
-| T_SI_NAV_DAILY | (C_BUSINESS_DATE, C_SI_CODE) | composite natural (composition + NAV + hiệu suất) |
-| T_SI_NAV_CURRENT | (C_SI_CODE) | typed (current cấp SI, ~100 dòng) |
-| T_SI_INDEX_DAILY | (C_BUSINESS_DATE, C_SI_CODE) | composite natural |
-| T_SI_HOLDING_DAILY | (C_BUSINESS_DATE, C_SI_CODE, C_TICKER) | composite natural |
-| T_EOD_RUN | (C_BUSINESS_DATE, C_JOB) | composite natural |
+> **Chuẩn PK (chốt 2026-06-18):** mọi bảng có cột GUID `PK_<table>` (NEWID, random, IDOR-safe) = **khóa public API/UI**. Cách **cluster** chọn theo tải để giữ tốc độ EOD:
+> - **Bảng lớn/ghi-nóng EOD** → **clustered = khóa perf** (BIGINT IDENTITY cho append-fact / natural cho point-access+join), GUID là **UNIQUE NONCLUSTERED** (`UQ_<table>_PKID`). Khóa natural giữ `UQ_<table>_NK` cho idempotency.
+> - **Bảng nhỏ/ghi-thưa** → **GUID làm clustered PK luôn** (`PK_<table>`), natural `UQ_<table>_NK`. (volume thấp ⇒ fragmentation không đáng kể, gọn 1 surrogate.)
+> - `T_MASTER_PORTFOLIO`: PK = `C_SI_CODE` (mã nghiệp vụ, đã là khóa public — không GUID). `T_EOD_WORK`: transient, natural PK, KHÔNG GUID.
 
-→ **SI key = `C_SI_CODE`** (mã SI, VARCHAR): PK của `T_MASTER_PORTFOLIO` + khóa public (IDOR-safe vì là mã nghiệp vụ, không int tuần tự); mọi bảng tham chiếu master theo `C_SI_CODE`. Đánh đổi: join key VARCHAR (cùng `C_CUST_CODE`) trên hot path → EOD chậm hơn BIGINT (chấp nhận, ưu tiên nhất quán/đọc được).
-→ **GUID surrogate `PK_<table>` (NEWID, UNIQUE NONCLUSTERED) — ở 3 bảng cần khóa public per-row:** `T_MASTER_PORTFOLIO_TICKER`, `T_INDEXING_PORTFOLIO`, `T_REBALANCE_REQUEST` — khóa duy nhất cho API/UI. **Cluster vẫn theo PK natural** (GUID nonclustered) → đo medium 1,25M: EOD **+~0%** (entity không ghi trong EOD). `T_MASTER_PORTFOLIO` không cần GUID (C_SI_CODE đã là khóa public).
+| Bảng | Clustered PK | GUID public | UNIQUE natural `_NK` |
+|---|---|---|---|
+| T_MASTER_PORTFOLIO | C_SI_CODE (natural) | — | — |
+| **T_CUSTOMER_NAV_DAILY** ~2,5 tỷ | C_NAV_DAILY_ID (BIGINT) | PK_… (nc) | (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE) |
+| **T_CUSTOMER_HOLDING_HIST** ~20M | C_HOLDING_HIST_ID (BIGINT) | PK_… (nc) | (C_CUST_CODE,C_SI_CODE,C_TICKER,C_VALID_FROM) +filtered IX |
+| **T_CUSTOMER_CASH_HIST** | C_CASH_HIST_ID (BIGINT) | PK_… (nc) | (C_CUST_CODE,C_SI_CODE,C_VALID_FROM) +filtered IX |
+| **T_CASHFLOW_EVENT** ~120M | C_EVENT_ID (BIGINT) | PK_… (nc) | — |
+| **T_UNIT_LEDGER** ~120M | C_UNIT_LEDGER_ID (BIGINT) | PK_… (nc) | (C_CUST_CODE,C_SI_CODE,C_BUSINESS_DATE) |
+| **T_INDEXING_PORTFOLIO_TICKER** ~20M | (C_CUST_CODE,C_SI_CODE,C_TICKER) natural | PK_… (nc) | — (PK là natural) |
+| **T_CUSTOMER_NAV_CURRENT** ~1M | (C_CUST_CODE,C_SI_CODE) natural | PK_… (nc) | — |
+| **T_PRICE_DAILY** | (C_BUSINESS_DATE,C_TICKER) natural | PK_… (nc) | — |
+| T_EOD_WORK (transient) | (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE) natural | — | — |
+| T_INDEXING_PORTFOLIO | PK_INDEXING_PORTFOLIO (GUID) | (clustered) | (C_CUST_CODE,C_SI_CODE) |
+| T_MASTER_PORTFOLIO_TICKER | PK_… (GUID) | (clustered) | (C_SI_CODE,C_EFFECTIVE_DATE,C_TICKER) |
+| T_REBALANCE_REQUEST | PK_… (GUID) | (clustered) | (C_REQUEST_ID) |
+| T_CORPORATE_ACTION | PK_… (GUID) | (clustered) | (C_TICKER,C_EX_DATE,C_CA_TYPE) |
+| T_BENCHMARK_DAILY | PK_… (GUID) | (clustered) | (C_BENCHMARK_CODE,C_BUSINESS_DATE) |
+| T_FO_CASH_SYNC | PK_… (GUID) | (clustered) | (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE) |
+| T_CUSTOMER_FEE_INCOME | PK_… (GUID) | (clustered) | (C_EVENT_ID) |
+| T_SI_NAV_DAILY / _INDEX_DAILY / _HOLDING_DAILY / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
+| T_EOD_RUN | PK_EOD_RUN (GUID) | (clustered) | (C_BUSINESS_DATE,C_JOB) |
 
-→ Bảng **volume-lớn** (history/hist-interval/work/daily) **KHÔNG GUID** — không address per-row qua API, và đo thật thêm GUID mọi bảng = **+18% (NEWSEQUENTIALID) ~ +34% (NEWID)** EOD (chi phí dồn vào chỉ mục GUID khi insert khối lớn). Cluster trên natural/date đã tối ưu → **KHÔNG cần cột BIGINT-cluster riêng** (BIGINT-cluster chỉ liên quan nếu cluster TRÊN GUID — không làm).
+→ **Đo thật (medium 1,25M, SQL Express):** GUID-clustered MỌI bảng = EOD **~40s**; mixed (perf-clustered cho 8 bảng nóng + GUID nonclustered) = **~32s**; baseline không GUID = **~20s**. J14B (interval insert holding+cash) là driver: chi phí ~2× đến từ **chỉ mục GUID nonclustered (NEWID random) phải maintain khi insert khối lớn** — không tránh được nếu muốn GUID per-row trên bảng history. **Tất cả vẫn << SLA EOD 10 phút** ⇒ chấp nhận để mọi row addressable qua API/UI.
+→ Muốn kéo J14B về ~10s: bỏ GUID ở `holding_hist`/`cash_hist` (API FR-06 địa chỉ theo cust+si+asOf, KHÔNG cần GUID per-row của history) — để ngỏ, chưa làm.
+→ **Prod (nav_daily tỷ-dòng):** chuyển sang **CCI clustered + GUID nonclustered** + partition; FILLFACTOR + REORG/REBUILD định kỳ cho bảng GUID-clustered.
 
 ### Benchmark GUID vs BIGINT (đo thật, 500.000 dòng, SQL Server Express)
 | PK clustered | Insert (ms) | Size | Fragmentation | Page fill | NC index |
@@ -294,7 +295,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 - ❌ **Cursor/WHILE loop** xử lý từng tiểu khoản trong EOD.
 - ❌ Tính NAV bằng **replay toàn lịch sử mỗi ngày** (thay vì roll-forward state).
 - ❌ **Scalar UDF** trong câu set-based (1 lần/dòng → giết batch; nếu phải, dùng inline TVF hoặc 2019+ scalar inlining).
-- ❌ **GUID ngẫu nhiên làm clustered key** trên bảng lớn (fragmentation, page split).
+- ❌ **GUID ngẫu nhiên làm clustered key** trên **bảng lớn/ghi-nóng** (fragmentation, page split) → policy: bảng lớn cluster theo BIGINT IDENTITY/natural, GUID để nonclustered. GUID-clustered chỉ cho bảng nhỏ/ghi-thưa.
 - ❌ Nonclustered rowstore index nặng trên bảng tỷ-dòng (phình + chậm ghi) — ưu tiên columnstore + partition elimination.
 - ❌ Lưu daily HOLDINGS snapshot per-KH (~50 tỷ) — thay vào đó materialize daily PERF (~2,5 tỷ, nhỏ hơn nhiều).
 - ❌ `MERGE` trên bảng cực lớn không partition-aligned (dễ chậm/deadlock) — tách INSERT/UPDATE hoặc switch.

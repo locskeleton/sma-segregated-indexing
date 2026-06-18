@@ -3,3 +3,5 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-18T05:17:27Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,19856,317,7791,65,14,88,991,10590
 2026-06-18T05:33:11Z,285e0e2,"docs: sua claim thoi gian J14b + log perf-history (bench medium)",small,1000,60000,1682,59,664,61,28,26,52,792
 2026-06-18T06:21:16Z,54b600d,"feat(db): read API procs SP_GET_* (FR-01..06) + UDF_RANGE_CUTOFF",medium,10000,1250000,20359,405,8109,84,31,92,1000,10638
+2026-06-18T06:50:45Z,d89ebae,"docs: dong nhat SI key = si_code (bo het si_id) trong toan bo docs",medium,10000,1250000,39785,916,7997,126,46,132,1112,29456
+2026-06-18T07:06:13Z,d89ebae,"docs: dong nhat SI key = si_code (bo het si_id) trong toan bo docs",medium,10000,1250000,32022,613,7107,127,41,126,1089,22919
