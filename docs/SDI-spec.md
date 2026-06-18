@@ -255,10 +255,10 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 
 | # | Job | Phụ thuộc | Đọc | Ghi | SB | ‖ | Halt nếu lỗi |
 |---|---|---|---|---|---|---|---|
-| **J0** | `GATE` chờ nguồn sẵn sàng | — | cờ sẵn sàng FO/Market/model_weight @d | `sdi_eod_run` | – | – | ✅ (timeout→alert) |
-| **J1** | `STAGE` bulk load input | J0 | FO sync (holdings+cash), giá, CA, model_weight, VN-Index, cashflow | staging tables (minimal logging) | ✅ | ‖ | ✅ |
-| **J2** | `VALIDATE` chất lượng input | J1 | staging | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
-| **J1b** | `SYNC_FO` (cash) | J2 | sdi_fo_cash_sync @d (holdings: FO nạp thẳng `indexing_portfolio_ticker` ở STAGE) | state.cash + tạo state KH mới (**KHÔNG mirror holdings**) | ✅ | ‖ | ✅ |
+| **INGEST** | `SP_INGEST_CUSTOMER` (Kafka per-KH, realtime, KHÔNG trong batch) | — | event 1 KH (JSON): cash + holdings + cổ tức/phí | cash→state + holdings→current + **interval CASH_HIST/HOLDING_HIST** + fee (dedup) + watermark `C_LAST_SYNC_DATE` | ✅ | ‖ per-cust | ✅ (forward-only: quá khứ→THROW) |
+| **J0** | `GATE` chờ đủ FO ingest | INGEST | received (watermark=@d) vs expected (tiểu khoản ACTIVE) | chặn EOD nếu thiếu | – | – | ✅ (thiếu→alert) |
+| ~~J1/J1b~~ | ~~`STAGE`/`SYNC_FO`~~ **(CHUYỂN sang INGEST realtime)** | — | FO sync giờ qua Kafka per-KH, không batch STAGE/SYNC | — | – | – | – |
+| **J2** | `VALIDATE` (giá/market) | J0 | giá/CA/model_weight (market feed) | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
 | ~~J6~~ | ~~`ACCRUE_FEE`~~ **(ĐÃ BỎ)** | — | phí QL + thuế GD do FO trừ vào cash khi book; SDI không accrue lại (tránh double-count) | — | – | – | – |
 | **J7** | `MTM` định giá lại toàn bộ | J1b | indexing_portfolio_ticker + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J7 | stock_value, state.cash (FO) | NAV = stock_value + cash | ✅ | ‖ | – |
@@ -268,21 +268,24 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | sdi_si_index_daily, sdi_benchmark_daily | ✅ | ‖ | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs SI NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | sdi_si_holding_balance (top20+mã khác) | ✅ | ‖ | – |
-| **J14b** | `HISTORY` (interval, **DROPPABLE**) | J1b | indexing_portfolio_ticker (current) + state.cash | DIFF → **sdi_customer_holding_hist** + **sdi_customer_cash_hist** (đóng/mở khoảng, no-dup) | ✅ | ‖ | – |
+| ~~J14b~~ | ~~`HISTORY`~~ **(CHUYỂN sang INGEST realtime)** | — | interval CASH_HIST/HOLDING_HIST maintain TẠI ingest per-event; `SP_EOD_HISTORY` chỉ còn utility bulk-backfill | — | – | – | – |
 | **J15** | `PUBLISH` | J13, J14 | staging/đích | commit customer_nav_current; SWITCH/MERGE SI-level; push current snapshot + SI series → Asset | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark eod_run done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
 ### 9.3 Thứ tự, song song & orchestration
 
 ```
-J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
-                              └─ J10 ─┐
-                                      └─ J11 → J13 ─┐
-              J2 ──► J12 (độc lập, song song) ──────┤
-                                    J8 → J14 ───────┴─ J15 → J16
+INGEST (Kafka per-KH realtime: cash/holdings/phí + interval history) ──┐
+                                                                       ▼
+J0 GATE → J7 ─ J8 → J9
+                    └─ J10 ─┐
+                            └─ J11 → J13 ─┐
+   J2 ──► J12 (độc lập, song song) ───────┤
+                          J8 → J14 ───────┴─ J15 → J16
 ```
 (J6 ACCRUE_FEE đã bỏ — FO cash đã NET phí; NAV = stock + cash.)
-- **J1b SYNC_FO**: chỉ cash → state (holdings FO nạp THẲNG current ở STAGE, KHÔNG mirror) → KHÔNG còn APPLY_CA/EXEC/CASHFLOW (FO đã phản ánh trade/cổ tức/split). CA chỉ dùng cho **J12 index**; cashflow event dùng cho **CF_t** (J9/J10).
+- **INGEST (thay J1/J1b/J14b)**: FO bắn Kafka per-KH (1 event=1 KH) cuối ngày trước EOD → `SP_INGEST_CUSTOMER` xử lý NGAY: cash→state + holdings→current + **interval history** + cổ tức/phí (dedup), set watermark. Idempotent (so-trạng-thái / fee dedup). **Forward-only** (event quá khứ→THROW; history sẽ làm sau: FO resync full D→nay + replay). Cashflow nạp/rút SDI-side (ghi thẳng, không Kafka). CA chỉ dùng cho **J12 index**; cashflow dùng cho **CF_t** (J9/J10).
+- **J0 GATE**: đếm received (state có watermark=@d) vs expected (tiểu khoản ACTIVE) → đủ mới chạy, thiếu thì alert.
 - **J12 (SI Index)** chỉ cần giá + model_weight → song song nhánh customer.
 - **J7 sau J1b** (state cash + holdings đã sync); J8 NAV = stock + cash (không trừ phí).
 - **J7/J8/J9/J10/J14** chia **dải SI hoặc hash(cust_code)** chạy nhiều luồng.

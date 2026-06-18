@@ -5,7 +5,9 @@ GO
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
   Mô hình roll-forward: T_CUSTOMER_NAV_CURRENT (current) + áp delta ngày @d → tính lại.
-  Thứ tự (master SP_EOD_RUN): J01_SYNC_FO → J07 → J11 → J12 → J13 → J14
+  INGEST (Kafka per-KH realtime): SP_INGEST_CUSTOMER → cash→state + holdings→current + interval
+    history (holding/cash) + cổ tức/phí. (Thay J01_SYNC_FO + J14B_HISTORY cũ — giờ làm tại ingest.)
+  Thứ tự (master SP_EOD_RUN): J0_GATE → J07 → J11 → J12 → J13 → J14
   (J06 fee đã bỏ — FO cash đã NET phí; NAV = stock + FO cash.)
 ==============================================================================*/
 SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
@@ -43,23 +45,97 @@ END
 GO
 
 /*===========================================================================
-  J01b — SYNC FO: cash → state. Holdings do FO nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current)
-         ở bước STAGE → SYNC_FO KHÔNG mirror → EOD core KHÔNG phụ thuộc T_CUSTOMER_HOLDING_HIST.
-         Cashflow lấy từ T_CASHFLOW_EVENT — chỉ dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash.
+  INGEST — Kafka per-KH (FORWARD). App đọc event 1 KH → EXEC proc này (JSON).
+    Xử lý NGAY khi nhận: cash (state + interval CASH_HIST), holdings (current + interval
+    HOLDING_HIST), cổ tức/phí (append dedup). Thay J01_SYNC_FO + J14B_HISTORY cũ.
+  Idempotent: cash/holdings so-trạng-thái (redelivery=no-op); fee dedup theo C_SOURCE_EVENT_ID.
+  FORWARD-ONLY: event quá khứ (business_date < watermark) → THROW (history CHƯA hỗ trợ — sẽ làm sau).
+  Cashflow nạp/rút KHÔNG qua đây (SDI là nguồn → ghi thẳng T_CASHFLOW_EVENT).
+  JSON (seam FO — chốt spec chỉ sửa lớp parse này):
+    {"cust_code","business_date","sub_accounts":[
+        {"si_code","cash","holdings":[{"ticker","quantity","avg_cost"}],
+         "fees":[{"event_id","type","ticker","amount"}]}]}
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_SYNC_FO @d DATE
+CREATE OR ALTER PROCEDURE SP_INGEST_CUSTOMER @json NVARCHAR(MAX)
 AS
 BEGIN
-    SET NOCOUNT ON;
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @cust VARCHAR(10) = JSON_VALUE(@json,'$.cust_code');
+    DECLARE @d    DATE        = TRY_CONVERT(DATE, JSON_VALUE(@json,'$.business_date'));
+    IF @cust IS NULL OR @d IS NULL THROW 50020, 'INGEST: thiếu cust_code/business_date.', 1;
 
-    -- Holdings: FO đã nạp THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current) ở bước STAGE → KHÔNG mirror.
-    -- cash = overwrite vào state; tạo state cho tiểu khoản mới
-    MERGE T_CUSTOMER_NAV_CURRENT AS s
-    USING (SELECT C_CUST_CODE,C_SI_CODE,C_CASH FROM T_FO_CASH_SYNC WHERE C_BUSINESS_DATE=@d) f
-    ON s.C_CUST_CODE=f.C_CUST_CODE AND s.C_SI_CODE=f.C_SI_CODE
-    WHEN MATCHED THEN UPDATE SET C_CASH = f.C_CASH
-    WHEN NOT MATCHED THEN INSERT (C_CUST_CODE,C_SI_CODE,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS)
-        VALUES (f.C_CUST_CODE,f.C_SI_CODE,0,f.C_CASH,0,0,NULL,'ACTIVE');
+    BEGIN TRY
+        BEGIN TRAN;
+
+        DECLARE @sub TABLE (C_SI_CODE VARCHAR(20) PRIMARY KEY, C_CASH DECIMAL(20,0));
+        INSERT INTO @sub (C_SI_CODE, C_CASH)
+        SELECT C_SI_CODE, C_CASH FROM OPENJSON(@json,'$.sub_accounts')
+        WITH (C_SI_CODE VARCHAR(20) '$.si_code', C_CASH DECIMAL(20,0) '$.cash');
+
+        -- FORWARD guard: tiểu khoản đã sync ngày MỚI HƠN @d ⇒ event quá khứ
+        IF EXISTS (SELECT 1 FROM @sub n JOIN T_CUSTOMER_NAV_CURRENT s
+                   ON s.C_CUST_CODE=@cust AND s.C_SI_CODE=n.C_SI_CODE WHERE s.C_LAST_SYNC_DATE > @d)
+            THROW 50021, 'INGEST: event quá khứ (< watermark) — history CHƯA hỗ trợ (forward-only).', 1;
+
+        /* HOLDINGS: overwrite current (theo sub-account event) + diff interval */
+        DECLARE @hold TABLE (C_SI_CODE VARCHAR(20), C_TICKER VARCHAR(20), C_QUANTITY DECIMAL(20,0), C_AVG_COST DECIMAL(18,4));
+        INSERT INTO @hold
+        SELECT sa.C_SI_CODE, h.C_TICKER, h.C_QUANTITY, h.C_AVG_COST
+        FROM OPENJSON(@json,'$.sub_accounts') WITH (C_SI_CODE VARCHAR(20) '$.si_code', holdings NVARCHAR(MAX) '$.holdings' AS JSON) sa
+        OUTER APPLY OPENJSON(sa.holdings) WITH (C_TICKER VARCHAR(20) '$.ticker', C_QUANTITY DECIMAL(20,0) '$.quantity', C_AVG_COST DECIMAL(18,4) '$.avg_cost') h
+        WHERE h.C_TICKER IS NOT NULL;
+
+        DELETE t FROM T_INDEXING_PORTFOLIO_TICKER t
+        WHERE t.C_CUST_CODE=@cust AND t.C_SI_CODE IN (SELECT C_SI_CODE FROM @sub);
+        INSERT INTO T_INDEXING_PORTFOLIO_TICKER (C_CUST_CODE,C_SI_CODE,C_TICKER,C_QUANTITY,C_AVG_COST)
+        SELECT @cust, C_SI_CODE, C_TICKER, C_QUANTITY, C_AVG_COST FROM @hold;
+
+        UPDATE h SET C_VALID_TO=@d
+        FROM T_CUSTOMER_HOLDING_HIST h
+        LEFT JOIN T_INDEXING_PORTFOLIO_TICKER c
+          ON c.C_CUST_CODE=h.C_CUST_CODE AND c.C_SI_CODE=h.C_SI_CODE AND c.C_TICKER=h.C_TICKER
+        WHERE h.C_CUST_CODE=@cust AND h.C_SI_CODE IN (SELECT C_SI_CODE FROM @sub) AND h.C_VALID_TO IS NULL
+          AND ( c.C_CUST_CODE IS NULL OR c.C_QUANTITY<>h.C_QUANTITY OR ISNULL(c.C_AVG_COST,-1)<>ISNULL(h.C_AVG_COST,-1) );
+        INSERT INTO T_CUSTOMER_HOLDING_HIST (C_CUST_CODE,C_SI_CODE,C_TICKER,C_VALID_FROM,C_VALID_TO,C_QUANTITY,C_AVG_COST)
+        SELECT c.C_CUST_CODE,c.C_SI_CODE,c.C_TICKER,@d,NULL,c.C_QUANTITY,c.C_AVG_COST
+        FROM T_INDEXING_PORTFOLIO_TICKER c
+        WHERE c.C_CUST_CODE=@cust AND c.C_SI_CODE IN (SELECT C_SI_CODE FROM @sub)
+          AND NOT EXISTS (SELECT 1 FROM T_CUSTOMER_HOLDING_HIST h
+              WHERE h.C_VALID_TO IS NULL AND h.C_CUST_CODE=c.C_CUST_CODE AND h.C_SI_CODE=c.C_SI_CODE AND h.C_TICKER=c.C_TICKER
+                AND h.C_QUANTITY=c.C_QUANTITY AND ISNULL(h.C_AVG_COST,-1)=ISNULL(c.C_AVG_COST,-1));
+
+        /* CASH: diff interval + cập nhật state + watermark (tạo state KH mới) */
+        UPDATE h SET C_VALID_TO=@d
+        FROM T_CUSTOMER_CASH_HIST h JOIN @sub n ON n.C_SI_CODE=h.C_SI_CODE
+        WHERE h.C_CUST_CODE=@cust AND h.C_VALID_TO IS NULL AND h.C_CASH<>n.C_CASH;
+        INSERT INTO T_CUSTOMER_CASH_HIST (C_CUST_CODE,C_SI_CODE,C_VALID_FROM,C_VALID_TO,C_CASH)
+        SELECT @cust, n.C_SI_CODE, @d, NULL, n.C_CASH FROM @sub n
+        WHERE NOT EXISTS (SELECT 1 FROM T_CUSTOMER_CASH_HIST h
+            WHERE h.C_VALID_TO IS NULL AND h.C_CUST_CODE=@cust AND h.C_SI_CODE=n.C_SI_CODE AND h.C_CASH=n.C_CASH);
+
+        MERGE T_CUSTOMER_NAV_CURRENT s
+        USING @sub n ON s.C_CUST_CODE=@cust AND s.C_SI_CODE=n.C_SI_CODE
+        WHEN MATCHED THEN UPDATE SET s.C_CASH=n.C_CASH, s.C_LAST_SYNC_DATE=@d
+        WHEN NOT MATCHED THEN INSERT (C_CUST_CODE,C_SI_CODE,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS,C_LAST_SYNC_DATE)
+            VALUES (@cust,n.C_SI_CODE,0,n.C_CASH,0,0,NULL,'ACTIVE',@d);
+
+        /* CỔ TỨC/PHÍ: append, dedup theo C_SOURCE_EVENT_ID (idempotent redelivery) */
+        INSERT INTO T_CUSTOMER_FEE_INCOME (C_BUSINESS_DATE,C_CUST_CODE,C_SI_CODE,C_TYPE,C_TICKER,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
+        SELECT @d, @cust, f.C_SI_CODE, f.C_TYPE, f.C_TICKER, f.C_AMOUNT, 'FO', f.event_id
+        FROM (
+            SELECT sa.C_SI_CODE, x.event_id, x.C_TYPE, x.C_TICKER, x.C_AMOUNT
+            FROM OPENJSON(@json,'$.sub_accounts') WITH (C_SI_CODE VARCHAR(20) '$.si_code', fees NVARCHAR(MAX) '$.fees' AS JSON) sa
+            OUTER APPLY OPENJSON(sa.fees) WITH (event_id VARCHAR(64) '$.event_id', C_TYPE VARCHAR(20) '$.type', C_TICKER VARCHAR(20) '$.ticker', C_AMOUNT DECIMAL(20,0) '$.amount') x
+            WHERE x.C_TYPE IS NOT NULL
+        ) f
+        WHERE f.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM T_CUSTOMER_FEE_INCOME e WHERE e.C_SOURCE_EVENT_ID=f.event_id);
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        THROW;
+    END CATCH
 END
 GO
 
@@ -71,9 +147,10 @@ GO
 GO
 
 /*===========================================================================
-  J14b — HISTORY (INTERVAL): maintain T_CUSTOMER_HOLDING_HIST + T_CUSTOMER_CASH_HIST.
-        DIFF current vs open-row → ĐÓNG (valid_to=@d) dòng đổi/biến mất, MỞ (valid_from=@d) dòng mới/đổi.
-        FULL history, KHÔNG trùng lặp (ngày không biến động → 0 ghi). Idempotent (re-run = no-op).
+  SP_EOD_HISTORY — UTILITY (KHÔNG còn trong EOD pipeline). History forward giờ do
+        SP_INGEST_CUSTOMER maintain per-event. Proc này = BULK BACKFILL/sửa lỗi: DIFF
+        TOÀN BỘ current vs open-row 1 phát (vd init lần đầu, hoặc dựng lại history).
+        Idempotent (ngày không biến động → 0 ghi).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_HISTORY @d DATE
 AS
@@ -334,6 +411,27 @@ END
 GO
 
 /*===========================================================================
+  J0 — GATE: chờ đủ FO ingest trước khi chạy EOD. So received (watermark C_LAST_SYNC_DATE=@d)
+       vs expected (tiểu khoản ACTIVE). Lệch ⇒ THROW (thiếu/dư data) → chặn EOD + alert.
+       (đếm theo state nên DISTINCT sẵn — Kafka redelivery không làm phồng số.)
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_GATE @d DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @expected INT = (SELECT COUNT(*) FROM T_INDEXING_PORTFOLIO WHERE C_STATUS='ACTIVE');
+    DECLARE @received INT = (SELECT COUNT(*) FROM T_CUSTOMER_NAV_CURRENT
+                             WHERE C_STATUS='ACTIVE' AND C_LAST_SYNC_DATE=@d);
+    IF @received <> @expected
+    BEGIN
+        DECLARE @msg NVARCHAR(300) = CONCAT('GATE @',CONVERT(VARCHAR,@d,23),': received ',@received,
+            '/',@expected,' tiểu khoản — chưa nhận đủ FO ingest, CHẶN EOD.');
+        THROW 50010, @msg, 1;
+    END
+END
+GO
+
+/*===========================================================================
   DISPATCHER: chạy 1 job idempotent + transaction + log (resume-safe)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_STEP @d DATE, @job VARCHAR(40), @proc SYSNAME
@@ -368,15 +466,15 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     DECLARE @d DATE = @C_BUSINESS_DATE;
 
-    -- (STAGE: FO nạp holdings THẲNG vào T_INDEXING_PORTFOLIO_TICKER trước khi gọi proc này)
-    EXEC SP_EOD_STEP @d, 'J01_SYNC_FO',  'SP_EOD_SYNC_FO';         -- cash → state (holdings đã ở current)
+    -- (INGEST: FO event per-KH đã vào qua SP_INGEST_CUSTOMER → cash/holdings/history sẵn trong current + interval)
+    EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
+    -- (ĐÃ BỎ J01_SYNC_FO + J14B_HISTORY) — chuyển sang SP_INGEST_CUSTOMER (per-event realtime)
     -- (ĐÃ BỎ J06_FEE) — phí QL + thuế GD do FO trừ vào cash khi book; SDI KHÔNG accrue lại (tránh double-count)
     EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
     EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
     EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
-    EXEC SP_EOD_STEP @d, 'J14B_HIST',    'SP_EOD_HISTORY';         -- interval history holding+cash (full, no-dup); core không phụ thuộc
     -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
 END
 GO

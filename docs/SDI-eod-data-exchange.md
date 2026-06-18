@@ -58,11 +58,13 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 ### B. FO → SDI (feed EOD)
 
+> **Cơ chế: Kafka per-KH (1 event = 1 KH, gồm các sub-account).** App đọc event → `SP_INGEST_CUSTOMER` (JSON) xử lý NGAY khi nhận (forward): cash→state + holdings→current + interval history + cổ tức/phí. (Thay batch STAGE/SYNC_FO/J14b cũ.) Cổ tức/phí dedup theo `event_id`. Forward-only (history: FO resync full D→nay + replay — chưa làm).
+
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
 | 2 | **Model weight** | `sdi_master_portfolio_ticker` | si_code, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
-| 3 | **Holdings snapshot** | `sdi_indexing_portfolio_ticker` (**current**) | cust_code, si_code, ticker, quantity, avg_cost | **DENSE — toàn bộ TK mỗi EOD**, FO **nạp THẲNG current** (overwrite), volume chính. **J14b droppable** DIFF current → `sdi_customer_holding_hist` (interval, full history, no-dup) — EOD core không phụ thuộc. |
-| 4 | **Cash snapshot** | `sdi_fo_cash_sync` (feed @d) | business_date, cust_code, si_code, cash | **DENSE** — available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT (transient feed); J14b DIFF state.cash → `sdi_customer_cash_hist` (interval, full history, no-dup). |
+| 3 | **Holdings** (trong event KH) | → `sdi_indexing_portfolio_ticker` (current) + diff `sdi_customer_holding_hist` | cust_code, si_code, ticker, quantity, avg_cost | Mỗi event mang holdings của KH; ingest overwrite current + đóng/mở interval (no-dup). |
+| 4 | **Cash** (trong event KH) | → `state.C_CASH` + diff `sdi_customer_cash_hist` | cust_code, si_code, cash | Available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT; ingest update state + interval. |
 | 5 | **Cổ tức + phí** | `sdi_customer_fee_income` | business_date, cust_code, si_code, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
 | 6 | **Cashflow** | `sdi_cashflow_event` | cust_code, si_code, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 

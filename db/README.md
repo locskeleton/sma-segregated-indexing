@@ -54,9 +54,17 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J01 sync_fo (cash từ T_FO_CASH_SYNC → state; holdings FO nạp THẲNG current) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot → J14b history (DIFF current → interval hist, DROPPABLE)`.
-(FO nạp holdings THẲNG vào T_INDEXING_PORTFOLIO_TICKER (current) + cash vào T_FO_CASH_SYNC (feed @d) cuối ngày — EOD core chỉ đọc current. T_CUSTOMER_HOLDING_HIST & T_CUSTOMER_CASH_HIST = **full history theo INTERVAL** (valid_from/valid_to, SCD-2, no-dup) do J14b DIFF current vs dòng open → đóng/mở khoảng. KHÔNG trong luồng core — bỏ J14b thì core không đổi (history dừng cập nhật). Cashflow event chỉ dùng cho CF_t.)
+`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
 (J06 ACCRUE_FEE đã bỏ — FO cash đã NET phí QL + thuế GD; **NAV = stock_value + FO cash**, SDI không accrue lại để tránh double-count.)
+
+## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
+FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):
+- **Cash** → cập nhật `T_CUSTOMER_NAV_CURRENT.C_CASH` + diff interval `T_CUSTOMER_CASH_HIST`.
+- **Holdings** → overwrite `T_INDEXING_PORTFOLIO_TICKER` (current) + diff interval `T_CUSTOMER_HOLDING_HIST`.
+- **Cổ tức/phí** → append `T_CUSTOMER_FEE_INCOME` (dedup theo `C_SOURCE_EVENT_ID`).
+- Set watermark `C_LAST_SYNC_DATE=@d` (J0 GATE đếm received vs expected = tiểu khoản ACTIVE).
+
+→ **Interval history maintain TẠI INGEST** (per-event), KHÔNG còn job J14b trong EOD → EOD batch nhẹ hẳn (đo medium: ~11s vs ~32–48s trước). **Idempotent**: cash/holdings so-trạng-thái (redelivery=no-op); fee dedup. **FORWARD-ONLY**: event quá khứ (< watermark) bị THROW (history sẽ làm sau: FO resync full D→nay + replay). Cashflow nạp/rút **KHÔNG** qua Kafka (SDI là nguồn → ghi thẳng `T_CASHFLOW_EVENT`). `SP_EOD_HISTORY` giữ lại làm **utility bulk-backfill** (không trong pipeline).
 
 ## Đã verify (SQL Server Express)
 Smoke 1 KH / 3 phiên — khớp kỳ vọng (phương án A: NAV = stock + FO cash, không accrue phí):
