@@ -1,1 +1,3 @@
 timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_ms,J11_ms,J12_ms,J13_ms,J14_ms
+2026-06-18T05:16:40Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,20439,364,8369,90,31,115,955
+2026-06-18T05:17:27Z,216fea7,"feat(db): holding/cash history theo INTERVAL (SCD-2) — full history, no-dup",medium,10000,1250000,19856,317,7791,65,14,88,991

@@ -72,7 +72,7 @@ Cơ chế: ngày đầu mở H₀ dòng open; mỗi lần một vị thế đổ
 | medium (H₀=1,25M) | 1,25M | ~6,3M | ~16,3M | ~51M |
 | large (H₀=6,25M) | 6,25M | ~31M | ~81M | ~256M |
 
-**So với snapshot dated cũ (đã bỏ):** snapshot = H₀ × 252/năm. medium 10 năm snapshot ≈ **3,15 tỷ** dòng; interval churn-4 ≈ **51M** → **giảm ~98%**, mà vẫn **full history** (tái dựng mọi ngày qua `valid_from≤D<valid_to`). Ngày không biến động: J14b DIFF (EXCEPT) thấy 0 thay đổi ⇒ **0 dòng ghi** (rẻ hơn cả insert snapshot).
+**So với snapshot dated cũ (đã bỏ):** snapshot = H₀ × 252/năm. medium 10 năm snapshot ≈ **3,15 tỷ** dòng; interval churn-4 ≈ **51M** → **giảm ~98% STORAGE**, mà vẫn **full history** (tái dựng mọi ngày qua `valid_from≤D<valid_to`). Ngày không biến động: J14b DIFF (EXCEPT) thấy 0 thay đổi ⇒ **0 dòng ghi** (storage đứng yên). **Lưu ý THỜI GIAN:** DIFF vẫn quét **current ⋈ open-rows (2×H₀) mỗi ngày** dù 0 thay đổi → thời gian J14b **KHÔNG giảm** vào ngày không đổi (chỉ storage giảm). Đo medium (1,25M, SQL Express): J14b ~10–15s, là job nặng nhất EOD (xem §7).
 
 `T_CUSTOMER_CASH_HIST` cùng cơ chế nhưng grain per-tiểu-khoản (S₀, không ×mã): base S₀ + S₀ × churn_cash × năm. medium 10Y churn-12 ≈ 50K + 50K×12×10 = ~6M dòng (nhỏ).
 
@@ -108,7 +108,7 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 2. **Hai khối tăng trưởng dài hạn:** (a) `T_CUSTOMER_NAV_DAILY` (dense ngày×KH, ~2,5 tỷ/10y — lớn nhất); (b) `T_CUSTOMER_HOLDING_HIST` (interval churn-driven, ~1 tỷ/10y churn-4). Cash hist nhỏ.
 3. **Bắt buộc với cả hai:** CCI + partition theo năm (`business_date` cho nav_daily; `valid_from` cho hist); cân nhắc **điểm thưa** nav_daily (unit_price tuần/tháng cho chart range dài).
 4. **Churn là tham số nhạy nhất của hist:** index SMA tái cân bằng quý ⇒ churn ~4/y là thực tế; nếu sản phẩm cho phép giao dịch chủ động nhiều thì churn tăng tuyến tính số dòng. Theo dõi churn thật để hiệu chỉnh.
-5. **EOD time:** driver vẫn là **MTM J07** (đọc current ~H₀, không đổi). J14b history = 1 bước DIFF (EXCEPT current vs open-rows) — ngày không đổi ⇒ gần 0 ghi; ngày rebalance ⇒ ghi ~số vị thế đổi. Droppable (bỏ = EOD core không đổi, history dừng cập nhật). Đo bằng `db/bench.ps1`.
+5. **EOD time (đo thật medium 1,25M, SQL Express, commit 216fea7):** J07 MTM ~4–8s; **J14b history ~10–15s — job NẶNG NHẤT EOD** (hơn cả MTM). Quan trọng: J14b DIFF quét **2×H₀ (current ⋈ open-rows) mỗi ngày** nên thời gian **KHÔNG giảm** vào ngày không biến động (storage thì đứng yên — 0 dòng ghi). Storage thắng lớn, thời gian thì không. **J14b droppable** (bỏ = EOD core không đổi, history dừng cập nhật). *Tối ưu tiềm năng (chưa làm):* checksum per (cust,si) / filter theo nhóm FO báo đổi để bỏ qua nhóm bất biến. Đo bằng `db/bench.ps1`.
 
 ---
 
