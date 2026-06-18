@@ -311,6 +311,7 @@ J0 → J1 → J2 → J1b ─ J7 ─ J8 → J9
 ## 11. Scale (100 SI, 200K KH × 5 SI, 10 năm)
 
 > Chi tiết kiến trúc DB + EOD ở quy mô lớn cho SQL Server: [SDI-db-architecture.md](./SDI-db-architecture.md) (roll-forward state, set-based, columnstore, partitioning).
+> Hợp đồng trao đổi dữ liệu EOD FO↔SDI↔Asset (payload từng bên + định lượng small/medium/large): [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md).
 
 | Dữ liệu | Ước lượng |
 |---|---|
