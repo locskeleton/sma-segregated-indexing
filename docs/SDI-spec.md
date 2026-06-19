@@ -224,7 +224,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 
 ### Control / orchestration
 - **`T_EOD_RUN`** (business_date, job PK; status[PENDING|RUNNING|DONE|FAILED], rows, started_at, ended_at, message) — theo dõi & resume batch EOD (§9.2).
-- **`T_SDI_CONFIG`** (singleton 1 dòng; `C_ENABLE_MGMT_FEE_ACCRUAL` BIT def 0, `C_FEE_DAY_COUNT` def 365, `C_FEE_AUM_BASIS` def 'GROSS') — cờ/tham số engine toggleable. Phí QL accrual mặc định **OFF**.
+- **`T_SDI_CONFIG`** (singleton 1 dòng; `C_ENABLE_MGMT_FEE_ACCRUAL` BIT def 0, `C_FEE_DAY_COUNT` def 365) — cờ bật/tắt phí QL accrual, mặc định **OFF**. Công thức chốt 1 cách (không cấu hình basis): AUM gross, thu trả sau (arrears).
 
 ### Customer-level: MATERIALIZE (do FO-sync)
 NAV/Unit Price/PnL theo ngày của KH được **lưu vào `T_SI_NAV_BALANCE`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.

@@ -375,13 +375,14 @@ CREATE TABLE T_EOD_RUN (
     CONSTRAINT UQ_EOD_RUN_NK UNIQUE (C_BUSINESS_DATE, C_JOB)
 );
 
--- CONFIG engine (singleton 1 dòng). Cờ + tham số toggleable cho BRD chưa chốt.
--- Phí QL accrual: MẶC ĐỊNH OFF (=0) → pipeline hiện tại KHÔNG đổi (payable=0, NAV=gross).
+-- CONFIG engine (singleton 1 dòng). Cờ bật/tắt phí QL accrual cho BRD chưa chốt.
+-- MẶC ĐỊNH OFF (=0) → pipeline hiện tại KHÔNG đổi (payable=0, NAV=gross).
+-- Công thức phí QL CHỐT 1 cách (không cấu hình): basis = AUM gross (stock+cash), thu TRẢ SAU (arrears),
+-- accrue ngày = AUM × rate / day_count.
 CREATE TABLE T_SDI_CONFIG (
     C_ID                        TINYINT     NOT NULL CONSTRAINT DF_SDI_CONFIG_ID  DEFAULT 1,
-    C_ENABLE_MGMT_FEE_ACCRUAL   BIT         NOT NULL CONSTRAINT DF_SDI_CFG_FEEON  DEFAULT 0,        -- 0=OFF (phương án A) | 1=accrue daily
+    C_ENABLE_MGMT_FEE_ACCRUAL   BIT         NOT NULL CONSTRAINT DF_SDI_CFG_FEEON  DEFAULT 0,        -- 0=OFF (phương án A) | 1=accrue daily (arrears)
     C_FEE_DAY_COUNT             SMALLINT    NOT NULL CONSTRAINT DF_SDI_CFG_DAYCNT DEFAULT 365,      -- mẫu số rate/ngày
-    C_FEE_AUM_BASIS             VARCHAR(10) NOT NULL CONSTRAINT DF_SDI_CFG_BASIS  DEFAULT 'GROSS',  -- GROSS = (stock+cash); (mở rộng: NET_PREV)
     CONSTRAINT PK_SDI_CONFIG PRIMARY KEY (C_ID),
     CONSTRAINT CK_SDI_CONFIG_SINGLETON CHECK (C_ID = 1)
 );
