@@ -5,13 +5,12 @@ GO
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
   Mô hình roll-forward: T_SI_NAV_CURRENT (current) + áp delta ngày @d → tính lại.
-  INGEST (Kafka per-KH realtime): SP_INGEST_CUSTOMER → cash→state + holdings→current + interval
-    history (holding/cash) + cổ tức/phí. (Thay J01_SYNC_FO + J14B_HISTORY cũ — giờ làm tại ingest.)
+  INGEST (Kafka per-KH realtime): SP_INGEST_CUSTOMER → tiền (3 khoản)→state + holdings→current
+    + interval history + cổ tức/phí lưu ký. SP_INGEST_FEE_CHARGE → net-off payable khi BO cắt phí.
   Thứ tự (master SP_EOD_RUN): J0_GATE → J07 → J11 → J12 → J13 → J14
-  Phí QL: mặc định OFF (T_SDI_CONFIG.C_ENABLE_MGMT_FEE_ACCRUAL=0) → NAV = stock + FO cash
-  (phương án A). Bật =1 → J07 accrue payable ngày (J06b) + settle khi FO cắt (J06a) +
-  sinh lệnh thu cuối tháng (SP_EOD_FEE_CHARGE); NAV = stock + cash − payable_fee (NET phí).
-  Thuế GD vẫn FO net vào cash (ngoài phạm vi accrual).
+  NAV = Tổng tài sản − payable; Tổng tài sản = stock + tiền mặt + tiền bán chờ về + cổ tức tiền.
+  Phí QL (BO-driven, cố định): J07 accrue payable theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate);
+  BO cắt phí 1 cục/tháng → SP_INGEST_FEE_CHARGE net-off payable. SDI KHÔNG sinh lịch. Thuế GD FO net.
 ==============================================================================*/
 SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
 GO
@@ -72,10 +71,12 @@ BEGIN
         BEGIN TRAN;
 
         -- sub-account của event; master suy từ config (T_SI_PORTFOLIO)
-        DECLARE @sub TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_MASTER_CODE VARCHAR(20), C_CASH DECIMAL(20,0));
-        INSERT INTO @sub (C_SI_ACCOUNT, C_MASTER_CODE, C_CASH)
-        SELECT j.C_SI_ACCOUNT, ip.C_MASTER_CODE, j.C_CASH
-        FROM OPENJSON(@json,'$.sub_accounts') WITH (C_SI_ACCOUNT VARCHAR(20) '$.si_account', C_CASH DECIMAL(20,0) '$.cash') j
+        DECLARE @sub TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_MASTER_CODE VARCHAR(20),
+                            C_CASH DECIMAL(20,0), C_PENDING_CASH DECIMAL(20,0), C_DIV_CASH DECIMAL(20,0));
+        INSERT INTO @sub (C_SI_ACCOUNT, C_MASTER_CODE, C_CASH, C_PENDING_CASH, C_DIV_CASH)
+        SELECT j.C_SI_ACCOUNT, ip.C_MASTER_CODE, j.C_CASH, ISNULL(j.C_PENDING_CASH,0), ISNULL(j.C_DIV_CASH,0)
+        FROM OPENJSON(@json,'$.sub_accounts') WITH (C_SI_ACCOUNT VARCHAR(20) '$.si_account', C_CASH DECIMAL(20,0) '$.cash',
+             C_PENDING_CASH DECIMAL(20,0) '$.pending_cash', C_DIV_CASH DECIMAL(20,0) '$.div_cash') j
         LEFT JOIN T_SI_PORTFOLIO ip ON ip.C_SI_ACCOUNT = j.C_SI_ACCOUNT AND ip.C_CUST_CODE = @cust;
 
         IF EXISTS (SELECT 1 FROM @sub WHERE C_MASTER_CODE IS NULL)
@@ -124,9 +125,9 @@ BEGIN
 
         MERGE T_SI_NAV_CURRENT s
         USING @sub n ON s.C_SI_ACCOUNT=n.C_SI_ACCOUNT
-        WHEN MATCHED THEN UPDATE SET s.C_CASH=n.C_CASH, s.C_LAST_SYNC_DATE=@d
-        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS,C_LAST_SYNC_DATE)
-            VALUES (n.C_SI_ACCOUNT,@cust,n.C_MASTER_CODE,0,n.C_CASH,0,0,NULL,'ACTIVE',@d);
+        WHEN MATCHED THEN UPDATE SET s.C_CASH=n.C_CASH, s.C_PENDING_CASH=n.C_PENDING_CASH, s.C_DIV_CASH=n.C_DIV_CASH, s.C_LAST_SYNC_DATE=@d
+        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_UNIT,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS,C_LAST_SYNC_DATE)
+            VALUES (n.C_SI_ACCOUNT,@cust,n.C_MASTER_CODE,0,n.C_CASH,n.C_PENDING_CASH,n.C_DIV_CASH,0,0,NULL,'ACTIVE',@d);
 
         /* CỔ TỨC/PHÍ: append, dedup theo C_SOURCE_EVENT_ID (idempotent redelivery) */
         INSERT INTO T_SI_FEE_INCOME (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_TYPE,C_TICKER,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
@@ -152,11 +153,10 @@ GO
 -- (ĐÃ BỎ J03 APPLY_CA & J04 APPLY_EXEC) — FO sync đã phản ánh cổ tức/split/trade vào cash+holdings.
 --   T_CORPORATE_ACTION chỉ còn dùng cho SI INDEX (điều chỉnh P_ref khi có quyền — J12).
 
--- PHÍ QL (J06) — TOGGLE qua T_SDI_CONFIG.C_ENABLE_MGMT_FEE_ACCRUAL:
---   OFF (mặc định, phương án A): FO cash đã NET phí → SDI KHÔNG accrue. NAV = stock + FO_cash.
---   ON: SDI accrue payable ngày trong SP_EOD_COMPUTE (J06b) + settle khi FO cắt (J06a) +
---       sinh lệnh thu cuối tháng (SP_EOD_FEE_CHARGE, arrears). NAV = stock + cash − payable.
---   Thuế GD: LUÔN do FO net vào cash khi khớp lệnh (ngoài phạm vi accrual phí QL).
+-- PHÍ QL (J06, BO-driven, CỐ ĐỊNH — không toggle):
+--   SDI accrue payable trong SP_EOD_COMPUTE theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate>0).
+--   BO cắt phí 1 cục/tháng → event Kafka → SP_INGEST_FEE_CHARGE net-off payable (log T_SI_FEE_CHARGE).
+--   SDI KHÔNG sinh lịch/ra lệnh. NAV = total_asset − payable. Thuế GD: LUÔN FO net vào cash.
 GO
 
 /*===========================================================================
@@ -209,16 +209,13 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- config phí QL accrual (mặc định OFF → pipeline như phương án A)
-    DECLARE @feeOn BIT, @dayCount SMALLINT;
-    SELECT @feeOn = C_ENABLE_MGMT_FEE_ACCRUAL, @dayCount = C_FEE_DAY_COUNT
-    FROM T_SDI_CONFIG WHERE C_ID = 1;
+    DECLARE @dayCount SMALLINT = 365;   -- mẫu số rate/ngày (cố định — spec phí QL không còn config)
 
     DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
 
-    -- seed từ state (đã áp delta cash/payable; last_nav/last_up = hôm qua). KEY = C_SI_ACCOUNT.
-    INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
-    SELECT @d,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT
+    -- seed từ state. Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH (FO sync). KEY = C_SI_ACCOUNT.
+    INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
+    SELECT @d,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT
     FROM T_SI_NAV_CURRENT WHERE C_STATUS='ACTIVE';
 
     -- CF của ngày (cho PnL & unit) — group theo sub-account
@@ -243,38 +240,26 @@ BEGIN
     ) m ON m.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@d;
 
-    -- J06a SETTLE phí QL (config-ON): lệnh thu đã EXECUTED hôm nay (FO xác nhận cắt cash) → giảm payable
-    --   = giải phóng phần accrual đã thu. Cash đã tụt qua ingest cùng ngày ⇒ NAV liên tục (−cash, −payable triệt tiêu).
-    IF @feeOn = 1
-    BEGIN
-        UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE - sch.AMT
-        FROM T_EOD_WORK w
-        JOIN (SELECT C_SI_ACCOUNT, SUM(C_AMOUNT) AS AMT
-              FROM T_SI_FEE_SCHEDULE
-              WHERE C_STATUS='EXECUTED' AND C_EXECUTED_DATE=@d
-              GROUP BY C_SI_ACCOUNT) sch ON sch.C_SI_ACCOUNT = w.C_SI_ACCOUNT
-        WHERE w.C_BUSINESS_DATE=@d;
+    -- J06 ACCRUE phí QL (luôn chạy, gated rate>0; net-off do SP_INGEST_FEE_CHARGE khi BO cắt):
+    --   payable += AUM_gross × rate × (NGÀY DƯƠNG LỊCH kể từ EOD trước) / 365.
+    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền. rate: override tiểu khoản > master.
+    --   IDEMPOTENT: chỉ accrue khi CHƯA compute @d (C_LAST_BUSINESS_DATE < @d) → re-run không cộng đôi.
+    UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
+        + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
+          * COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE)
+          * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @d) END)
+          / @dayCount
+    FROM T_EOD_WORK w
+    JOIN T_SI_NAV_CURRENT   s  ON s.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
+    JOIN T_SI_PORTFOLIO     ip ON ip.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
+    JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = w.C_MASTER_CODE
+    WHERE w.C_BUSINESS_DATE=@d
+      AND COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) > 0
+      AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @d);
 
-        UPDATE T_SI_FEE_SCHEDULE SET C_STATUS='SETTLED', C_SETTLED_DATE=@d
-        WHERE C_STATUS='EXECUTED' AND C_EXECUTED_DATE=@d;
-    END
-
-    -- J06b ACCRUE phí QL ngày (config-ON): payable += AUM_gross × rate / day_count  (AUM = stock+cash)
-    --   rate hiệu lực: override tiểu khoản (T_SI_PORTFOLIO) > master (T_MASTER_PORTFOLIO).
-    --   Tích luỹ cuối tháng = rate × AUM_TB × số_ngày/day_count (câu 4: phí theo AUM trung bình).
-    --   IDEMPOTENT: chỉ accrue khi CHƯA compute @d (C_LAST_BUSINESS_DATE < @d) → re-run/resume không cộng đôi.
-    IF @feeOn = 1
-        UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
-            + (w.C_STOCK_VALUE + w.C_CASH) * COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) / @dayCount
-        FROM T_EOD_WORK w
-        JOIN T_SI_NAV_CURRENT   s  ON s.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
-        JOIN T_SI_PORTFOLIO     ip ON ip.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
-        JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = w.C_MASTER_CODE
-        WHERE w.C_BUSINESS_DATE=@d
-          AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @d);
-
-    -- J08 NAV = stock + cash − payable_fee (NET phí). config-OFF: payable=0 ⇒ NAV = gross (phương án A, không đổi)
-    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH - C_PAYABLE_FEE WHERE C_BUSINESS_DATE=@d;
+    -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
+    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH - C_PAYABLE_FEE
+    WHERE C_BUSINESS_DATE=@d;
 
     -- J09 PnL = NAV − NAV_prev + ra − vào
     UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@d;
@@ -316,56 +301,56 @@ BEGIN
            CASE WHEN C_LAST_UNIT_PRICE>0 THEN C_UNIT_PRICE/C_LAST_UNIT_PRICE - 1 END
     FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
 
-    -- cuối kỳ (arrears): sinh lệnh thu phí QL → FO (config-ON, ngày cuối tháng)
-    IF @feeOn = 1 EXEC SP_EOD_FEE_CHARGE @d;
 END
 GO
 
 /*===========================================================================
-  PHÍ QUẢN LÝ — sinh lệnh thu (arrears, cuối tháng) + hook FO xác nhận EXECUTED
-  (chỉ gọi khi config C_ENABLE_MGMT_FEE_ACCRUAL=1; SP_EOD_COMPUTE gọi SP_EOD_FEE_CHARGE)
+  PHÍ QUẢN LÝ — INGEST event BO cắt phí (BO-driven). BO cắt 1 cục → báo Kafka →
+  SP_INGEST_FEE_CHARGE: log T_SI_FEE_CHARGE + net-off payable (payable −= amount).
+  SDI KHÔNG sinh lịch/ra lệnh. Idempotent qua source_event_id. Ngoài batch EOD.
+  JSON: {"charge_date":"YYYY-MM-DD", "charges":[
+           {"si_account","amount","period"(opt),"source_event_id"}, ...]}
 ===========================================================================*/
--- Cuối THÁNG (arrears) → tạo charge = payable tích luỹ kỳ cho mỗi tiểu khoản ACTIVE (payable>0).
--- Status PENDING (app đọc → bắn lệnh sang FO). Idempotent theo (si_account, period).
-CREATE OR ALTER PROCEDURE SP_EOD_FEE_CHARGE @d DATE
+CREATE OR ALTER PROCEDURE SP_INGEST_FEE_CHARGE @json NVARCHAR(MAX)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    IF @d <> EOMONTH(@d) RETURN;   -- chỉ ngày cuối tháng dương lịch (charge-day rule — BRD có thể đổi)
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    DECLARE @hdr_date DATE = TRY_CONVERT(DATE, JSON_VALUE(@json,'$.charge_date'));
+    BEGIN TRY
+        BEGIN TRAN;
 
-    DECLARE @period CHAR(6) = CONVERT(CHAR(6), @d, 112);                 -- 'YYYYMM'
-    DECLARE @periodStart DATE = DATEFROMPARTS(YEAR(@d), MONTH(@d), 1);
+        DECLARE @chg TABLE (C_SI_ACCOUNT VARCHAR(20), C_AMOUNT DECIMAL(20,0),
+                            C_CHARGE_DATE DATE, C_PERIOD CHAR(6), C_SOURCE_EVENT_ID VARCHAR(64) PRIMARY KEY);
+        INSERT INTO @chg (C_SI_ACCOUNT,C_AMOUNT,C_CHARGE_DATE,C_PERIOD,C_SOURCE_EVENT_ID)
+        SELECT j.C_SI_ACCOUNT, j.C_AMOUNT,
+               COALESCE(TRY_CONVERT(DATE,j.C_CHARGE_DATE), @hdr_date, CAST(GETDATE() AS DATE)),
+               j.C_PERIOD, j.C_SOURCE_EVENT_ID
+        FROM OPENJSON(@json,'$.charges') WITH (
+            C_SI_ACCOUNT VARCHAR(20) '$.si_account', C_AMOUNT DECIMAL(20,0) '$.amount',
+            C_CHARGE_DATE VARCHAR(10) '$.charge_date', C_PERIOD CHAR(6) '$.period',
+            C_SOURCE_EVENT_ID VARCHAR(64) '$.source_event_id') j;
 
-    INSERT INTO T_SI_FEE_SCHEDULE
-        (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_PERIOD,C_PERIOD_START,C_PERIOD_END,C_DUE_DATE,
-         C_AVG_AUM,C_FEE_RATE,C_AMOUNT,C_STATUS,C_INSTRUCTED_DATE)
-    SELECT s.C_SI_ACCOUNT, s.C_CUST_CODE, s.C_MASTER_CODE, @period, @periodStart, @d, @d,
-           aum.AVG_AUM,                                                  -- AUM trung bình kỳ (gross) — chính xác, kể cả kỳ lẻ
-           COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE),
-           s.C_PAYABLE_FEE,                                              -- số ra lệnh = payable tích luỹ kỳ (= rate×AUM_TB×ngày/daycount)
-           'PENDING', @d
-    FROM T_SI_NAV_CURRENT s
-    JOIN T_SI_PORTFOLIO     ip ON ip.C_SI_ACCOUNT  = s.C_SI_ACCOUNT
-    JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = s.C_MASTER_CODE
-    OUTER APPLY (SELECT AVG(b.C_NAV + b.C_PAYABLE_FEE) AS AVG_AUM        -- nav_gross = net + payable
-                 FROM T_SI_NAV_BALANCE b
-                 WHERE b.C_SI_ACCOUNT = s.C_SI_ACCOUNT
-                   AND b.C_BUSINESS_DATE BETWEEN @periodStart AND @d) aum
-    WHERE s.C_STATUS='ACTIVE' AND s.C_PAYABLE_FEE > 0
-      AND NOT EXISTS (SELECT 1 FROM T_SI_FEE_SCHEDULE x
-                      WHERE x.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND x.C_PERIOD=@period);  -- idempotent
-END
-GO
+        -- dedup: bỏ event đã nhận (Kafka redelivery → no-op)
+        DELETE c FROM @chg c WHERE EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE e WHERE e.C_SOURCE_EVENT_ID=c.C_SOURCE_EVENT_ID);
 
--- Hook FO xác nhận đã cắt tiền: app/feed gọi để đánh EXECUTED (+ngày). SP_EOD_COMPUTE ngày đó sẽ settle.
-CREATE OR ALTER PROCEDURE SP_FEE_MARK_EXECUTED
-    @C_SI_ACCOUNT VARCHAR(20), @C_PERIOD CHAR(6), @C_EXECUTED_DATE DATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    UPDATE T_SI_FEE_SCHEDULE
-    SET C_STATUS='EXECUTED', C_EXECUTED_DATE=@C_EXECUTED_DATE
-    WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_PERIOD=@C_PERIOD AND C_STATUS IN ('PENDING','INSTRUCTED');
+        -- log (derive cust/master từ registry)
+        INSERT INTO T_SI_FEE_CHARGE (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CHARGE_DATE,C_PERIOD,C_AMOUNT,C_SOURCE_EVENT_ID)
+        SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, c.C_PERIOD, c.C_AMOUNT, c.C_SOURCE_EVENT_ID
+        FROM @chg c LEFT JOIN T_SI_PORTFOLIO ip ON ip.C_SI_ACCOUNT=c.C_SI_ACCOUNT;
+
+        -- net-off payable (thiếu đủ cứ trừ; residual treo → carry sang kỳ sau)
+        UPDATE s SET s.C_PAYABLE_FEE = s.C_PAYABLE_FEE - x.AMT
+        FROM T_SI_NAV_CURRENT s
+        JOIN (SELECT C_SI_ACCOUNT, CAST(SUM(C_AMOUNT) AS DECIMAL(20,0)) AS AMT  -- CAST tránh SUM→(38,0) cắt scale payable
+              FROM @chg GROUP BY C_SI_ACCOUNT) x
+          ON x.C_SI_ACCOUNT = s.C_SI_ACCOUNT;
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        THROW;
+    END CATCH
 END
 GO
 
@@ -382,41 +367,43 @@ BEGIN
 
     ;WITH agg AS (
         SELECT C_MASTER_CODE,
-               SUM(C_CASH) AS CASH, SUM(C_STOCK_VALUE) AS STOCK, SUM(C_PAYABLE_FEE) AS PAY,
-               SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL
+               SUM(C_CASH) AS CASH, SUM(C_PENDING_CASH) AS PEND, SUM(C_DIV_CASH) AS DIVC,
+               SUM(C_STOCK_VALUE) AS STOCK, SUM(C_PAYABLE_FEE) AS PAY,
+               SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL,
+               SUM(C_CF_IN) AS CFIN, SUM(C_CF_OUT) AS CFOUT, COUNT(*) AS ACCT   -- [PM] flow + #tiểu khoản ACTIVE
         FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d GROUP BY C_MASTER_CODE
     ),
-    fee AS (   -- cổ tức + phí per-KH → SUM lên SI (sparse). SI không có sự kiện nào → NULL
-        SELECT C_MASTER_CODE,                                       -- (LEFT JOIN); loại phí vắng trong ngày có sự kiện → 0
+    fee AS (   -- cổ tức + phí lưu ký per-KH → SUM lên master (sparse; phí QL KHÔNG ở đây → BO/T_SI_FEE_CHARGE)
+        SELECT C_MASTER_CODE,
                SUM(CASE WHEN C_TYPE='DIVIDEND'    THEN C_AMOUNT ELSE 0 END) AS DIV,
-               SUM(CASE WHEN C_TYPE='CUSTODY_FEE' THEN C_AMOUNT ELSE 0 END) AS CUST,
-               SUM(CASE WHEN C_TYPE='MGMT_FEE'    THEN C_AMOUNT ELSE 0 END) AS MGMT
+               SUM(CASE WHEN C_TYPE='CUSTODY_FEE' THEN C_AMOUNT ELSE 0 END) AS CUST
         FROM T_SI_FEE_INCOME WHERE C_BUSINESS_DATE=@d GROUP BY C_MASTER_CODE
     )
-    INSERT INTO T_MASTER_NAV_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,C_STOCK_VALUE,
+    INSERT INTO T_MASTER_NAV_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_STOCK_VALUE,
                              C_CASH_DIVIDEND,C_CUSTODY_FEE,C_MGMT_FEE_ACCRUED,C_PAYABLE_FEE,C_TOTAL_ASSET,
-                             C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
-    SELECT @d, a.C_MASTER_CODE, a.CASH, a.STOCK,
-           f.DIV, f.CUST, f.MGMT, a.PAY, a.CASH+a.STOCK,
+                             C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT)
+    SELECT @d, a.C_MASTER_CODE, a.CASH, a.PEND, a.DIVC, a.STOCK,
+           f.DIV, f.CUST, a.PAY, a.PAY, (a.CASH + a.PEND + a.DIVC + a.STOCK),   -- mgmt_fee_accrued = payable; total_asset gồm receivables
            a.NAV, a.UNT,
            CASE WHEN a.UNT>0 THEN a.NAV/a.UNT END,
            a.PNL,
-           CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END
+           CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END,
+           a.CFIN, a.CFOUT, a.ACCT
     FROM agg a
     LEFT JOIN fee f ON f.C_MASTER_CODE=a.C_MASTER_CODE
     LEFT JOIN T_MASTER_NAV_BALANCE prev ON prev.C_MASTER_CODE=a.C_MASTER_CODE AND prev.C_BUSINESS_DATE=@prev;
 
-    -- current cấp SI (overwrite) — đọc nhanh "toàn bộ quỹ hiện tại", khỏi WHERE date=MAX
+    -- current cấp master (overwrite) — đọc nhanh AUM/cash-drag/#KH hiện tại
     MERGE T_MASTER_NAV_CURRENT AS t
-    USING (SELECT C_MASTER_CODE,C_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_NAV,C_UNIT,C_UNIT_PRICE,C_BUSINESS_DATE
+    USING (SELECT C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_NAV,C_UNIT,C_UNIT_PRICE,C_TOTAL_ACCOUNT,C_BUSINESS_DATE
            FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@d) s
     ON t.C_MASTER_CODE=s.C_MASTER_CODE
     WHEN MATCHED THEN UPDATE SET
-        t.C_CASH=s.C_CASH, t.C_STOCK_VALUE=s.C_STOCK_VALUE, t.C_TOTAL_ASSET=s.C_TOTAL_ASSET,
-        t.C_LAST_NAV=s.C_NAV, t.C_UNIT=s.C_UNIT, t.C_LAST_UNIT_PRICE=s.C_UNIT_PRICE,
+        t.C_CASH=s.C_CASH, t.C_PENDING_CASH=s.C_PENDING_CASH, t.C_DIV_CASH=s.C_DIV_CASH, t.C_STOCK_VALUE=s.C_STOCK_VALUE, t.C_TOTAL_ASSET=s.C_TOTAL_ASSET,
+        t.C_LAST_NAV=s.C_NAV, t.C_UNIT=s.C_UNIT, t.C_LAST_UNIT_PRICE=s.C_UNIT_PRICE, t.C_TOTAL_ACCOUNT=s.C_TOTAL_ACCOUNT,
         t.C_LAST_BUSINESS_DATE=s.C_BUSINESS_DATE
-    WHEN NOT MATCHED THEN INSERT (C_MASTER_CODE,C_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_LAST_NAV,C_UNIT,C_LAST_UNIT_PRICE,C_LAST_BUSINESS_DATE)
-        VALUES (s.C_MASTER_CODE,s.C_CASH,s.C_STOCK_VALUE,s.C_TOTAL_ASSET,s.C_NAV,s.C_UNIT,s.C_UNIT_PRICE,s.C_BUSINESS_DATE);
+    WHEN NOT MATCHED THEN INSERT (C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_LAST_NAV,C_UNIT,C_LAST_UNIT_PRICE,C_TOTAL_ACCOUNT,C_LAST_BUSINESS_DATE)
+        VALUES (s.C_MASTER_CODE,s.C_CASH,s.C_PENDING_CASH,s.C_DIV_CASH,s.C_STOCK_VALUE,s.C_TOTAL_ASSET,s.C_NAV,s.C_UNIT,s.C_UNIT_PRICE,s.C_TOTAL_ACCOUNT,s.C_BUSINESS_DATE);
 END
 GO
 
@@ -569,7 +556,7 @@ BEGIN
     -- (INGEST: FO event per-KH đã vào qua SP_INGEST_CUSTOMER → cash/holdings/history sẵn trong current + interval)
     EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
     -- (ĐÃ BỎ J01_SYNC_FO + J14B_HISTORY) — chuyển sang SP_INGEST_CUSTOMER (per-event realtime)
-    -- (J06 PHÍ QL accrue/settle/charge nằm TRONG J07_COMPUTE, toggle qua T_SDI_CONFIG — không phải job riêng)
+    -- (J06 PHÍ QL accrue nằm TRONG J07_COMPUTE; net-off do SP_INGEST_FEE_CHARGE khi BO cắt — không job riêng)
     EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';

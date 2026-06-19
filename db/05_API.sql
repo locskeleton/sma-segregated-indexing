@@ -291,8 +291,8 @@ BEGIN
 
     -- RS1: summary
     --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
-    --     C_CUM_MGMT_FEE_PAID  = phí QL đã THU (SETTLED) lũy kế ≤ asOf  (từ T_SI_FEE_SCHEDULE)
-    --     C_MGMT_FEE_ACCRUED   = phí QL ACCRUED chưa thu @ asOf (payable đang treo, gồm cả charge chưa settle)
+    --     C_CUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (từ T_SI_FEE_CHARGE)
+    --     C_MGMT_FEE_ACCRUED   = phí QL accrued chưa net-off @ asOf (payable đang treo)
     SELECT  @ASOF                  AS C_ASOF,
             @C_SI_ACCOUNT          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
@@ -315,9 +315,9 @@ BEGIN
         WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
     ) fi
     OUTER APPLY (
-        SELECT  SUM(C_AMOUNT) AS C_MGMT_FEE_PAID                 -- phí QL đã cắt thực (settled)
-        FROM T_SI_FEE_SCHEDULE
-        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_STATUS='SETTLED' AND C_SETTLED_DATE <= @ASOF
+        SELECT  SUM(C_AMOUNT) AS C_MGMT_FEE_PAID                 -- phí QL BO đã cắt thực (log)
+        FROM T_SI_FEE_CHARGE
+        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CHARGE_DATE <= @ASOF
     ) sch;
 
     -- RS2: holdings reconstruct @asOf
@@ -340,11 +340,10 @@ BEGIN
     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
     ORDER BY C_BUSINESS_DATE DESC, C_TYPE;
 
-    -- RS4: chi tiết lệnh thu phí QL (SDI-owned) ≤ asOf — kỳ, số, trạng thái, ngày
-    SELECT C_PERIOD, C_PERIOD_START, C_PERIOD_END, C_DUE_DATE, C_AVG_AUM, C_FEE_RATE,
-           C_AMOUNT, C_STATUS, C_INSTRUCTED_DATE, C_EXECUTED_DATE, C_SETTLED_DATE
-    FROM T_SI_FEE_SCHEDULE
-    WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_DUE_DATE <= @ASOF
-    ORDER BY C_PERIOD DESC;
+    -- RS4: chi tiết phí QL BO đã cắt ≤ asOf — ngày cắt, kỳ, số tiền
+    SELECT C_CHARGE_DATE, C_PERIOD, C_AMOUNT, C_SOURCE_EVENT_ID
+    FROM T_SI_FEE_CHARGE
+    WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CHARGE_DATE <= @ASOF
+    ORDER BY C_CHARGE_DATE DESC;
 END
 GO
