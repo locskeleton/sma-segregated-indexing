@@ -71,8 +71,8 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 |---|---|---|---|
 | `SP_GET_PM_OVERVIEW_ALL` | US1 | `@range` | RS1 header (#master,#KH); RS2 tổng (AUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master (AUM/#KH/hiệu suất master/hiệu suất KH/dev/TE/cash-drag, sort) |
 | `SP_GET_MASTER_OVERVIEW` | US2 | `@C_MASTER_CODE, @range` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B |
-| `SP_GET_MASTER_PERFORMANCE` | US3 | `@C_MASTER_CODE, @range, @resolution` | chuỗi: master index (PR) + DM tổng KH (AUM-weighted) + VN-Index, + danh sách mốc rebalance |
-| `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@C_MASTER_CODE, @date` | weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`) + net delta holdings (`T_SI_HOLDING_HIST` agg quanh ngày) |
+| `SP_GET_MASTER_PERFORMANCE` | US3 | `@C_MASTER_CODE, @range, @resolution` (NULL=auto: D/W/M theo độ dài kỳ) | RS1 chuỗi: master index (PR) + `C_KH_COMPOSITE` (DM tổng KH AUM-weighted end-weight, base=1.0) + benchmark (PR) — app rebase 0%; RS2 mốc rebalance |
+| `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@C_MASTER_CODE, @date` | RS1 target weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`, FULL OUTER → mã ra/vào); RS2 net delta holdings THỰC TẾ per mã từ **`T_MASTER_HOLDING_BALANCE`** (@phiên ≤ eff vs phiên trước) — master-level daily holdings, chính xác hơn agg per-KH hist |
 | `SP_GET_MASTER_PNL_DIST` | US4 | `@C_MASTER_CODE, @range` | #lãi/#lỗ + tỷ lệ, histogram buckets, AUM-weighted avg %PnL, trung vị |
 | `SP_GET_MASTER_TOP_KH` | US5 | `@C_MASTER_CODE, @range, @topN, @dir` | rank mã KH theo %PnL (TR) |
 | `SP_SET_MASTER_PM_CONFIG` | (cấu hình) | `@C_MASTER_CODE, ngưỡng...` | upsert ngưỡng PM per-master |
@@ -119,10 +119,26 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 - TE = on-read (join 2 chuỗi return có sẵn, STDEV × √X); scale nhỏ → không materialize.
 - Snapshot realtime-on-query, hiệu suất T-1.
 - Ngưỡng per-master (`T_MASTER_PM_CONFIG`).
-- Rebalance detail = weight cũ/mới + net delta holdings (KHÔNG execution từng lệnh — SDI không có).
+- Rebalance detail = target weight cũ/mới (`T_MASTER_PORTFOLIO_TICKER`) + net delta holdings thực tế từ `T_MASTER_HOLDING_BALANCE` (KHÔNG execution từng lệnh — SDI không có).
 
-## 8. Open / cần xác nhận
-- TE alert threshold riêng hay = badge_high (đề xuất riêng).
-- Default ngưỡng khi master chưa cấu hình.
-- "DM tổng KH" AUM-weight: end-weight theo BRD (đã chốt) — chart per-điểm tính lại theo weight ngày đó.
-- US1 ở scale thật: on-read hay cần rollup (đo ở P5).
+## 8. Quyết định (đã chốt khi duyệt — trước open)
+- **TE alert threshold RIÊNG** (`C_TE_ALERT_THRESHOLD`, không = badge_high). ✅
+- **Default ngưỡng hệ thống** (UDF_PM_CONFIG, fallback khi cột NULL): TE badge low=0.02/high=0.05; TE alert=0.05; cash drag Y=0.05; deviation A=+100 BPS / B=−100 BPS. ✅
+- **"DM tổng KH" = end-weight cố định** (`Wᵢ=AUMᵢ,end/ΣAUM`); chuỗi US3: `value_t = Σ Wᵢ·(UPᵢ,t/UPᵢ,base) / Σ Wᵢ(present)` (equi-join sample-date set-based — KHÔNG OUTER APPLY per-KH; renormalize Σweight present → KH join/đóng giữa kỳ không méo), base=1.0. ✅
+- **Resolution US3**: NULL=auto (kỳ >90 ngày→tháng, >21→tuần, còn lại→ngày); chọn phiên cuối mỗi bucket + luôn gồm base/end. ✅
+
+## 9. P5 — đo perf scale thật (50k KH, 10 master, 250 phiên = 12.5M dòng NAV_BALANCE; warm, SQLEXPRESS)
+| SP | thời gian | trạng thái |
+|---|---|---|
+| US3 REBALANCE_DETAIL | ~1 ms | ✅ |
+| US3 PERFORMANCE | ~1.4 s | ✅ (composite đã sửa từ OUTER APPLY per-KH → equi-join set-based; nếu giữ bản cũ = treo hàng giờ) |
+| US4 PNL_DIST | ~2.4 s | ✅ chấp nhận |
+| US5 TOP_KH | ~2.3 s | ✅ chấp nhận |
+| US2 OVERVIEW (1 master, 5k KH) | ~3.5 s | 🟡 chậm-nhẹ (drill-down) |
+| **US1 OVERVIEW_ALL** | **~48 s** | 🔴 **không xài được on-read** |
+
+**Nguyên nhân US1**: quét toàn bộ NAV_BALANCE (mọi master, 12.5M) 2 lần — `up_base` (GROUP BY si) + TE STDEV (GROUP BY si) — tức chạy phần nặng của US2 × 10 master. RS1/RS2 (header, ΣAUM, net flow, cash drag) đọc từ master tables = nhanh (ms); chỉ RS3 (KH-return/deviation/TE per-master) là điểm chết.
+
+**CHƯA QUYẾT — cần user chốt hướng** (xem [[pm-tool-serve-layer]]): (A) rollup `T_MASTER_PM_DAILY` trong EOD (TE thành master-level stdev, đổi nhẹ ngữ nghĩa) → US1 còn ms; (B) lazy-load RS3 (US1 trả nhanh AUM/cash/flow, cột TE/deviation/KH-return load sau per-row); (C) cache US1 daily. US2-5 giữ on-read.
+- **Tối ưu phụ chưa làm** (chờ chốt cùng US1): INCEPTION → `up_base=10000` (T0 const) bỏ được 1 scan ở US2/4/5; index leading `C_SI_ACCOUNT` cho customer FR-02/03/06 (cũng scan, vấn đề có sẵn).
+- Master ACTIVE chưa có EOD data → hiện bị loại khỏi #master count/list. Sau cần hiển thị "mới tạo" thì điều chỉnh.

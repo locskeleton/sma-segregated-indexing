@@ -270,17 +270,26 @@ BEGIN
     SELECT bd FROM bucketed WHERE @RESOLUTION='D' OR rn=1
     UNION SELECT @base UNION SELECT @end;
 
-    -- RS1 chuỗi
+    -- RS1 chuỗi. Composite KH set-based: sample-date là business-date thật ⇒ KH active có đúng 1
+    -- dòng NAV_BALANCE @ngày đó → equi-join (master,date∈sample) dùng IX_MASTER (KHÔNG OUTER APPLY
+    -- per-KH = tránh 60k scan). Renormalize Σweight present → KH join/đóng giữa kỳ không méo, base=1.0.
+    ;WITH comp AS (
+        SELECT b.C_BUSINESS_DATE AS d,
+               CAST( SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
+                              THEN kw.w * b.C_UNIT_PRICE / kw.up_base END)
+                   / NULLIF(SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
+                                     THEN kw.w END),0) AS DECIMAL(18,8)) AS kc
+        FROM #kw kw
+        JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@C_MASTER_CODE
+        JOIN @samp s2 ON s2.d=b.C_BUSINESS_DATE
+        GROUP BY b.C_BUSINESS_DATE
+    )
     SELECT  s.d AS C_BUSINESS_DATE,
             idx.C_INDEX_VALUE AS C_MASTER_INDEX,
             bm.C_INDEX_VALUE  AS C_BENCHMARK,
-            (SELECT CAST(SUM(kw.w * COALESCE(px.up, kw.up_base) / NULLIF(kw.up_base,0)) AS DECIMAL(18,8))
-             FROM #kw kw
-             OUTER APPLY (SELECT TOP 1 b.C_UNIT_PRICE up FROM T_SI_NAV_BALANCE b
-                          WHERE b.C_SI_ACCOUNT=kw.si AND b.C_BUSINESS_DATE<=s.d
-                          ORDER BY b.C_BUSINESS_DATE DESC) px
-            ) AS C_KH_COMPOSITE
+            comp.kc           AS C_KH_COMPOSITE
     FROM @samp s
+    LEFT JOIN comp ON comp.d = s.d
     LEFT JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=@C_MASTER_CODE AND idx.C_BUSINESS_DATE=s.d
     LEFT JOIN T_BENCHMARK_DAILY    bm  ON bm.C_BENCHMARK_CODE=@bench AND bm.C_BUSINESS_DATE=s.d
     ORDER BY s.d;
