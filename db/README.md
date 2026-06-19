@@ -87,7 +87,7 @@ Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. 
 | FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_account, range | chuỗi ngày: unit_price sub-account + master UP (TR) + master index (PR) + benchmark (PR) |
 | FR-04 | `SP_GET_SI_INFO` | cust, si_account | config sub-account + master (mgmt fee effective) |
 | FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_account, top=20 | holdings current sub-account định giá mới nhất, top-N + `OTHER` |
-| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lũy kế); RS2 holdings @asOf; RS3 chi tiết |
+| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lưu ký lũy kế + **phí QL: đã thu `C_CUM_MGMT_FEE_PAID` + accrued `C_MGMT_FEE_ACCRUED`**); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí lưu ký; **RS4 chi tiết lệnh thu phí QL** |
 
 `range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 

@@ -290,6 +290,9 @@ BEGIN
           AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL));
 
     -- RS1: summary
+    --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
+    --     C_CUM_MGMT_FEE_PAID  = phí QL đã THU (SETTLED) lũy kế ≤ asOf  (từ T_SI_FEE_SCHEDULE)
+    --     C_MGMT_FEE_ACCRUED   = phí QL ACCRUED chưa thu @ asOf (payable đang treo, gồm cả charge chưa settle)
     SELECT  @ASOF                  AS C_ASOF,
             @C_SI_ACCOUNT          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
@@ -301,16 +304,21 @@ BEGIN
             ISNULL(@cash,0) + ISNULL(@stock,0) AS C_TOTAL_ASSET,
             fi.C_CUM_DIVIDEND,
             fi.C_CUM_CUSTODY_FEE,
-            fi.C_CUM_MGMT_FEE
+            ISNULL(sch.C_MGMT_FEE_PAID, 0) AS C_CUM_MGMT_FEE_PAID,
+            ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_MGMT_FEE_ACCRUED
     FROM (SELECT 1 x) z
     LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@C_SI_ACCOUNT AND nd.C_BUSINESS_DATE = @ASOF
     OUTER APPLY (
         SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_CUM_DIVIDEND,
-                SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_CUM_CUSTODY_FEE,
-                SUM(CASE WHEN C_TYPE = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_CUM_MGMT_FEE
+                SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_CUM_CUSTODY_FEE
         FROM T_SI_FEE_INCOME
         WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
-    ) fi;
+    ) fi
+    OUTER APPLY (
+        SELECT  SUM(C_AMOUNT) AS C_MGMT_FEE_PAID                 -- phí QL đã cắt thực (settled)
+        FROM T_SI_FEE_SCHEDULE
+        WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_STATUS='SETTLED' AND C_SETTLED_DATE <= @ASOF
+    ) sch;
 
     -- RS2: holdings reconstruct @asOf
     SELECT  h.C_TICKER, h.C_QUANTITY,
@@ -326,10 +334,17 @@ BEGIN
       AND h.C_VALID_FROM <= @ASOF AND (h.C_VALID_TO > @ASOF OR h.C_VALID_TO IS NULL)
     ORDER BY C_MARKET_VALUE DESC;
 
-    -- RS3: chi tiết cổ tức/phí ≤ asOf (sparse)
+    -- RS3: chi tiết cổ tức/phí lưu ký ≤ asOf (sparse, FO đẩy)
     SELECT C_BUSINESS_DATE, C_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
     FROM T_SI_FEE_INCOME
     WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
     ORDER BY C_BUSINESS_DATE DESC, C_TYPE;
+
+    -- RS4: chi tiết lệnh thu phí QL (SDI-owned) ≤ asOf — kỳ, số, trạng thái, ngày
+    SELECT C_PERIOD, C_PERIOD_START, C_PERIOD_END, C_DUE_DATE, C_AVG_AUM, C_FEE_RATE,
+           C_AMOUNT, C_STATUS, C_INSTRUCTED_DATE, C_EXECUTED_DATE, C_SETTLED_DATE
+    FROM T_SI_FEE_SCHEDULE
+    WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_DUE_DATE <= @ASOF
+    ORDER BY C_PERIOD DESC;
 END
 GO

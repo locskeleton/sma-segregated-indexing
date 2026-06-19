@@ -312,7 +312,7 @@ J0 GATE → J7 ─ J8 → J9
 | FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | `SP_GET_SI_PERFORMANCE` | T_MASTER_NAV_BALANCE (TR) + T_MASTER_INDEX_DAILY (PR) + benchmark VN-Index (PR), chuỗi [mốc..cuối] |
 | FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | `SP_GET_SI_INFO` | T_SI_PORTFOLIO + master |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | `SP_GET_SI_HOLDINGS` | **holdings CURRENT của KH** (T_SI_PORTFOLIO_HOLDING × giá mới nhất) top20 + "OTHER" — sản phẩm segregated nên đọc holdings KH (≠ master-aggregate T_MASTER_HOLDING_BALANCE) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | T_SI_NAV_BALANCE (NAV) + T_SI_FEE_INCOME (cổ tức/phí) + cash/stock reconstruct (T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá theo interval) |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | T_SI_NAV_BALANCE (NAV+payable) + T_SI_FEE_INCOME (cổ tức/phí lưu ký) + T_SI_FEE_SCHEDULE (phí QL: paid+accrued, RS4 chi tiết) + cash/stock reconstruct (T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá theo interval) |
 
 ---
 
