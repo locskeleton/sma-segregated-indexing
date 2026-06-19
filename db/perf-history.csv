@@ -11,3 +11,4 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-18T15:01:05Z,690cdc1,"refactor(db): tach 2 cap — MASTER (C_MASTER_CODE) vs SUB-ACCOUNT (C_SI_CODE)",medium,10000,1250000,8187,NULL,6072,143,38,109,1632,NULL
 2026-06-18T18:00:22Z,95421e0,"refactor(db): audit timestamp DATETIME2/SYSUTCDATETIME → DATETIME/GETDATE (khớp codebase)",small,1000,60000,880,NULL,556,57,30,37,160,NULL
 2026-06-19T14:19:34Z,ce52c44,"docs(eod): Track 1 — receivables→NAV + master flow/count + phí QL BO-driven (cố định, no toggle)",small,1000,60000,1034,NULL,693,84,20,27,160,NULL
+2026-06-19T15:23:17Z,3276606,"docs(pm-tool): spec PM dashboard quản lý master (US1-5, SP serve, TE/deviation/cash-drag)",small,1000,60000,1119,NULL,773,50,16,36,184,NULL

@@ -254,6 +254,9 @@ CREATE TABLE T_SI_NAV_BALANCE (
     CONSTRAINT UQ_SI_NAV_BALANCE_PKID UNIQUE NONCLUSTERED (PK_SI_NAV_BALANCE),
     CONSTRAINT UQ_SI_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_SI_ACCOUNT) -- idempotency
 );
+-- [PM tool] quét per-master theo ngày (US3/US4/US5/TE): all KH của 1 master trong kỳ.
+CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_NAV_BALANCE (C_MASTER_CODE, C_BUSINESS_DATE)
+    INCLUDE (C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV);
 
 -- Sổ cái CỔ TỨC + PHÍ per sub-account, SPARSE — FO đẩy về (ingest, dedup C_SOURCE_EVENT_ID).
 CREATE TABLE T_SI_FEE_INCOME (
@@ -381,4 +384,27 @@ CREATE TABLE T_EOD_RUN (
 
 -- (Đã BỎ T_SDI_CONFIG — spec phí QL chốt cố định, không còn toggle/knob.
 --  Phí QL: accrue luôn theo NGÀY DƯƠNG LỊCH, gated bởi mgmt_fee_rate; day_count = 365 hardcode trong engine.)
+GO
+
+-- =====================================================================
+-- [PM tool] Cấu hình ngưỡng cảnh báo per-master (PM cài đặt từng danh mục master).
+--   Serve-layer cho dashboard PM (US1-US5). Không đụng vào EOD engine.
+--   Ngưỡng deviation/cash-drag/TE: dùng để badge & đếm KH vượt. NULL => fallback default hệ thống.
+-- =====================================================================
+--   Cột NULL => fallback default hệ thống (hằng số trong SP serve, xem UDF_PM_DEFAULTS).
+--   TE = decimal ratio (annualized stdev active-return, vd 0.05 = 5%); deviation = BPS (1% = 100).
+CREATE TABLE T_MASTER_PM_CONFIG (
+    C_MASTER_CODE        VARCHAR(20)     NOT NULL,
+    PK_MASTER_PM_CONFIG  UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_PM_CONFIG_GUID DEFAULT NEWID(),
+    C_TE_BADGE_LOW       DECIMAL(10,6)   NULL,   -- ngưỡng AUM-weighted TE badge low/med (ratio)
+    C_TE_BADGE_HIGH      DECIMAL(10,6)   NULL,   -- ngưỡng AUM-weighted TE badge med/high (ratio)
+    C_TE_ALERT_THRESHOLD DECIMAL(10,6)   NULL,   -- ngưỡng TE per-KH để ĐẾM #KH vượt (riêng — không = badge_high)
+    C_CASH_DRAG_THRESHOLD DECIMAL(9,6)   NULL,   -- Y: ngưỡng cash drag (ratio, vd 0.05) đếm #KH vượt
+    C_DEV_THRESHOLD_HIGH DECIMAL(10,2)   NULL,   -- A: ngưỡng deviation cao (BPS) đếm #KH dev>A (vượt trội)
+    C_DEV_THRESHOLD_LOW  DECIMAL(10,2)   NULL,   -- B: ngưỡng deviation thấp (BPS) đếm #KH dev<B (tụt)
+    C_UPDATED_BY         VARCHAR(64)     NULL,
+    C_UPDATED_TIME       DATETIME        NOT NULL CONSTRAINT DF_MASTER_PM_CONFIG_TIME DEFAULT GETDATE(),
+    CONSTRAINT PK_MASTER_PM_CONFIG PRIMARY KEY CLUSTERED (C_MASTER_CODE),
+    CONSTRAINT UQ_MASTER_PM_CONFIG_GUID UNIQUE (PK_MASTER_PM_CONFIG)
+);
 GO

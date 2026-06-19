@@ -17,13 +17,19 @@ RETURNS DATE
 AS
 BEGIN
     RETURN CASE UPPER(ISNULL(@range,'INCEPTION'))
+        WHEN '1D'  THEN DATEADD(DAY,   -1, @end)
+        WHEN '1W'  THEN DATEADD(DAY,   -7, @end)
         WHEN '1M'  THEN DATEADD(MONTH, -1, @end)
         WHEN '3M'  THEN DATEADD(MONTH, -3, @end)
+        WHEN '3T'  THEN DATEADD(MONTH, -3, @end)   -- alias 3 tháng
         WHEN '6M'  THEN DATEADD(MONTH, -6, @end)
+        WHEN '6T'  THEN DATEADD(MONTH, -6, @end)   -- alias 6 tháng
         WHEN '1Y'  THEN DATEADD(YEAR,  -1, @end)
         WHEN '3Y'  THEN DATEADD(YEAR,  -3, @end)
+        WHEN 'MTD' THEN DATEADD(DAY, -1, DATEFROMPARTS(YEAR(@end), MONTH(@end), 1))         -- mốc = cuối tháng trước
+        WHEN 'QTD' THEN DATEADD(DAY, -1, DATEFROMPARTS(YEAR(@end), (DATEPART(QUARTER,@end)-1)*3 + 1, 1)) -- cuối quý trước
         WHEN 'YTD' THEN DATEFROMPARTS(YEAR(@end) - 1, 12, 31)
-        ELSE NULL
+        ELSE NULL  -- INCEPTION / INCEP / unknown → toàn kỳ
     END;
 END
 GO

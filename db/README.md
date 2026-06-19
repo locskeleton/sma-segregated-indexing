@@ -18,11 +18,13 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 ```
 01_TABLES.sql      -- DDL bảng (T_/C_/PK_, PAGE compression; prod: + partition/columnstore)
 02_SP_ENGINE.sql   -- engine core: UDF + SP_EOD_* + master SP_EOD_RUN + dispatcher SP_EOD_STEP
-05_API.sql         -- read API: UDF_RANGE_CUTOFF + SP_GET_* (FR-01..06) cho Asset/SMO
-03_SMOKE.sql       -- smoke test (1 SI, 1 KH, 4 phiên) — verify số đúng
+05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho Asset/SMO
+06_PM_API.sql      -- read API PM (master-keyed): UDF_PM_CONFIG + SP_GET_MASTER_*/PM_OVERVIEW_ALL + SP_SET_MASTER_PM_CONFIG
+03_SMOKE.sql       -- smoke test core (1 SI, 1 KH, 4 phiên) — verify số đúng
+07_PM_SMOKE.sql    -- smoke PM (1 master × 3 KH × 3 phiên) — verify AUM-weighted/TE/deviation/dist/top-N
 04_BENCH.sql       -- (benchmark) seed dataset lớn theo scale + chạy EOD — dùng qua bench.ps1
 ```
-(`05_API.sql` chạy sau `02` — read-only, không cần cho EOD/bench; cần cho API.)
+(`05_API`/`06_PM_API` chạy sau `02` — read-only, không cần cho EOD/bench; cần cho API. `07_PM_SMOKE` cần `06`.)
 (Tùy chọn `00_INFRA.sql` — DBA: filegroups, partition function/scheme, RCSI, resource governor — xem `docs/SDI-db-architecture.md`.)
 
 ## Benchmark perf (theo dõi regression sau refactor)
@@ -56,7 +58,7 @@ EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
 `J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
-(J06 phí QL = **TOGGLE** qua `T_SDI_CONFIG.C_ENABLE_MGMT_FEE_ACCRUAL`. **OFF mặc định**: FO cash đã NET phí QL + thuế GD → **NAV = stock + FO cash** (tránh double-count). **ON**: SDI accrue payable ngày trong J07 + lệnh thu cuối tháng `T_SI_FEE_SCHEDULE` → FO cắt → settle; **NAV = stock + cash − payable** (net phí). Thuế GD luôn FO net.)
+(J06 phí QL = **BO-driven, CỐ ĐỊNH (no toggle)**: SDI accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH trong J07 (`payable += AUM_gross × rate × DATEDIFF(ngày)/365`, gated `rate>0`, day_count=365 hardcode). BO cắt phí 1 cục/tháng → event Kafka → `SP_INGEST_FEE_CHARGE` net-off payable (log `T_SI_FEE_CHARGE`, dedup `C_SOURCE_EVENT_ID`). **NAV = total_asset − payable**; total_asset = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables). Thuế GD luôn FO net. Đã BỎ `T_SDI_CONFIG`/`T_SI_FEE_SCHEDULE`/`SP_EOD_FEE_CHARGE`.)
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
 FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):
@@ -89,6 +91,21 @@ Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. 
 | FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_account, top=20 | holdings current sub-account định giá mới nhất, top-N + `OTHER` |
 | FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lưu ký lũy kế + **phí QL: đã thu `C_CUM_MGMT_FEE_PAID` + accrued `C_MGMT_FEE_ACCRUED`**); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí lưu ký; **RS4 chi tiết lệnh thu phí QL** |
 
-`range` ∈ {`1M`,`3M`,`6M`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
+`range` ∈ {`1D`,`1W`,`MTD`,`1M`,`3M`/`3T`,`6M`/`6T`,`QTD`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
+
+## PM tool API — `06_PM_API.sql` (dashboard quản lý master)
+Serve-layer **on-read** cho PM theo dõi cấp **master** (spec: `docs/SDI-pm-tool-spec.md`). master-keyed (`@C_MASTER_CODE`), KHÔNG trả định danh KH ngoài top-N (US5). 2 bản chất: snapshot (current) realtime-on-query · hiệu suất (T-1).
+
+| US | Proc | Tham số | Trả về |
+|---|---|---|---|
+| cfg | `SP_SET_MASTER_PM_CONFIG` | master + 6 ngưỡng (NULL=default) | upsert `T_MASTER_PM_CONFIG`; RS cấu hình hiệu lực |
+| US2 | `SP_GET_MASTER_OVERVIEW` | master, range | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt, deviation+#dev>A/<B |
+| US3 | `SP_GET_MASTER_PERFORMANCE` | master, range, resolution(auto) | RS1 chuỗi 3 đường (master index PR + KH AUM-weighted + benchmark); RS2 mốc rebalance |
+| US3 | `SP_GET_MASTER_REBALANCE_DETAIL` | master, date | RS1 target weight cũ→mới; RS2 net delta holdings (`T_MASTER_HOLDING_BALANCE`) |
+| US4 | `SP_GET_MASTER_PNL_DIST` | master, range | #lãi/#lỗ+tỷ lệ, avg AUM-weighted, trung vị, histogram %PnL |
+| US5 | `SP_GET_MASTER_TOP_KH` | master, range, topN, dir | top-N mã KH theo %PnL (TWR) |
+| US1 | `SP_GET_PM_OVERVIEW_ALL` | range, sort | RS1 #master/#KH; RS2 tổng (ΣAUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master |
+
+Công thức (spec §2): AUM = total_asset = `C_LAST_NAV+C_PAYABLE_FEE` (per KH); DM tổng KH = AUM-weighted end-weight (`ΣWᵢ·PnLᵢ`, PnL=TWR unit_price); deviation = (R_KH−R_master_index)×10000 BPS; TE per-KH = `STDEV(R_KH,t−R_master,t)×√X` (X=#ngày GD, cap 252), master = AUM-weighted. Ngưỡng per-master `T_MASTER_PM_CONFIG` (NULL→default `UDF_PM_CONFIG`). Verify: `07_PM_SMOKE.sql` (3 KH, số tính tay — KH_ret=.08/master=.071/dev=90BPS/TE≈.0297 MED/histogram/top-N đúng).
 
 > Chưa implement (mở rộng): ingestion file FO → `T_SI_PORTFOLIO_HOLDING` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_SI_FEE_INCOME` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_SI_NAV_BALANCE` CCI + interval hist partition theo `valid_from`).
