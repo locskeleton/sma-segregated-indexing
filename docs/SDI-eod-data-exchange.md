@@ -10,9 +10,10 @@ Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống c�
 
 | Hệ thống | Vai trò trong luồng EOD |
 |---|---|
-| **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ phí QL + thuế GD vào cash). **Nguồn sự thật về holdings + cash + cổ tức/phí + cashflow.** |
+| **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ thuế GD vào cash). **Nguồn sự thật: holdings + tiền (3 khoản) + cổ tức/phí lưu ký + cashflow.** |
+| **BO** (Back Office) | **Cắt phí quản lý** của KH (1 cục/tháng) → báo event Kafka cho SDI `{si_account, amount, charge_date}`. SDI net-off vào payable. |
 | **Market data** | Cấp giá EOD, corporate action, chỉ số benchmark (VN-Index…). (Nguồn riêng, không phải FO.) |
-| **SDI** | Nhận holdings (FO nạp THẲNG vào current) + cash từ FO → tính NAV, Unit/Unit Price, PnL, TWR, MWR, Master Index. KHÔNG quản lý từng lệnh khớp, KHÔNG accrue phí. → đẩy kết quả sang Asset. |
+| **SDI** | Nhận holdings + tiền (FO) + event cắt phí (BO) → tính NAV (= tổng tài sản − payable), Unit/Unit Price, PnL, TWR, MWR, Master Index; **accrue payable phí QL hằng ngày + net-off khi BO cắt**. → đẩy kết quả sang Asset. |
 | **Asset** | Nhận current snapshot + chuỗi master từ SDI; phục vụ **SMO** đọc/hiển thị (read-only, không tính). |
 | **SMO** | Tầng hiển thị, đọc qua Asset. |
 
@@ -30,7 +31,7 @@ SDI ──(1) rebalance_request (trigger REBALANCE/DEPLOY/REDEEM) ────�
         ┌──────────────────────── cuối ngày (EOD) ─────────────────────┐
 FO  ──(2) model_weight ─────────────────────────────────────────────▶ SDI
 FO  ──(3) holdings snapshot (KH×master×mã)  ◀── volume chính ───────▶ SDI
-FO  ──(4) cash snapshot (KH×master) ───────────────────────────────▶ SDI
+FO  ──(4) tiền 3 khoản (mặt + bán chờ về + cổ tức tiền) ────────────▶ SDI
 FO  ──(5) cổ tức/phí per-KH (sparse) ──────────────────────────────▶ SDI
 FO  ──(6) cashflow nạp/rút/SIP (sparse) ───────────────────────────▶ SDI
 Mkt ──(7) giá EOD + corporate action + benchmark ──────────────────▶ SDI
@@ -65,8 +66,9 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 |---|---|---|---|---|
 | 2 | **Model weight** | `T_MASTER_PORTFOLIO_TICKER` | C_MASTER_CODE, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
 | 3 | **Holdings** (trong event KH) | → `T_SI_PORTFOLIO_HOLDING` (current) + diff `T_SI_HOLDING_HIST` | C_SI_ACCOUNT, ticker, quantity, avg_cost | Mỗi event mang holdings từng sub-account của KH; ingest overwrite current + đóng/mở interval (no-dup). |
-| 4 | **Cash** (trong event KH) | → `state.C_CASH` + diff `T_SI_CASH_HIST` | C_SI_ACCOUNT, cash | Available cash đã NET phí/thuế/SIP. Nguồn tiền DUY NHẤT; ingest update state + interval. |
-| 5 | **Cổ tức + phí** | `T_SI_FEE_INCOME` | business_date, C_SI_ACCOUNT, type[DIVIDEND\|CUSTODY_FEE\|MGMT_FEE], ticker, amount, event_id | **SPARSE** — chỉ ngày có sự kiện. Cho báo cáo FR-06; KHÔNG ảnh hưởng NAV. |
+| 4 | **Tiền (3 khoản)** (trong event KH) | → state `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff `T_SI_CASH_HIST` | C_SI_ACCOUNT, **tiền mặt, tiền bán chờ về, cổ tức tiền** | FO đồng bộ 3 khoản → `Tiền = Σ`. Tiền mặt đã NET thuế/phí. Tiền bán chờ về (T0+T1+T2, lưu **tổng**) + cổ tức tiền **vào tài sản** → `total_asset = stock + Tiền`, `NAV = total_asset − payable`. |
+| 5 | **Cổ tức + phí lưu ký** | `T_SI_FEE_INCOME` | business_date, C_SI_ACCOUNT, type[DIVIDEND\|CUSTODY_FEE], ticker, amount, event_id | **SPARSE** — chỉ ngày có sự kiện. Cho FR-06. (Phí QL KHÔNG ở đây — BO cắt, xem luồng BO→SDI.) |
+| 5b | **Phí QL đã cắt** (BO→SDI) | `T_SI_FEE_CHARGE` → net-off `payable` | si_account, amount, charge_date, period?, source_event_id | **Event Kafka từ BO** (`SP_INGEST_FEE_CHARGE`). BO cắt 1 cục/tháng; SDI net-off payable (dedup source_event_id). |
 | 6 | **Cashflow** | `T_SI_CASHFLOW_EVENT` | C_SI_ACCOUNT, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 
 ### C. Market data → SDI (feed EOD)

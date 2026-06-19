@@ -129,13 +129,15 @@ J07_COMPUTE   (câu nặng nhất) MTM TOÀN BỘ + NAV + PnL + Unit, roll-forwa
       FROM   T_SI_PORTFOLIO_HOLDING h
       JOIN   T_PRICE_DAILY p ON p.C_TICKER=h.C_TICKER AND p.C_BUSINESS_DATE=@d
       GROUP BY h.C_SI_ACCOUNT;                  -- batch-mode (NCCI) trên 20M dòng
-      NAV = stock_value + state.cash (FO cash đã NET phí → KHÔNG trừ lại)
-      PnL ngày = NAV_today − NAV_prev + ra − vào
+      total_asset = stock_value + state(tiền mặt + tiền bán chờ về + cổ tức tiền)  ← receivables vào tài sản
+      NAV = total_asset − payable   (FO net thuế GD; tiền bán chờ về vào tài sản → NAV liên tục khi bán CK)
+      PnL ngày = NAV_today − NAV_prev + ra − vào   (phí KHÔNG tính vào ra/vào)
       UNIT: vị thế có CF_t → ΔUnit = CF/unit_price_prev; unit_price = NAV/unit → INSERT T_SI_UNIT_LEDGER (ΔUnit≠0)
-      [J06 phí QL — TOGGLE T_SDI_CONFIG] ON: payable += AUM×rate/daycount (accrue ngày) +
-        settle khi FO cắt + charge cuối tháng (T_SI_FEE_SCHEDULE); NAV = stock+cash−payable.
-        OFF (mặc định): bỏ qua, FO net phí, NAV = stock+cash. Thuế GD luôn FO net.
-J11_SI_AGG    Σ per master (C_MASTER_CODE) → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất); upsert T_MASTER_NAV_CURRENT
+      [J06 phí QL] accrue payable += AUM×rate×(ngày DƯƠNG LỊCH)/365 (continuous; gated mgmt_fee_rate, =0→0).
+        BO cắt phí 1 cục/tháng → event Kafka SP_INGEST_FEE_CHARGE → net-off payable (log T_SI_FEE_CHARGE).
+        SDI KHÔNG sinh lịch, KHÔNG toggle (spec cố định). Thuế GD luôn FO net.
+J11_SI_AGG    Σ per master → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất + **[PM] cash_in/cash_out Σ
+              + total_account + total_asset gồm receivables**); upsert T_MASTER_NAV_CURRENT
 J12_SI_INDEX  Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 master × ~25 mã — nhẹ) → T_MASTER_INDEX_DAILY
 J13_RECONCILE đối soát Σ holding qty (SDI) vs FO → bảng break; CHẶN snapshot nếu lệch quá ngưỡng
 J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_NAV_BALANCE; push delta Asset (current snapshot, không append toàn lịch sử)
@@ -266,10 +268,9 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_CORPORATE_ACTION | PK_… (GUID) | (clustered) | (C_TICKER,C_EX_DATE,C_CA_TYPE) |
 | T_BENCHMARK_DAILY | PK_… (GUID) | (clustered) | (C_BENCHMARK_CODE,C_BUSINESS_DATE) |
 | T_SI_FEE_INCOME | PK_… (GUID) | (clustered) | (C_EVENT_ID) + filtered-unique (C_SOURCE_EVENT_ID) |
-| **T_SI_FEE_SCHEDULE** (sổ thu phí QL) | C_FEE_SCHEDULE_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_PERIOD) |
+| **T_SI_FEE_CHARGE** (log BO cắt phí QL) | C_FEE_CHARGE_ID (BIGINT) | PK_… (nc) | (C_SOURCE_EVENT_ID) dedup |
 | T_MASTER_NAV_BALANCE / _INDEX_DAILY / _HOLDING_BALANCE / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
 | T_EOD_RUN | PK_EOD_RUN (GUID) | (clustered) | (C_BUSINESS_DATE,C_JOB) |
-| T_SDI_CONFIG (singleton) | C_ID=1 (natural) | — | — |
 
 → **Đo thật (medium 1,25M, SQL Express — thời điểm interval-insert CÒN là job EOD `J14b`):** GUID-clustered MỌI bảng = **~40s**; mixed (perf-clustered cho 8 bảng nóng + GUID nonclustered) = **~32s**; baseline không GUID = **~20s**. Driver chi phí ~2× = **chỉ mục GUID nonclustered (NEWID random) phải maintain khi insert khối lớn** vào history. **Lưu ý:** interval-insert nay đã **chuyển sang INGEST (per-event Kafka)** → overhead GUID này áp ở **ingest-time, KHÔNG trong EOD core** (EOD nhẹ hơn nhiều). Tất cả vẫn << SLA 10 phút ⇒ chấp nhận để mọi row addressable qua API/UI.
 → Muốn giảm overhead GUID ở history: bỏ GUID ở `holding_hist`/`cash_hist` (API FR-06 địa chỉ theo `C_SI_ACCOUNT`+asOf, KHÔNG cần GUID per-row của history) — để ngỏ, chưa làm.
