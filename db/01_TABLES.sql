@@ -15,7 +15,7 @@ GO
   Naming: T_/C_ UPPERCASE. Khóa surrogate public GUID `PK_<table>` (NEWID, IDOR-safe). Clustered theo
     tải: append-fact → BIGINT IDENTITY (PK_<t>_ID); point/join → natural (PK_<t>_NK); nhỏ → GUID.
     Natural giữ UQ_<t>_NK (idempotency). T_MASTER_PORTFOLIO: PK = C_MASTER_CODE (không GUID).
-  DECIMAL: Tiền & Quantity = (20,0); Giá = (18,4); % / return / fee_rate = (10,6);
+  DECIMAL: Tiền & Quantity = (20,0); Giá = (18,4); % / return / fee_rate = (10,6); phí lũy kế ngày (payable/accrued, net-off định kỳ) = (20,6);
     Unit & Unit Price = (18,6); Weight (12,8); CA ratio (18,8); index_value (18,x).
 ==============================================================================*/
 
@@ -187,7 +187,7 @@ CREATE TABLE T_SI_NAV_CURRENT (
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
     C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_CNC_UNIT DEFAULT 0,
     C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,
-    C_PAYABLE_FEE      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,
+    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,
     C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,
     C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
@@ -217,7 +217,7 @@ CREATE TABLE T_EOD_WORK (
     C_CUST_CODE       VARCHAR(10)    NOT NULL,
     C_MASTER_CODE     VARCHAR(20)    NOT NULL,
     C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_PAYABLE_FEE     DECIMAL(20,0)  NOT NULL DEFAULT 0,
+    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,
     C_LAST_NAV        DECIMAL(20,0)  NOT NULL DEFAULT 0,
     C_LAST_UNIT_PRICE DECIMAL(18,6) NULL,
     C_UNIT_PREV       DECIMAL(18,6) NOT NULL DEFAULT 0,
@@ -241,7 +241,7 @@ CREATE TABLE T_SI_NAV_BALANCE (
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV NET phí (= gross − payable). Khi accrual OFF: payable=0 ⇒ = gross
-    C_PAYABLE_FEE    DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_NAV_BAL_PAY DEFAULT 0,  -- phí QL accrued chưa thu @ngày; NAV_gross = C_NAV + C_PAYABLE_FEE
+    C_PAYABLE_FEE    DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SI_NAV_BAL_PAY DEFAULT 0,  -- phí QL accrued chưa thu @ngày; NAV_gross = C_NAV + C_PAYABLE_FEE
     C_UNIT           DECIMAL(18,6)  NOT NULL,
     C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- unit price NET phí
     C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,
@@ -286,9 +286,9 @@ CREATE TABLE T_SI_FEE_SCHEDULE (
     C_PERIOD_START   DATE          NOT NULL,
     C_PERIOD_END     DATE          NOT NULL,
     C_DUE_DATE       DATE          NOT NULL,        -- ngày ra lệnh thu (cuối kỳ)
-    C_AVG_AUM        DECIMAL(20,0) NULL,            -- AUM trung bình kỳ (thông tin; = amount / (rate × kỳ/daycount))
+    C_AVG_AUM        DECIMAL(20,0) NULL,            -- AUM trung bình kỳ (thông tin; = AVG(nav_gross) các ngày trong kỳ)
     C_FEE_RATE       DECIMAL(10,6) NOT NULL,        -- rate hiệu lực snapshot lúc tạo
-    C_AMOUNT         DECIMAL(20,0) NOT NULL,        -- số ra lệnh thu = payable tích luỹ kỳ (= rate × AUM_TB × kỳ)
+    C_AMOUNT         DECIMAL(20,6) NOT NULL,        -- số ra lệnh thu = payable tích luỹ kỳ (= rate × AUM_TB × kỳ)
     C_STATUS         VARCHAR(12)   NOT NULL CONSTRAINT DF_SI_FEE_SCH_STATUS DEFAULT 'PENDING',
     C_INSTRUCTED_DATE DATE         NULL,
     C_EXECUTED_DATE  DATE          NULL,            -- ngày FO xác nhận cắt → settle vào ngày này
@@ -334,8 +334,8 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,
     C_CASH_DIVIDEND    DECIMAL(20,0) NULL,
     C_CUSTODY_FEE      DECIMAL(20,0) NULL,
-    C_MGMT_FEE_ACCRUED DECIMAL(20,0) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue)
-    C_PAYABLE_FEE      DECIMAL(20,0) NULL,
+    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue)
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,
     C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,
     C_NAV              DECIMAL(20,0)  NOT NULL,
     C_UNIT             DECIMAL(18,6) NOT NULL,
