@@ -747,3 +747,107 @@ BEGIN
     END CATCH
 END
 GO
+
+/*===========================================================================
+  SP_GET_MASTER_DEVIATION_DIST (BRD §3.8) — phân phối Performance Deviation per-KH.
+    dev_bps = (Return KH TWR − Return Master Index) × 10000, kỳ [base..end].
+    RS1: #DM + dev AUM-weighted (BRD field 1) + trung vị + σ + #>A/#<B.
+    RS2: histogram theo bucket BPS (width @p_bucket_bps, biên ±@p_cap_bps + 2 overflow).
+    Ngưỡng A/B override 3 tầng (giống US2): param tra cứu → config per-master → default.
+    API convention: @p_user + @p_err_code/@p_err_msg OUT (0=OK, KHÔNG THROW).
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_MASTER_DEVIATION_DIST
+    @p_master_code VARCHAR(20),
+    @p_range         VARCHAR(20) = 'INCEPTION',
+    @p_dev_threshold_high DECIMAL(10,2) = NULL,   -- override A (>A = vượt trội); NULL = config
+    @p_dev_threshold_low  DECIMAL(10,2) = NULL,   -- override B (<B = tụt); NULL = config
+    @p_bucket_bps    INT = 5,                      -- bề rộng bucket (BPS)
+    @p_cap_bps       INT = 25,                     -- biên histogram (±); ngoài biên → overflow
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+    IF @p_bucket_bps <= 0 OR @p_cap_bps <= 0
+        BEGIN SET @p_err_code = 3; SET @p_err_msg = N'bucket_bps/cap_bps phải > 0'; THROW 50003, N'validation', 1; END
+
+    -- ngưỡng A/B hiệu lực (override 3 tầng)
+    DECLARE @devHi DECIMAL(10,2), @devLo DECIMAL(10,2);
+    SELECT @devHi=C_DEV_THRESHOLD_HIGH, @devLo=C_DEV_THRESHOLD_LOW FROM dbo.UDF_PM_CONFIG(@p_master_code);
+    SET @devHi = COALESCE(@p_dev_threshold_high, @devHi);
+    SET @devLo = COALESCE(@p_dev_threshold_low,  @devLo);
+
+    -- khung ngày + master index return kỳ (PR)
+    DECLARE @end DATE, @cutoff DATE, @base DATE;
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+    IF @base IS NULL
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+
+    DECLARE @idxBase DECIMAL(18,6), @idxEnd DECIMAL(18,6), @rMaster DECIMAL(18,10);
+    SELECT @idxBase=C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
+    SELECT @idxEnd =C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@end;
+    SET @rMaster = CASE WHEN @idxBase IS NULL OR @idxBase=0 THEN NULL ELSE @idxEnd/@idxBase - 1 END;
+
+    -- per-KH deviation (BPS) = (TWR KH − return master) × 10000
+    CREATE TABLE #d (si VARCHAR(20), aum DECIMAL(20,6), dev_bps DECIMAL(18,6));
+    INSERT #d (si, aum, dev_bps)
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
+           ((nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1) - @rMaster) * 10000
+    FROM T_SI_NAV_CURRENT nc
+    LEFT JOIN T_SI_NAV_BALANCE b
+      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+    WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
+
+    -- RS1: summary
+    SELECT @p_master_code AS C_MASTER_CODE, @p_range AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE,
+           @devHi AS C_DEV_THRESHOLD_HIGH, @devLo AS C_DEV_THRESHOLD_LOW,
+           COUNT(*) AS C_TOTAL_KH,
+           CAST(SUM(dev_bps*aum)/NULLIF(SUM(aum),0) AS DECIMAL(18,4)) AS C_DEV_AUMW_BPS,
+           CAST((SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY dev_bps) OVER () FROM #d) AS DECIMAL(18,4)) AS C_MEDIAN_BPS,
+           CAST(STDEV(dev_bps) AS DECIMAL(18,4)) AS C_SIGMA_BPS,
+           COUNT(CASE WHEN dev_bps > @devHi THEN 1 END) AS C_CNT_OVER_HIGH,
+           COUNT(CASE WHEN dev_bps < @devLo THEN 1 END) AS C_CNT_UNDER_LOW
+    FROM #d;
+
+    -- RS2: histogram (axis liên tục gồm bucket rỗng + 2 overflow)
+    DECLARE @w DECIMAL(18,4)=@p_bucket_bps, @cap DECIMAL(18,4)=@p_cap_bps;
+    ;WITH tally AS (
+        SELECT TOP (CAST(2*@cap/@w AS INT)) (ROW_NUMBER() OVER (ORDER BY (SELECT NULL))-1) AS i
+        FROM sys.all_objects
+    ),
+    axis AS (
+        SELECT i AS bidx, (-@cap+i*@w) AS lo, (-@cap+(i+1)*@w) AS hi, i+1 AS srt FROM tally
+        UNION ALL SELECT -1, NULL, -@cap, 0
+        UNION ALL SELECT 9999, @cap, NULL, 1000000
+    ),
+    cnt AS (
+        SELECT CASE WHEN dev_bps < -@cap THEN -1 WHEN dev_bps >= @cap THEN 9999
+                    ELSE CAST(FLOOR((dev_bps+@cap)/@w) AS INT) END AS bidx, COUNT(*) AS c
+        FROM #d WHERE dev_bps IS NOT NULL
+        GROUP BY CASE WHEN dev_bps < -@cap THEN -1 WHEN dev_bps >= @cap THEN 9999
+                      ELSE CAST(FLOOR((dev_bps+@cap)/@w) AS INT) END
+    )
+    SELECT a.srt AS C_SORT,
+           CASE WHEN a.bidx=-1   THEN CONCAT('<',CAST(-@cap AS INT),' bps')
+                WHEN a.bidx=9999 THEN CONCAT('>=',CAST(@cap AS INT),' bps')
+                ELSE CONCAT(CAST(a.lo AS INT),'..',CAST(a.hi AS INT),' bps') END AS C_BUCKET,
+           a.lo AS C_LO_BPS, a.hi AS C_HI_BPS, ISNULL(c.c,0) AS C_CNT
+    FROM axis a LEFT JOIN cnt c ON c.bidx=a.bidx
+    ORDER BY a.srt;
+
+    DROP TABLE #d;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+        IF OBJECT_ID('tempdb..#d') IS NOT NULL DROP TABLE #d;
+    END CATCH
+END
+GO

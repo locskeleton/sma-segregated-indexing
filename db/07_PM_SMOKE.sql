@@ -160,3 +160,16 @@ PRINT '  bad-master err_code='+CAST(@ec AS VARCHAR(10))+' (kỳ vọng 1) msg='+
 DELETE FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='M1' AND C_BUSINESS_DATE='2026-01-08';
 EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 GO
+
+PRINT '';
+PRINT '======== BRD §3.8: SP_GET_MASTER_DEVIATION_DIST (dev per-KH: S1=90 S2=-110 S3=490 bps) ========';
+PRINT '-- KỲ VỌNG RS1: #KH=3 dev_aumw=90 median=90 #>100(A)=1(S3) #<-100(B)=1(S2); RS2: "<-25"=1(S2) ">=25"=2(S1,S3) ---';
+DECLARE @ec2 INT, @em2 NVARCHAR(400);
+EXEC SP_GET_MASTER_DEVIATION_DIST @p_master_code='M1', @p_range='INCEPTION',
+     @p_err_code=@ec2 OUTPUT, @p_err_msg=@em2 OUTPUT;
+PRINT '  err_code='+CAST(@ec2 AS VARCHAR(10))+' (kỳ vọng 0)';
+PRINT '-- override A=500/B=-200 → #>A=0 #<B=0 (deviation value khong doi) --';
+EXEC SP_GET_MASTER_DEVIATION_DIST @p_master_code='M1', @p_range='INCEPTION',
+     @p_dev_threshold_high=500, @p_dev_threshold_low=-200,
+     @p_err_code=@ec2 OUTPUT, @p_err_msg=@em2 OUTPUT;
+GO
