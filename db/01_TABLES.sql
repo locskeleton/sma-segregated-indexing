@@ -351,10 +351,7 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ TIỀN bán chờ về
     C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ TIỀN cổ tức chờ về
     C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,                                   -- Σ giá trị cổ phiếu (MTM)
-    C_CASH_DIVIDEND    DECIMAL(20,0) NULL,                                       -- Σ cổ tức tiền ghi nhận trong ngày (tham chiếu)
-    C_CUSTODY_FEE      DECIMAL(20,0) NULL,                                       -- Σ phí lưu ký trong ngày (tham chiếu)
-    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue ở cấp master)
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản)
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_FEE_INCOME on-demand (không lưu rollup master).
     C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
     C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_TOTAL_ASSET − C_PAYABLE_FEE (NAV net phí)
     C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master

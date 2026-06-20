@@ -372,25 +372,18 @@ BEGIN
                SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL,
                SUM(C_CF_IN) AS CFIN, SUM(C_CF_OUT) AS CFOUT, COUNT(*) AS ACCT   -- [PM] flow + #tiểu khoản ACTIVE
         FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE
-    ),
-    fee AS (   -- cổ tức + phí lưu ký per-KH → SUM lên master (sparse; phí QL KHÔNG ở đây → BO/T_SI_FEE_CHARGE)
-        SELECT C_MASTER_CODE,
-               SUM(CASE WHEN C_TYPE='DIVIDEND'    THEN C_AMOUNT ELSE 0 END) AS DIV,
-               SUM(CASE WHEN C_TYPE='CUSTODY_FEE' THEN C_AMOUNT ELSE 0 END) AS CUST
-        FROM T_SI_FEE_INCOME WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE
     )
     INSERT INTO T_MASTER_NAV_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_STOCK_VALUE,
-                             C_CASH_DIVIDEND,C_CUSTODY_FEE,C_MGMT_FEE_ACCRUED,C_PAYABLE_FEE,C_TOTAL_ASSET,
+                             C_PAYABLE_FEE,C_TOTAL_ASSET,
                              C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT)
     SELECT @p_d, a.C_MASTER_CODE, a.CASH, a.PEND, a.DIVC, a.STOCK,
-           f.DIV, f.CUST, a.PAY, a.PAY, (a.CASH + a.PEND + a.DIVC + a.STOCK),   -- mgmt_fee_accrued = payable; total_asset gồm receivables
+           a.PAY, (a.CASH + a.PEND + a.DIVC + a.STOCK),   -- total_asset gồm receivables (pending+div cash)
            a.NAV, a.UNT,
            CASE WHEN a.UNT>0 THEN a.NAV/a.UNT END,
            a.PNL,
            CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END,
            a.CFIN, a.CFOUT, a.ACCT
     FROM agg a
-    LEFT JOIN fee f ON f.C_MASTER_CODE=a.C_MASTER_CODE
     LEFT JOIN T_MASTER_NAV_BALANCE prev ON prev.C_MASTER_CODE=a.C_MASTER_CODE AND prev.C_BUSINESS_DATE=@prev;
 
     -- current cấp master (overwrite) — đọc nhanh AUM/cash-drag/#KH hiện tại
