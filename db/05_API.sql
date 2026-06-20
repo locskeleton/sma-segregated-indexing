@@ -118,14 +118,15 @@ BEGIN
     SELECT @end_nav = C_NAV, @end_up = C_UNIT_PRICE FROM T_SI_NAV_BALANCE
      WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE = @end;
 
-    -- MWR Modified Dietz: cần lịch phiên (T_PRICE_DAILY distinct date) cho trọng số w_i
+    -- MWR Modified Dietz: cần lịch phiên cho trọng số w_i. Lấy từ T_MASTER_INDEX_DAILY (1 dòng/master/phiên)
+    -- thay vì T_PRICE_DAILY (date×TẤT CẢ mã) — cùng tập ngày GD nhưng ~250 dòng thay vì hàng triệu.
     DECLARE @T INT, @cf_net DECIMAL(20,0) = 0, @weighted DECIMAL(18,6) = 0;
-    SELECT @T = COUNT(*) FROM (SELECT DISTINCT C_BUSINESS_DATE FROM T_PRICE_DAILY
-                               WHERE C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end) c;
+    SELECT @T = COUNT(*) FROM T_MASTER_INDEX_DAILY
+     WHERE C_MASTER_CODE=@master AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
 
     ;WITH cal AS (
-        SELECT DISTINCT C_BUSINESS_DATE d FROM T_PRICE_DAILY
-         WHERE C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
+        SELECT C_BUSINESS_DATE d FROM T_MASTER_INDEX_DAILY
+         WHERE C_MASTER_CODE=@master AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
     ), flows AS (
         SELECT C_BUSINESS_DATE bd,
                CASE WHEN C_EVENT_TYPE = 'WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END cf
