@@ -13,7 +13,7 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_MASTER_CODE` → master; `FK_<table>` → surrogate) |
 | Stored procedure | `SP_` + UPPERCASE (vd `SP_EOD_RUN`, `SP_GET_SI_DETAIL`) |
 | Tham số SP | **BẮT BUỘC prefix `@p_`** (vd `@p_si_account`, `@p_d`, `@p_json`, `@p_range`) — phân biệt tham số với biến cục bộ (`@local`) trong proc |
-| Tham số SP cho API | SP phục vụ API (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm 3 tham số chuẩn: `@p_user` (định danh người gọi — audit/authz), `@p_err_code INT OUTPUT` + `@p_err_msg NVARCHAR(400) OUTPUT` (trả mã/thông điệp lỗi về app, KHÔNG THROW ra ngoài). Quy ước: `@p_err_code=0` = OK, ≠0 = lỗi. **Engine SP** (`SP_EOD_*`, `SP_INGEST_*`, dispatcher) KHÔNG cần bộ 3 này — chạy nội bộ EOD pipeline, lỗi → `THROW` chặn publish (chỉ áp dụng rule prefix `@p_`) |
+| Tham số SP cho API | SP phục vụ API (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm 3 tham số chuẩn: `@p_user` (định danh người gọi — audit/authz), `@p_err_code INT OUTPUT` + `@p_err_msg NVARCHAR(400) OUTPUT` (trả mã/thông điệp lỗi về app, KHÔNG THROW ra ngoài). Quy ước: `@p_err_code=0` = OK, ≠0 = lỗi. **Engine SP nội bộ** (`SP_EOD_STEP`/`SP_EOD_COMPUTE`/`SP_EOD_*` job, `SP_INGEST_*`) lỗi → `THROW` (chỉ áp dụng rule prefix `@p_`). **NGOẠI LỆ — `SP_EOD_RUN`** (orchestrator app gọi trực tiếp): bọc TRY/CATCH, trả lỗi qua `@p_err_code`/`@p_err_msg` OUT (KHÔNG THROW); step nội bộ vẫn THROW + log FAILED `T_EOD_RUN`, orchestrator bắt lại |
 | Function | `UDF_` |
 
 ## Thứ tự chạy
