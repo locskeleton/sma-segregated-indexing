@@ -102,36 +102,37 @@ EXEC SP_EOD_TE_ACCUM @D2;
 EXEC SP_EOD_TE_ACCUM @D3;
 GO
 
+DECLARE @ec INT, @em NVARCHAR(400);
 PRINT '======== P1: SP_SET_MASTER_PM_CONFIG (set HIGH dev=200, giữ còn lại default) ========';
-EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_dev_threshold_high=200.00, @p_updated_by='smoke';
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_dev_threshold_high=200.00, @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 PRINT '-- reset về toàn default cho các assert dưới --';
-EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke';  -- all NULL → default
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;  -- all NULL → default
 
 PRINT '';
 PRINT '======== US2: SP_GET_MASTER_OVERVIEW (kỳ vọng: KH_RET=.08 MASTER_RET=.071 DEV=90 TE≈.029661 badge MED #TE>=1 #cash=1 #devHi=1 #devLo=1 growth≈.081081) ========';
-EXEC SP_GET_MASTER_OVERVIEW @p_master_code='M1', @p_range='INCEPTION';
+EXEC SP_GET_MASTER_OVERVIEW @p_master_code='M1', @p_range='INCEPTION', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== US3: SP_GET_MASTER_PERFORMANCE (3 đường; KH_COMPOSITE base≈1.0; RS2 rebalance D1,D3) ========';
-EXEC SP_GET_MASTER_PERFORMANCE @p_master_code='M1', @p_range='INCEPTION', @p_resolution='D';
+EXEC SP_GET_MASTER_PERFORMANCE @p_master_code='M1', @p_range='INCEPTION', @p_resolution='D', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== US3 click: SP_GET_MASTER_REBALANCE_DETAIL @D3 (weight CCC 0→.2; AAA .6→.5; qty delta) ========';
-EXEC SP_GET_MASTER_REBALANCE_DETAIL @p_master_code='M1', @p_date='2026-01-07';
+EXEC SP_GET_MASTER_REBALANCE_DETAIL @p_master_code='M1', @p_date='2026-01-07', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== US4: SP_GET_MASTER_PNL_DIST (gain=3 loss=0 avg=.08 median=.08; hist 0..10%=2 10..20%=1) ========';
-EXEC SP_GET_MASTER_PNL_DIST @p_master_code='M1', @p_range='INCEPTION';
+EXEC SP_GET_MASTER_PNL_DIST @p_master_code='M1', @p_range='INCEPTION', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== US5: SP_GET_MASTER_TOP_KH DESC (S3 .12, S1 .08, S2 .06) ========';
-EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='DESC';
+EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='DESC', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 PRINT '-- ASC (S2 .06, S1 .08, S3 .12) --';
-EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='ASC';
+EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='ASC', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== US1: SP_GET_PM_OVERVIEW_ALL (header #master>=1 #KH=3; RS3 list M1) ========';
-EXEC SP_GET_PM_OVERVIEW_ALL @p_range='INCEPTION', @p_sort='AUM';
+EXEC SP_GET_PM_OVERVIEW_ALL @p_range='INCEPTION', @p_sort='AUM', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
 PRINT '';
 PRINT '======== SP_GET_MASTER_ALERTS (phiên scratch D4: cố ý drift để có breach) ========';
@@ -146,8 +147,7 @@ INSERT T_MASTER_HOLDING_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_TICKER,C_QUANTI
  ('2026-01-08','M1','CCC',2000,20, 40000,0.10);
 -- ngưỡng: symbol .45 → AAA(.62) vượt; drift .08 → AAA(.12)+CCC(.10) vượt; industry .70 → BANK(.90) vượt
 EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_symbol_weight_alert=0.45,
-     @p_drift_threshold=0.08, @p_industry_weight_alert=0.70, @p_updated_by='smoke';
-DECLARE @ec INT, @em NVARCHAR(400);
+     @p_drift_threshold=0.08, @p_industry_weight_alert=0.70, @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 PRINT '-- KỲ VỌNG RS1: #symbol=1 (AAA) #drift=2 (AAA,CCC) #industry=1 (BANK); err_code=0 --';
 EXEC SP_GET_MASTER_ALERTS @p_master_code='M1', @p_date='2026-01-08', @p_user='smoke',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
@@ -158,5 +158,5 @@ EXEC SP_GET_MASTER_ALERTS @p_master_code='NOPE', @p_user='smoke',
 PRINT '  bad-master err_code='+CAST(@ec AS VARCHAR(10))+' (kỳ vọng 1) msg='+ISNULL(@em,'NULL');
 -- cleanup scratch + reset config
 DELETE FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='M1' AND C_BUSINESS_DATE='2026-01-08';
-EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke';
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 GO

@@ -78,6 +78,8 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 | `SP_GET_MASTER_ALERTS` | (alert) | `@p_master_code, @p_date`(NULL=phiên mới nhất)`, @p_user, @p_err_code OUT, @p_err_msg OUT` | cảnh báo composition: actual (`T_MASTER_HOLDING_BALANCE`) vs target (`T_MASTER_PORTFOLIO_TICKER`) + Σ ngành (`T_TICKER_INDUSTRY`). RS1 summary (#vượt symbol/drift/industry + ngưỡng); RS2 per-mã (actual/target/drift+cờ); RS3 per-ngành (Σweight+cờ). Ngưỡng NULL ⇒ alert tắt. **Proc API theo convention mới** (err qua OUT, 0=OK; KHÔNG THROW) |
 | `SP_SET_MASTER_PM_CONFIG` | (cấu hình) | `@p_master_code, ngưỡng...` | upsert ngưỡng PM per-master (gồm drift/symbol/industry weight) |
 
+> Mọi SP trong bảng đều thêm bộ tham số API chuẩn `@p_user`, `@p_err_code INT OUT`, `@p_err_msg NVARCHAR(400) OUT` (convention: lỗi trả qua OUT, `0`=OK, KHÔNG THROW). Caller phải truyền 2 tham số OUTPUT (bắt buộc).
+
 **Mẫu tính TE on-read** (1 master, kỳ [a,b]):
 ```sql
 ;WITH ar AS (   -- active return ngày = R_KH − R_master_index

@@ -41,10 +41,15 @@ GO
     RS2: tổng hợp toàn KH (Σ NAV, Σ cash, số sub-account)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_OVERVIEW
-    @p_cust_code VARCHAR(10)
+    @p_cust_code VARCHAR(10),
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     SELECT  ip.C_SI_ACCOUNT,         -- mã sub-account (đơn vị customer-level)
             ip.C_MASTER_CODE,        -- master KH đầu tư
@@ -70,6 +75,10 @@ BEGIN
     FROM        T_SI_PORTFOLIO   ip
     LEFT JOIN   T_SI_NAV_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
     WHERE  ip.C_CUST_CODE = @p_cust_code;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -80,13 +89,18 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_DETAIL
     @p_si_account VARCHAR(20),               -- si_account UNIQUE toàn cục → đủ định danh (master suy từ đây)
-    @p_range        VARCHAR(20) = 'INCEPTION'
+    @p_range        VARCHAR(20) = 'INCEPTION',
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
@@ -151,6 +165,10 @@ BEGIN
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
                  C_TOTAL_ASSET, C_CASH, C_STOCK_VALUE
     FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -161,13 +179,18 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_PERFORMANCE
     @p_si_account VARCHAR(20),
-    @p_range        VARCHAR(20) = '1Y'
+    @p_range        VARCHAR(20) = '1Y',
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -190,6 +213,10 @@ BEGIN
     LEFT JOIN   T_BENCHMARK_DAILY      bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     WHERE  cd.C_SI_ACCOUNT=@p_si_account AND cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
     ORDER BY cd.C_BUSINESS_DATE;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -197,10 +224,15 @@ GO
   FR-04 — GET /customer/{id}/si/{si_account}/info : thông tin đầu tư sub-account
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_INFO
-    @p_si_account VARCHAR(20)
+    @p_si_account VARCHAR(20),
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     SELECT  ip.PK_SI_PORTFOLIO AS C_SUBACCOUNT_PK_ID,
             ip.C_SI_ACCOUNT,
@@ -218,6 +250,10 @@ BEGIN
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
     WHERE ip.C_SI_ACCOUNT = @p_si_account;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -227,13 +263,18 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_HOLDINGS
     @p_si_account VARCHAR(20),
-    @p_top          INT = 20
+    @p_top          INT = 20,
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account)
-        BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
@@ -254,6 +295,10 @@ BEGIN
     FROM ranked CROSS JOIN tot WHERE rn > @p_top
     HAVING COUNT(*) > 0
     ORDER BY C_SORT, C_MARKET_VALUE DESC;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -263,13 +308,18 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_ASSET_REPORT
     @p_si_account VARCHAR(20),
-    @p_asof         DATE = NULL
+    @p_asof         DATE = NULL,
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
 
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
@@ -344,5 +394,9 @@ BEGIN
     FROM T_SI_FEE_CHARGE
     WHERE C_SI_ACCOUNT=@p_si_account AND C_CHARGE_DATE <= @p_asof
     ORDER BY C_CHARGE_DATE DESC;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO

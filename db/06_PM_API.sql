@@ -50,12 +50,17 @@ CREATE OR ALTER PROCEDURE SP_SET_MASTER_PM_CONFIG
     @p_drift_threshold       DECIMAL(9,6) = NULL,
     @p_symbol_weight_alert   DECIMAL(9,6) = NULL,
     @p_industry_weight_alert DECIMAL(9,6) = NULL,
-    @p_updated_by           VARCHAR(64)   = NULL
+    @p_updated_by           VARCHAR(64)   = NULL,
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN RAISERROR('Master not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
 
     MERGE T_MASTER_PM_CONFIG AS t
     USING (SELECT @p_master_code AS m) AS s ON t.C_MASTER_CODE = s.m
@@ -81,6 +86,10 @@ BEGIN
          @p_drift_threshold, @p_symbol_weight_alert, @p_industry_weight_alert, @p_updated_by);
 
     SELECT @p_master_code AS C_MASTER_CODE, * FROM dbo.UDF_PM_CONFIG(@p_master_code);
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -91,12 +100,17 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_OVERVIEW
     @p_master_code VARCHAR(20),
-    @p_range         VARCHAR(20) = 'INCEPTION'
+    @p_range         VARCHAR(20) = 'INCEPTION',
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN RAISERROR('Master not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
 
     -- cấu hình ngưỡng hiệu lực
     DECLARE @teLow DECIMAL(10,6), @teHigh DECIMAL(10,6), @teAlert DECIMAL(10,6),
@@ -203,6 +217,10 @@ BEGIN
     FROM T_MASTER_PORTFOLIO mp WHERE mp.C_MASTER_CODE=@p_master_code;
 
     DROP TABLE #kh;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -216,12 +234,17 @@ GO
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_PERFORMANCE
     @p_master_code VARCHAR(20),
     @p_range         VARCHAR(20) = '1Y',
-    @p_resolution    VARCHAR(2)  = NULL   -- 'D'|'W'|'M' ; NULL = auto
+    @p_resolution    VARCHAR(2)  = NULL,   -- 'D'|'W'|'M' ; NULL = auto
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN RAISERROR('Master not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -297,6 +320,10 @@ BEGIN
     ORDER BY C_EFFECTIVE_DATE;
 
     DROP TABLE #kw;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -307,10 +334,15 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_REBALANCE_DETAIL
     @p_master_code VARCHAR(20),
-    @p_date          DATE
+    @p_date          DATE,
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     -- effective_date hiệu lực = lớn nhất ≤ @p_date ; kỳ trước = lớn nhất < eff
     DECLARE @eff DATE, @prevEff DATE;
@@ -349,6 +381,10 @@ BEGIN
                  WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@hdPrev) p
       ON p.C_TICKER=c.C_TICKER
     ORDER BY ABS(ISNULL(c.C_QUANTITY,0)-ISNULL(p.C_QUANTITY,0)) DESC;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -359,12 +395,17 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_PNL_DIST
     @p_master_code VARCHAR(20),
-    @p_range         VARCHAR(20) = 'INCEPTION'
+    @p_range         VARCHAR(20) = 'INCEPTION',
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN RAISERROR('Master not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
@@ -410,6 +451,10 @@ BEGIN
     ORDER BY bk.C_SORT;
 
     DROP TABLE #p;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -420,12 +465,17 @@ CREATE OR ALTER PROCEDURE SP_GET_MASTER_TOP_KH
     @p_master_code VARCHAR(20),
     @p_range         VARCHAR(20) = 'INCEPTION',
     @p_topn          INT = 20,
-    @p_dir           VARCHAR(4) = 'DESC'   -- DESC = top lãi ; ASC = top lỗ
+    @p_dir           VARCHAR(4) = 'DESC',   -- DESC = top lãi ; ASC = top lỗ
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN RAISERROR('Master not found',16,1); RETURN; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
@@ -450,6 +500,10 @@ BEGIN
     FROM k
     ORDER BY CASE WHEN @p_dir='ASC' THEN C_PNL_PCT END ASC,
              CASE WHEN @p_dir<>'ASC' THEN C_PNL_PCT END DESC;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -462,10 +516,15 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_PM_OVERVIEW_ALL
     @p_range VARCHAR(20) = 'INCEPTION',
-    @p_sort  VARCHAR(8)  = 'AUM'
+    @p_sort  VARCHAR(8)  = 'AUM',
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
 
     -- khung ngày per-master (ACTIVE)
     CREATE TABLE #md (m VARCHAR(20), dend DATE, dcut DATE, dbase DATE,
@@ -581,6 +640,10 @@ BEGIN
              mc.C_TOTAL_ASSET DESC;
 
     DROP TABLE #kh; DROP TABLE #mr; DROP TABLE #md;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
 END
 GO
 
@@ -607,7 +670,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
     BEGIN
         SET @p_err_code = 1; SET @p_err_msg = N'Master not found: ' + ISNULL(@p_master_code,N'(null)');
-        RETURN;
+        THROW 50001, N'validation', 1;
     END
 
     -- ngày mặc định = phiên holdings gần nhất của master
@@ -616,7 +679,7 @@ BEGIN
     IF @p_date IS NULL
     BEGIN
         SET @p_err_code = 2; SET @p_err_msg = N'Chưa có holdings balance cho master.';
-        RETURN;
+        THROW 50002, N'validation', 1;
     END
 
     -- ngưỡng cấu hình (NULL = alert type tắt)
@@ -673,7 +736,7 @@ BEGIN
 
     END TRY
     BEGIN CATCH
-        SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE();   -- lỗi runtime bất ngờ → trả qua OUT, KHÔNG THROW (convention API)
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- validation đã set (THROW vào đây); chỉ -1 cho runtime. KHÔNG THROW ra ngoài.
         IF OBJECT_ID('tempdb..#pt') IS NOT NULL DROP TABLE #pt;
         IF OBJECT_ID('tempdb..#pi') IS NOT NULL DROP TABLE #pi;
     END CATCH

@@ -378,7 +378,7 @@ Quy tắc: trong công thức dùng `net_cashflow` (rõ "net"); `income` tách k
 
 **Tham số stored procedure:**
 - Mọi tham số SP **BẮT BUỘC prefix `@p_`** (vd `@p_si_account`, `@p_d`, `@p_range`) — phân biệt với biến cục bộ `@local`.
-- SP phục vụ **API** (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm: `@p_user` (định danh người gọi), `@p_err_code INT OUTPUT`, `@p_err_msg NVARCHAR(400) OUTPUT` (trả lỗi về app, `@p_err_code=0`=OK; KHÔNG THROW ra ngoài).
+- SP phục vụ **API** (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm: `@p_user` (định danh người gọi), `@p_err_code INT OUTPUT`, `@p_err_msg NVARCHAR(400) OUTPUT` (trả lỗi về app, `@p_err_code=0`=OK; KHÔNG THROW ra ngoài). Pattern: validate trong thân → set err_code/err_msg → `THROW` để `TRY/CATCH` bắt; `CATCH` gán `err_code=-1` cho lỗi runtime (guard `IF @p_err_code=0`). **Đã áp dụng toàn bộ** `SP_GET_SI_*` (05_API) + `SP_GET_MASTER_*`/`SP_GET_PM_*`/`SP_SET_MASTER_PM_CONFIG`/`SP_GET_MASTER_ALERTS` (06_PM_API).
 - SP **engine** (`SP_EOD_*`, `SP_INGEST_*`, dispatcher) **KHÔNG** cần bộ 3 tham số API — lỗi → `THROW` chặn EOD publish (chỉ theo rule prefix `@p_`).
 
 ---
