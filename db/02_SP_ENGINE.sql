@@ -151,7 +151,7 @@ END
 GO
 
 -- (ĐÃ BỎ J03 APPLY_CA & J04 APPLY_EXEC) — FO sync đã phản ánh cổ tức/split/trade vào cash+holdings.
---   T_CORPORATE_ACTION chỉ còn dùng cho SI INDEX (điều chỉnh P_ref khi có quyền — J12).
+--   Điều chỉnh P_ref khi có quyền (J12) lấy thẳng C_ADJUSTED_REF_PRICE trên dòng T_PRICE_DAILY ngày ex-rights.
 
 -- PHÍ QL (J06, BO-driven, CỐ ĐỊNH — không toggle):
 --   SDI accrue payable trong SP_EOD_COMPUTE theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate>0).
@@ -429,11 +429,10 @@ BEGIN
     FACT AS (
         SELECT W.C_MASTER_CODE,
                SUM( W.C_TARGET_WEIGHT * p.C_CLOSE_PRICE
-                    / COALESCE(ca.C_ADJUSTED_REF_PRICE, pref.C_CLOSE_PRICE, p.C_CLOSE_PRICE) ) AS FACTOR
+                    / COALESCE(p.C_ADJUSTED_REF_PRICE, pref.C_CLOSE_PRICE, p.C_CLOSE_PRICE) ) AS FACTOR
         FROM W
-        JOIN T_PRICE_DAILY p         ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@d
+        JOIN T_PRICE_DAILY p         ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@d   -- P_ref ex-rights nằm ngay trên dòng giá @d (gộp từ T_CORPORATE_ACTION)
         LEFT JOIN T_PRICE_DAILY pref ON pref.C_TICKER=W.C_TICKER AND pref.C_BUSINESS_DATE=@prev
-        LEFT JOIN T_CORPORATE_ACTION ca ON ca.C_TICKER=W.C_TICKER AND ca.C_EX_DATE=@d
         GROUP BY W.C_MASTER_CODE
     )
     INSERT INTO T_MASTER_INDEX_DAILY (C_BUSINESS_DATE,C_MASTER_CODE,C_INDEX_VALUE,C_DAILY_RETURN)

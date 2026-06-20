@@ -92,7 +92,7 @@ SELECT C_BUSINESS_DATE, C_TYPE, C_TICKER, C_AMOUNT, C_SOURCE_EVENT_ID FROM T_SI_
 WHERE C_CUST_CODE='KH00001001' ORDER BY C_TYPE;   -- KỲ VỌNG: 2 dòng (DIVIDEND 50000, CUSTODY_FEE 1000)
 
 PRINT '--- T_EOD_RUN (job log) ---';
-SELECT C_STATUS, COUNT(*) AS N FROM T_EOD_RUN GROUP BY C_STATUS;   -- KỲ VỌNG: 24 DONE (6 job × 4 phiên)
+SELECT C_STATUS, COUNT(*) AS N FROM T_EOD_RUN GROUP BY C_STATUS;   -- KỲ VỌNG: 28 DONE (7 job × 4 phiên)
 
 PRINT '--- GUARD 1: event QUÁ KHỨ (business_date 06 < watermark 07) phải bị CHẶN ---';
 BEGIN TRY
@@ -107,3 +107,20 @@ BEGIN TRY
     PRINT '  !!! LỖI: GATE không chặn khi thiếu data';
 END TRY BEGIN CATCH PRINT '  OK GATE chặn: '+ERROR_MESSAGE(); END CATCH;
 DELETE FROM T_SI_PORTFOLIO WHERE C_CUST_CODE='KH00009999';
+
+PRINT '--- GỘP GIÁ+CA: J12 lấy C_ADJUSTED_REF_PRICE ngay trên dòng ex-rights (cột mới C_IS_EX_RIGHTS) ---';
+-- Phiên scratch 08: AAA là ngày KHÔNG hưởng quyền (P_ref=115 ≠ close hôm trước 110). Gọi J12 standalone.
+INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_CLOSE_PRICE,C_IS_EX_RIGHTS,C_ADJUSTED_REF_PRICE) VALUES
+ ('AAA','2026-01-08',120,1,115),   -- ex-rights: P_ref=115
+ ('BBB','2026-01-08',52,0,NULL);   -- phiên thường (fallback close hôm trước)
+EXEC SP_EOD_SI_INDEX '2026-01-08';
+DECLARE @ret08 DECIMAL(18,8) = (SELECT C_DAILY_RETURN FROM T_MASTER_INDEX_DAILY
+    WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-08');
+-- dùng adjusted_ref 115 → FACTOR = 0.6*120/115 + 0.4*52/52 = 1.0260870 → return ≈ 0.0260870
+-- nếu BỎ adjusted_ref (rơi về close hôm trước 110) → return ≈ 0.0545455 (SAI)
+IF @ret08 IS NOT NULL AND ABS(@ret08 - 0.0260870) < 0.0001
+    PRINT '  OK J12 áp dụng adjusted_ref (return='+CAST(@ret08 AS VARCHAR(20))+')';
+ELSE
+    PRINT '  !!! LỖI: return='+ISNULL(CAST(@ret08 AS VARCHAR(20)),'NULL')+' (kỳ vọng ~0.0260870 — adjusted_ref KHÔNG áp dụng?)';
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-01-08';   -- dọn scratch
+DELETE FROM T_PRICE_DAILY       WHERE C_BUSINESS_DATE='2026-01-08';

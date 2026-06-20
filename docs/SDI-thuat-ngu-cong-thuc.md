@@ -248,7 +248,6 @@ NAV ròng = Tổng tài sản − Phí phải trả
 | Phí lũy kế ngày (payable/accrued) | `(20,6)` | giữ thập phân, không round VND/ngày |
 | Unit & Unit Price | `(18,6)` | Unit Price gốc 10.000 |
 | Trọng số (weight) | `(12,8)` | Σ = 1.0 |
-| Tỷ lệ CA (ratio) | `(18,8)` | chia/tách/quyền |
 | Index value | `(18,x)` | gốc 1000 |
 | Lũy kế TE (accum active) | `FLOAT` | double, tránh mất số khi cộng dồn |
 | Deviation | BPS (`DECIMAL(12,2)`) | 1% = 100 BPS |

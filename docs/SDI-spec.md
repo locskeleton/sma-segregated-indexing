@@ -204,8 +204,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04).
 
 ### Market data
-- **`T_PRICE_DAILY`** (ticker, business_date PK; close_price, adjusted_ref_price)
-- **`T_CORPORATE_ACTION`** (ticker, ex_date, ca_type PK; ratio, cash_div_per_share, adjusted_ref_price)
+- **`T_PRICE_DAILY`** (ticker, business_date PK; close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường], adjusted_ref_price) — **gộp corporate action vào bảng giá**: ngày ex-rights đánh dấu `is_ex_rights=1` + `adjusted_ref_price`=P_ref cho J12. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
 - **`T_BENCHMARK_DAILY`** (benchmark_code, business_date PK; index_value) — chỉ số thị trường ngoài (VN-Index, price return), **nạp từ market data** (không do SDI tính). Key = code tự mô tả (giống ticker), không cần dimension riêng.
 
 ### FO sync (EOD) & cashflow

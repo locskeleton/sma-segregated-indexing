@@ -75,9 +75,8 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 7a | **Giá EOD** | `T_PRICE_DAILY` | ticker, business_date, close_price, adjusted_ref_price | Theo **universe mã** (không theo KH). |
-| 7b | **Corporate action** | `T_CORPORATE_ACTION` | ticker, ex_date, ca_type, ratio, cash_div_per_share, adjusted_ref_price | **SPARSE** — chỉ ex-date. Chỉ dùng J12 index. |
-| 7c | **Benchmark** | `T_BENCHMARK_DAILY` | benchmark_code (VNINDEX…), business_date, index_value | 1 dòng/benchmark/ngày. |
+| 7a | **Giá EOD (gộp CA)** | `T_PRICE_DAILY` | ticker, business_date, close_price, **is_ex_rights** (1/0), adjusted_ref_price | Theo **universe mã** (không theo KH). Ngày KHÔNG hưởng quyền: `is_ex_rights=1` + `adjusted_ref_price`=P_ref (J12). Bỏ bảng CA riêng — engine chỉ cần P_ref; type/ratio/cash_div đã vào NAV qua FO sync. |
+| 7b | **Benchmark** | `T_BENCHMARK_DAILY` | benchmark_code (VNINDEX…), business_date, index_value | 1 dòng/benchmark/ngày. |
 
 ### D. SDI → Asset (J14 SNAPSHOT, sau reconcile)
 

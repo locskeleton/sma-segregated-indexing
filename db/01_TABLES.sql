@@ -68,26 +68,19 @@ CREATE INDEX IX_SI_PORTFOLIO_CUST ON T_SI_PORTFOLIO (C_CUST_CODE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_STATUS, C_JOIN_DATE);
 
 /*-------------------------------------------------------------- MARKET DATA ---*/
+-- GỘP giá daily + sự kiện quyền vào 1 bảng: mỗi (mã, phiên) 1 dòng giá; dòng nào là
+-- ngày ex-rights (không hưởng quyền) thì C_IS_EX_RIGHTS=1 + C_ADJUSTED_REF_PRICE = P_ref.
+-- Bỏ bảng T_CORPORATE_ACTION riêng: engine chỉ cần adjusted_ref_price cho J12; thuộc tính CA
+-- (type/ratio/cash_div) không tham gia tính toán (cổ tức/quyền đã vào NAV qua FO sync).
 CREATE TABLE T_PRICE_DAILY (
     PK_PRICE_DAILY      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PRICE_DAILY_PKID DEFAULT NEWID(),
     C_TICKER            VARCHAR(20)  NOT NULL,
     C_BUSINESS_DATE     DATE         NOT NULL,
     C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,  -- GIÁ đóng cửa — định giá MTM (J07: stock_value = Σ qty×close_price) + index J12 (Pᵢ,t)
-    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,     -- GIÁ tham chiếu đã điều chỉnh quyền (P_ref cho J12 khi có CA; ưu tiên hơn close hôm trước)
+    C_IS_EX_RIGHTS      TINYINT      NOT NULL CONSTRAINT DF_PRICE_DAILY_EXR DEFAULT 0,  -- 1 = ngày có sự kiện quyền gây chia giá (ex-rights/ex-div); 0 = phiên thường
+    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,     -- GIÁ tham chiếu đã điều chỉnh quyền (P_ref cho J12 khi C_IS_EX_RIGHTS=1; ưu tiên hơn close hôm trước)
     CONSTRAINT PK_PRICE_DAILY_NK PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_TICKER),  -- natural clustered (join MTM nóng)
     CONSTRAINT UQ_PRICE_DAILY_PKID UNIQUE NONCLUSTERED (PK_PRICE_DAILY)
-);
-
-CREATE TABLE T_CORPORATE_ACTION (
-    PK_CORPORATE_ACTION  UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_CORPORATE_ACTION_PKID DEFAULT NEWID(),
-    C_TICKER             VARCHAR(20)  NOT NULL,
-    C_EX_DATE            DATE         NOT NULL,
-    C_CA_TYPE            VARCHAR(20)  NOT NULL,  -- CASH_DIV | STOCK_DIV | SPLIT | RIGHTS. Chỉ dùng cho J12 index (điều chỉnh P_ref ngày ex-date); cổ tức/quyền vào NAV qua FO sync.
-    C_RATIO              DECIMAL(18,8) NULL,      -- tỷ lệ chia/tách (STOCK_DIV/SPLIT/RIGHTS)
-    C_CASH_DIV_PER_SHARE DECIMAL(18,4) NULL,      -- TIỀN cổ tức/cổ phiếu (CASH_DIV)
-    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,      -- GIÁ tham chiếu sau điều chỉnh quyền tại ex-date (P_ref cho J12)
-    CONSTRAINT PK_CORPORATE_ACTION PRIMARY KEY CLUSTERED (PK_CORPORATE_ACTION),
-    CONSTRAINT UQ_CORPORATE_ACTION_NK UNIQUE (C_TICKER, C_EX_DATE, C_CA_TYPE)
 );
 
 CREATE TABLE T_BENCHMARK_DAILY (
