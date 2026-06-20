@@ -250,13 +250,20 @@ CREATE TABLE T_SI_NAV_BALANCE (
     C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- unit price NET phí
     C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,
     C_DAILY_RETURN   DECIMAL(10,6)  NULL,
+    -- [PM tool] TE prefix-sum: lũy kế active return (= KH return − master index return) từ inception.
+    --   Cho phép tính STDEV(active) qua range BẤT KỲ bằng HIỆU 2 mốc (base/end) → đọc 2 lát, không quét.
+    --   Maintain ở EOD bước SP_EOD_TE_CUM (sau J12, cần index daily return). FLOAT (double) cho ổn số.
+    C_CUM_ACTIVE_RET    FLOAT       NOT NULL CONSTRAINT DF_SI_NAV_BAL_CAR  DEFAULT 0,  -- Σ aᵢ,d  (a = active return)
+    C_CUM_ACTIVE_RET_SQ FLOAT       NOT NULL CONSTRAINT DF_SI_NAV_BAL_CARSQ DEFAULT 0, -- Σ aᵢ,d²
+    C_RET_DAY_COUNT     INT         NOT NULL CONSTRAINT DF_SI_NAV_BAL_RDC  DEFAULT 0,  -- n (số ngày có active return)
     CONSTRAINT PK_SI_NAV_BALANCE_ID PRIMARY KEY CLUSTERED (C_NAV_BALANCE_ID),
     CONSTRAINT UQ_SI_NAV_BALANCE_PKID UNIQUE NONCLUSTERED (PK_SI_NAV_BALANCE),
     CONSTRAINT UQ_SI_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_SI_ACCOUNT) -- idempotency
 );
--- [PM tool] quét per-master theo ngày (US3/US4/US5/TE): all KH của 1 master trong kỳ.
+-- [PM tool] quét per-master theo ngày (US3 chart) + đọc 2 lát base/end (US1/US2 return+TE prefix-sum).
 CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_NAV_BALANCE (C_MASTER_CODE, C_BUSINESS_DATE)
-    INCLUDE (C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV);
+    INCLUDE (C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV,
+             C_CUM_ACTIVE_RET, C_CUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT);
 
 -- Sổ cái CỔ TỨC + PHÍ per sub-account, SPARSE — FO đẩy về (ingest, dedup C_SOURCE_EVENT_ID).
 CREATE TABLE T_SI_FEE_INCOME (

@@ -12,3 +12,5 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-18T18:00:22Z,95421e0,"refactor(db): audit timestamp DATETIME2/SYSUTCDATETIME → DATETIME/GETDATE (khớp codebase)",small,1000,60000,880,NULL,556,57,30,37,160,NULL
 2026-06-19T14:19:34Z,ce52c44,"docs(eod): Track 1 — receivables→NAV + master flow/count + phí QL BO-driven (cố định, no toggle)",small,1000,60000,1034,NULL,693,84,20,27,160,NULL
 2026-06-19T15:23:17Z,3276606,"docs(pm-tool): spec PM dashboard quản lý master (US1-5, SP serve, TE/deviation/cash-drag)",small,1000,60000,1119,NULL,773,50,16,36,184,NULL
+2026-06-20T02:04:08Z,85bfe21,"perf(pm-tool): fix US3 composite OUTER APPLY→equi-join + P5 bench scale thật",small,1000,60000,1150,NULL,713,67,20,27,187,NULL
+2026-06-20T02:04:59Z,85bfe21,"perf(pm-tool): fix US3 composite OUTER APPLY→equi-join + P5 bench scale thật",medium,10000,1250000,10476,NULL,7640,124,17,130,1693,NULL

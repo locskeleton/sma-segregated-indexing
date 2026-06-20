@@ -95,8 +95,11 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
 - **`T_MASTER_PM_CONFIG`** (per-master, PM cài đặt):
   `C_MASTER_CODE` (UNIQUE/PK) · `C_TE_BADGE_LOW` · `C_TE_BADGE_HIGH` · `C_TE_ALERT_THRESHOLD` · `C_CASH_DRAG_THRESHOLD` (Y) · `C_DEV_THRESHOLD_HIGH` (A) · `C_DEV_THRESHOLD_LOW` (B) · `C_UPDATED_BY` · `C_UPDATED_TIME`.
   - Fallback: master chưa cấu hình → default hệ thống (row `C_MASTER_CODE='*'` hoặc hardcode). Chỉ giữ current + updated_by/time (không lịch sử).
-- **Index** `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE, C_BUSINESS_DATE)` INCLUDE `(C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV)` — quét per-master cho US3/US4/US5/TE.
-- **KHÔNG** đụng EOD (Track 1 đã cung cấp building-block).
+- **Index** `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE, C_BUSINESS_DATE)` INCLUDE `(C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV, C_CUM_ACTIVE_RET, C_CUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT)` — đọc 2 lát base/end (return + TE prefix-sum) phủ index.
+- **[P6] TE prefix-sum** — 3 cột lũy kế trên `T_SI_NAV_BALANCE` (maintain EOD J12B `SP_EOD_TE_CUM`):
+  `C_CUM_ACTIVE_RET` (Σ active return từ inception) · `C_CUM_ACTIVE_RET_SQ` (Σ active²) · `C_RET_DAY_COUNT` (n). FLOAT.
+  TE range = từ HIỆU 2 mốc base/end: `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). ⇒ on-read đọc 2 lát ngày, KHÔNG quét lịch sử → US1 từ ~48s xuống ~1s, end-weight GIỮ NGUYÊN.
+- Return/deviation: KHÔNG precompute — đọc `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000).
 
 ---
 
@@ -139,6 +142,19 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 
 **Nguyên nhân US1**: quét toàn bộ NAV_BALANCE (mọi master, 12.5M) 2 lần — `up_base` (GROUP BY si) + TE STDEV (GROUP BY si) — tức chạy phần nặng của US2 × 10 master. RS1/RS2 (header, ΣAUM, net flow, cash drag) đọc từ master tables = nhanh (ms); chỉ RS3 (KH-return/deviation/TE per-master) là điểm chết.
 
-**CHƯA QUYẾT — cần user chốt hướng** (xem [[pm-tool-serve-layer]]): (A) rollup `T_MASTER_PM_DAILY` trong EOD (TE thành master-level stdev, đổi nhẹ ngữ nghĩa) → US1 còn ms; (B) lazy-load RS3 (US1 trả nhanh AUM/cash/flow, cột TE/deviation/KH-return load sau per-row); (C) cache US1 daily. US2-5 giữ on-read.
-- **Tối ưu phụ chưa làm** (chờ chốt cùng US1): INCEPTION → `up_base=10000` (T0 const) bỏ được 1 scan ở US2/4/5; index leading `C_SI_ACCOUNT` cho customer FR-02/03/06 (cũng scan, vấn đề có sẵn).
+## 10. P6 — fix perf (GIỮ end-weight, KHÔNG đổi ngữ nghĩa). Đo lại @12.5M, warm:
+| SP | P5 (trước) | P6 (sau) | |
+|---|---|---|---|
+| US1 OVERVIEW_ALL | ~48 s | **~1.0 s** | **45× nhanh** |
+| US2 OVERVIEW | ~3.5 s | **80 ms** | 44× |
+| US3 PERFORMANCE | ~1.4 s | 160 ms | |
+| US4 PNL_DIST | ~2.4 s | 48 ms | |
+| US5 TOP_KH | ~2.3 s | 16 ms | |
+
+**Cách fix** (end-weight nguyên vẹn): (1) **Return** — bỏ subquery GROUP-BY quét lịch sử, đọc thẳng lát `@base` + current (return chỉ cần `UPᵢ,base`/`UPᵢ,end`, KHÔNG cần precompute). (2) **TE** — prefix-sum 3 cột lũy kế trên `T_SI_NAV_BALANCE` (EOD J12B), query đọc HIỆU 2 mốc base/end. Cả 2 đọc 2 lát ngày (dùng `IX_SI_NAV_BALANCE_MASTER`) thay vì quét toàn bộ. Verify số khớp 100% bản STDEV trực tiếp (smoke). EOD J12B ~676ms/phiên @50k account (bench medium), J07 không regression.
+- Lưu ý: TE annualize bằng `√(n per-KH)` (n = số ngày active trong range của từng KH) — KH join giữa kỳ scale theo cửa sổ thực của họ (chính xác hơn dùng X master đồng nhất).
+
+## 11. Còn mở
 - Master ACTIVE chưa có EOD data → hiện bị loại khỏi #master count/list. Sau cần hiển thị "mới tạo" thì điều chỉnh.
+- Index leading `C_SI_ACCOUNT` cho customer FR-02/03/06 (cũng scan theo si — vấn đề có sẵn, ngoài scope PM).
+- Backfill ngày quá khứ ⇒ cum các ngày sau lệch (EOD forward-only nên không phải luồng thường); nếu cần resync phải recompute cum xuôi từ ngày sửa.

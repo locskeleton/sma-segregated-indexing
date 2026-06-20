@@ -125,43 +125,35 @@ BEGIN
     SELECT @aumBase = C_TOTAL_ASSET FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@base;
 
-    -- per-KH: AUM (end gross), pnl (TWR), cash drag, TE
+    -- per-KH (end-weight): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end).
+    --   TE = STDEV(active) qua (base,end] = hiệu cum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, cum_base=0.
     CREATE TABLE #kh (si VARCHAR(20), aum DECIMAL(20,6), up_base DECIMAL(18,6),
-                      up_end DECIMAL(18,6), tien DECIMAL(20,0), te FLOAT);
+                      up_end DECIMAL(18,6), tien DECIMAL(20,0),
+                      car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
 
-    INSERT #kh (si, aum, up_end, tien)
+    INSERT #kh (si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
     SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE, nc.C_LAST_UNIT_PRICE,
-           nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH
+           nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE';
 
-    -- up_base: balance tại (MAX date<=cutoff, else MIN date) per KH
-    UPDATE k SET up_base = bp.up
-    FROM #kh k
-    JOIN (
-        SELECT b.C_SI_ACCOUNT, b.C_UNIT_PRICE AS up
-        FROM T_SI_NAV_BALANCE b
-        JOIN (SELECT C_SI_ACCOUNT,
-                     COALESCE(MAX(CASE WHEN C_BUSINESS_DATE<=@cutoff THEN C_BUSINESS_DATE END),
-                              MIN(C_BUSINESS_DATE)) AS bd
-              FROM T_SI_NAV_BALANCE
-              WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE<=@end
-              GROUP BY C_SI_ACCOUNT) x
-          ON x.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND x.bd=b.C_BUSINESS_DATE
-        WHERE b.C_MASTER_CODE=@C_MASTER_CODE
-    ) bp ON bp.C_SI_ACCOUNT = k.si;
+    -- lát @end: cum active đến cuối kỳ
+    UPDATE k SET car_e=e.C_CUM_ACTIVE_RET, car2_e=e.C_CUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
+    FROM #kh k JOIN T_SI_NAV_BALANCE e
+      ON e.C_MASTER_CODE=@C_MASTER_CODE AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
 
-    -- TE per KH = STDEV(active return) × √X trên (base, end]
-    UPDATE k SET te = t.te
-    FROM #kh k
-    JOIN (
-        SELECT b.C_SI_ACCOUNT, STDEV(b.C_DAILY_RETURN - idx.C_DAILY_RETURN) * SQRT(NULLIF(@X,0)) AS te
-        FROM T_SI_NAV_BALANCE b
-        JOIN T_MASTER_INDEX_DAILY idx
-          ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=b.C_BUSINESS_DATE
-        WHERE b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE > @base AND b.C_BUSINESS_DATE <= @end
-        GROUP BY b.C_SI_ACCOUNT
-    ) t ON t.C_SI_ACCOUNT = k.si;
+    -- lát @base: up_base + cum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, cum_base=0)
+    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_CUM_ACTIVE_RET, car2_b=b.C_CUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    FROM #kh k JOIN T_SI_NAV_BALANCE b
+      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
+    UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
+
+    -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
+    UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
+        SQRT(CASE WHEN ((car2_e-car2_b) - (car_e-car_b)*(car_e-car_b)/(n_e-n_b))/((n_e-n_b)-1) < 0 THEN 0
+                  ELSE ((car2_e-car2_b) - (car_e-car_b)*(car_e-car_b)/(n_e-n_b))/((n_e-n_b)-1) END)
+        * SQRT(CASE WHEN (n_e-n_b) > 252 THEN 252 ELSE (n_e-n_b) END)
+      END;
 
     -- tổng hợp per-KH
     DECLARE @sumAum DECIMAL(38,6), @wRet DECIMAL(18,10), @wTE FLOAT, @sumAumTE DECIMAL(38,6);
@@ -233,25 +225,17 @@ BEGIN
         SET @RESOLUTION = CASE WHEN DATEDIFF(DAY,@base,@end) > 90 THEN 'M'
                                WHEN DATEDIFF(DAY,@base,@end) > 21 THEN 'W' ELSE 'D' END;
 
-    -- end-weight per KH: W_i = aum_i/Σaum ; up_base per KH
+    -- end-weight per KH: W_i = aum_i/Σaum ; up_base = lát @base (join sau base → 10000)
     CREATE TABLE #kw (si VARCHAR(20), w DECIMAL(18,12), up_base DECIMAL(18,6));
     ;WITH kh AS (
         SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum
         FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE'
-    ), bp AS (
-        SELECT b.C_SI_ACCOUNT AS si, b.C_UNIT_PRICE AS up
-        FROM T_SI_NAV_BALANCE b
-        JOIN (SELECT C_SI_ACCOUNT,
-                     COALESCE(MAX(CASE WHEN C_BUSINESS_DATE<=@cutoff THEN C_BUSINESS_DATE END),
-                              MIN(C_BUSINESS_DATE)) AS bd
-              FROM T_SI_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE<=@end
-              GROUP BY C_SI_ACCOUNT) x
-          ON x.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND x.bd=b.C_BUSINESS_DATE
-        WHERE b.C_MASTER_CODE=@C_MASTER_CODE
     ), tot AS (SELECT SUM(aum) s FROM kh)
     INSERT #kw (si, w, up_base)
-    SELECT kh.si, CAST(kh.aum / NULLIF(tot.s,0) AS DECIMAL(18,12)), bp.up
-    FROM kh CROSS JOIN tot LEFT JOIN bp ON bp.si=kh.si;
+    SELECT kh.si, CAST(kh.aum / NULLIF(tot.s,0) AS DECIMAL(18,12)), COALESCE(b.C_UNIT_PRICE,10000)
+    FROM kh CROSS JOIN tot
+    LEFT JOIN T_SI_NAV_BALANCE b
+      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=kh.si;
 
     -- sample dates theo resolution (luôn gồm base & end)
     DECLARE @samp TABLE (d DATE PRIMARY KEY);
@@ -381,20 +365,11 @@ BEGIN
     CREATE TABLE #p (si VARCHAR(20), aum DECIMAL(20,6), pnl DECIMAL(18,10));
     INSERT #p (si, aum, pnl)
     SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
-           nc.C_LAST_UNIT_PRICE / NULLIF(bp.up,0) - 1
+           nc.C_LAST_UNIT_PRICE / NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1
     FROM T_SI_NAV_CURRENT nc
-    JOIN (
-        SELECT b.C_SI_ACCOUNT, b.C_UNIT_PRICE AS up
-        FROM T_SI_NAV_BALANCE b
-        JOIN (SELECT C_SI_ACCOUNT,
-                     COALESCE(MAX(CASE WHEN C_BUSINESS_DATE<=@cutoff THEN C_BUSINESS_DATE END),
-                              MIN(C_BUSINESS_DATE)) AS bd
-              FROM T_SI_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE<=@end
-              GROUP BY C_SI_ACCOUNT) x
-          ON x.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND x.bd=b.C_BUSINESS_DATE
-        WHERE b.C_MASTER_CODE=@C_MASTER_CODE
-    ) bp ON bp.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
-    WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE' AND bp.up IS NOT NULL AND bp.up<>0;
+    LEFT JOIN T_SI_NAV_BALANCE b
+      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+    WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE';
 
     -- RS1 summary
     SELECT  @C_MASTER_CODE AS C_MASTER_CODE, @RANGE AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE,
@@ -448,24 +423,16 @@ BEGIN
     IF @base IS NULL
         SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
 
-    ;WITH bp AS (
-        SELECT b.C_SI_ACCOUNT, b.C_UNIT_PRICE AS up
-        FROM T_SI_NAV_BALANCE b
-        JOIN (SELECT C_SI_ACCOUNT,
-                     COALESCE(MAX(CASE WHEN C_BUSINESS_DATE<=@cutoff THEN C_BUSINESS_DATE END),
-                              MIN(C_BUSINESS_DATE)) AS bd
-              FROM T_SI_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE<=@end
-              GROUP BY C_SI_ACCOUNT) x
-          ON x.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND x.bd=b.C_BUSINESS_DATE
-        WHERE b.C_MASTER_CODE=@C_MASTER_CODE
-    ), k AS (
+    ;WITH k AS (
         SELECT nc.C_CUST_CODE, nc.C_SI_ACCOUNT,
                nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS C_AUM,
-               nc.C_LAST_UNIT_PRICE AS C_UNIT_PRICE_END, bp.up AS C_UNIT_PRICE_BASE,
-               CAST(nc.C_LAST_UNIT_PRICE/NULLIF(bp.up,0) - 1 AS DECIMAL(18,6)) AS C_PNL_PCT
+               nc.C_LAST_UNIT_PRICE AS C_UNIT_PRICE_END,
+               COALESCE(b.C_UNIT_PRICE,10000) AS C_UNIT_PRICE_BASE,
+               CAST(nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1 AS DECIMAL(18,6)) AS C_PNL_PCT
         FROM T_SI_NAV_CURRENT nc
-        JOIN bp ON bp.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
-        WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE' AND bp.up IS NOT NULL AND bp.up<>0
+        LEFT JOIN T_SI_NAV_BALANCE b
+          ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+        WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE'
     )
     SELECT TOP (@TOPN) C_CUST_CODE, C_SI_ACCOUNT, C_AUM, C_UNIT_PRICE_BASE, C_UNIT_PRICE_END, C_PNL_PCT
     FROM k
@@ -510,41 +477,35 @@ BEGIN
                       FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE>m.dbase AND C_BUSINESS_DATE<=m.dend)
     FROM #md m;
 
-    -- per-KH metrics (toàn hệ), base/end theo master của KH
+    -- per-KH metrics (toàn hệ): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum đọc 2 LÁT
+    --   (@base/@end theo master của KH) — KHÔNG quét toàn lịch sử.
     CREATE TABLE #kh (m VARCHAR(20), si VARCHAR(20), aum DECIMAL(20,6),
-                      up_base DECIMAL(18,6), up_end DECIMAL(18,6), tien DECIMAL(20,0), te FLOAT);
-    INSERT #kh (m, si, aum, up_end, tien)
+                      up_base DECIMAL(18,6), up_end DECIMAL(18,6), tien DECIMAL(20,0),
+                      car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
+    INSERT #kh (m, si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
     SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
-           nc.C_LAST_UNIT_PRICE, nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH
+           nc.C_LAST_UNIT_PRICE, nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     JOIN #md d ON d.m=nc.C_MASTER_CODE
     WHERE nc.C_STATUS='ACTIVE';
 
-    UPDATE k SET up_base = bp.up
-    FROM #kh k
-    JOIN (
-        SELECT b.C_MASTER_CODE m, b.C_SI_ACCOUNT si, b.C_UNIT_PRICE up
-        FROM T_SI_NAV_BALANCE b
-        JOIN #md d ON d.m=b.C_MASTER_CODE
-        JOIN (SELECT b2.C_SI_ACCOUNT,
-                     COALESCE(MAX(CASE WHEN b2.C_BUSINESS_DATE<=d2.dcut THEN b2.C_BUSINESS_DATE END),
-                              MIN(b2.C_BUSINESS_DATE)) AS bd
-              FROM T_SI_NAV_BALANCE b2 JOIN #md d2 ON d2.m=b2.C_MASTER_CODE
-              WHERE b2.C_BUSINESS_DATE<=d2.dend
-              GROUP BY b2.C_SI_ACCOUNT) x
-          ON x.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND x.bd=b.C_BUSINESS_DATE
-    ) bp ON bp.si=k.si;
+    -- lát @end per master (cum active đến cuối kỳ)
+    UPDATE k SET car_e=e.C_CUM_ACTIVE_RET, car2_e=e.C_CUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
+    FROM #kh k JOIN #md d ON d.m=k.m
+    JOIN T_SI_NAV_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
 
-    UPDATE k SET te = t.te
-    FROM #kh k
-    JOIN (
-        SELECT b.C_SI_ACCOUNT, STDEV(b.C_DAILY_RETURN - idx.C_DAILY_RETURN) * SQRT(NULLIF(d.X,0)) AS te
-        FROM T_SI_NAV_BALANCE b
-        JOIN #md d ON d.m=b.C_MASTER_CODE
-        JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=b.C_BUSINESS_DATE
-        WHERE b.C_BUSINESS_DATE>d.dbase AND b.C_BUSINESS_DATE<=d.dend
-        GROUP BY b.C_SI_ACCOUNT, d.X
-    ) t ON t.C_SI_ACCOUNT=k.si;
+    -- lát @base per master (up_base + cum active đến base; thiếu lát ⇒ up_base=10000, cum_base=0)
+    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_CUM_ACTIVE_RET, car2_b=b.C_CUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    FROM #kh k JOIN #md d ON d.m=k.m
+    JOIN T_SI_NAV_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
+    UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
+
+    -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
+    UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
+        SQRT(CASE WHEN ((car2_e-car2_b) - (car_e-car_b)*(car_e-car_b)/(n_e-n_b))/((n_e-n_b)-1) < 0 THEN 0
+                  ELSE ((car2_e-car2_b) - (car_e-car_b)*(car_e-car_b)/(n_e-n_b))/((n_e-n_b)-1) END)
+        * SQRT(CASE WHEN (n_e-n_b) > 252 THEN 252 ELSE (n_e-n_b) END)
+      END;
 
     -- per-master rollup
     DECLARE @cdThrDefault DECIMAL(9,6) = 0.05;

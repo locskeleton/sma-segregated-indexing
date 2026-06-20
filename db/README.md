@@ -57,7 +57,8 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J13 reconcile (cổng) → J14 snapshot`.
+`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE cum → J13 reconcile (cổng) → J14 snapshot`.
+(J12B `SP_EOD_TE_CUM` [PM tool]: lũy kế per-KH `C_CUM_ACTIVE_RET/_SQ` + `C_RET_DAY_COUNT` vào `T_SI_NAV_BALANCE` — active return = KH return − master index return; chạy sau J12 vì cần index daily return. Cho phép tính TE qua range BẤT KỲ bằng HIỆU 2 mốc base/end (prefix-sum) → serve-layer PM đọc 2 lát thay vì quét lịch sử. Idempotent: cum@d = cum@prev + a@d. Bench medium ~676ms/phiên.)
 (J06 phí QL = **BO-driven, CỐ ĐỊNH (no toggle)**: SDI accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH trong J07 (`payable += AUM_gross × rate × DATEDIFF(ngày)/365`, gated `rate>0`, day_count=365 hardcode). BO cắt phí 1 cục/tháng → event Kafka → `SP_INGEST_FEE_CHARGE` net-off payable (log `T_SI_FEE_CHARGE`, dedup `C_SOURCE_EVENT_ID`). **NAV = total_asset − payable**; total_asset = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables). Thuế GD luôn FO net. Đã BỎ `T_SDI_CONFIG`/`T_SI_FEE_SCHEDULE`/`SP_EOD_FEE_CHARGE`.)
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
