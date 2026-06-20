@@ -25,7 +25,7 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     C_MASTER_NAME        NVARCHAR(200)   NULL,
     C_STATUS         VARCHAR(10)     NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_STATUS DEFAULT 'ACTIVE', -- ACTIVE|CLOSED
     C_INCEPTION_DATE DATE            NULL,
-    C_MGMT_FEE_RATE  DECIMAL(10,6)   NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_FEE DEFAULT 0.01,        -- %/năm
+    C_MGMT_FEE_RATE  DECIMAL(10,6)   NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_FEE DEFAULT 0.01,        -- phí QL %/NĂM (vd 0.01=1%/năm). EOD J06 accrue payable theo ngày dương lịch: payable += AUM_gross×rate×DATEDIFF(ngày)/365. rate=0 ⇒ không phí.
     C_BENCHMARK_CODE VARCHAR(20)     NULL,   -- benchmark đối chiếu (vd 'VNINDEX','VN30') → T_BENCHMARK_DAILY
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)
 );
@@ -34,9 +34,9 @@ CREATE TABLE T_MASTER_PORTFOLIO (
 CREATE TABLE T_MASTER_PORTFOLIO_TICKER (
     PK_MASTER_PORTFOLIO_TICKER UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_TICKER_PKID DEFAULT NEWID(),
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_EFFECTIVE_DATE DATE            NOT NULL,
+    C_EFFECTIVE_DATE DATE            NOT NULL,   -- ngày hiệu lực trọng số = mốc REBALANCE (J12 dùng latest eff_date ≤ @d)
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,
+    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,   -- trọng số mục tiêu mã trong danh mục mẫu; Σ theo (master,eff_date)=1.0. Vào công thức index J12 (Σ wᵢ·Pᵢ,t/P_ref)
     CONSTRAINT PK_MASTER_PORTFOLIO_TICKER PRIMARY KEY CLUSTERED (PK_MASTER_PORTFOLIO_TICKER),
     CONSTRAINT UQ_MASTER_PORTFOLIO_TICKER_NK UNIQUE (C_MASTER_CODE, C_EFFECTIVE_DATE, C_TICKER)
 );
@@ -52,11 +52,11 @@ CREATE TABLE T_SI_PORTFOLIO (
     C_JOIN_DATE      DATE            NOT NULL,
     C_CLOSE_DATE     DATE            NULL,        -- ngày đóng sub-account (KH dừng đầu tư master)
     C_STATUS         VARCHAR(10)     NOT NULL CONSTRAINT DF_SI_PORTFOLIO_STATUS DEFAULT 'ACTIVE', -- ACTIVE|CLOSED
-    C_INITIAL_AMOUNT DECIMAL(20,0)   NULL,
-    C_SIP_AMOUNT     DECIMAL(20,0)   NULL,
+    C_INITIAL_AMOUNT DECIMAL(20,0)   NULL,    -- TIỀN (VND) cam kết đầu tư ban đầu khi mở tiểu khoản (tham chiếu; dòng tiền thực = T_SI_CASHFLOW_EVENT INITIAL)
+    C_SIP_AMOUNT     DECIMAL(20,0)   NULL,    -- TIỀN (VND) nạp định kỳ (SIP) mỗi kỳ theo C_SIP_SCHEDULE
     C_SIP_SCHEDULE   VARCHAR(50)     NULL,
-    C_MGMT_FEE_RATE  DECIMAL(10,6)   NULL,    -- override; NULL = lấy theo T_MASTER_PORTFOLIO
-    C_MIN_INVEST     DECIMAL(20,0)   NULL,
+    C_MGMT_FEE_RATE  DECIMAL(10,6)   NULL,    -- phí QL %/NĂM override riêng tiểu khoản; NULL = lấy theo T_MASTER_PORTFOLIO (J06 dùng COALESCE)
+    C_MIN_INVEST     DECIMAL(20,0)   NULL,    -- TIỀN (VND) tối thiểu phải duy trì
     CONSTRAINT PK_SI_PORTFOLIO PRIMARY KEY CLUSTERED (PK_SI_PORTFOLIO),
     CONSTRAINT UQ_SI_PORTFOLIO_NK UNIQUE (C_SI_ACCOUNT)   -- mã sub-account duy nhất toàn cục
 );
@@ -69,8 +69,8 @@ CREATE TABLE T_PRICE_DAILY (
     PK_PRICE_DAILY      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PRICE_DAILY_PKID DEFAULT NEWID(),
     C_TICKER            VARCHAR(20)  NOT NULL,
     C_BUSINESS_DATE     DATE         NOT NULL,
-    C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,
-    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,
+    C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,  -- GIÁ đóng cửa — định giá MTM (J07: stock_value = Σ qty×close_price) + index J12 (Pᵢ,t)
+    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,     -- GIÁ tham chiếu đã điều chỉnh quyền (P_ref cho J12 khi có CA; ưu tiên hơn close hôm trước)
     CONSTRAINT PK_PRICE_DAILY_NK PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_TICKER),  -- natural clustered (join MTM nóng)
     CONSTRAINT UQ_PRICE_DAILY_PKID UNIQUE NONCLUSTERED (PK_PRICE_DAILY)
 );
@@ -79,10 +79,10 @@ CREATE TABLE T_CORPORATE_ACTION (
     PK_CORPORATE_ACTION  UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_CORPORATE_ACTION_PKID DEFAULT NEWID(),
     C_TICKER             VARCHAR(20)  NOT NULL,
     C_EX_DATE            DATE         NOT NULL,
-    C_CA_TYPE            VARCHAR(20)  NOT NULL,  -- CASH_DIV | STOCK_DIV | SPLIT | RIGHTS
-    C_RATIO              DECIMAL(18,8) NULL,
-    C_CASH_DIV_PER_SHARE DECIMAL(18,4) NULL,
-    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,
+    C_CA_TYPE            VARCHAR(20)  NOT NULL,  -- CASH_DIV | STOCK_DIV | SPLIT | RIGHTS. Chỉ dùng cho J12 index (điều chỉnh P_ref ngày ex-date); cổ tức/quyền vào NAV qua FO sync.
+    C_RATIO              DECIMAL(18,8) NULL,      -- tỷ lệ chia/tách (STOCK_DIV/SPLIT/RIGHTS)
+    C_CASH_DIV_PER_SHARE DECIMAL(18,4) NULL,      -- TIỀN cổ tức/cổ phiếu (CASH_DIV)
+    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,      -- GIÁ tham chiếu sau điều chỉnh quyền tại ex-date (P_ref cho J12)
     CONSTRAINT PK_CORPORATE_ACTION PRIMARY KEY CLUSTERED (PK_CORPORATE_ACTION),
     CONSTRAINT UQ_CORPORATE_ACTION_NK UNIQUE (C_TICKER, C_EX_DATE, C_CA_TYPE)
 );
@@ -91,7 +91,7 @@ CREATE TABLE T_BENCHMARK_DAILY (
     PK_BENCHMARK_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_BENCHMARK_DAILY_PKID DEFAULT NEWID(),
     C_BENCHMARK_CODE VARCHAR(20)     NOT NULL,   -- 'VNINDEX' | 'VN30' | …
     C_BUSINESS_DATE  DATE            NOT NULL,
-    C_INDEX_VALUE    DECIMAL(18,4)   NOT NULL,
+    C_INDEX_VALUE    DECIMAL(18,4)   NOT NULL,    -- điểm benchmark (PR). So sánh FR-03/US3: (điểm cuối/điểm mốc − 1)
     CONSTRAINT PK_BENCHMARK_DAILY PRIMARY KEY CLUSTERED (PK_BENCHMARK_DAILY),
     CONSTRAINT UQ_BENCHMARK_DAILY_NK UNIQUE (C_BENCHMARK_CODE, C_BUSINESS_DATE)
 );
@@ -117,10 +117,10 @@ CREATE TABLE T_SI_HOLDING_HIST (
     C_CUST_CODE      VARCHAR(10)     NOT NULL,   -- denormalized (query)
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,   -- denormalized (tổng hợp master)
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_VALID_FROM     DATE            NOT NULL,
+    C_VALID_FROM     DATE            NOT NULL,   -- khoảng hiệu lực interval [from, to) — dòng mở C_VALID_TO=NULL
     C_VALID_TO       DATE            NULL,
-    C_QUANTITY       DECIMAL(20,0)   NOT NULL,
-    C_AVG_COST       DECIMAL(18,4)   NULL,
+    C_QUANTITY       DECIMAL(20,0)   NOT NULL,   -- số lượng CP nắm giữ trong khoảng (reconstruct tài sản FR-06)
+    C_AVG_COST       DECIMAL(18,4)   NULL,       -- GIÁ vốn bình quân (tham chiếu lãi/lỗ; KHÔNG vào NAV — NAV theo giá thị trường)
     CONSTRAINT PK_SI_HOLDING_HIST_ID PRIMARY KEY CLUSTERED (C_HOLDING_HIST_ID),
     CONSTRAINT UQ_SI_HOLDING_HIST_PKID UNIQUE NONCLUSTERED (PK_SI_HOLDING_HIST),
     CONSTRAINT UQ_SI_HOLDING_HIST_NK UNIQUE (C_SI_ACCOUNT, C_TICKER, C_VALID_FROM)
@@ -136,9 +136,9 @@ CREATE TABLE T_SI_CASH_HIST (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_VALID_FROM     DATE            NOT NULL,
+    C_VALID_FROM     DATE            NOT NULL,   -- khoảng hiệu lực interval [from, to)
     C_VALID_TO       DATE            NULL,
-    C_CASH           DECIMAL(20,0)   NOT NULL,
+    C_CASH           DECIMAL(20,0)   NOT NULL,   -- TIỀN MẶT (VND) snapshot trong khoảng (reconstruct tài sản FR-06; chỉ tiền mặt, KHÔNG gồm pending/div)
     CONSTRAINT PK_SI_CASH_HIST_ID PRIMARY KEY CLUSTERED (C_CASH_HIST_ID),
     CONSTRAINT UQ_SI_CASH_HIST_PKID UNIQUE NONCLUSTERED (PK_SI_CASH_HIST),
     CONSTRAINT UQ_SI_CASH_HIST_NK UNIQUE (C_SI_ACCOUNT, C_VALID_FROM)
@@ -154,8 +154,8 @@ CREATE TABLE T_SI_CASHFLOW_EVENT (
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_BUSINESS_DATE  DATE            NOT NULL,
-    C_EVENT_TYPE     VARCHAR(20)     NOT NULL,  -- INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW
-    C_AMOUNT         DECIMAL(20,0)   NOT NULL,
+    C_EVENT_TYPE     VARCHAR(20)     NOT NULL,  -- INITIAL|TOPUP|SIP|INTEREST_IN = TIỀN VÀO; WITHDRAW = TIỀN RA. Là dòng tiền ngoài (external CF), KHÔNG tính vào PnL.
+    C_AMOUNT         DECIMAL(20,0)   NOT NULL,  -- TIỀN (VND) > 0. EOD: CF_IN/CF_OUT (J09 PnL=NAV−NAV_prev+ra−vào; J10 ΔUnit=CF_net/UP_prev). WITHDRAW vào CF_OUT.
     C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_CF_CREATED DEFAULT GETDATE(),
     CONSTRAINT PK_SI_CASHFLOW_EVENT_ID PRIMARY KEY CLUSTERED (C_EVENT_ID),
     CONSTRAINT UQ_SI_CASHFLOW_EVENT_PKID UNIQUE NONCLUSTERED (PK_SI_CASHFLOW_EVENT)
@@ -170,9 +170,9 @@ CREATE TABLE T_SI_UNIT_LEDGER (
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_BUSINESS_DATE  DATE            NOT NULL,
-    C_CF_NET         DECIMAL(20,0)   NOT NULL,
-    C_DELTA_UNIT     DECIMAL(18,6)   NOT NULL,
-    C_UNIT           DECIMAL(18,6)   NOT NULL,
+    C_CF_NET         DECIMAL(20,0)   NOT NULL,   -- TIỀN ròng vào trong ngày = CF_IN − CF_OUT
+    C_DELTA_UNIT     DECIMAL(18,6)   NOT NULL,   -- ΔUnit = C_CF_NET / UnitPrice_(t-1) (số đơn vị quỹ phát hành/hủy do dòng tiền)
+    C_UNIT           DECIMAL(18,6)   NOT NULL,   -- tổng Unit sau biến động (lũy kế)
     CONSTRAINT PK_SI_UNIT_LEDGER_ID PRIMARY KEY CLUSTERED (C_SI_UNIT_LEDGER_ID),
     CONSTRAINT UQ_SI_UNIT_LEDGER_PKID UNIQUE NONCLUSTERED (PK_SI_UNIT_LEDGER),
     CONSTRAINT UQ_SI_UNIT_LEDGER_NK UNIQUE (C_SI_ACCOUNT, C_BUSINESS_DATE)
@@ -185,13 +185,13 @@ CREATE TABLE T_SI_NAV_CURRENT (
     C_SI_ACCOUNT       VARCHAR(20)   NOT NULL,
     C_CUST_CODE        VARCHAR(10)   NOT NULL,
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
-    C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_CNC_UNIT DEFAULT 0,
-    C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- tiền mặt (FO)
-    C_PENDING_CASH     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_PEND DEFAULT 0,     -- tiền bán chờ về (FO, tổng T0+T1+T2)
-    C_DIV_CASH         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_DIV DEFAULT 0,      -- cổ tức tiền chờ về (FO)
-    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,      -- phí QL accrued chưa net-off (Tiền = C_CASH+C_PENDING_CASH+C_DIV_CASH)
-    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,
-    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,
+    C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_CNC_UNIT DEFAULT 0,      -- tổng đơn vị quỹ (lũy kế); biến động chỉ do dòng tiền (TWR sạch)
+    C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- TIỀN MẶT khả dụng (FO sync). Đã NET phí GD + thuế.
+    C_PENDING_CASH     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_PEND DEFAULT 0,     -- TIỀN bán chờ về (FO, tổng T0+T1+T2) — receivable, vẫn tính vào tài sản
+    C_DIV_CASH         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_DIV DEFAULT 0,      -- TIỀN cổ tức chờ về (FO) — receivable
+    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,      -- PHÍ QL accrued chưa net-off (khoản PHẢI TRẢ). TIỀN = C_CASH+C_PENDING_CASH+C_DIV_CASH; NAV = (stock+TIỀN) − C_PAYABLE_FEE
+    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- NAV NET phí gần nhất = tổng tài sản (stock+TIỀN) − payable
+    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                           -- Unit Price gần nhất = NAV/Unit (T0=10.000). %hiệu suất TWR = UP_cuối/UP_mốc − 1
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
     C_LAST_BUSINESS_DATE DATE         NULL,                       -- ngày EOD compute gần nhất
     C_LAST_SYNC_DATE   DATE           NULL,                       -- watermark: ngày FO ingest gần nhất (GATE + guard forward)
@@ -218,21 +218,22 @@ CREATE TABLE T_EOD_WORK (
     C_SI_ACCOUNT      VARCHAR(20)    NOT NULL,
     C_CUST_CODE       VARCHAR(10)    NOT NULL,
     C_MASTER_CODE     VARCHAR(20)    NOT NULL,
-    C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_PENDING_CASH    DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_DIV_CASH        DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,
-    C_LAST_NAV        DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_LAST_UNIT_PRICE DECIMAL(18,6) NULL,
-    C_UNIT_PREV       DECIMAL(18,6) NOT NULL DEFAULT 0,
-    C_CF_IN           DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_CF_OUT          DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_STOCK_VALUE     DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_DAILY_PNL       DECIMAL(20,0)  NOT NULL DEFAULT 0,
-    C_DELTA_UNIT      DECIMAL(18,6) NOT NULL DEFAULT 0,
-    C_UNIT            DECIMAL(18,6) NOT NULL DEFAULT 0,
-    C_UNIT_PRICE      DECIMAL(18,6) NULL,
+    -- seed từ T_SI_NAV_CURRENT (trạng thái đầu ngày) + delta ngày @d:
+    C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN MẶT @d (FO sync)
+    C_PENDING_CASH    DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN bán chờ về @d
+    C_DIV_CASH        DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN cổ tức chờ về @d
+    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- PHÍ QL phải trả lũy kế sau accrue J06 (payable_prev + accrue ngày)
+    C_LAST_NAV        DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- NAV cuối ngày TRƯỚC (để tính PnL J09)
+    C_LAST_UNIT_PRICE DECIMAL(18,6) NULL,                  -- Unit Price cuối ngày trước (mẫu số ΔUnit J10)
+    C_UNIT_PREV       DECIMAL(18,6) NOT NULL DEFAULT 0,    -- Unit đầu ngày (trước biến động dòng tiền)
+    C_CF_IN           DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN vào ngày @d (Σ INITIAL/TOPUP/SIP/INTEREST_IN)
+    C_CF_OUT          DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN ra ngày @d (Σ WITHDRAW)
+    C_STOCK_VALUE     DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J07 MTM = Σ qty × close_price (định giá cổ phiếu)
+    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J08 = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH − C_PAYABLE_FEE
+    C_DAILY_PNL       DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J09 = C_NAV − C_LAST_NAV + C_CF_OUT − C_CF_IN (loại ảnh hưởng dòng tiền)
+    C_DELTA_UNIT      DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = (C_CF_IN − C_CF_OUT) / C_LAST_UNIT_PRICE (init: NAV/10000 khi UP_prev=0)
+    C_UNIT            DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = C_UNIT_PREV + C_DELTA_UNIT
+    C_UNIT_PRICE      DECIMAL(18,6) NULL,                  -- J10 = C_NAV / C_UNIT (TWR; daily_return = UP_t/UP_(t-1) − 1)
     CONSTRAINT PK_EOD_WORK PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_SI_ACCOUNT)  -- transient
 );
 
@@ -246,10 +247,10 @@ CREATE TABLE T_SI_NAV_BALANCE (
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV NET phí (= gross − payable). Khi accrual OFF: payable=0 ⇒ = gross
     C_PAYABLE_FEE    DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SI_NAV_BAL_PAY DEFAULT 0,  -- phí QL accrued chưa thu @ngày; NAV_gross = C_NAV + C_PAYABLE_FEE
-    C_UNIT           DECIMAL(18,6)  NOT NULL,
-    C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- unit price NET phí
-    C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,
-    C_DAILY_RETURN   DECIMAL(10,6)  NULL,
+    C_UNIT           DECIMAL(18,6)  NOT NULL,    -- Unit cuối ngày (snapshot lịch sử)
+    C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- Unit Price NET phí = NAV/Unit. TWR kỳ = UP_cuối/UP_mốc − 1 (chart FR-03, US3 composite)
+    C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,   -- lãi/lỗ TIỀN trong ngày (đã loại dòng tiền)
+    C_DAILY_RETURN   DECIMAL(10,6)  NULL,        -- lợi suất ngày = UP_t/UP_(t-1) − 1. Vào active return J12B (KH − master index) + TE
     -- [PM tool] TE prefix-sum: lũy kế active return (= KH return − master index return) từ inception.
     --   Cho phép tính STDEV(active) qua range BẤT KỲ bằng HIỆU 2 mốc (base/end) → đọc 2 lát, không quét.
     --   Maintain ở EOD bước SP_EOD_TE_CUM (sau J12, cần index daily return). FLOAT (double) cho ổn số.
@@ -273,9 +274,9 @@ CREATE TABLE T_SI_FEE_INCOME (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND | CUSTODY_FEE  (phí QL → T_SI_FEE_SCHEDULE, SDI-owned)
+    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND (cổ tức tiền) | CUSTODY_FEE (phí lưu ký). Phí QL KHÔNG ở đây → log riêng T_SI_FEE_CHARGE (BO cắt).
     C_TICKER         VARCHAR(20)     NULL,
-    C_AMOUNT         DECIMAL(20,0)   NOT NULL,
+    C_AMOUNT         DECIMAL(20,0)   NOT NULL,  -- TIỀN (VND); DIVIDEND cộng tài sản, CUSTODY_FEE trừ. Lũy kế hiển thị FR-06.
     C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CFI_SRC DEFAULT 'FO',
     C_SOURCE_EVENT_ID VARCHAR(64)    NULL,      -- khóa idempotency FO (chống Kafka redelivery nhân đôi)
     C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_CFI_CREATED DEFAULT GETDATE(),
@@ -312,8 +313,8 @@ CREATE TABLE T_MASTER_INDEX_DAILY (
     PK_MASTER_INDEX_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_INDEX_DAILY_PKID DEFAULT NEWID(),
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_INDEX_VALUE    DECIMAL(18,6)   NOT NULL,
-    C_DAILY_RETURN   DECIMAL(10,6)  NULL,
+    C_INDEX_VALUE    DECIMAL(18,6)   NOT NULL,   -- Index danh mục mẫu (PR, daily-rebalanced): Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref. Gốc 1000.
+    C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- lợi suất index ngày = FACTOR − 1. Là R_master cho deviation + active return (J12B/TE)
     CONSTRAINT PK_MASTER_INDEX_DAILY PRIMARY KEY CLUSTERED (PK_MASTER_INDEX_DAILY),
     CONSTRAINT UQ_MASTER_INDEX_DAILY_NK UNIQUE (C_BUSINESS_DATE, C_MASTER_CODE)
 );
@@ -323,10 +324,10 @@ CREATE TABLE T_MASTER_HOLDING_BALANCE (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_QUANTITY       DECIMAL(20,0)   NOT NULL,
-    C_MARKET_PRICE   DECIMAL(18,4)   NOT NULL,
-    C_MARKET_VALUE   DECIMAL(20,0)   NOT NULL,
-    C_WEIGHT         DECIMAL(12,8)   NULL,
+    C_QUANTITY       DECIMAL(20,0)   NOT NULL,   -- Σ số lượng mã toàn master (Σ holdings sub-account)
+    C_MARKET_PRICE   DECIMAL(18,4)   NOT NULL,   -- GIÁ đóng cửa định giá
+    C_MARKET_VALUE   DECIMAL(20,0)   NOT NULL,   -- = C_QUANTITY × C_MARKET_PRICE
+    C_WEIGHT         DECIMAL(12,8)   NULL,        -- tỷ trọng thực tế = C_MARKET_VALUE / Σ market_value (US3 rebalance detail: cũ→mới)
     CONSTRAINT PK_MASTER_HOLDING_BALANCE PRIMARY KEY CLUSTERED (PK_MASTER_HOLDING_BALANCE),
     CONSTRAINT UQ_MASTER_HOLDING_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_MASTER_CODE, C_TICKER)
 );
@@ -336,20 +337,20 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     PK_MASTER_NAV_BALANCE    UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_NAV_BALANCE_PKID DEFAULT NEWID(),
     C_BUSINESS_DATE    DATE          NOT NULL,
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
-    C_CASH             DECIMAL(20,0) NOT NULL,
-    C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ tiền bán chờ về
-    C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ cổ tức tiền chờ về
-    C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,
-    C_CASH_DIVIDEND    DECIMAL(20,0) NULL,
-    C_CUSTODY_FEE      DECIMAL(20,0) NULL,
-    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue)
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,
-    C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- = stock + cash + pending + div (gồm tiền chờ về)
-    C_NAV              DECIMAL(20,0)  NOT NULL,
-    C_UNIT             DECIMAL(18,6) NOT NULL,
-    C_UNIT_PRICE       DECIMAL(18,6) NULL,
-    C_DAILY_PNL        DECIMAL(20,0)  NOT NULL,
-    C_DAILY_RETURN     DECIMAL(10,6) NULL,
+    C_CASH             DECIMAL(20,0) NOT NULL,                                   -- Σ TIỀN MẶT các tiểu khoản
+    C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ TIỀN bán chờ về
+    C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ TIỀN cổ tức chờ về
+    C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,                                   -- Σ giá trị cổ phiếu (MTM)
+    C_CASH_DIVIDEND    DECIMAL(20,0) NULL,                                       -- Σ cổ tức tiền ghi nhận trong ngày (tham chiếu)
+    C_CUSTODY_FEE      DECIMAL(20,0) NULL,                                       -- Σ phí lưu ký trong ngày (tham chiếu)
+    C_MGMT_FEE_ACCRUED DECIMAL(20,6) NULL,    -- FO báo cáo tham khảo (SDI không tự accrue ở cấp master)
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản)
+    C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
+    C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_TOTAL_ASSET − C_PAYABLE_FEE (NAV net phí)
+    C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master
+    C_UNIT_PRICE       DECIMAL(18,6) NULL,      -- = C_NAV / C_UNIT (pooled master unit price)
+    C_DAILY_PNL        DECIMAL(20,0)  NOT NULL, -- Σ lãi/lỗ TIỀN ngày
+    C_DAILY_RETURN     DECIMAL(10,6) NULL,      -- lợi suất pooled master ngày
     C_CASH_IN          DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_CIN  DEFAULT 0,  -- [PM] Σ nạp/SIP/initial/lãi master/ngày
     C_CASH_OUT         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_COUT DEFAULT 0,  -- [PM] Σ rút
     C_TOTAL_ACCOUNT    INT           NOT NULL CONSTRAINT DF_MNB_TACC DEFAULT 0,  -- [PM] #tiểu khoản ACTIVE
@@ -365,10 +366,10 @@ CREATE TABLE T_MASTER_NAV_CURRENT (
     C_PENDING_CASH     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_PEND DEFAULT 0,
     C_DIV_CASH         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_DIV  DEFAULT 0,
     C_STOCK_VALUE      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_STOCK DEFAULT 0,
-    C_TOTAL_ASSET      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- gồm tiền chờ về
-    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_NAV DEFAULT 0,
+    C_TOTAL_ASSET      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- TỔNG TÀI SẢN (AUM) hiện tại = stock+cash+pending+div. Nguồn nhanh cho US1/US2 AUM + cash drag.
+    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_NAV DEFAULT 0,    -- NAV net phí = C_TOTAL_ASSET − Σpayable
     C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_SNC_UNIT DEFAULT 0,
-    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,
+    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                          -- pooled master unit price = NAV/Unit
     C_TOTAL_ACCOUNT    INT           NOT NULL CONSTRAINT DF_SNC_TACC DEFAULT 0,  -- [PM] #tiểu khoản ACTIVE
     C_LAST_BUSINESS_DATE DATE         NULL,
     CONSTRAINT PK_MASTER_NAV_CURRENT PRIMARY KEY CLUSTERED (PK_MASTER_NAV_CURRENT),
@@ -398,7 +399,7 @@ GO
 --   Serve-layer cho dashboard PM (US1-US5). Không đụng vào EOD engine.
 --   Ngưỡng deviation/cash-drag/TE: dùng để badge & đếm KH vượt. NULL => fallback default hệ thống.
 -- =====================================================================
---   Cột NULL => fallback default hệ thống (hằng số trong SP serve, xem UDF_PM_DEFAULTS).
+--   Cột NULL => fallback default hệ thống (hằng số trong UDF_PM_CONFIG ở 06_PM_API).
 --   TE = decimal ratio (annualized stdev active-return, vd 0.05 = 5%); deviation = BPS (1% = 100).
 CREATE TABLE T_MASTER_PM_CONFIG (
     C_MASTER_CODE        VARCHAR(20)     NOT NULL,
