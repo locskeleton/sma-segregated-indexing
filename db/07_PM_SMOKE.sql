@@ -102,33 +102,33 @@ EXEC SP_EOD_TE_ACCUM @D3;
 GO
 
 PRINT '======== P1: SP_SET_MASTER_PM_CONFIG (set HIGH dev=200, giữ còn lại default) ========';
-EXEC SP_SET_MASTER_PM_CONFIG @C_MASTER_CODE='M1', @C_DEV_THRESHOLD_HIGH=200.00, @C_UPDATED_BY='smoke';
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_dev_threshold_high=200.00, @p_updated_by='smoke';
 PRINT '-- reset về toàn default cho các assert dưới --';
-EXEC SP_SET_MASTER_PM_CONFIG @C_MASTER_CODE='M1', @C_UPDATED_BY='smoke';  -- all NULL → default
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke';  -- all NULL → default
 
 PRINT '';
 PRINT '======== US2: SP_GET_MASTER_OVERVIEW (kỳ vọng: KH_RET=.08 MASTER_RET=.071 DEV=90 TE≈.029661 badge MED #TE>=1 #cash=1 #devHi=1 #devLo=1 growth≈.081081) ========';
-EXEC SP_GET_MASTER_OVERVIEW @C_MASTER_CODE='M1', @RANGE='INCEPTION';
+EXEC SP_GET_MASTER_OVERVIEW @p_master_code='M1', @p_range='INCEPTION';
 
 PRINT '';
 PRINT '======== US3: SP_GET_MASTER_PERFORMANCE (3 đường; KH_COMPOSITE base≈1.0; RS2 rebalance D1,D3) ========';
-EXEC SP_GET_MASTER_PERFORMANCE @C_MASTER_CODE='M1', @RANGE='INCEPTION', @RESOLUTION='D';
+EXEC SP_GET_MASTER_PERFORMANCE @p_master_code='M1', @p_range='INCEPTION', @p_resolution='D';
 
 PRINT '';
 PRINT '======== US3 click: SP_GET_MASTER_REBALANCE_DETAIL @D3 (weight CCC 0→.2; AAA .6→.5; qty delta) ========';
-EXEC SP_GET_MASTER_REBALANCE_DETAIL @C_MASTER_CODE='M1', @DATE='2026-01-07';
+EXEC SP_GET_MASTER_REBALANCE_DETAIL @p_master_code='M1', @p_date='2026-01-07';
 
 PRINT '';
 PRINT '======== US4: SP_GET_MASTER_PNL_DIST (gain=3 loss=0 avg=.08 median=.08; hist 0..10%=2 10..20%=1) ========';
-EXEC SP_GET_MASTER_PNL_DIST @C_MASTER_CODE='M1', @RANGE='INCEPTION';
+EXEC SP_GET_MASTER_PNL_DIST @p_master_code='M1', @p_range='INCEPTION';
 
 PRINT '';
 PRINT '======== US5: SP_GET_MASTER_TOP_KH DESC (S3 .12, S1 .08, S2 .06) ========';
-EXEC SP_GET_MASTER_TOP_KH @C_MASTER_CODE='M1', @RANGE='INCEPTION', @TOPN=10, @DIR='DESC';
+EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='DESC';
 PRINT '-- ASC (S2 .06, S1 .08, S3 .12) --';
-EXEC SP_GET_MASTER_TOP_KH @C_MASTER_CODE='M1', @RANGE='INCEPTION', @TOPN=10, @DIR='ASC';
+EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10, @p_dir='ASC';
 
 PRINT '';
 PRINT '======== US1: SP_GET_PM_OVERVIEW_ALL (header #master>=1 #KH=3; RS3 list M1) ========';
-EXEC SP_GET_PM_OVERVIEW_ALL @RANGE='INCEPTION', @SORT='AUM';
+EXEC SP_GET_PM_OVERVIEW_ALL @p_range='INCEPTION', @p_sort='AUM';
 GO

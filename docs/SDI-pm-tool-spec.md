@@ -13,7 +13,7 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
   - **Snapshot (current)**: AUM, cash, #KH, cash drag, net flow → tính **on-query từ state hiện tại** (`T_MASTER_NAV_CURRENT`/`T_SI_NAV_CURRENT`), "realtime" = mới tới EOD sync gần nhất.
   - **Hiệu suất (T-1)**: return, %PnL, TE, deviation, index, phân phối → từ daily tables, **T-1 theo bản chất** (cần giá đóng cửa).
 - **Tất cả ON-READ** (scale nhỏ): không materialize thêm (TE/deviation/dist tính lúc đọc). Building-block EOD đã đủ. Chỉ cần **1 index** `(C_MASTER_CODE, C_BUSINESS_DATE)` trên `T_SI_NAV_BALANCE` để quét per-master nhanh.
-- **SP master-keyed**: nhận `@C_MASTER_CODE` (+ range), KHÔNG nhận/không trả định danh KH ngoài top-N ranking (mã KH).
+- **SP master-keyed**: nhận `@p_master_code` (+ range), KHÔNG nhận/không trả định danh KH ngoài top-N ranking (mã KH).
 
 ---
 
@@ -69,13 +69,13 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 
 | SP | US | Tham số | Trả |
 |---|---|---|---|
-| `SP_GET_PM_OVERVIEW_ALL` | US1 | `@range` | RS1 header (#master,#KH); RS2 tổng (AUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master (AUM/#KH/hiệu suất master/hiệu suất KH/dev/TE/cash-drag, sort) |
-| `SP_GET_MASTER_OVERVIEW` | US2 | `@C_MASTER_CODE, @range` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B |
-| `SP_GET_MASTER_PERFORMANCE` | US3 | `@C_MASTER_CODE, @range, @resolution` (NULL=auto: D/W/M theo độ dài kỳ) | RS1 chuỗi: master index (PR) + `C_KH_COMPOSITE` (DM tổng KH AUM-weighted end-weight, base=1.0) + benchmark (PR) — app rebase 0%; RS2 mốc rebalance |
-| `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@C_MASTER_CODE, @date` | RS1 target weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`, FULL OUTER → mã ra/vào); RS2 net delta holdings THỰC TẾ per mã từ **`T_MASTER_HOLDING_BALANCE`** (@phiên ≤ eff vs phiên trước) — master-level daily holdings, chính xác hơn agg per-KH hist |
-| `SP_GET_MASTER_PNL_DIST` | US4 | `@C_MASTER_CODE, @range` | #lãi/#lỗ + tỷ lệ, histogram buckets, AUM-weighted avg %PnL, trung vị |
-| `SP_GET_MASTER_TOP_KH` | US5 | `@C_MASTER_CODE, @range, @topN, @dir` | rank mã KH theo %PnL (TR) |
-| `SP_SET_MASTER_PM_CONFIG` | (cấu hình) | `@C_MASTER_CODE, ngưỡng...` | upsert ngưỡng PM per-master |
+| `SP_GET_PM_OVERVIEW_ALL` | US1 | `@p_range` | RS1 header (#master,#KH); RS2 tổng (AUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master (AUM/#KH/hiệu suất master/hiệu suất KH/dev/TE/cash-drag, sort) |
+| `SP_GET_MASTER_OVERVIEW` | US2 | `@p_master_code, @p_range` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B |
+| `SP_GET_MASTER_PERFORMANCE` | US3 | `@p_master_code, @p_range, @p_resolution` (NULL=auto: D/W/M theo độ dài kỳ) | RS1 chuỗi: master index (PR) + `C_KH_COMPOSITE` (DM tổng KH AUM-weighted end-weight, base=1.0) + benchmark (PR) — app rebase 0%; RS2 mốc rebalance |
+| `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@p_master_code, @p_date` | RS1 target weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`, FULL OUTER → mã ra/vào); RS2 net delta holdings THỰC TẾ per mã từ **`T_MASTER_HOLDING_BALANCE`** (@phiên ≤ eff vs phiên trước) — master-level daily holdings, chính xác hơn agg per-KH hist |
+| `SP_GET_MASTER_PNL_DIST` | US4 | `@p_master_code, @p_range` | #lãi/#lỗ + tỷ lệ, histogram buckets, AUM-weighted avg %PnL, trung vị |
+| `SP_GET_MASTER_TOP_KH` | US5 | `@p_master_code, @p_range, @p_topn, @p_dir` | rank mã KH theo %PnL (TR) |
+| `SP_SET_MASTER_PM_CONFIG` | (cấu hình) | `@p_master_code, ngưỡng...` | upsert ngưỡng PM per-master |
 
 **Mẫu tính TE on-read** (1 master, kỳ [a,b]):
 ```sql

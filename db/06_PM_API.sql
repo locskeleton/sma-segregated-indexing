@@ -4,7 +4,7 @@ GO
 /*==============================================================================
   SDI MODULE — PM TOOL READ API (SQL Server)  | ALL-IN-DB, serve-layer on-read
   Dashboard PM quản lý cấp MASTER (10 master, ~50k KH). Spec: docs/SDI-pm-tool-spec.md
-  master-keyed: nhận @C_MASTER_CODE (+ range); KHÔNG trả định danh KH ngoài top-N (US5).
+  master-keyed: nhận @p_master_code (+ range); KHÔNG trả định danh KH ngoài top-N (US5).
   2 bản chất: Snapshot (current, T_MASTER/SI_NAV_CURRENT) | Hiệu suất (T-1, *_NAV_BALANCE).
   Công thức (spec §2):
     AUM = total_asset (gross) = stock+cash+pending+div = C_LAST_NAV + C_PAYABLE_FEE (per KH)
@@ -36,39 +36,39 @@ GO
     RS: cấu hình HIỆU LỰC sau khi set.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_SET_MASTER_PM_CONFIG
-    @C_MASTER_CODE          VARCHAR(20),
-    @C_TE_BADGE_LOW         DECIMAL(10,6) = NULL,
-    @C_TE_BADGE_HIGH        DECIMAL(10,6) = NULL,
-    @C_TE_ALERT_THRESHOLD   DECIMAL(10,6) = NULL,
-    @C_CASH_DRAG_THRESHOLD  DECIMAL(9,6)  = NULL,
-    @C_DEV_THRESHOLD_HIGH   DECIMAL(10,2) = NULL,
-    @C_DEV_THRESHOLD_LOW    DECIMAL(10,2) = NULL,
-    @C_UPDATED_BY           VARCHAR(64)   = NULL
+    @p_master_code          VARCHAR(20),
+    @p_te_badge_low         DECIMAL(10,6) = NULL,
+    @p_te_badge_high        DECIMAL(10,6) = NULL,
+    @p_te_alert_threshold   DECIMAL(10,6) = NULL,
+    @p_cash_drag_threshold  DECIMAL(9,6)  = NULL,
+    @p_dev_threshold_high   DECIMAL(10,2) = NULL,
+    @p_dev_threshold_low    DECIMAL(10,2) = NULL,
+    @p_updated_by           VARCHAR(64)   = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN RAISERROR('Master not found',16,1); RETURN; END
 
     MERGE T_MASTER_PM_CONFIG AS t
-    USING (SELECT @C_MASTER_CODE AS m) AS s ON t.C_MASTER_CODE = s.m
+    USING (SELECT @p_master_code AS m) AS s ON t.C_MASTER_CODE = s.m
     WHEN MATCHED THEN UPDATE SET
-        C_TE_BADGE_LOW        = @C_TE_BADGE_LOW,
-        C_TE_BADGE_HIGH       = @C_TE_BADGE_HIGH,
-        C_TE_ALERT_THRESHOLD  = @C_TE_ALERT_THRESHOLD,
-        C_CASH_DRAG_THRESHOLD = @C_CASH_DRAG_THRESHOLD,
-        C_DEV_THRESHOLD_HIGH  = @C_DEV_THRESHOLD_HIGH,
-        C_DEV_THRESHOLD_LOW   = @C_DEV_THRESHOLD_LOW,
-        C_UPDATED_BY          = @C_UPDATED_BY,
+        C_TE_BADGE_LOW        = @p_te_badge_low,
+        C_TE_BADGE_HIGH       = @p_te_badge_high,
+        C_TE_ALERT_THRESHOLD  = @p_te_alert_threshold,
+        C_CASH_DRAG_THRESHOLD = @p_cash_drag_threshold,
+        C_DEV_THRESHOLD_HIGH  = @p_dev_threshold_high,
+        C_DEV_THRESHOLD_LOW   = @p_dev_threshold_low,
+        C_UPDATED_BY          = @p_updated_by,
         C_UPDATED_TIME        = GETDATE()
     WHEN NOT MATCHED THEN INSERT
         (C_MASTER_CODE, C_TE_BADGE_LOW, C_TE_BADGE_HIGH, C_TE_ALERT_THRESHOLD,
          C_CASH_DRAG_THRESHOLD, C_DEV_THRESHOLD_HIGH, C_DEV_THRESHOLD_LOW, C_UPDATED_BY)
         VALUES
-        (@C_MASTER_CODE, @C_TE_BADGE_LOW, @C_TE_BADGE_HIGH, @C_TE_ALERT_THRESHOLD,
-         @C_CASH_DRAG_THRESHOLD, @C_DEV_THRESHOLD_HIGH, @C_DEV_THRESHOLD_LOW, @C_UPDATED_BY);
+        (@p_master_code, @p_te_badge_low, @p_te_badge_high, @p_te_alert_threshold,
+         @p_cash_drag_threshold, @p_dev_threshold_high, @p_dev_threshold_low, @p_updated_by);
 
-    SELECT @C_MASTER_CODE AS C_MASTER_CODE, * FROM dbo.UDF_PM_CONFIG(@C_MASTER_CODE);
+    SELECT @p_master_code AS C_MASTER_CODE, * FROM dbo.UDF_PM_CONFIG(@p_master_code);
 END
 GO
 
@@ -78,12 +78,12 @@ GO
                   + cash drag+#vượt + deviation+#vượt A/B.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_OVERVIEW
-    @C_MASTER_CODE VARCHAR(20),
-    @RANGE         VARCHAR(20) = 'INCEPTION'
+    @p_master_code VARCHAR(20),
+    @p_range         VARCHAR(20) = 'INCEPTION'
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN RAISERROR('Master not found',16,1); RETURN; END
 
     -- cấu hình ngưỡng hiệu lực
@@ -91,39 +91,39 @@ BEGIN
             @cdThr DECIMAL(9,6),  @devHi  DECIMAL(10,2), @devLo  DECIMAL(10,2);
     SELECT @teLow=C_TE_BADGE_LOW, @teHigh=C_TE_BADGE_HIGH, @teAlert=C_TE_ALERT_THRESHOLD,
            @cdThr=C_CASH_DRAG_THRESHOLD, @devHi=C_DEV_THRESHOLD_HIGH, @devLo=C_DEV_THRESHOLD_LOW
-    FROM dbo.UDF_PM_CONFIG(@C_MASTER_CODE);
+    FROM dbo.UDF_PM_CONFIG(@p_master_code);
 
     -- khung ngày (hiệu suất T-1)
     DECLARE @end DATE, @cutoff DATE, @base DATE, @X INT;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
-    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
 
     -- master index return kỳ (PR) + #ngày GD (cap 252)
     DECLARE @idxBase DECIMAL(18,6), @idxEnd DECIMAL(18,6), @rMaster DECIMAL(18,10);
-    SELECT @idxBase = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@base;
-    SELECT @idxEnd  = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@end;
+    SELECT @idxBase = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
+    SELECT @idxEnd  = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@end;
     SET @rMaster = CASE WHEN @idxBase IS NULL OR @idxBase=0 THEN NULL ELSE @idxEnd/@idxBase - 1 END;
     SELECT @X = COUNT(DISTINCT C_BUSINESS_DATE) FROM T_MASTER_INDEX_DAILY
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
     IF @X > 252 SET @X = 252;
 
     -- net in/out kỳ (base, end]
     DECLARE @cashIn DECIMAL(20,0), @cashOut DECIMAL(20,0);
     SELECT @cashIn = ISNULL(SUM(C_CASH_IN),0), @cashOut = ISNULL(SUM(C_CASH_OUT),0)
     FROM T_MASTER_NAV_BALANCE
-    WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
+    WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
 
     -- AUM hiện tại + base + cash drag (master current/daily)
     DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT, @aumBase DECIMAL(20,0);
     SELECT @aumNow = C_TOTAL_ASSET, @nKH = C_TOTAL_ACCOUNT,
            @tienNow = C_CASH + C_PENDING_CASH + C_DIV_CASH
-    FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@C_MASTER_CODE;
+    FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@p_master_code;
     SELECT @aumBase = C_TOTAL_ASSET FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@base;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
 
     -- per-KH (end-weight): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end).
     --   TE = STDEV(active) qua (base,end] = hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, accum_base=0.
@@ -135,17 +135,17 @@ BEGIN
     SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE, nc.C_LAST_UNIT_PRICE,
            nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
-    WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE';
+    WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
 
     -- lát @end: accum active đến cuối kỳ
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k JOIN T_SI_NAV_BALANCE e
-      ON e.C_MASTER_CODE=@C_MASTER_CODE AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
+      ON e.C_MASTER_CODE=@p_master_code AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
 
     -- lát @base: up_base + accum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, accum_base=0)
     UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
+      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
     UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
@@ -172,7 +172,7 @@ BEGIN
     FROM #kh;
 
     SELECT  mp.C_MASTER_CODE, mp.C_MASTER_NAME, mp.C_STATUS, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
-            @RANGE AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE, @X AS C_TRADING_DAYS,
+            @p_range AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE, @X AS C_TRADING_DAYS,
             @nKH AS C_TOTAL_ACCOUNT,
             @aumNow AS C_AUM, @aumBase AS C_AUM_BASE,
             CASE WHEN @aumBase IS NULL OR @aumBase=0 THEN NULL
@@ -188,7 +188,7 @@ BEGIN
             CASE WHEN @wTE IS NULL THEN NULL
                  WHEN @wTE < @teLow THEN 'LOW' WHEN @wTE < @teHigh THEN 'MED' ELSE 'HIGH' END AS C_TE_BADGE,
             @nTEover AS C_CNT_TE_OVER
-    FROM T_MASTER_PORTFOLIO mp WHERE mp.C_MASTER_CODE=@C_MASTER_CODE;
+    FROM T_MASTER_PORTFOLIO mp WHERE mp.C_MASTER_CODE=@p_master_code;
 
     DROP TABLE #kh;
 END
@@ -196,62 +196,62 @@ GO
 
 /*===========================================================================
   US3 — SP_GET_MASTER_PERFORMANCE : chart 3 đường + mốc rebalance
-    RS1 chuỗi theo @RESOLUTION (D/W/M, NULL=auto theo độ dài kỳ):
+    RS1 chuỗi theo @p_resolution (D/W/M, NULL=auto theo độ dài kỳ):
         C_MASTER_INDEX (PR) | C_KH_COMPOSITE (AUM-weighted end-weight, base=1.0) | C_BENCHMARK (PR)
         → App rebase cả 3 về 0% tại điểm đầu.
     RS2: mốc rebalance (effective_date của T_MASTER_PORTFOLIO_TICKER trong kỳ).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_PERFORMANCE
-    @C_MASTER_CODE VARCHAR(20),
-    @RANGE         VARCHAR(20) = '1Y',
-    @RESOLUTION    VARCHAR(2)  = NULL   -- 'D'|'W'|'M' ; NULL = auto
+    @p_master_code VARCHAR(20),
+    @p_range         VARCHAR(20) = '1Y',
+    @p_resolution    VARCHAR(2)  = NULL   -- 'D'|'W'|'M' ; NULL = auto
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN RAISERROR('Master not found',16,1); RETURN; END
 
-    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@C_MASTER_CODE);
+    DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
-    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
 
     -- auto resolution theo độ dài kỳ
-    IF @RESOLUTION IS NULL
-        SET @RESOLUTION = CASE WHEN DATEDIFF(DAY,@base,@end) > 90 THEN 'M'
+    IF @p_resolution IS NULL
+        SET @p_resolution = CASE WHEN DATEDIFF(DAY,@base,@end) > 90 THEN 'M'
                                WHEN DATEDIFF(DAY,@base,@end) > 21 THEN 'W' ELSE 'D' END;
 
     -- end-weight per KH: W_i = aum_i/Σaum ; up_base = lát @base (join sau base → 10000)
     CREATE TABLE #kw (si VARCHAR(20), w DECIMAL(18,12), up_base DECIMAL(18,6));
     ;WITH kh AS (
         SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum
-        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE'
+        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), tot AS (SELECT SUM(aum) s FROM kh)
     INSERT #kw (si, w, up_base)
     SELECT kh.si, CAST(kh.aum / NULLIF(tot.s,0) AS DECIMAL(18,12)), COALESCE(b.C_UNIT_PRICE,10000)
     FROM kh CROSS JOIN tot
     LEFT JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=kh.si;
+      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=kh.si;
 
     -- sample dates theo resolution (luôn gồm base & end)
     DECLARE @samp TABLE (d DATE PRIMARY KEY);
     ;WITH dd AS (
         SELECT DISTINCT C_BUSINESS_DATE bd FROM T_MASTER_NAV_BALANCE
-        WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE BETWEEN @base AND @end
+        WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE BETWEEN @base AND @end
     ), bucketed AS (
         SELECT bd,
-               CASE @RESOLUTION
+               CASE @p_resolution
                     WHEN 'M' THEN ROW_NUMBER() OVER (PARTITION BY YEAR(bd),MONTH(bd) ORDER BY bd DESC)
                     WHEN 'W' THEN ROW_NUMBER() OVER (PARTITION BY DATEPART(YEAR,bd),DATEPART(ISO_WEEK,bd) ORDER BY bd DESC)
                     ELSE 1 END AS rn
         FROM dd
     )
     INSERT @samp(d)
-    SELECT bd FROM bucketed WHERE @RESOLUTION='D' OR rn=1
+    SELECT bd FROM bucketed WHERE @p_resolution='D' OR rn=1
     UNION SELECT @base UNION SELECT @end;
 
     -- RS1 chuỗi. Composite KH set-based: sample-date là business-date thật ⇒ KH active có đúng 1
@@ -264,7 +264,7 @@ BEGIN
                    / NULLIF(SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
                                      THEN kw.w END),0) AS DECIMAL(18,8)) AS kc
         FROM #kw kw
-        JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@C_MASTER_CODE
+        JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@p_master_code
         JOIN @samp s2 ON s2.d=b.C_BUSINESS_DATE
         GROUP BY b.C_BUSINESS_DATE
     )
@@ -274,14 +274,14 @@ BEGIN
             comp.kc           AS C_KH_COMPOSITE
     FROM @samp s
     LEFT JOIN comp ON comp.d = s.d
-    LEFT JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=@C_MASTER_CODE AND idx.C_BUSINESS_DATE=s.d
+    LEFT JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=@p_master_code AND idx.C_BUSINESS_DATE=s.d
     LEFT JOIN T_BENCHMARK_DAILY    bm  ON bm.C_BENCHMARK_CODE=@bench AND bm.C_BUSINESS_DATE=s.d
     ORDER BY s.d;
 
     -- RS2 mốc rebalance trong kỳ
     SELECT DISTINCT C_EFFECTIVE_DATE
     FROM T_MASTER_PORTFOLIO_TICKER
-    WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_EFFECTIVE_DATE BETWEEN @base AND @end
+    WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE BETWEEN @base AND @end
     ORDER BY C_EFFECTIVE_DATE;
 
     DROP TABLE #kw;
@@ -294,18 +294,18 @@ GO
     RS2: net delta holdings thực tế per mã (T_MASTER_HOLDING_BALANCE @date vs phiên trước).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_REBALANCE_DETAIL
-    @C_MASTER_CODE VARCHAR(20),
-    @DATE          DATE
+    @p_master_code VARCHAR(20),
+    @p_date          DATE
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- effective_date hiệu lực = lớn nhất ≤ @DATE ; kỳ trước = lớn nhất < eff
+    -- effective_date hiệu lực = lớn nhất ≤ @p_date ; kỳ trước = lớn nhất < eff
     DECLARE @eff DATE, @prevEff DATE;
     SELECT @eff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_EFFECTIVE_DATE <= @DATE;
+     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE <= @p_date;
     SELECT @prevEff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_EFFECTIVE_DATE < @eff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE < @eff;
 
     -- RS1: weight cũ → mới (full outer: mã ra/vào danh mục)
     SELECT  COALESCE(n.C_TICKER, o.C_TICKER) AS C_TICKER,
@@ -313,18 +313,18 @@ BEGIN
             n.C_TARGET_WEIGHT AS C_WEIGHT_NEW,
             COALESCE(n.C_TARGET_WEIGHT,0) - COALESCE(o.C_TARGET_WEIGHT,0) AS C_WEIGHT_DELTA
     FROM        (SELECT C_TICKER,C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
-                 WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_EFFECTIVE_DATE=@eff) n
+                 WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@eff) n
     FULL OUTER JOIN (SELECT C_TICKER,C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
-                 WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_EFFECTIVE_DATE=@prevEff) o
+                 WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@prevEff) o
       ON o.C_TICKER=n.C_TICKER
     ORDER BY ABS(COALESCE(n.C_TARGET_WEIGHT,0)-COALESCE(o.C_TARGET_WEIGHT,0)) DESC;
 
     -- RS2: net delta holdings thực tế quanh @eff (phiên có holdings ≤ eff vs phiên ngay trước)
     DECLARE @hd DATE, @hdPrev DATE;
     SELECT @hd = MAX(C_BUSINESS_DATE) FROM T_MASTER_HOLDING_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE <= @eff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @eff;
     SELECT @hdPrev = MAX(C_BUSINESS_DATE) FROM T_MASTER_HOLDING_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE < @hd;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE < @hd;
 
     SELECT  COALESCE(c.C_TICKER, p.C_TICKER) AS C_TICKER,
             ISNULL(p.C_QUANTITY,0) AS C_QTY_PREV,
@@ -332,9 +332,9 @@ BEGIN
             ISNULL(c.C_QUANTITY,0) - ISNULL(p.C_QUANTITY,0) AS C_QTY_DELTA,
             c.C_WEIGHT AS C_WEIGHT_ACTUAL
     FROM        (SELECT C_TICKER,C_QUANTITY,C_WEIGHT FROM T_MASTER_HOLDING_BALANCE
-                 WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@hd) c
+                 WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@hd) c
     FULL OUTER JOIN (SELECT C_TICKER,C_QUANTITY FROM T_MASTER_HOLDING_BALANCE
-                 WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@hdPrev) p
+                 WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@hdPrev) p
       ON p.C_TICKER=c.C_TICKER
     ORDER BY ABS(ISNULL(c.C_QUANTITY,0)-ISNULL(p.C_QUANTITY,0)) DESC;
 END
@@ -346,21 +346,21 @@ GO
     RS2: histogram buckets %PnL.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_PNL_DIST
-    @C_MASTER_CODE VARCHAR(20),
-    @RANGE         VARCHAR(20) = 'INCEPTION'
+    @p_master_code VARCHAR(20),
+    @p_range         VARCHAR(20) = 'INCEPTION'
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN RAISERROR('Master not found',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
-    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
 
     CREATE TABLE #p (si VARCHAR(20), aum DECIMAL(20,6), pnl DECIMAL(18,10));
     INSERT #p (si, aum, pnl)
@@ -368,11 +368,11 @@ BEGIN
            nc.C_LAST_UNIT_PRICE / NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1
     FROM T_SI_NAV_CURRENT nc
     LEFT JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
-    WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE';
+      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+    WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
 
     -- RS1 summary
-    SELECT  @C_MASTER_CODE AS C_MASTER_CODE, @RANGE AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE,
+    SELECT  @p_master_code AS C_MASTER_CODE, @p_range AS C_RANGE, @base AS C_BASE_DATE, @end AS C_END_DATE,
             COUNT(*)                                   AS C_TOTAL_KH,
             COUNT(CASE WHEN pnl > 0 THEN 1 END)        AS C_CNT_GAIN,
             COUNT(CASE WHEN pnl < 0 THEN 1 END)        AS C_CNT_LOSS,
@@ -405,23 +405,23 @@ GO
   US5 — SP_GET_MASTER_TOP_KH : top-N KH theo %PnL (TWR)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_TOP_KH
-    @C_MASTER_CODE VARCHAR(20),
-    @RANGE         VARCHAR(20) = 'INCEPTION',
-    @TOPN          INT = 20,
-    @DIR           VARCHAR(4) = 'DESC'   -- DESC = top lãi ; ASC = top lỗ
+    @p_master_code VARCHAR(20),
+    @p_range         VARCHAR(20) = 'INCEPTION',
+    @p_topn          INT = 20,
+    @p_dir           VARCHAR(4) = 'DESC'   -- DESC = top lãi ; ASC = top lỗ
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @C_MASTER_CODE)
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN RAISERROR('Master not found',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
-    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @RANGE);
+    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@C_MASTER_CODE;
+        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
 
     ;WITH k AS (
         SELECT nc.C_CUST_CODE, nc.C_SI_ACCOUNT,
@@ -431,13 +431,13 @@ BEGIN
                CAST(nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1 AS DECIMAL(18,6)) AS C_PNL_PCT
         FROM T_SI_NAV_CURRENT nc
         LEFT JOIN T_SI_NAV_BALANCE b
-          ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
-        WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE'
+          ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+        WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     )
-    SELECT TOP (@TOPN) C_CUST_CODE, C_SI_ACCOUNT, C_AUM, C_UNIT_PRICE_BASE, C_UNIT_PRICE_END, C_PNL_PCT
+    SELECT TOP (@p_topn) C_CUST_CODE, C_SI_ACCOUNT, C_AUM, C_UNIT_PRICE_BASE, C_UNIT_PRICE_END, C_PNL_PCT
     FROM k
-    ORDER BY CASE WHEN @DIR='ASC' THEN C_PNL_PCT END ASC,
-             CASE WHEN @DIR<>'ASC' THEN C_PNL_PCT END DESC;
+    ORDER BY CASE WHEN @p_dir='ASC' THEN C_PNL_PCT END ASC,
+             CASE WHEN @p_dir<>'ASC' THEN C_PNL_PCT END DESC;
 END
 GO
 
@@ -446,11 +446,11 @@ GO
     RS1 header: #master ACTIVE, Σ#KH.
     RS2 tổng: ΣAUM + growth (vs base mỗi master), Σ net in/out, cash drag toàn hệ, #master cash>ngưỡng.
     RS3 list master: AUM/#KH/master return/KH AUM-weighted return/deviation/AUM-weighted TE/cash drag.
-        @SORT: AUM|RET|DEV|TE|CASH (mặc định AUM desc).
+        @p_sort: AUM|RET|DEV|TE|CASH (mặc định AUM desc).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_PM_OVERVIEW_ALL
-    @RANGE VARCHAR(20) = 'INCEPTION',
-    @SORT  VARCHAR(8)  = 'AUM'
+    @p_range VARCHAR(20) = 'INCEPTION',
+    @p_sort  VARCHAR(8)  = 'AUM'
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -465,7 +465,7 @@ BEGIN
     WHERE mp.C_STATUS='ACTIVE'
     GROUP BY mp.C_MASTER_CODE;
 
-    UPDATE #md SET dcut = dbo.UDF_RANGE_CUTOFF(dend, @RANGE);
+    UPDATE #md SET dcut = dbo.UDF_RANGE_CUTOFF(dend, @p_range);
     UPDATE m SET dbase = COALESCE(
         (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
           WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE<=m.dcut),
@@ -561,11 +561,11 @@ BEGIN
     FROM #mr r
     JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=r.m
     JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
-    ORDER BY CASE @SORT WHEN 'AUM'  THEN mc.C_TOTAL_ASSET END DESC,
-             CASE @SORT WHEN 'RET'  THEN r.wret END DESC,
-             CASE @SORT WHEN 'DEV'  THEN (r.wret-r.rmaster) END DESC,
-             CASE @SORT WHEN 'TE'   THEN r.wte END DESC,
-             CASE @SORT WHEN 'CASH' THEN r.cashdrag END DESC,
+    ORDER BY CASE @p_sort WHEN 'AUM'  THEN mc.C_TOTAL_ASSET END DESC,
+             CASE @p_sort WHEN 'RET'  THEN r.wret END DESC,
+             CASE @p_sort WHEN 'DEV'  THEN (r.wret-r.rmaster) END DESC,
+             CASE @p_sort WHEN 'TE'   THEN r.wte END DESC,
+             CASE @p_sort WHEN 'CASH' THEN r.cashdrag END DESC,
              mc.C_TOTAL_ASSET DESC;
 
     DROP TABLE #kh; DROP TABLE #mr; DROP TABLE #md;
