@@ -153,5 +153,5 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 
 ## 11. Còn mở
 - Master ACTIVE chưa có EOD data → hiện bị loại khỏi #master count/list. Sau cần hiển thị "mới tạo" thì điều chỉnh.
-- Index leading `C_SI_ACCOUNT` cho customer FR-02/03/06 (cũng scan theo si — vấn đề có sẵn, ngoài scope PM).
+- ~~Index leading `C_SI_ACCOUNT` cho customer FR-02/03/06~~ ✅ ĐÃ THÊM (`IX_SI_NAV_BALANCE_ACCT` + cashflow/fee_income acct + `IX_SI_PORTFOLIO_CUST` + `IX_SI_NAV_CURRENT_MASTER`).
 - Backfill ngày quá khứ ⇒ accum các ngày sau lệch (EOD forward-only nên không phải luồng thường); nếu cần resync phải recompute accum xuôi từ ngày sửa.
