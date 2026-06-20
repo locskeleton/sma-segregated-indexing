@@ -90,16 +90,13 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
 
 ---
 
-## 5. Schema bổ sung (Track 2)
+## 5. Schema
 
-- **`T_MASTER_PM_CONFIG`** (per-master, PM cài đặt):
+- **`T_MASTER_PM_CONFIG`** (per-master, PM cài đặt — **bảng RIÊNG của PM tool**, sở hữu ở doc này):
   `C_MASTER_CODE` (UNIQUE/PK) · `C_TE_BADGE_LOW` · `C_TE_BADGE_HIGH` · `C_TE_ALERT_THRESHOLD` · `C_CASH_DRAG_THRESHOLD` (Y) · `C_DEV_THRESHOLD_HIGH` (A) · `C_DEV_THRESHOLD_LOW` (B) · `C_UPDATED_BY` · `C_UPDATED_TIME`.
-  - Fallback: master chưa cấu hình → default hệ thống (row `C_MASTER_CODE='*'` hoặc hardcode). Chỉ giữ current + updated_by/time (không lịch sử).
-- **Index** `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE, C_BUSINESS_DATE)` INCLUDE `(C_SI_ACCOUNT, C_UNIT_PRICE, C_DAILY_RETURN, C_NAV, C_CUM_ACTIVE_RET, C_CUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT)` — đọc 2 lát base/end (return + TE prefix-sum) phủ index.
-- **[P6] TE prefix-sum** — 3 cột lũy kế trên `T_SI_NAV_BALANCE` (maintain EOD J12B `SP_EOD_TE_CUM`):
-  `C_CUM_ACTIVE_RET` (Σ active return từ inception) · `C_CUM_ACTIVE_RET_SQ` (Σ active²) · `C_RET_DAY_COUNT` (n). FLOAT.
-  TE range = từ HIỆU 2 mốc base/end: `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). ⇒ on-read đọc 2 lát ngày, KHÔNG quét lịch sử → US1 từ ~48s xuống ~1s, end-weight GIỮ NGUYÊN.
-- Return/deviation: KHÔNG precompute — đọc `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000).
+  - Fallback: master chưa cấu hình → default hệ thống (`UDF_PM_CONFIG` hardcode). Chỉ giữ current + updated_by/time (không lịch sử).
+- **3 cột TE prefix-sum trên `T_SI_NAV_BALANCE`** (`cum_active_ret`, `cum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
+- **Cách serve-layer tiêu thụ** (đọc 2 lát base/end, không quét): TE range = HIỆU 2 mốc `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). Return/deviation = `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000). ⇒ US1 ~48s→~1s, **end-weight GIỮ NGUYÊN**.
 
 ---
 

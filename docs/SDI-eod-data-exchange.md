@@ -39,7 +39,7 @@ Mkt ──(7) giá EOD + corporate action + benchmark ────────�
         │  INGEST (Kafka per-KH, NGOÀI EOD): SP_INGEST_CUSTOMER → overwrite current
         │       holdings+cash + maintain interval hist + cổ tức/phí
         │  SDI EOD (SP_EOD_RUN): J0 GATE → J07 COMPUTE (MTM→NAV→PnL→Unit)
-        │       → J11 master agg → J12 Index → J13 RECONCILE (cổng) → J14 snapshot (push Asset)
+        │       → J11 master agg → J12 Index → J12B TE cum → J13 RECONCILE (cổng) → J14 snapshot (push Asset)
         ▼
 SDI ──(8) current snapshot + master series ────────────────────────▶ Asset ──▶ SMO
 SDI ──(9) (API pull) customer NAV/holdings lịch sử theo yêu cầu ◀───── Asset

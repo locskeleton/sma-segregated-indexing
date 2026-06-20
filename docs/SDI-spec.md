@@ -217,7 +217,8 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_SI_FEE_CHARGE`** (event_id PK; `C_SI_ACCOUNT`, charge_date, period[opt], amount, source_event_id [dedup], created_time) — **LOG phí QL do BO cắt**. BO cắt 1 cục/tháng → báo **event Kafka** → SDI ingest (`SP_INGEST_FEE_CHARGE`) → `payable −= amount` (net-off; thiếu đủ cứ trừ, residual carry). **KHÔNG status lifecycle** (BO sở hữu việc cắt, SDI chỉ net-off). Idempotent qua `source_event_id`.
 
 ### Per-KH daily performance (LỊCH SỬ — materialize)
-- **`T_SI_NAV_BALANCE`** (business_date, `C_SI_ACCOUNT`; nav, **payable_fee**, unit, unit_price, daily_pnl, daily_return) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). `nav` = NET phí (= gross − payable_fee); `nav_gross = nav + payable_fee`. Khi accrual OFF: payable_fee=0 ⇒ nav = gross.
+- **`T_SI_NAV_BALANCE`** (business_date, `C_SI_ACCOUNT`; nav, **payable_fee**, unit, unit_price, daily_pnl, daily_return, **cum_active_ret, cum_active_ret_sq, ret_day_count**) — **BẮT BUỘC**: vì FO sync snapshot (overwrite) → holdings không event-source → không derive được NAV/unit_price quá khứ → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). `nav` = NET phí (= gross − payable_fee); `nav_gross = nav + payable_fee`. Khi accrual OFF: payable_fee=0 ⇒ nav = gross.
+  - **`cum_active_ret` / `cum_active_ret_sq` / `ret_day_count`** (FLOAT/INT) — **lũy kế TE prefix-sum** (active return = `daily_return` KH − `daily_return` master index), maintain bởi **J12B** (xem §9.2). Cho phép serve-layer PM tính Tracking Error qua range BẤT KỲ bằng HIỆU 2 mốc base/end (đọc 2 lát, không quét lịch sử): `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TE=√Var×√min(n,252)`. Tiêu thụ ở [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) (US1/US2). Index `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE,C_BUSINESS_DATE)` INCLUDE 3 cột này + unit_price/daily_return/nav để phủ đọc-2-lát.
 
 ### Chuỗi daily master-level (materialize, nhỏ)
 - **`T_MASTER_NAV_BALANCE`** (business_date, `C_MASTER_CODE`; cash, **pending_cash**, **div_cash**, stock_value, cash_dividend, custody_fee, mgmt_fee_accrued, payable_fee, total_asset, nav, unit, unit_price, daily_pnl, daily_return, **cash_in**, **cash_out**, **total_account**) — **NGUỒN NAV master-level DUY NHẤT**. `total_asset = stock_value + cash + pending_cash + div_cash` (gồm tiền chờ về); `nav = total_asset − payable_fee`. **[PM tool +]** `cash_in`/`cash_out` = Σ cashflow nạp/rút master/ngày (loại phí); `total_account` = #tiểu khoản ACTIVE → phục vụ AUM-growth, net-flow, #KH ở dashboard PM (US1/US2).
@@ -274,6 +275,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; T_SI_UNIT_LEDGER; **T_SI_NAV_BALANCE** (lịch sử per-KH) | ✅ | ‖ | – |
 | **J11** | `SI_AGG` tổng hợp master | J8, J10 | cash/pending/div/stock/NAV/unit per tiểu khoản + T_SI_FEE_INCOME + T_SI_CASHFLOW_EVENT | **T_MASTER_NAV_BALANCE** (composition + NAV + hiệu suất + cổ tức/phí Σ + **[PM] cash_in/cash_out Σ + total_account + total_asset gồm receivables**) + **T_MASTER_NAV_CURRENT** (upsert) | ✅ | ‖ | – |
 | **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | T_MASTER_INDEX_DAILY, T_BENCHMARK_DAILY | ✅ | ‖ | – |
+| **J12B** | `TE_CUM` lũy kế active return *(PM)* | J10, J12 | `daily_return` KH (J10) − `daily_return` index (J12); cum @prev | **T_SI_NAV_BALANCE** cập nhật `cum_active_ret/_sq + ret_day_count` (TE prefix-sum cho serve-layer PM). Idempotent: cum@d=cum@prev+a@d | ✅ | – | – |
 | **J13** | `RECONCILE` đối soát | J11 | SDI holdings/NAV vs FO; Σ customer NAV vs master NAV; Σ unit | bảng break | ✅ | – | ✅ (break > ngưỡng → chặn publish) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | T_MASTER_HOLDING_BALANCE (top20+mã khác) | ✅ | ‖ | – |
 | ~~J14b~~ | ~~`HISTORY`~~ **(CHUYỂN sang INGEST realtime)** | — | interval CASH_HIST/HOLDING_HIST maintain TẠI ingest per-event; `SP_EOD_HISTORY` chỉ còn utility bulk-backfill | — | – | – | – |
@@ -286,9 +288,10 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 INGEST (Kafka per-KH realtime: cash/holdings/phí + interval history) ──┐
                                                                        ▼
 J0 GATE → J7 ─ J8 → J9
-                    └─ J10 ─┐
-                            └─ J11 → J13 ─┐
-   J2 ──► J12 (độc lập, song song) ───────┤
+                    └─ J10 ─┬─ J11 → J13 ─┐
+                            └─ J12B ──────┤   (J12B cần J10 + J12)
+   J2 ──► J12 (độc lập, song song) ─┬─────┤
+                                    └─ J12B
                           J8 → J14 ───────┴─ J15 → J16
 ```
 (J6 ACCRUE_FEE: SDI accrue payable theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate), NAV = total_asset − payable; **BO cắt phí → event Kafka `SP_INGEST_FEE_CHARGE` → net-off payable** (log `T_SI_FEE_CHARGE`). SDI KHÔNG sinh lịch/ra lệnh. Không còn toggle — spec cố định.)
