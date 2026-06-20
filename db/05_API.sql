@@ -280,10 +280,12 @@ BEGIN
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
     ;WITH h AS (
-        SELECT t.C_TICKER, t.C_QUANTITY, p.C_CLOSE_PRICE,
-               t.C_QUANTITY * p.C_CLOSE_PRICE AS mv
+        SELECT t.C_TICKER, t.C_QUANTITY, px.C_CLOSE_PRICE,
+               t.C_QUANTITY * px.C_CLOSE_PRICE AS mv
         FROM       T_SI_PORTFOLIO_HOLDING t
-        INNER JOIN       T_PRICE_DAILY p ON p.C_TICKER = t.C_TICKER AND p.C_BUSINESS_DATE = @pd
+        OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY     -- giá mới nhất ≤ @pd CỦA TỪNG MÃ
+                     WHERE C_TICKER = t.C_TICKER AND C_BUSINESS_DATE <= @pd
+                     ORDER BY C_BUSINESS_DATE DESC) px                  -- mã halt/thiếu giá @pd vẫn HIỆN (last-known); chưa từng có giá → NULL, KHÔNG bị giấu
         WHERE  t.C_SI_ACCOUNT = @p_si_account
     ), tot AS (SELECT SUM(mv) smv FROM h),
        ranked AS (SELECT h.*, ROW_NUMBER() OVER (ORDER BY mv DESC) rn FROM h)
