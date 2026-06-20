@@ -25,7 +25,11 @@ RETURNS TABLE AS RETURN
             CAST(COALESCE(c.C_TE_ALERT_THRESHOLD,  0.050000) AS DECIMAL(10,6)) AS C_TE_ALERT_THRESHOLD,
             CAST(COALESCE(c.C_CASH_DRAG_THRESHOLD, 0.050000) AS DECIMAL(9,6))  AS C_CASH_DRAG_THRESHOLD,
             CAST(COALESCE(c.C_DEV_THRESHOLD_HIGH,  100.00)   AS DECIMAL(10,2)) AS C_DEV_THRESHOLD_HIGH,
-            CAST(COALESCE(c.C_DEV_THRESHOLD_LOW,  -100.00)   AS DECIMAL(10,2)) AS C_DEV_THRESHOLD_LOW
+            CAST(COALESCE(c.C_DEV_THRESHOLD_LOW,  -100.00)   AS DECIMAL(10,2)) AS C_DEV_THRESHOLD_LOW,
+            -- ngưỡng cảnh báo cấu hình: KHÔNG default (NULL = chưa cấu hình → consumer tương lai tự xử)
+            CAST(c.C_DRIFT_THRESHOLD       AS DECIMAL(9,6)) AS C_DRIFT_THRESHOLD,
+            CAST(c.C_SYMBOL_WEIGHT_ALERT   AS DECIMAL(9,6)) AS C_SYMBOL_WEIGHT_ALERT,
+            CAST(c.C_INDUSTRY_WEIGHT_ALERT AS DECIMAL(9,6)) AS C_INDUSTRY_WEIGHT_ALERT
     FROM        (SELECT @m AS m) z
     LEFT JOIN   T_MASTER_PM_CONFIG c ON c.C_MASTER_CODE = z.m;
 GO
@@ -43,6 +47,9 @@ CREATE OR ALTER PROCEDURE SP_SET_MASTER_PM_CONFIG
     @p_cash_drag_threshold  DECIMAL(9,6)  = NULL,
     @p_dev_threshold_high   DECIMAL(10,2) = NULL,
     @p_dev_threshold_low    DECIMAL(10,2) = NULL,
+    @p_drift_threshold       DECIMAL(9,6) = NULL,
+    @p_symbol_weight_alert   DECIMAL(9,6) = NULL,
+    @p_industry_weight_alert DECIMAL(9,6) = NULL,
     @p_updated_by           VARCHAR(64)   = NULL
 AS
 BEGIN
@@ -59,14 +66,19 @@ BEGIN
         C_CASH_DRAG_THRESHOLD = @p_cash_drag_threshold,
         C_DEV_THRESHOLD_HIGH  = @p_dev_threshold_high,
         C_DEV_THRESHOLD_LOW   = @p_dev_threshold_low,
+        C_DRIFT_THRESHOLD       = @p_drift_threshold,
+        C_SYMBOL_WEIGHT_ALERT   = @p_symbol_weight_alert,
+        C_INDUSTRY_WEIGHT_ALERT = @p_industry_weight_alert,
         C_UPDATED_BY          = @p_updated_by,
         C_UPDATED_TIME        = GETDATE()
     WHEN NOT MATCHED THEN INSERT
         (C_MASTER_CODE, C_TE_BADGE_LOW, C_TE_BADGE_HIGH, C_TE_ALERT_THRESHOLD,
-         C_CASH_DRAG_THRESHOLD, C_DEV_THRESHOLD_HIGH, C_DEV_THRESHOLD_LOW, C_UPDATED_BY)
+         C_CASH_DRAG_THRESHOLD, C_DEV_THRESHOLD_HIGH, C_DEV_THRESHOLD_LOW,
+         C_DRIFT_THRESHOLD, C_SYMBOL_WEIGHT_ALERT, C_INDUSTRY_WEIGHT_ALERT, C_UPDATED_BY)
         VALUES
         (@p_master_code, @p_te_badge_low, @p_te_badge_high, @p_te_alert_threshold,
-         @p_cash_drag_threshold, @p_dev_threshold_high, @p_dev_threshold_low, @p_updated_by);
+         @p_cash_drag_threshold, @p_dev_threshold_high, @p_dev_threshold_low,
+         @p_drift_threshold, @p_symbol_weight_alert, @p_industry_weight_alert, @p_updated_by);
 
     SELECT @p_master_code AS C_MASTER_CODE, * FROM dbo.UDF_PM_CONFIG(@p_master_code);
 END

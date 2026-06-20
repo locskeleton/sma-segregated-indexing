@@ -417,6 +417,11 @@ CREATE TABLE T_MASTER_PM_CONFIG (
     C_CASH_DRAG_THRESHOLD DECIMAL(9,6)   NULL,   -- Y: ngưỡng cash drag (ratio, vd 0.05) đếm #KH vượt
     C_DEV_THRESHOLD_HIGH DECIMAL(10,2)   NULL,   -- A: ngưỡng deviation cao (BPS) đếm #KH dev>A (vượt trội)
     C_DEV_THRESHOLD_LOW  DECIMAL(10,2)   NULL,   -- B: ngưỡng deviation thấp (BPS) đếm #KH dev<B (tụt)
+    -- Ngưỡng cảnh báo cấu hình (ratio, vd 0.15 = 15%). NULL = chưa cấu hình. CHƯA có consumer tính alert
+    -- (drift/symbol/industry weight) — config plumbing trước, computation + dimension ngành = task sau.
+    C_DRIFT_THRESHOLD       DECIMAL(9,6) NULL,   -- độ trôi trọng số THỰC vs MỤC TIÊU → cảnh báo cần rebalance
+    C_SYMBOL_WEIGHT_ALERT   DECIMAL(9,6) NULL,   -- ngưỡng tỷ trọng 1 MÃ → cảnh báo tập trung rủi ro cổ phiếu
+    C_INDUSTRY_WEIGHT_ALERT DECIMAL(9,6) NULL,   -- ngưỡng tỷ trọng 1 NGÀNH → cảnh báo tập trung ngành (cần dimension mã→ngành khi build consumer)
     C_UPDATED_BY         VARCHAR(64)     NULL,
     C_UPDATED_TIME       DATETIME        NOT NULL CONSTRAINT DF_MASTER_PM_CONFIG_TIME DEFAULT GETDATE(),
     CONSTRAINT PK_MASTER_PM_CONFIG PRIMARY KEY CLUSTERED (C_MASTER_CODE),
