@@ -94,7 +94,7 @@ CREATE TABLE T_BENCHMARK_DAILY (
 );
 
 -- Dimension mã→ngành — cho industryWeight alert (SP_GET_MASTER_ALERTS). 1 ticker = 1 ngành.
--- Seed hiện ở smoke; NGUỒN NẠP THẬT (FO/market data feed) = task data-ops sau.
+-- Seed dữ liệu mẫu bên dưới (tạm); NGUỒN NẠP THẬT (FO/market data feed) = task data-ops sau.
 CREATE TABLE T_TICKER_INDUSTRY (
     PK_TICKER_INDUSTRY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_TICKER_INDUSTRY_PKID DEFAULT NEWID(),
     C_TICKER         VARCHAR(20)   NOT NULL,
@@ -103,6 +103,19 @@ CREATE TABLE T_TICKER_INDUSTRY (
     CONSTRAINT PK_TICKER_INDUSTRY_NK PRIMARY KEY CLUSTERED (C_TICKER),  -- point-lookup theo mã
     CONSTRAINT UQ_TICKER_INDUSTRY_PKID UNIQUE NONCLUSTERED (PK_TICKER_INDUSTRY)
 );
+-- DỮ LIỆU MẪU (tạm — thay bằng datafeed thật FO/market data sau). Map VN30-ish → ngành ICB.
+INSERT INTO T_TICKER_INDUSTRY (C_TICKER, C_INDUSTRY_CODE, C_INDUSTRY_NAME) VALUES
+ ('VCB','BANK',N'Ngân hàng'),('BID','BANK',N'Ngân hàng'),('CTG','BANK',N'Ngân hàng'),
+ ('TCB','BANK',N'Ngân hàng'),('MBB','BANK',N'Ngân hàng'),('ACB','BANK',N'Ngân hàng'),
+ ('VPB','BANK',N'Ngân hàng'),('STB','BANK',N'Ngân hàng'),
+ ('VIC','REAL',N'Bất động sản'),('VHM','REAL',N'Bất động sản'),('VRE','REAL',N'Bất động sản'),
+ ('NVL','REAL',N'Bất động sản'),('KDH','REAL',N'Bất động sản'),('PDR','REAL',N'Bất động sản'),
+ ('HPG','MATL',N'Vật liệu'),('HSG','MATL',N'Vật liệu'),('NKG','MATL',N'Vật liệu'),
+ ('FPT','TECH',N'Công nghệ'),('CMG','TECH',N'Công nghệ'),
+ ('VNM','CONS',N'Tiêu dùng'),('MSN','CONS',N'Tiêu dùng'),('SAB','CONS',N'Tiêu dùng'),
+ ('MWG','RETL',N'Bán lẻ'),('PNJ','RETL',N'Bán lẻ'),
+ ('GAS','ENGY',N'Năng lượng'),('PLX','ENGY',N'Năng lượng'),('POW','ENGY',N'Năng lượng'),
+ ('SSI','SECU',N'Chứng khoán'),('VND','SECU',N'Chứng khoán'),('HCM','SECU',N'Chứng khoán');
 
 /*------------------------------------------------------- EVENT / LEDGER -------*/
 CREATE TABLE T_REBALANCE_REQUEST (
