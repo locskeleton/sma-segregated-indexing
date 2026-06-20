@@ -70,7 +70,7 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 | SP | US | Tham số | Trả |
 |---|---|---|---|
 | `SP_GET_PM_OVERVIEW_ALL` | US1 | `@p_range` | RS1 header (#master,#KH); RS2 tổng (AUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master (AUM/#KH/hiệu suất master/hiệu suất KH/dev/TE/cash-drag, sort) |
-| `SP_GET_MASTER_OVERVIEW` | US2 | `@p_master_code, @p_range` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B |
+| `SP_GET_MASTER_OVERVIEW` | US2 | `@p_master_code, @p_range, @p_dev_threshold_high?, @p_dev_threshold_low?` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B. **Ngưỡng A/B override 3 tầng**: param tra cứu (what-if) → config per-master → default. PM kéo ngưỡng lúc tra cứu KHÔNG ghi đè config (chỉ đổi #đếm; giá trị deviation giữ nguyên) |
 | `SP_GET_MASTER_PERFORMANCE` | US3 | `@p_master_code, @p_range, @p_resolution` (NULL=auto: D/W/M theo độ dài kỳ) | RS1 chuỗi: master index (PR) + `C_KH_COMPOSITE` (DM tổng KH AUM-weighted end-weight, base=1.0) + benchmark (PR) — app rebase 0%; RS2 mốc rebalance |
 | `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@p_master_code, @p_date` | RS1 target weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`, FULL OUTER → mã ra/vào); RS2 net delta holdings THỰC TẾ per mã từ **`T_MASTER_HOLDING_BALANCE`** (@phiên ≤ eff vs phiên trước) — master-level daily holdings, chính xác hơn agg per-KH hist |
 | `SP_GET_MASTER_PNL_DIST` | US4 | `@p_master_code, @p_range` | #lãi/#lỗ + tỷ lệ, histogram buckets, AUM-weighted avg %PnL, trung vị |

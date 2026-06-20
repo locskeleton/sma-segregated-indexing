@@ -101,6 +101,8 @@ GO
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_OVERVIEW
     @p_master_code VARCHAR(20),
     @p_range         VARCHAR(20) = 'INCEPTION',
+    @p_dev_threshold_high DECIMAL(10,2) = NULL,   -- override A lúc tra cứu (what-if); NULL = lấy config per-master
+    @p_dev_threshold_low  DECIMAL(10,2) = NULL,   -- override B lúc tra cứu; NULL = lấy config
     @p_user        VARCHAR(64)   = NULL,
     @p_err_code    INT           OUTPUT,
     @p_err_msg     NVARCHAR(400) OUTPUT
@@ -118,6 +120,9 @@ BEGIN
     SELECT @teLow=C_TE_BADGE_LOW, @teHigh=C_TE_BADGE_HIGH, @teAlert=C_TE_ALERT_THRESHOLD,
            @cdThr=C_CASH_DRAG_THRESHOLD, @devHi=C_DEV_THRESHOLD_HIGH, @devLo=C_DEV_THRESHOLD_LOW
     FROM dbo.UDF_PM_CONFIG(@p_master_code);
+    -- override 3 tầng ngưỡng deviation: param tra cứu > config per-master > default (đã COALESCE trong UDF)
+    SET @devHi = COALESCE(@p_dev_threshold_high, @devHi);
+    SET @devLo = COALESCE(@p_dev_threshold_low,  @devLo);
 
     -- khung ngày (hiệu suất T-1)
     DECLARE @end DATE, @cutoff DATE, @base DATE, @X INT;
