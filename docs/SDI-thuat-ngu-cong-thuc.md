@@ -6,101 +6,103 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 ---
 
+> **Viết tắt cột "BRD tham chiếu":** `spec` = [SDI-spec.md](./SDI-spec.md) · `pm` = [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) · `eod` = [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md) · `db-arch` = [SDI-db-architecture.md](./SDI-db-architecture.md). Số sau là mục (§) trong doc đó.
+
 ## 1. Mô hình & định danh (Model & identifiers)
 
-| Tiếng Việt | English | Ký hiệu / cột | Giải thích |
-|---|---|---|---|
-| Danh mục mẫu / Master | Master portfolio / Strategy | `C_MASTER_CODE` | Danh mục chiến lược chuẩn (rổ cổ phiếu + trọng số mục tiêu) do FO quản lý. PM theo dõi ở cấp này. PK bảng `T_MASTER_PORTFOLIO`. |
-| Tiểu khoản | Sub-account | `C_SI_ACCOUNT` | Sinh khi 1 khách hàng (KH) đầu tư vào 1 master. Mã = `CUST_CODE` + đuôi, duy nhất toàn cục. Đóng rồi mở lại master ⇒ tiểu khoản MỚI. Tối đa 1 ACTIVE / (KH×master). Đơn vị tính NAV/hiệu suất customer-level. |
-| Khách hàng | Customer | `C_CUST_CODE` | Định danh KH (VARCHAR10), xuyên các sub-system. 1 KH có nhiều tiểu khoản (nhiều master / theo thời gian). |
-| Mã cổ phiếu | Ticker / Symbol | `C_TICKER` | Mã chứng khoán trong rổ. |
-| Trọng số mục tiêu | Target weight | `C_TARGET_WEIGHT`, `wᵢ` | Tỷ trọng mã trong danh mục mẫu; Σ theo (master, ngày hiệu lực) = 1.0 (100% cổ phiếu, không có thành phần tiền). |
-| Ngày hiệu lực (trọng số) | Effective date | `C_EFFECTIVE_DATE` | Ngày bộ trọng số bắt đầu áp dụng = **mốc rebalance**. Bộ "mới nhất ≤ ngày D" chi phối ngày D. |
-| Tái cân bằng | Rebalance | — | FO đổi bộ trọng số (thêm/bớt mã, đổi tỷ trọng). Tính EOD, close-to-close. |
-| Ngày giao dịch | Business date | `C_BUSINESS_DATE` | Ngày làm việc thị trường (có giá đóng cửa). |
+| Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Danh mục mẫu / Master | Master portfolio / Strategy | `C_MASTER_CODE` | Danh mục chiến lược chuẩn (rổ cổ phiếu + trọng số mục tiêu) do FO quản lý. PM theo dõi ở cấp này. PK bảng `T_MASTER_PORTFOLIO`. | spec §1 |
+| Tiểu khoản | Sub-account | `C_SI_ACCOUNT` | Sinh khi 1 khách hàng (KH) đầu tư vào 1 master. Mã = `CUST_CODE` + đuôi, duy nhất toàn cục. Đóng rồi mở lại master ⇒ tiểu khoản MỚI. Tối đa 1 ACTIVE / (KH×master). Đơn vị tính NAV/hiệu suất customer-level. | spec §1 |
+| Khách hàng | Customer | `C_CUST_CODE` | Định danh KH (VARCHAR10), xuyên các sub-system. 1 KH có nhiều tiểu khoản (nhiều master / theo thời gian). | spec §1 |
+| Mã cổ phiếu | Ticker / Symbol | `C_TICKER` | Mã chứng khoán trong rổ. | spec §2 |
+| Trọng số mục tiêu | Target weight | `C_TARGET_WEIGHT`, `wᵢ` | Tỷ trọng mã trong danh mục mẫu; Σ theo (master, ngày hiệu lực) = 1.0 (100% cổ phiếu, không có thành phần tiền). | spec §7 |
+| Ngày hiệu lực (trọng số) | Effective date | `C_EFFECTIVE_DATE` | Ngày bộ trọng số bắt đầu áp dụng = **mốc rebalance**. Bộ "mới nhất ≤ ngày D" chi phối ngày D. | spec §7 |
+| Tái cân bằng | Rebalance | — | FO đổi bộ trọng số (thêm/bớt mã, đổi tỷ trọng). Tính EOD, close-to-close. | spec §7 ; pm §3 (US3) |
+| Ngày giao dịch | Business date | `C_BUSINESS_DATE` | Ngày làm việc thị trường (có giá đóng cửa). | spec §8 |
 
 ---
 
 ## 2. Tiền & tài sản (Cash & assets)
 
-| Tiếng Việt | English | Ký hiệu / cột | Giải thích |
-|---|---|---|---|
-| Tiền mặt | Cash | `C_CASH` | Tiền khả dụng (FO sync). **Đã NET** phí giao dịch + thuế (FO trừ khi khớp lệnh). |
-| Tiền bán chờ về | Pending settlement cash | `C_PENDING_CASH` | Tiền bán cổ phiếu chưa về tài khoản (chu kỳ T+2, tổng T0+T1+T2). Là **khoản phải thu (receivable)** — vẫn tính vào tài sản → NAV không hụt giả khi bán. |
-| Cổ tức tiền chờ về | Dividend receivable | `C_DIV_CASH` | Tiền cổ tức đã chia nhưng chưa về. Receivable. |
-| Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). |
-| Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. |
-| Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). |
-| Phí phải trả | Payable (accrued) fee | `C_PAYABLE_FEE` | Phí quản lý đã tính dồn nhưng **chưa thu** (khoản phải trả). |
-| NAV ròng | Net Asset Value (net) | `C_NAV` | `= Tổng tài sản − Phí phải trả`. Giá trị thực thuộc về nhà đầu tư. |
-| NAV gộp | Gross NAV | — | `= Tổng tài sản = NAV ròng + Phí phải trả`. |
-| Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. |
-| Giá vốn bình quân | Average cost | `C_AVG_COST` | Tham chiếu lãi/lỗ; **KHÔNG** vào NAV (NAV theo giá thị trường). |
-| Dòng tiền vào/ra | Cashflow in/out | `C_CF_IN`/`C_CF_OUT`, `CF` | Nạp/rút của KH (external). **Không** tính vào lãi/lỗ (PnL khử dòng tiền). |
-| Nạp ban đầu / Nạp thêm / SIP | Initial / Top-up / SIP | `C_EVENT_TYPE` | Các loại tiền VÀO. SIP = nạp định kỳ (Systematic Investment Plan). |
-| Rút | Withdraw | `WITHDRAW` | Tiền RA. |
+| Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Tiền mặt | Cash | `C_CASH` | Tiền khả dụng (FO sync). **Đã NET** phí giao dịch + thuế (FO trừ khi khớp lệnh). | spec §3 |
+| Tiền bán chờ về | Pending settlement cash | `C_PENDING_CASH` | Tiền bán cổ phiếu chưa về tài khoản (chu kỳ T+2, tổng T0+T1+T2). Là **khoản phải thu (receivable)** — vẫn tính vào tài sản → NAV không hụt giả khi bán. | spec §3 |
+| Cổ tức tiền chờ về | Dividend receivable | `C_DIV_CASH` | Tiền cổ tức đã chia nhưng chưa về. Receivable. | spec §3 |
+| Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). | spec §3 |
+| Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. | spec §3 ; eod (J07) |
+| Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). | spec §3 ; pm §2 |
+| Phí phải trả | Payable (accrued) fee | `C_PAYABLE_FEE` | Phí quản lý đã tính dồn nhưng **chưa thu** (khoản phải trả). | spec §3 ; §9 (J06) |
+| NAV ròng | Net Asset Value (net) | `C_NAV` | `= Tổng tài sản − Phí phải trả`. Giá trị thực thuộc về nhà đầu tư. | spec §3 |
+| NAV gộp | Gross NAV | — | `= Tổng tài sản = NAV ròng + Phí phải trả`. | spec §3 |
+| Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. | spec §8 |
+| Giá vốn bình quân | Average cost | `C_AVG_COST` | Tham chiếu lãi/lỗ; **KHÔNG** vào NAV (NAV theo giá thị trường). | spec §8 |
+| Dòng tiền vào/ra | Cashflow in/out | `C_CF_IN`/`C_CF_OUT`, `CF` | Nạp/rút của KH (external). **Không** tính vào lãi/lỗ (PnL khử dòng tiền). | spec §4 |
+| Nạp ban đầu / Nạp thêm / SIP | Initial / Top-up / SIP | `C_EVENT_TYPE` | Các loại tiền VÀO. SIP = nạp định kỳ (Systematic Investment Plan). | spec §4 |
+| Rút | Withdraw | `WITHDRAW` | Tiền RA. | spec §4 |
 
 ---
 
 ## 3. Đơn vị quỹ & hiệu suất (Units & performance)
 
-| Tiếng Việt | English | Ký hiệu / cột | Giải thích |
-|---|---|---|---|
-| Đơn vị quỹ | Unit | `C_UNIT` | Số "phần" của tiểu khoản. Chỉ thay đổi do dòng tiền (nạp/rút), KHÔNG do biến động giá → tách bạch hiệu suất khỏi dòng tiền. |
-| Giá đơn vị quỹ | Unit Price (NAVPS) | `C_UNIT_PRICE`, `UP` | `= NAV ròng / Unit`. Gốc tại ngày tham gia (T0) = **10.000**. |
-| Lợi suất ngày | Daily return | `C_DAILY_RETURN`, `rₜ` | `= UPₜ / UP₍ₜ₋₁₎ − 1`. Độc lập dòng tiền. |
-| Lãi/lỗ (tiền) | PnL (money) | `C_DAILY_PNL` | Lãi/lỗ bằng tiền trong ngày/kỳ, đã khử dòng tiền. |
-| Hiệu suất theo thời gian | Time-Weighted Return (TWR) | — | Lợi suất "chiến lược", miễn nhiễm thời điểm/khối lượng nạp-rút. Tính qua Unit Price. |
-| Lợi suất theo dòng tiền | Money-Weighted Return (MWR) | — | Lợi suất "của bạn", chịu ảnh hưởng thời điểm nạp-rút. Dùng Modified Dietz / XIRR. |
-| %Lãi lỗ kỳ | %PnL (range return) | — | `= UP(cuối kỳ)/UP(mốc) − 1` (TWR). |
-| Ngày mốc (đầu kỳ) | Base date | `@base` | Gốc 0% của kỳ xem (theo filter 1D/1M/YTD/INCEPTION…). KH tham gia sau mốc → mốc = ngày tham gia. |
+| Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Đơn vị quỹ | Unit | `C_UNIT` | Số "phần" của tiểu khoản. Chỉ thay đổi do dòng tiền (nạp/rút), KHÔNG do biến động giá → tách bạch hiệu suất khỏi dòng tiền. | spec §5 |
+| Giá đơn vị quỹ | Unit Price (NAVPS) | `C_UNIT_PRICE`, `UP` | `= NAV ròng / Unit`. Gốc tại ngày tham gia (T0) = **10.000**. | spec §5 |
+| Lợi suất ngày | Daily return | `C_DAILY_RETURN`, `rₜ` | `= UPₜ / UP₍ₜ₋₁₎ − 1`. Độc lập dòng tiền. | spec §6 |
+| Lãi/lỗ (tiền) | PnL (money) | `C_DAILY_PNL` | Lãi/lỗ bằng tiền trong ngày/kỳ, đã khử dòng tiền. | spec §6 |
+| Hiệu suất theo thời gian | Time-Weighted Return (TWR) | — | Lợi suất "chiến lược", miễn nhiễm thời điểm/khối lượng nạp-rút. Tính qua Unit Price. | spec §6 |
+| Lợi suất theo dòng tiền | Money-Weighted Return (MWR) | — | Lợi suất "của bạn", chịu ảnh hưởng thời điểm nạp-rút. Dùng Modified Dietz / XIRR. | spec §6 |
+| %Lãi lỗ kỳ | %PnL (range return) | — | `= UP(cuối kỳ)/UP(mốc) − 1` (TWR). | spec §6 |
+| Ngày mốc (đầu kỳ) | Base date | `@base` | Gốc 0% của kỳ xem (theo filter 1D/1M/YTD/INCEPTION…). KH tham gia sau mốc → mốc = ngày tham gia. | spec §6 ; pm §2 |
 
 ---
 
 ## 4. Chỉ số, benchmark & chỉ số PM (Index, benchmark & PM metrics)
 
-| Tiếng Việt | English | Ký hiệu / cột | Giải thích |
-|---|---|---|---|
-| Chỉ số danh mục mẫu | Master Index | `C_INDEX_VALUE` (`T_MASTER_INDEX_DAILY`) | Chỉ số mô phỏng hiệu suất rổ mẫu (price-return), tái cân bằng hằng ngày về trọng số mục tiêu. Gốc 1000. |
-| Lợi nhuận giá | Price Return (PR) | — | Chỉ tính biến động giá, KHÔNG gồm cổ tức. (Master Index, VN-Index là PR.) |
-| Lợi nhuận tổng | Total Return (TR) | — | Gồm cả cổ tức. (Unit Price của KH/master là TR vì NAV ăn cổ tức.) |
-| Benchmark | Benchmark | `C_BENCHMARK_CODE` | Chỉ số tham chiếu ngoài (VN-Index, VN30…). PR. |
-| Hiệu suất DM tổng KH | Aggregate customer return (AUM-weighted) | — | Lợi suất bình quân gia quyền theo AUM của toàn bộ KH trong master (end-weight). |
-| Độ lệch hiệu suất | Performance deviation | `C_DEVIATION_BPS` | Chênh giữa hiệu suất KH và chỉ số master, tính bằng **điểm cơ bản (BPS)**. |
-| Điểm cơ bản | Basis point (BPS) | — | `1 BPS = 0.01% = 0.0001`. (1% = 100 BPS.) |
-| Sai số theo dõi | Tracking Error (TE) | `C_TE_AUMW` | Độ biến động của chênh lệch lợi suất KH vs chỉ số master (độ "bám" danh mục mẫu). |
-| Lợi suất chủ động | Active return | `aₜ` | `= r_KH,t − r_masterIndex,t` (chênh lợi suất ngày). TE = độ lệch chuẩn của chuỗi này. |
-| Tỷ lệ tiền nhàn rỗi | Cash drag | `C_CASH_DRAG` | `= Tiền / Tổng tài sản`. Tiền nhiều ⇒ "ghì" hiệu suất so với rổ 100% cổ phiếu. |
-| Dòng tiền ròng | Net flow | `C_NET_IN`/`C_NET_OUT`/`C_NET_FLOW` | Tiền vào − ra trong kỳ ở cấp master. |
-| Tăng trưởng AUM | AUM growth | `C_AUM_GROWTH_PCT` | `= AUM_hiện tại / AUM_đầu kỳ − 1`. |
-| Số tiểu khoản | Account count | `C_TOTAL_ACCOUNT` | Số tiểu khoản ACTIVE của master. |
+| Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Chỉ số danh mục mẫu | Master Index | `C_INDEX_VALUE` (`T_MASTER_INDEX_DAILY`) | Chỉ số mô phỏng hiệu suất rổ mẫu (price-return), tái cân bằng hằng ngày về trọng số mục tiêu. Gốc 1000. | spec §7 |
+| Lợi nhuận giá | Price Return (PR) | — | Chỉ tính biến động giá, KHÔNG gồm cổ tức. (Master Index, VN-Index là PR.) | spec §7 |
+| Lợi nhuận tổng | Total Return (TR) | — | Gồm cả cổ tức. (Unit Price của KH/master là TR vì NAV ăn cổ tức.) | spec §7 |
+| Benchmark | Benchmark | `C_BENCHMARK_CODE` | Chỉ số tham chiếu ngoài (VN-Index, VN30…). PR. | spec §7 |
+| Hiệu suất DM tổng KH | Aggregate customer return (AUM-weighted) | — | Lợi suất bình quân gia quyền theo AUM của toàn bộ KH trong master (end-weight). | pm §2 (US3) |
+| Độ lệch hiệu suất | Performance deviation | `C_DEVIATION_BPS` | Chênh giữa hiệu suất KH và chỉ số master, tính bằng **điểm cơ bản (BPS)**. | pm §2 (US2) |
+| Điểm cơ bản | Basis point (BPS) | — | `1 BPS = 0.01% = 0.0001`. (1% = 100 BPS.) | pm §2 |
+| Sai số theo dõi | Tracking Error (TE) | `C_TE_AUMW` | Độ biến động của chênh lệch lợi suất KH vs chỉ số master (độ "bám" danh mục mẫu). | pm §2/§5 (US2) |
+| Lợi suất chủ động | Active return | `aₜ` | `= r_KH,t − r_masterIndex,t` (chênh lợi suất ngày). TE = độ lệch chuẩn của chuỗi này. | pm §5 ; spec §8 (J12B) |
+| Tỷ lệ tiền nhàn rỗi | Cash drag | `C_CASH_DRAG` | `= Tiền / Tổng tài sản`. Tiền nhiều ⇒ "ghì" hiệu suất so với rổ 100% cổ phiếu. | pm §2 |
+| Dòng tiền ròng | Net flow | `C_NET_IN`/`C_NET_OUT`/`C_NET_FLOW` | Tiền vào − ra trong kỳ ở cấp master. | pm §2 ; spec §8 (J11) |
+| Tăng trưởng AUM | AUM growth | `C_AUM_GROWTH_PCT` | `= AUM_hiện tại / AUM_đầu kỳ − 1`. | pm §2 |
+| Số tiểu khoản | Account count | `C_TOTAL_ACCOUNT` | Số tiểu khoản ACTIVE của master. | pm §2 ; spec §8 (J11) |
 
 ---
 
 ## 5. Phí (Fees)
 
-| Tiếng Việt | English | Ký hiệu / cột | Giải thích |
-|---|---|---|---|
-| Phí quản lý | Management fee | `C_MGMT_FEE_RATE` | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. |
-| Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền). |
-| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_CHARGE` | BO cắt tiền phí 1 cục/tháng → báo về → SDI trừ vào khoản phải trả. |
-| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_INCOME`). |
-| Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. |
+| Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Phí quản lý | Management fee | `C_MGMT_FEE_RATE` | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. | spec §9 (J06) |
+| Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền). | spec §9 (J06) |
+| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_CHARGE` | BO cắt tiền phí 1 cục/tháng → báo về → SDI trừ vào khoản phải trả. | spec §9 ; eod (B) |
+| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_INCOME`). | spec §3 ; eod (B) |
+| Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. | spec §3 ; eod (B) |
 
 ---
 
 ## 6. Kỹ thuật / EOD (Technical / End-of-day)
 
-| Tiếng Việt | English | Ký hiệu | Giải thích |
-|---|---|---|---|
-| Cuối ngày | End-of-day (EOD) | `SP_EOD_RUN` | Batch tính toán chốt ngày (định giá → NAV → hiệu suất → index → đối soát → snapshot). |
-| Định giá thị trường | Mark-to-market (MTM) | J07 | Định giá lại toàn bộ cổ phiếu theo giá đóng cửa. |
-| Cuốn trạng thái | Roll-forward | — | EOD lấy trạng thái hôm trước (current) + delta ngày → tính ngày mới, ghi đè current. |
-| Đối soát | Reconcile | J13 | Cổng kiểm tra lệch (SDI vs FO, Σ KH vs master) — lệch quá ngưỡng thì chặn publish. |
-| Ảnh chụp | Snapshot | J14 | Chốt holdings/NAV cấp master để phục vụ đọc. |
-| Idempotent | Idempotent | — | Chạy lại cho cùng kết quả (không cộng đôi). |
-| Tổng tích lũy | Prefix-sum / cumulative | `C_CUM_ACTIVE_RET`… | Lũy kế để tính nhanh thống kê qua khoảng bất kỳ bằng hiệu 2 mốc. |
-| Lịch sử theo khoảng | Interval / SCD-2 | `C_VALID_FROM/TO` | Lưu lịch sử không trùng lặp (1 dòng/khoảng bất biến). |
+| Tiếng Việt | English | Ký hiệu | Giải thích | BRD tham chiếu |
+|---|---|---|---|---|
+| Cuối ngày | End-of-day (EOD) | `SP_EOD_RUN` | Batch tính toán chốt ngày (định giá → NAV → hiệu suất → index → đối soát → snapshot). | spec §9 ; eod §2 |
+| Định giá thị trường | Mark-to-market (MTM) | J07 | Định giá lại toàn bộ cổ phiếu theo giá đóng cửa. | spec §9 |
+| Cuốn trạng thái | Roll-forward | — | EOD lấy trạng thái hôm trước (current) + delta ngày → tính ngày mới, ghi đè current. | db-arch ; spec §9 |
+| Đối soát | Reconcile | J13 | Cổng kiểm tra lệch (SDI vs FO, Σ KH vs master) — lệch quá ngưỡng thì chặn publish. | spec §9 ; eod §5 |
+| Ảnh chụp | Snapshot | J14 | Chốt holdings/NAV cấp master để phục vụ đọc. | spec §9 |
+| Idempotent | Idempotent | — | Chạy lại cho cùng kết quả (không cộng đôi). | eod ; db-arch |
+| Tổng tích lũy | Prefix-sum / cumulative | `C_CUM_ACTIVE_RET`… | Lũy kế để tính nhanh thống kê qua khoảng bất kỳ bằng hiệu 2 mốc. | spec §8 (J12B) ; pm §5 |
+| Lịch sử theo khoảng | Interval / SCD-2 | `C_VALID_FROM/TO` | Lưu lịch sử không trùng lặp (1 dòng/khoảng bất biến). | eod ; db-arch |
 
 ---
 
