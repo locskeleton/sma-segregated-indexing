@@ -129,3 +129,26 @@ ELSE
     PRINT '  !!! LỖI: return='+ISNULL(CAST(@ret08 AS VARCHAR(20)),'NULL')+' (kỳ vọng ~0.0260870 — ref_price sai?)';
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-01-08';   -- dọn scratch
 DELETE FROM T_PRICE_DAILY       WHERE C_BUSINESS_DATE='2026-01-08';
+
+PRINT '--- SDI→ASSET SNAPSHOT: SP_GET_ASSET_SNAPSHOT (EOD @07, HISTORY @06, replay-identical) ---';
+DECLARE @ecS INT, @emS NVARCHAR(400);
+PRINT '-- EOD @2026-01-07 (kỳ vọng 1 KH; nav=11280000; holdings AAA 60000/BBB 90000) --';
+EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',
+     @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
+PRINT '  err='+CAST(@ecS AS VARCHAR(10))+' (kỳ vọng 0)';
+PRINT '-- HISTORY @2026-01-06 (replay; nav=10760000; holdings AAA 60000/BBB 80000) --';
+EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-06', @p_mode='HISTORY',
+     @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
+-- REPLAY INVARIANT: payload EOD@07 và HISTORY@07 phải GIỐNG HỆT (chỉ khác field "mode")
+CREATE TABLE #snapE (si VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
+CREATE TABLE #snapH (si VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
+INSERT #snapE EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',    @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
+INSERT #snapH EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='HISTORY', @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
+DECLARE @jEOD NVARCHAR(MAX) = (SELECT payload FROM #snapE WHERE si='SUB00001001');
+DECLARE @jHIS NVARCHAR(MAX) = (SELECT payload FROM #snapH WHERE si='SUB00001001');
+IF REPLACE(@jEOD,'"mode":"EOD"','"mode":"HISTORY"') = @jHIS
+    PRINT '  OK REPLAY: payload EOD@07 == HISTORY@07 (chỉ khác mode) → reconstruct-only ổn';
+ELSE
+    PRINT '  !!! LỖI REPLAY: payload EOD@07 != HISTORY@07';
+PRINT '  EOD@07 payload: ' + ISNULL(@jEOD,'(NULL)');
+DROP TABLE #snapE; DROP TABLE #snapH;

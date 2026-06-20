@@ -89,6 +89,8 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 > **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `T_SI_NAV_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core.
 
+> **⚠️ Cập nhật mô hình SDI→Asset (2026-06-21):** SMO **đọc tài sản KH từ ASSET**, KHÔNG gọi API SDI (dòng 9 "API pull" ở trên LỆCH thực tế). SDI **đồng bộ qua Kafka** như mọi hệ, 2 mode **EOD** (snapshot ngày) + **HISTORY** (đẩy LẠI ngày quá khứ). Producer: **`SP_GET_ASSET_SNAPSHOT @p_business_date,@p_mode`** (db/05_API.sql) — build 1 payload JSON/sub-account (`FOR JSON`), app đọc result set → publish Kafka (key=`C_SI_ACCOUNT`). **RECONSTRUCT-ONLY** từ bảng DATED (`T_SI_NAV_BALANCE`+`T_SI_CASH_HIST`+`T_SI_HOLDING_HIST`×giá+`T_SI_FEE_*`) ⇒ EOD & HISTORY replay cùng ngày ra payload **y hệt**. `pending_cash`/`div_cash` KHÔNG có lịch sử per-ngày → ngoài payload (chỉ `total_asset = nav+payable` authoritative). **Payload hiện là DRAFT — map lại theo schema Asset thật khi có.** Xem memory `sdi-asset-sync-architecture`.
+
 ---
 
 ## 4. Báo cáo định lượng (small / medium / large)

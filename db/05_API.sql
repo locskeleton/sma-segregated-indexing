@@ -424,3 +424,95 @@ BEGIN
     END CATCH
 END
 GO
+
+/*===========================================================================
+  SDI → ASSET SYNC PRODUCER (Kafka, "SP build JSON, app publish")
+  SP_GET_ASSET_SNAPSHOT : build payload tài sản per sub-account cho 1 NGÀY → app đọc
+    result set, publish từng C_PAYLOAD_JSON lên Kafka (key = C_SI_ACCOUNT) cho Asset.
+    SMO đọc từ Asset (KHÔNG gọi SDI). Xem memory sdi-asset-sync-architecture.
+
+  MODE: 'EOD' (snapshot ngày hôm nay) | 'HISTORY' (đẩy LẠI ngày quá khứ). 2 mode DÙNG CHUNG
+    code & payload — chỉ khác @p_business_date. RECONSTRUCT-ONLY từ bảng DATED
+    (T_SI_NAV_BALANCE + T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá + T_SI_FEE_*) ⇒ EOD và replay
+    cùng ngày cho RA PAYLOAD Y HỆT. TUYỆT ĐỐI KHÔNG đọc *_CURRENT (đổi mỗi ngày → replay sai).
+
+  Driver = các sub-account có dòng NAV_BALANCE @ngày (đã chốt EOD ngày đó).
+  total_asset = NAV + payable (authoritative). cash = TIỀN MẶT (cash_hist; pending/div KHÔNG
+    có lịch sử per-ngày → KHÔNG đưa vào payload, tránh emit field không reproduce được khi replay).
+  ⚠️ PAYLOAD DRAFT (tên field tự đặt) — map lại theo schema Asset thật khi có.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_ASSET_SNAPSHOT
+    @p_business_date DATE,
+    @p_mode          VARCHAR(10)   = 'EOD',
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+    IF @p_mode NOT IN ('EOD','HISTORY')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
+    IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu EOD cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); THROW 50003,N'validation',1; END
+
+    -- Holdings reconstruct @ngày (per-mã giá mới nhất ≤ ngày — resilient halt, giống FR-05/06)
+    SELECT b.C_SI_ACCOUNT, h.C_TICKER, h.C_QUANTITY,
+           px.C_CLOSE_PRICE AS C_PRICE,
+           CAST(h.C_QUANTITY * px.C_CLOSE_PRICE AS DECIMAL(38,4)) AS C_MV
+    INTO #hold
+    FROM       (SELECT DISTINCT C_SI_ACCOUNT FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date) b
+    INNER JOIN T_SI_HOLDING_HIST h ON h.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+           AND h.C_VALID_FROM <= @p_business_date AND (h.C_VALID_TO > @p_business_date OR h.C_VALID_TO IS NULL)
+    OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
+                 WHERE C_TICKER=h.C_TICKER AND C_BUSINESS_DATE<=@p_business_date
+                 ORDER BY C_BUSINESS_DATE DESC) px;
+    CREATE CLUSTERED INDEX IX_hold ON #hold (C_SI_ACCOUNT);
+
+    -- 1 dòng payload JSON / sub-account
+    SELECT b.C_SI_ACCOUNT, b.C_BUSINESS_DATE,
+        (SELECT
+            b.C_CUST_CODE                                   AS cust_code,
+            b.C_SI_ACCOUNT                                  AS si_account,
+            b.C_MASTER_CODE                                 AS master_code,
+            CONVERT(VARCHAR(10), b.C_BUSINESS_DATE, 23)     AS business_date,
+            @p_mode                                         AS mode,
+            b.C_NAV                                          AS nav,
+            b.C_PAYABLE_FEE                                  AS payable_fee,
+            (b.C_NAV + b.C_PAYABLE_FEE)                      AS total_asset,   -- authoritative (gồm receivables)
+            b.C_UNIT                                         AS unit,
+            b.C_UNIT_PRICE                                   AS unit_price,
+            b.C_DAILY_PNL                                    AS daily_pnl,
+            b.C_DAILY_RETURN                                 AS daily_return,
+            ISNULL(ch.C_CASH, 0)                            AS cash,          -- tiền mặt (pending/div: không có hist → bỏ)
+            ISNULL(st.stock_value, 0)                       AS stock_value,
+            ISNULL(fi.div, 0)                               AS accum_dividend,
+            ISNULL(fi.cust, 0)                              AS accum_custody_fee,
+            ISNULL(sch.paid, 0)                            AS mgmt_fee_paid,
+            b.C_PAYABLE_FEE                                  AS mgmt_fee_accrued,
+            JSON_QUERY(ISNULL((SELECT hh.C_TICKER AS ticker, hh.C_QUANTITY AS qty,
+                                      hh.C_PRICE AS price, hh.C_MV AS market_value
+                               FROM #hold hh WHERE hh.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+                               FOR JSON PATH), N'[]'))      AS holdings
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)              AS C_PAYLOAD_JSON
+    FROM T_SI_NAV_BALANCE b
+    LEFT JOIN T_SI_CASH_HIST ch ON ch.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+           AND ch.C_VALID_FROM <= @p_business_date AND (ch.C_VALID_TO > @p_business_date OR ch.C_VALID_TO IS NULL)
+    OUTER APPLY (SELECT SUM(C_MV) AS stock_value FROM #hold WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT) st
+    OUTER APPLY (SELECT SUM(CASE WHEN C_TYPE='DIVIDEND' THEN C_AMOUNT END) AS div,
+                        SUM(CASE WHEN C_TYPE='CUSTODY_FEE' THEN C_AMOUNT END) AS cust
+                 FROM T_SI_FEE_INCOME WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_BUSINESS_DATE<=@p_business_date) fi
+    OUTER APPLY (SELECT SUM(C_AMOUNT) AS paid FROM T_SI_FEE_CHARGE
+                 WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_CHARGE_DATE<=@p_business_date) sch
+    WHERE b.C_BUSINESS_DATE=@p_business_date
+    ORDER BY b.C_SI_ACCOUNT;
+
+    DROP TABLE #hold;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+        IF OBJECT_ID('tempdb..#hold') IS NOT NULL DROP TABLE #hold;
+    END CATCH
+END
+GO
