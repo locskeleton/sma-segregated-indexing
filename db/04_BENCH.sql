@@ -77,7 +77,9 @@ SELECT C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, @d, 'INITIAL', @nTick*@qty*@pri
 DROP TABLE #cust, #tk;
 
 /*--- CHẠY EOD (đây là phần được đo qua T_EOD_RUN) ---*/
-EXEC SP_EOD_RUN @d;
+DECLARE @ec INT, @em NVARCHAR(400);
+EXEC SP_EOD_RUN @d, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+IF @ec<>0 PRINT CONCAT('!!! EOD FAILED ec=',@ec,' ',@em);
 
 /*--- duration per job (bench.ps1 đọc kết quả này) ---*/
 SELECT C_JOB AS job, DATEDIFF(MILLISECOND, C_STARTED_AT, C_ENDED_AT) AS ms, C_STATUS AS status, C_ROWS AS rows

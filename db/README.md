@@ -56,7 +56,9 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 
 ## EOD: app gọi 1 proc
 ```sql
-EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
+DECLARE @ec INT, @em NVARCHAR(400);
+EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- @ec=0 OK; <>0 lỗi (xem @em + T_EOD_RUN job FAILED)
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
 `J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE accum → J13 reconcile (cổng) → J14 snapshot`.

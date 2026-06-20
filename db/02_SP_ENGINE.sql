@@ -568,22 +568,32 @@ GO
 /*===========================================================================
   MASTER ORCHESTRATOR — app chỉ EXEC proc này
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_RUN @p_business_date DATE
+CREATE OR ALTER PROCEDURE SP_EOD_RUN
+    @p_business_date DATE,
+    @p_err_code      INT           OUTPUT,   -- 0=OK, -1=lỗi (step nào FAILED xem T_EOD_RUN)
+    @p_err_msg       NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
-    -- (INGEST: FO event per-KH đã vào qua SP_INGEST_CUSTOMER → cash/holdings/history sẵn trong current + interval)
-    EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
-    -- (ĐÃ BỎ J01_SYNC_FO + J14B_HISTORY) — chuyển sang SP_INGEST_CUSTOMER (per-event realtime)
-    -- (J06 PHÍ QL accrue nằm TRONG J07_COMPUTE; net-off do SP_INGEST_FEE_CHARGE khi BO cắt — không job riêng)
-    EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
-    EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
-    EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
-    EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (TE prefix-sum)
-    EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
-    EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
-    -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
+    BEGIN TRY
+        -- (INGEST: FO event per-KH đã vào qua SP_INGEST_CUSTOMER → cash/holdings/history sẵn trong current + interval)
+        EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
+        -- (ĐÃ BỎ J01_SYNC_FO + J14B_HISTORY) — chuyển sang SP_INGEST_CUSTOMER (per-event realtime)
+        -- (J06 PHÍ QL accrue nằm TRONG J07_COMPUTE; net-off do SP_INGEST_FEE_CHARGE khi BO cắt — không job riêng)
+        EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
+        EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
+        EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
+        EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (TE prefix-sum)
+        EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
+        EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
+        -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;   -- phòng hờ (SP_EOD_STEP thường đã rollback tran của nó)
+        SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE();   -- trả lỗi về caller, KHÔNG THROW. Step FAILED đã log T_EOD_RUN.
+    END CATCH
 END
 GO
