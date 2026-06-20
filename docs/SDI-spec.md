@@ -206,6 +206,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 ### Market data
 - **`T_PRICE_DAILY`** (ticker, business_date PK; **ref_price** NOT NULL, close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường]) — **gộp corporate action vào bảng giá**: `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia), là mẫu số daily-return J12 → engine self-contained, KHÔNG tra bản ghi ngày trước. `is_ex_rights` = metadata. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
 - **`T_BENCHMARK_DAILY`** (benchmark_code, business_date PK; index_value) — chỉ số thị trường ngoài (VN-Index, price return), **nạp từ market data** (không do SDI tính). Key = code tự mô tả (giống ticker), không cần dimension riêng.
+- **`T_TICKER_INDUSTRY`** (ticker PK; industry_code, industry_name) — dimension mã→ngành cho industryWeight alert (`SP_GET_MASTER_ALERTS`). Nguồn nạp thật (FO/market data) chưa làm — hiện seed ở smoke.
 
 ### FO sync (EOD) & cashflow
 - **`T_REBALANCE_REQUEST`** (request_id PK; `C_MASTER_CODE`, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).

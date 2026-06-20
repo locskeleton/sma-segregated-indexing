@@ -33,6 +33,7 @@ DELETE FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='M1';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='M1';
 DELETE FROM T_BENCHMARK_DAILY        WHERE C_BENCHMARK_CODE='BM';
 DELETE FROM T_PRICE_DAILY            WHERE C_TICKER='AAA';
+DELETE FROM T_TICKER_INDUSTRY        WHERE C_TICKER IN ('AAA','BBB','CCC');
 DELETE FROM T_MASTER_PORTFOLIO       WHERE C_MASTER_CODE='M1';
 
 DECLARE @D1 DATE='2026-01-05', @D2 DATE='2026-01-06', @D3 DATE='2026-01-07';
@@ -131,4 +132,31 @@ EXEC SP_GET_MASTER_TOP_KH @p_master_code='M1', @p_range='INCEPTION', @p_topn=10,
 PRINT '';
 PRINT '======== US1: SP_GET_PM_OVERVIEW_ALL (header #master>=1 #KH=3; RS3 list M1) ========';
 EXEC SP_GET_PM_OVERVIEW_ALL @p_range='INCEPTION', @p_sort='AUM';
+
+PRINT '';
+PRINT '======== SP_GET_MASTER_ALERTS (phiên scratch D4: cố ý drift để có breach) ========';
+-- D3 khớp target hoàn hảo → seed phiên D4 với holdings lệch để test alert.
+-- Ngành: AAA,BBB=BANK ; CCC=TECH. Target hiệu lực @D4 = eff D3 (AAA .50 / BBB .30 / CCC .20).
+-- Holdings @D4: AAA .62 / BBB .28 / CCC .10  → drift AAA .12, BBB .02, CCC .10 ; ngành BANK .90 TECH .10.
+INSERT T_TICKER_INDUSTRY (C_TICKER,C_INDUSTRY_CODE,C_INDUSTRY_NAME) VALUES
+ ('AAA','BANK',N'Ngân hàng'),('BBB','BANK',N'Ngân hàng'),('CCC','TECH',N'Công nghệ');
+INSERT T_MASTER_HOLDING_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT) VALUES
+ ('2026-01-08','M1','AAA',6200,40,248000,0.62),
+ ('2026-01-08','M1','BBB',5600,20,112000,0.28),
+ ('2026-01-08','M1','CCC',2000,20, 40000,0.10);
+-- ngưỡng: symbol .45 → AAA(.62) vượt; drift .08 → AAA(.12)+CCC(.10) vượt; industry .70 → BANK(.90) vượt
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_symbol_weight_alert=0.45,
+     @p_drift_threshold=0.08, @p_industry_weight_alert=0.70, @p_updated_by='smoke';
+DECLARE @ec INT, @em NVARCHAR(400);
+PRINT '-- KỲ VỌNG RS1: #symbol=1 (AAA) #drift=2 (AAA,CCC) #industry=1 (BANK); err_code=0 --';
+EXEC SP_GET_MASTER_ALERTS @p_master_code='M1', @p_date='2026-01-08', @p_user='smoke',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+PRINT '  err_code='+CAST(@ec AS VARCHAR(10))+' (kỳ vọng 0)';
+PRINT '-- err path: master không tồn tại → err_code=1, KHÔNG result set --';
+EXEC SP_GET_MASTER_ALERTS @p_master_code='NOPE', @p_user='smoke',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+PRINT '  bad-master err_code='+CAST(@ec AS VARCHAR(10))+' (kỳ vọng 1) msg='+ISNULL(@em,'NULL');
+-- cleanup scratch + reset config
+DELETE FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='M1' AND C_BUSINESS_DATE='2026-01-08';
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke';
 GO

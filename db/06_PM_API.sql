@@ -583,3 +583,99 @@ BEGIN
     DROP TABLE #kh; DROP TABLE #mr; DROP TABLE #md;
 END
 GO
+
+/*===========================================================================
+  SP_GET_MASTER_ALERTS : cảnh báo composition cấp master (PM dashboard alert panel).
+    So tỷ trọng THỰC (T_MASTER_HOLDING_BALANCE @date) vs MỤC TIÊU (T_MASTER_PORTFOLIO_TICKER
+    eff mới nhất ≤ date) + Σ theo ngành (T_TICKER_INDUSTRY) → đối chiếu ngưỡng PM config.
+    Ngưỡng NULL ⇒ alert type TẮT (không cờ, đếm 0).
+    RS1 summary (đếm #vượt + ngưỡng); RS2 per-mã (actual/target/drift + cờ); RS3 per-ngành.
+    API convention: @p_user audit + @p_err_code/@p_err_msg OUT (0=OK, ≠0=lỗi, KHÔNG THROW).
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_MASTER_ALERTS
+    @p_master_code VARCHAR(20),
+    @p_date        DATE          = NULL,
+    @p_user        VARCHAR(64)   = NULL,
+    @p_err_code    INT           OUTPUT,
+    @p_err_msg     NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
+    BEGIN
+        SET @p_err_code = 1; SET @p_err_msg = N'Master not found: ' + ISNULL(@p_master_code,N'(null)');
+        RETURN;
+    END
+
+    -- ngày mặc định = phiên holdings gần nhất của master
+    IF @p_date IS NULL
+        SELECT @p_date = MAX(C_BUSINESS_DATE) FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @p_date IS NULL
+    BEGIN
+        SET @p_err_code = 2; SET @p_err_msg = N'Chưa có holdings balance cho master.';
+        RETURN;
+    END
+
+    -- ngưỡng cấu hình (NULL = alert type tắt)
+    DECLARE @drift DECIMAL(9,6), @symW DECIMAL(9,6), @indW DECIMAL(9,6);
+    SELECT @drift=C_DRIFT_THRESHOLD, @symW=C_SYMBOL_WEIGHT_ALERT, @indW=C_INDUSTRY_WEIGHT_ALERT
+    FROM dbo.UDF_PM_CONFIG(@p_master_code);
+
+    -- target weight hiệu lực (eff mới nhất ≤ @p_date)
+    DECLARE @eff DATE;
+    SELECT @eff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
+     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE <= @p_date;
+
+    -- per-mã: actual vs target + drift + cờ (FULL OUTER: mã chỉ có ở 1 phía vẫn ra)
+    SELECT COALESCE(a.C_TICKER, t.C_TICKER) AS C_TICKER,
+           CAST(ISNULL(a.C_WEIGHT,0)        AS DECIMAL(12,8)) AS C_WEIGHT_ACTUAL,
+           CAST(ISNULL(t.C_TARGET_WEIGHT,0) AS DECIMAL(12,8)) AS C_WEIGHT_TARGET,
+           CAST(ABS(ISNULL(a.C_WEIGHT,0) - ISNULL(t.C_TARGET_WEIGHT,0)) AS DECIMAL(12,8)) AS C_DRIFT,
+           CASE WHEN @symW  IS NOT NULL AND ISNULL(a.C_WEIGHT,0) > @symW THEN 1 ELSE 0 END AS C_IS_SYMBOL_ALERT,
+           CASE WHEN @drift IS NOT NULL AND ABS(ISNULL(a.C_WEIGHT,0) - ISNULL(t.C_TARGET_WEIGHT,0)) > @drift THEN 1 ELSE 0 END AS C_IS_DRIFT_ALERT
+    INTO #pt
+    FROM       (SELECT C_TICKER, C_WEIGHT FROM T_MASTER_HOLDING_BALANCE
+                WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@p_date) a
+    FULL OUTER JOIN (SELECT C_TICKER, C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
+                WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@eff) t
+      ON t.C_TICKER = a.C_TICKER;
+
+    -- per-ngành: Σ tỷ trọng thực tế theo ngành (mã chưa map → 'UNKNOWN')
+    SELECT COALESCE(ti.C_INDUSTRY_CODE,'UNKNOWN') AS C_INDUSTRY_CODE,
+           MAX(ti.C_INDUSTRY_NAME)               AS C_INDUSTRY_NAME,
+           CAST(SUM(a.C_WEIGHT) AS DECIMAL(12,8)) AS C_WEIGHT_INDUSTRY,
+           CASE WHEN @indW IS NOT NULL AND SUM(a.C_WEIGHT) > @indW THEN 1 ELSE 0 END AS C_IS_INDUSTRY_ALERT
+    INTO #pi
+    FROM       (SELECT C_TICKER, C_WEIGHT FROM T_MASTER_HOLDING_BALANCE
+                WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@p_date) a
+    LEFT JOIN  T_TICKER_INDUSTRY ti ON ti.C_TICKER = a.C_TICKER
+    GROUP BY COALESCE(ti.C_INDUSTRY_CODE,'UNKNOWN');
+
+    -- RS1: summary (ngưỡng dùng + #vượt từng loại)
+    SELECT @p_master_code AS C_MASTER_CODE, @p_date AS C_BUSINESS_DATE, @eff AS C_EFFECTIVE_DATE,
+           @symW AS C_SYMBOL_WEIGHT_ALERT, @drift AS C_DRIFT_THRESHOLD, @indW AS C_INDUSTRY_WEIGHT_ALERT,
+           (SELECT COUNT(*) FROM #pt WHERE C_IS_SYMBOL_ALERT=1)   AS C_CNT_SYMBOL_ALERT,
+           (SELECT COUNT(*) FROM #pt WHERE C_IS_DRIFT_ALERT=1)    AS C_CNT_DRIFT_ALERT,
+           (SELECT COUNT(*) FROM #pi WHERE C_IS_INDUSTRY_ALERT=1) AS C_CNT_INDUSTRY_ALERT;
+
+    -- RS2: per-mã (toàn bộ + cờ, vượt lên đầu)
+    SELECT C_TICKER, C_WEIGHT_ACTUAL, C_WEIGHT_TARGET, C_DRIFT, C_IS_SYMBOL_ALERT, C_IS_DRIFT_ALERT
+    FROM #pt ORDER BY (C_IS_SYMBOL_ALERT + C_IS_DRIFT_ALERT) DESC, C_DRIFT DESC, C_WEIGHT_ACTUAL DESC;
+
+    -- RS3: per-ngành (toàn bộ + cờ)
+    SELECT C_INDUSTRY_CODE, C_INDUSTRY_NAME, C_WEIGHT_INDUSTRY, C_IS_INDUSTRY_ALERT
+    FROM #pi ORDER BY C_IS_INDUSTRY_ALERT DESC, C_WEIGHT_INDUSTRY DESC;
+
+    DROP TABLE #pt; DROP TABLE #pi;
+
+    END TRY
+    BEGIN CATCH
+        SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE();   -- lỗi runtime bất ngờ → trả qua OUT, KHÔNG THROW (convention API)
+        IF OBJECT_ID('tempdb..#pt') IS NOT NULL DROP TABLE #pt;
+        IF OBJECT_ID('tempdb..#pi') IS NOT NULL DROP TABLE #pi;
+    END CATCH
+END
+GO
