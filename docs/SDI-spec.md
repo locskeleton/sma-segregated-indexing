@@ -2,6 +2,8 @@
 
 Engine tính tài sản, hiệu suất danh mục master và từng khách hàng cho sản phẩm **SMA chỉ số** (separately managed account). Cấp dữ liệu cho Asset → SMO.
 
+> 📖 Tra cứu nhanh thuật ngữ (VN/EN) + mọi công thức kèm ví dụ: [SDI-thuat-ngu-cong-thuc.md](./SDI-thuat-ngu-cong-thuc.md).
+
 ---
 
 ## 1. Mô hình & ranh giới
