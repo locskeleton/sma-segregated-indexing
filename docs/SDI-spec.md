@@ -375,6 +375,11 @@ snake_case. Một khái niệm = một code.
 
 Quy tắc: trong công thức dùng `net_cashflow` (rõ "net"); `income` tách khỏi cashflow; `cash` (tổng) chỉ cho NAV; % lưu dạng thập phân.
 
+**Tham số stored procedure:**
+- Mọi tham số SP **BẮT BUỘC prefix `@p_`** (vd `@p_si_account`, `@p_d`, `@p_range`) — phân biệt với biến cục bộ `@local`.
+- SP phục vụ **API** (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm: `@p_user` (định danh người gọi), `@p_err_code INT OUTPUT`, `@p_err_msg NVARCHAR(400) OUTPUT` (trả lỗi về app, `@p_err_code=0`=OK; KHÔNG THROW ra ngoài).
+- SP **engine** (`SP_EOD_*`, `SP_INGEST_*`, dispatcher) **KHÔNG** cần bộ 3 tham số API — lỗi → `THROW` chặn EOD publish (chỉ theo rule prefix `@p_`).
+
 ---
 
 ## 14. Worked example — per KH (khớp file mẫu)

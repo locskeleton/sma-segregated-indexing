@@ -11,7 +11,9 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 | Khóa public (GUID `PK_<table>`, NEWID, IDOR-safe) | Mọi bảng (trừ master + `T_EOD_WORK` transient) có cột GUID `PK_<table>` cho API/UI. **Bảng lớn/ghi-nóng:** GUID `UNIQUE NONCLUSTERED` (`UQ_<table>_PKID`), clustered theo khóa perf. **Bảng nhỏ:** GUID làm clustered PK luôn. `T_MASTER_PORTFOLIO`: `C_MASTER_CODE` là khóa public |
 | Clustered PK theo tải | append-fact lớn → **BIGINT IDENTITY** `C_<table>_ID` (`PK_<table>_ID`); point-access/join → **natural** (`PK_<table>_NK`); nhỏ → GUID (`PK_<table>`). Natural giữ `UQ_<table>_NK` cho idempotency |
 | Foreign key | **KHÔNG hard-set constraint** — đánh dấu qua tên cột (`C_MASTER_CODE` → master; `FK_<table>` → surrogate) |
-| Stored procedure | `SP_` |
+| Stored procedure | `SP_` + UPPERCASE (vd `SP_EOD_RUN`, `SP_GET_SI_DETAIL`) |
+| Tham số SP | **BẮT BUỘC prefix `@p_`** (vd `@p_si_account`, `@p_d`, `@p_json`, `@p_range`) — phân biệt tham số với biến cục bộ (`@local`) trong proc |
+| Tham số SP cho API | SP phục vụ API (`SP_GET_*`, `SP_SET_*`) **BẮT BUỘC** thêm 3 tham số chuẩn: `@p_user` (định danh người gọi — audit/authz), `@p_err_code INT OUTPUT` + `@p_err_msg NVARCHAR(400) OUTPUT` (trả mã/thông điệp lỗi về app, KHÔNG THROW ra ngoài). Quy ước: `@p_err_code=0` = OK, ≠0 = lỗi. **Engine SP** (`SP_EOD_*`, `SP_INGEST_*`, dispatcher) KHÔNG cần bộ 3 này — chạy nội bộ EOD pipeline, lỗi → `THROW` chặn publish (chỉ áp dụng rule prefix `@p_`) |
 | Function | `UDF_` |
 
 ## Thứ tự chạy
