@@ -126,7 +126,7 @@ BEGIN
      WHERE C_MASTER_CODE=@C_MASTER_CODE AND C_BUSINESS_DATE=@base;
 
     -- per-KH (end-weight): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end).
-    --   TE = STDEV(active) qua (base,end] = hiệu cum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, cum_base=0.
+    --   TE = STDEV(active) qua (base,end] = hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, accum_base=0.
     CREATE TABLE #kh (si VARCHAR(20), aum DECIMAL(20,6), up_base DECIMAL(18,6),
                       up_end DECIMAL(18,6), tien DECIMAL(20,0),
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
@@ -137,13 +137,13 @@ BEGIN
     FROM T_SI_NAV_CURRENT nc
     WHERE nc.C_MASTER_CODE=@C_MASTER_CODE AND nc.C_STATUS='ACTIVE';
 
-    -- lát @end: cum active đến cuối kỳ
-    UPDATE k SET car_e=e.C_CUM_ACTIVE_RET, car2_e=e.C_CUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
+    -- lát @end: accum active đến cuối kỳ
+    UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k JOIN T_SI_NAV_BALANCE e
       ON e.C_MASTER_CODE=@C_MASTER_CODE AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
 
-    -- lát @base: up_base + cum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, cum_base=0)
-    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_CUM_ACTIVE_RET, car2_b=b.C_CUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    -- lát @base: up_base + accum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, accum_base=0)
+    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k JOIN T_SI_NAV_BALANCE b
       ON b.C_MASTER_CODE=@C_MASTER_CODE AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
     UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
@@ -489,13 +489,13 @@ BEGIN
     JOIN #md d ON d.m=nc.C_MASTER_CODE
     WHERE nc.C_STATUS='ACTIVE';
 
-    -- lát @end per master (cum active đến cuối kỳ)
-    UPDATE k SET car_e=e.C_CUM_ACTIVE_RET, car2_e=e.C_CUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
+    -- lát @end per master (accum active đến cuối kỳ)
+    UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k JOIN #md d ON d.m=k.m
     JOIN T_SI_NAV_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
 
-    -- lát @base per master (up_base + cum active đến base; thiếu lát ⇒ up_base=10000, cum_base=0)
-    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_CUM_ACTIVE_RET, car2_b=b.C_CUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    -- lát @base per master (up_base + accum active đến base; thiếu lát ⇒ up_base=10000, accum_base=0)
+    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k JOIN #md d ON d.m=k.m
     JOIN T_SI_NAV_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
     UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;

@@ -91,14 +91,14 @@ INSERT T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
  (@D2,'S3','C3','M1',110000000,0, 9000,11000,10000000,0.100000),
  (@D3,'S3','C3','M1',112000000,0, 9000,11200,2000000,0.018182);
 
--- T_PRICE_DAILY: cần cho UDF_PREV_BUSINESS_DATE (SP_EOD_TE_CUM lấy @prev). 1 mã dummy đủ các phiên.
+-- T_PRICE_DAILY: cần cho UDF_PREV_BUSINESS_DATE (SP_EOD_TE_ACCUM lấy @prev). 1 mã dummy đủ các phiên.
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_CLOSE_PRICE) VALUES
  ('AAA',@D1,40),('AAA',@D2,40),('AAA',@D3,40);
 
--- Lũy kế active return (TE prefix-sum) qua EOD proc SP_EOD_TE_CUM — chạy tuần tự D1→D3 (test luôn EOD).
-EXEC SP_EOD_TE_CUM @D1;
-EXEC SP_EOD_TE_CUM @D2;
-EXEC SP_EOD_TE_CUM @D3;
+-- Lũy kế active return (TE prefix-sum) qua EOD proc SP_EOD_TE_ACCUM — chạy tuần tự D1→D3 (test luôn EOD).
+EXEC SP_EOD_TE_ACCUM @D1;
+EXEC SP_EOD_TE_ACCUM @D2;
+EXEC SP_EOD_TE_ACCUM @D3;
 GO
 
 PRINT '======== P1: SP_SET_MASTER_PM_CONFIG (set HIGH dev=200, giữ còn lại default) ========';

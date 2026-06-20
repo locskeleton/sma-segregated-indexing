@@ -446,14 +446,14 @@ END
 GO
 
 /*===========================================================================
-  J12B — TE CUM: lũy kế active return per-KH cho TE prefix-sum (PM tool).
+  J12B — TE ACCUM: lũy kế active return per-KH cho TE prefix-sum (PM tool).
     active aᵢ,d = C_DAILY_RETURN(KH) − C_DAILY_RETURN(master index @d). Chạy SAU J12
-    (cần index daily return). cum@d = cum@prev (cùng si) + đóng góp @d.
-    IDEMPOTENT: đọc cum @prev (KHÔNG in-place) → re-run @d cho cùng kết quả
+    (cần index daily return). accum@d = accum@prev (cùng si) + đóng góp @d.
+    IDEMPOTENT: đọc accum @prev (KHÔNG in-place) → re-run @d cho cùng kết quả
       (J07 INSERT lại NAV_BALANCE @d ⇒ 3 cột reset DEFAULT 0 ⇒ J12B set lại đúng).
     Đọc 2 lát ngày (@d, @prev) join theo si (hash) → KHÔNG cần index leading si.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_TE_CUM @d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_TE_ACCUM @d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -462,10 +462,10 @@ BEGIN
     UPDATE b SET
         b.C_RET_DAY_COUNT = ISNULL(p.C_RET_DAY_COUNT,0)
             + CASE WHEN b.C_DAILY_RETURN IS NULL OR idx.C_DAILY_RETURN IS NULL THEN 0 ELSE 1 END,
-        b.C_CUM_ACTIVE_RET = ISNULL(p.C_CUM_ACTIVE_RET,0)
+        b.C_ACCUM_ACTIVE_RET = ISNULL(p.C_ACCUM_ACTIVE_RET,0)
             + CASE WHEN b.C_DAILY_RETURN IS NULL OR idx.C_DAILY_RETURN IS NULL THEN 0
                    ELSE CAST(b.C_DAILY_RETURN - idx.C_DAILY_RETURN AS FLOAT) END,
-        b.C_CUM_ACTIVE_RET_SQ = ISNULL(p.C_CUM_ACTIVE_RET_SQ,0)
+        b.C_ACCUM_ACTIVE_RET_SQ = ISNULL(p.C_ACCUM_ACTIVE_RET_SQ,0)
             + CASE WHEN b.C_DAILY_RETURN IS NULL OR idx.C_DAILY_RETURN IS NULL THEN 0
                    ELSE POWER(CAST(b.C_DAILY_RETURN - idx.C_DAILY_RETURN AS FLOAT),2) END
     FROM T_SI_NAV_BALANCE b
@@ -590,7 +590,7 @@ BEGIN
     EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
     EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
     EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
-    EXEC SP_EOD_STEP @d, 'J12B_TE_CUM', 'SP_EOD_TE_CUM';           -- lũy kế active return per-KH (TE prefix-sum)
+    EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (TE prefix-sum)
     EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
     EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
     -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng

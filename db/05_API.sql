@@ -297,7 +297,7 @@ BEGIN
 
     -- RS1: summary
     --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
-    --     C_CUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (từ T_SI_FEE_CHARGE)
+    --     C_ACCUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (từ T_SI_FEE_CHARGE)
     --     C_MGMT_FEE_ACCRUED   = phí QL accrued chưa net-off @ asOf (payable đang treo)
     SELECT  @ASOF                  AS C_ASOF,
             @C_SI_ACCOUNT          AS C_SI_ACCOUNT,
@@ -308,15 +308,15 @@ BEGIN
             ISNULL(@cash, 0)       AS C_CASH,
             ISNULL(@stock, 0)      AS C_STOCK_VALUE,
             ISNULL(@cash,0) + ISNULL(@stock,0) AS C_TOTAL_ASSET,
-            fi.C_CUM_DIVIDEND,
-            fi.C_CUM_CUSTODY_FEE,
-            ISNULL(sch.C_MGMT_FEE_PAID, 0) AS C_CUM_MGMT_FEE_PAID,
+            fi.C_ACCUM_DIVIDEND,
+            fi.C_ACCUM_CUSTODY_FEE,
+            ISNULL(sch.C_MGMT_FEE_PAID, 0) AS C_ACCUM_MGMT_FEE_PAID,
             ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_MGMT_FEE_ACCRUED
     FROM (SELECT 1 x) z
     LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@C_SI_ACCOUNT AND nd.C_BUSINESS_DATE = @ASOF
     OUTER APPLY (
-        SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_CUM_DIVIDEND,
-                SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_CUM_CUSTODY_FEE
+        SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
+                SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE
         FROM T_SI_FEE_INCOME
         WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_BUSINESS_DATE <= @ASOF
     ) fi

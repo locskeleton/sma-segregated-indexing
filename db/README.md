@@ -57,8 +57,8 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 EXEC SP_EOD_RUN @C_BUSINESS_DATE = '2026-01-06';
 ```
 Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE cum → J13 reconcile (cổng) → J14 snapshot`.
-(J12B `SP_EOD_TE_CUM` [PM tool]: lũy kế per-KH `C_CUM_ACTIVE_RET/_SQ` + `C_RET_DAY_COUNT` vào `T_SI_NAV_BALANCE` — active return = KH return − master index return; chạy sau J12 vì cần index daily return. Cho phép tính TE qua range BẤT KỲ bằng HIỆU 2 mốc base/end (prefix-sum) → serve-layer PM đọc 2 lát thay vì quét lịch sử. Idempotent: cum@d = cum@prev + a@d. Bench medium ~676ms/phiên.)
+`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE accum → J13 reconcile (cổng) → J14 snapshot`.
+(J12B `SP_EOD_TE_ACCUM` [PM tool]: lũy kế per-KH `C_ACCUM_ACTIVE_RET/_SQ` + `C_RET_DAY_COUNT` vào `T_SI_NAV_BALANCE` — active return = KH return − master index return; chạy sau J12 vì cần index daily return. Cho phép tính TE qua range BẤT KỲ bằng HIỆU 2 mốc base/end (prefix-sum) → serve-layer PM đọc 2 lát thay vì quét lịch sử. Idempotent: accum@d = accum@prev + a@d. Bench medium ~676ms/phiên.)
 (J06 phí QL = **BO-driven, CỐ ĐỊNH (no toggle)**: SDI accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH trong J07 (`payable += AUM_gross × rate × DATEDIFF(ngày)/365`, gated `rate>0`, day_count=365 hardcode). BO cắt phí 1 cục/tháng → event Kafka → `SP_INGEST_FEE_CHARGE` net-off payable (log `T_SI_FEE_CHARGE`, dedup `C_SOURCE_EVENT_ID`). **NAV = total_asset − payable**; total_asset = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables). Thuế GD luôn FO net. Đã BỎ `T_SDI_CONFIG`/`T_SI_FEE_SCHEDULE`/`SP_EOD_FEE_CHARGE`.)
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
@@ -90,7 +90,7 @@ Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. 
 | FR-03 | `SP_GET_SI_PERFORMANCE` | cust, si_account, range | chuỗi ngày: unit_price sub-account + master UP (TR) + master index (PR) + benchmark (PR) |
 | FR-04 | `SP_GET_SI_INFO` | cust, si_account | config sub-account + master (mgmt fee effective) |
 | FR-05 | `SP_GET_SI_HOLDINGS` | cust, si_account, top=20 | holdings current sub-account định giá mới nhất, top-N + `OTHER` |
-| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lưu ký lũy kế + **phí QL: đã thu `C_CUM_MGMT_FEE_PAID` + accrued `C_MGMT_FEE_ACCRUED`**); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí lưu ký; **RS4 chi tiết lệnh thu phí QL** |
+| FR-06 | `SP_GET_ASSET_REPORT` | cust, si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lưu ký lũy kế + **phí QL: đã thu `C_ACCUM_MGMT_FEE_PAID` + accrued `C_MGMT_FEE_ACCRUED`**); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí lưu ký; **RS4 chi tiết lệnh thu phí QL** |
 
 `range` ∈ {`1D`,`1W`,`MTD`,`1M`,`3M`/`3T`,`6M`/`6T`,`QTD`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 

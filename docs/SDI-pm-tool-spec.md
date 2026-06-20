@@ -95,7 +95,7 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
 - **`T_MASTER_PM_CONFIG`** (per-master, PM cài đặt — **bảng RIÊNG của PM tool**, sở hữu ở doc này):
   `C_MASTER_CODE` (UNIQUE/PK) · `C_TE_BADGE_LOW` · `C_TE_BADGE_HIGH` · `C_TE_ALERT_THRESHOLD` · `C_CASH_DRAG_THRESHOLD` (Y) · `C_DEV_THRESHOLD_HIGH` (A) · `C_DEV_THRESHOLD_LOW` (B) · `C_UPDATED_BY` · `C_UPDATED_TIME`.
   - Fallback: master chưa cấu hình → default hệ thống (`UDF_PM_CONFIG` hardcode). Chỉ giữ current + updated_by/time (không lịch sử).
-- **3 cột TE prefix-sum trên `T_SI_NAV_BALANCE`** (`cum_active_ret`, `cum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
+- **3 cột TE prefix-sum trên `T_SI_NAV_BALANCE`** (`accum_active_ret`, `accum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
 - **Cách serve-layer tiêu thụ** (đọc 2 lát base/end, không quét): TE range = HIỆU 2 mốc `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). Return/deviation = `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000). ⇒ US1 ~48s→~1s, **end-weight GIỮ NGUYÊN**.
 
 ---
@@ -154,4 +154,4 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 ## 11. Còn mở
 - Master ACTIVE chưa có EOD data → hiện bị loại khỏi #master count/list. Sau cần hiển thị "mới tạo" thì điều chỉnh.
 - Index leading `C_SI_ACCOUNT` cho customer FR-02/03/06 (cũng scan theo si — vấn đề có sẵn, ngoài scope PM).
-- Backfill ngày quá khứ ⇒ cum các ngày sau lệch (EOD forward-only nên không phải luồng thường); nếu cần resync phải recompute cum xuôi từ ngày sửa.
+- Backfill ngày quá khứ ⇒ accum các ngày sau lệch (EOD forward-only nên không phải luồng thường); nếu cần resync phải recompute accum xuôi từ ngày sửa.

@@ -101,7 +101,7 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Đối soát | Reconcile | J13 | Cổng kiểm tra lệch (SDI vs FO, Σ KH vs master) — lệch quá ngưỡng thì chặn publish. | spec §9 ; eod §5 |
 | Ảnh chụp | Snapshot | J14 | Chốt holdings/NAV cấp master để phục vụ đọc. | spec §9 |
 | Idempotent | Idempotent | — | Chạy lại cho cùng kết quả (không cộng đôi). | eod ; db-arch |
-| Tổng tích lũy | Prefix-sum / cumulative | `C_CUM_ACTIVE_RET`… | Lũy kế để tính nhanh thống kê qua khoảng bất kỳ bằng hiệu 2 mốc. | spec §8 (J12B) ; pm §5 |
+| Tổng tích lũy | Prefix-sum / cumulative | `C_ACCUM_ACTIVE_RET`… | Lũy kế để tính nhanh thống kê qua khoảng bất kỳ bằng hiệu 2 mốc. | spec §8 (J12B) ; pm §5 |
 | Lịch sử theo khoảng | Interval / SCD-2 | `C_VALID_FROM/TO` | Lưu lịch sử không trùng lặp (1 dòng/khoảng bất biến). | eod ; db-arch |
 
 ---
@@ -201,8 +201,8 @@ TE master = Σᵢ (TEᵢ · AUMᵢ) / Σ AUMᵢ                  (AUM-weighted)
 ```
 Trên đoạn (base, end]:
    n   = ret_day_count(end)     − ret_day_count(base)
-   ΣA  = cum_active_ret(end)    − cum_active_ret(base)
-   ΣA² = cum_active_ret_sq(end) − cum_active_ret_sq(base)
+   ΣA  = accum_active_ret(end)    − accum_active_ret(base)
+   ΣA² = accum_active_ret_sq(end) − accum_active_ret_sq(base)
    Var = (ΣA² − (ΣA)²/n) / (n − 1)              (n ≥ 2 ; Var<0 do làm tròn → 0)
    TEᵢ = √Var × √min(n, 252)
 ```
@@ -250,7 +250,7 @@ NAV ròng = Tổng tài sản − Phí phải trả
 | Trọng số (weight) | `(12,8)` | Σ = 1.0 |
 | Tỷ lệ CA (ratio) | `(18,8)` | chia/tách/quyền |
 | Index value | `(18,x)` | gốc 1000 |
-| Lũy kế TE (cum active) | `FLOAT` | double, tránh mất số khi cộng dồn |
+| Lũy kế TE (accum active) | `FLOAT` | double, tránh mất số khi cộng dồn |
 | Deviation | BPS (`DECIMAL(12,2)`) | 1% = 100 BPS |
 
 > **Đơn vị mặc định:** tiền = VND; lợi suất/return = tỷ lệ thập phân (0,08 = 8%); deviation = BPS; Unit Price gốc = 10.000; Index/benchmark gốc tương ứng 1000/điểm thị trường.
