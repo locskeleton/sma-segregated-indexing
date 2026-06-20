@@ -161,7 +161,7 @@ Mẫu số ≈ 0 → trả null. Hiển thị period return (không quy năm tr�
 Index₀ = 1000
 Indexₜ = Index₍ₜ₋₁₎ × Σᵢ ( wᵢ⁽ᵗ⁾ × Pᵢ,ₜ / P_refᵢ )
    wᵢ⁽ᵗ⁾  = bộ trọng số có effective_date ≤ t MỚI NHẤT ; Σ wᵢ⁽ᵗ⁾ = 100%
-   P_refᵢ = giá đóng cửa (t-1)  |  giá tham chiếu điều chỉnh khi có quyền (corporate action)
+   P_refᵢ = C_REF_PRICE (giá tham chiếu đầu phiên, sở publish): phiên thường = close (t-1); ex-rights = giá sau chia
 Daily return (index) = Σᵢ wᵢ⁽ᵗ⁾·Pᵢ,ₜ/P_refᵢ − 1   (= FACTOR − 1)
 ```
 **Ví dụ (rebalance ngày 3 −C +D):** Index₂=1011, trọng số eff_date=3 A45 B35 D20:

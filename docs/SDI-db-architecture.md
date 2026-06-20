@@ -260,7 +260,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | **T_SI_UNIT_LEDGER** ~120M | C_SI_UNIT_LEDGER_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_BUSINESS_DATE) |
 | **T_SI_PORTFOLIO_HOLDING** ~20M | (C_SI_ACCOUNT,C_TICKER) natural | PK_… (nc) | — (PK là natural) |
 | **T_SI_NAV_CURRENT** ~1M | (C_SI_ACCOUNT) natural | PK_… (nc) | — |
-| **T_PRICE_DAILY** (gộp CA: +C_IS_EX_RIGHTS, +C_ADJUSTED_REF_PRICE) | (C_BUSINESS_DATE,C_TICKER) natural | PK_… (nc) | — |
+| **T_PRICE_DAILY** (gộp CA: +C_REF_PRICE NOT NULL, +C_IS_EX_RIGHTS) | (C_BUSINESS_DATE,C_TICKER) natural | PK_… (nc) | — |
 | T_EOD_WORK (transient) | (C_BUSINESS_DATE,C_SI_ACCOUNT) natural | — | — |
 | T_SI_PORTFOLIO | PK_SI_PORTFOLIO (GUID) | (clustered) | (C_SI_ACCOUNT) + filtered-unique ACTIVE (C_CUST_CODE,C_MASTER_CODE) |
 | T_MASTER_PORTFOLIO_TICKER | PK_… (GUID) | (clustered) | (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER) |

@@ -21,11 +21,12 @@ VALUES ('SUB00001001','KH00001001','SDI01','2026-01-02','ACTIVE',0);  -- sub-acc
 INSERT INTO T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES
  ('SDI01','2026-01-02','AAA',0.60),('SDI01','2026-01-02','BBB',0.40);
 
-INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_CLOSE_PRICE) VALUES
- ('AAA','2026-01-02',100),('BBB','2026-01-02',50),
- ('AAA','2026-01-05',110),('BBB','2026-01-05',48),
- ('AAA','2026-01-06',110),('BBB','2026-01-06',52),
- ('AAA','2026-01-07',110),('BBB','2026-01-07',52);
+-- C_REF_PRICE = giá tham chiếu đầu phiên (sở publish): phiên thường = close hôm trước; ngày 02 inception = close.
+INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
+ ('AAA','2026-01-02',100,100),('BBB','2026-01-02', 50,50),
+ ('AAA','2026-01-05',100,110),('BBB','2026-01-05', 50,48),
+ ('AAA','2026-01-06',110,110),('BBB','2026-01-06', 48,52),
+ ('AAA','2026-01-07',110,110),('BBB','2026-01-07', 52,52);
 
 -- KH nạp 10,000,000 ngày 02 (cashflow nạp/rút = SDI-side → ghi thẳng, KHÔNG qua Kafka)
 INSERT INTO T_SI_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT)
@@ -108,19 +109,19 @@ BEGIN TRY
 END TRY BEGIN CATCH PRINT '  OK GATE chặn: '+ERROR_MESSAGE(); END CATCH;
 DELETE FROM T_SI_PORTFOLIO WHERE C_CUST_CODE='KH00009999';
 
-PRINT '--- GỘP GIÁ+CA: J12 lấy C_ADJUSTED_REF_PRICE ngay trên dòng ex-rights (cột mới C_IS_EX_RIGHTS) ---';
--- Phiên scratch 08: AAA là ngày KHÔNG hưởng quyền (P_ref=115 ≠ close hôm trước 110). Gọi J12 standalone.
-INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_CLOSE_PRICE,C_IS_EX_RIGHTS,C_ADJUSTED_REF_PRICE) VALUES
- ('AAA','2026-01-08',120,1,115),   -- ex-rights: P_ref=115
- ('BBB','2026-01-08',52,0,NULL);   -- phiên thường (fallback close hôm trước)
+PRINT '--- J12 dùng C_REF_PRICE đầu phiên (self-contained, KHÔNG tra ngày trước); ngày ex-rights C_IS_EX_RIGHTS=1 ---';
+-- Phiên scratch 08: AAA KHÔNG hưởng quyền → ref = giá sau chia 115 (≠ close hôm trước 110). Gọi J12 standalone.
+INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE,C_IS_EX_RIGHTS) VALUES
+ ('AAA','2026-01-08',115,120,1),   -- ex-rights: ref = giá sau chia 115
+ ('BBB','2026-01-08', 52, 52,0);   -- phiên thường: ref = close hôm trước
 EXEC SP_EOD_SI_INDEX '2026-01-08';
 DECLARE @ret08 DECIMAL(18,8) = (SELECT C_DAILY_RETURN FROM T_MASTER_INDEX_DAILY
     WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-08');
--- dùng adjusted_ref 115 → FACTOR = 0.6*120/115 + 0.4*52/52 = 1.0260870 → return ≈ 0.0260870
--- nếu BỎ adjusted_ref (rơi về close hôm trước 110) → return ≈ 0.0545455 (SAI)
+-- ref 115 → FACTOR = 0.6*120/115 + 0.4*52/52 = 1.0260870 → return ≈ 0.0260870
+-- nếu ref SAI lấy close hôm trước 110 → return ≈ 0.0545455
 IF @ret08 IS NOT NULL AND ABS(@ret08 - 0.0260870) < 0.0001
-    PRINT '  OK J12 áp dụng adjusted_ref (return='+CAST(@ret08 AS VARCHAR(20))+')';
+    PRINT '  OK J12 dùng C_REF_PRICE (return='+CAST(@ret08 AS VARCHAR(20))+')';
 ELSE
-    PRINT '  !!! LỖI: return='+ISNULL(CAST(@ret08 AS VARCHAR(20)),'NULL')+' (kỳ vọng ~0.0260870 — adjusted_ref KHÔNG áp dụng?)';
+    PRINT '  !!! LỖI: return='+ISNULL(CAST(@ret08 AS VARCHAR(20)),'NULL')+' (kỳ vọng ~0.0260870 — ref_price sai?)';
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-01-08';   -- dọn scratch
 DELETE FROM T_PRICE_DAILY       WHERE C_BUSINESS_DATE='2026-01-08';

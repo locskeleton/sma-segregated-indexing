@@ -68,17 +68,18 @@ CREATE INDEX IX_SI_PORTFOLIO_CUST ON T_SI_PORTFOLIO (C_CUST_CODE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_STATUS, C_JOIN_DATE);
 
 /*-------------------------------------------------------------- MARKET DATA ---*/
--- GỘP giá daily + sự kiện quyền vào 1 bảng: mỗi (mã, phiên) 1 dòng giá; dòng nào là
--- ngày ex-rights (không hưởng quyền) thì C_IS_EX_RIGHTS=1 + C_ADJUSTED_REF_PRICE = P_ref.
--- Bỏ bảng T_CORPORATE_ACTION riêng: engine chỉ cần adjusted_ref_price cho J12; thuộc tính CA
--- (type/ratio/cash_div) không tham gia tính toán (cổ tức/quyền đã vào NAV qua FO sync).
+-- GỘP giá daily + sự kiện quyền vào 1 bảng: mỗi (mã, phiên) 1 dòng giá. Sở publish EOD
+-- đủ thông tin của CHÍNH ngày đó → engine KHÔNG cần ngó bản ghi hôm trước.
+-- C_REF_PRICE = giá tham chiếu đầu phiên (mẫu số daily-return J12): phiên thường = close
+-- hôm trước; ngày ex-rights (không hưởng quyền) = giá sau chia. C_IS_EX_RIGHTS chỉ là metadata.
+-- Bỏ bảng T_CORPORATE_ACTION riêng: type/ratio/cash_div không tham gia tính (cổ tức/quyền vào NAV qua FO sync).
 CREATE TABLE T_PRICE_DAILY (
     PK_PRICE_DAILY      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_PRICE_DAILY_PKID DEFAULT NEWID(),
     C_TICKER            VARCHAR(20)  NOT NULL,
     C_BUSINESS_DATE     DATE         NOT NULL,
-    C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,  -- GIÁ đóng cửa — định giá MTM (J07: stock_value = Σ qty×close_price) + index J12 (Pᵢ,t)
-    C_IS_EX_RIGHTS      TINYINT      NOT NULL CONSTRAINT DF_PRICE_DAILY_EXR DEFAULT 0,  -- 1 = ngày có sự kiện quyền gây chia giá (ex-rights/ex-div); 0 = phiên thường
-    C_ADJUSTED_REF_PRICE DECIMAL(18,4) NULL,     -- GIÁ tham chiếu đã điều chỉnh quyền (P_ref cho J12 khi C_IS_EX_RIGHTS=1; ưu tiên hơn close hôm trước)
+    C_REF_PRICE         DECIMAL(18,4) NOT NULL,  -- GIÁ tham chiếu đầu phiên (sở publish): phiên thường = close hôm trước; ex-rights = giá sau chia. Mẫu số daily-return J12 (self-contained, không tra ngày trước)
+    C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,  -- GIÁ đóng cửa — định giá MTM (J07: stock_value = Σ qty×close_price) + tử số index J12 (Pᵢ,t)
+    C_IS_EX_RIGHTS      TINYINT      NOT NULL CONSTRAINT DF_PRICE_DAILY_EXR DEFAULT 0,  -- 1 = ngày có sự kiện quyền gây chia giá (ex-rights/ex-div) — metadata reporting/audit; 0 = phiên thường
     CONSTRAINT PK_PRICE_DAILY_NK PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_TICKER),  -- natural clustered (join MTM nóng)
     CONSTRAINT UQ_PRICE_DAILY_PKID UNIQUE NONCLUSTERED (PK_PRICE_DAILY)
 );

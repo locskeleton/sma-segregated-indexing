@@ -204,7 +204,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, mgmt_fee_rate, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04).
 
 ### Market data
-- **`T_PRICE_DAILY`** (ticker, business_date PK; close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường], adjusted_ref_price) — **gộp corporate action vào bảng giá**: ngày ex-rights đánh dấu `is_ex_rights=1` + `adjusted_ref_price`=P_ref cho J12. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
+- **`T_PRICE_DAILY`** (ticker, business_date PK; **ref_price** NOT NULL, close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường]) — **gộp corporate action vào bảng giá**: `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia), là mẫu số daily-return J12 → engine self-contained, KHÔNG tra bản ghi ngày trước. `is_ex_rights` = metadata. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
 - **`T_BENCHMARK_DAILY`** (benchmark_code, business_date PK; index_value) — chỉ số thị trường ngoài (VN-Index, price return), **nạp từ market data** (không do SDI tính). Key = code tự mô tả (giống ticker), không cần dimension riêng.
 
 ### FO sync (EOD) & cashflow
@@ -370,7 +370,7 @@ snake_case. Một khái niệm = một code.
 | Tài sản | `total_asset`, `stock_value`, `cash`, `cash_dividend`, `custody_fee`, `management_fee`, `payable_fee`, `nav`, `buying_power`, `withdrawable_asset`, `net_invested_capital` |
 | Cashflow | `cash_in`, `cash_out`, **`net_cashflow`** (=cash_in−cash_out, dùng trong công thức), `income` (≠ cashflow) |
 | Hiệu suất | `unit` (full precision), `unit_price`, `delta_unit`, `pnl`/`daily_pnl`, `return_pct` (=%PnL=TWR), `daily_return`, `mwr` |
-| Index | `master_index`/`index_value`, `target_weight`, `weight` (holdings), `ref_price`, `adjusted_ref_price`, `benchmark`, `close_price` |
+| Index | `master_index`/`index_value`, `target_weight`, `weight` (holdings), `ref_price` (giá tham chiếu đầu phiên), `is_ex_rights`, `benchmark`, `close_price` |
 | Khái niệm | `cash_drag`, `tracking_error`, `trade_date_accounting`, `segregated`, `price_return` |
 
 Quy tắc: trong công thức dùng `net_cashflow` (rõ "net"); `income` tách khỏi cashflow; `cash` (tổng) chỉ cho NAV; % lưu dạng thập phân.
