@@ -260,7 +260,9 @@ GO
 
 /*===========================================================================
   FR-05 — GET /customer/{id}/si/{si_account}/holdings : holdings hiện tại top-N + "OTHER"
-    Holdings CURRENT của sub-account (T_SI_PORTFOLIO_HOLDING) × giá mới nhất.
+    Holdings CURRENT của sub-account (T_SI_PORTFOLIO_HOLDING) × giá mới nhất ≤ @pd.
+    Sản phẩm SEGREGATED: KH sở hữu cổ phiếu THẬT ⇒ báo cáo TUYỆT ĐỐI không được giấu
+    vị thế nào. Định giá theo per-mã latest-price (giống FR-06), KHÔNG khớp đúng 1 ngày.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_HOLDINGS
     @p_si_account VARCHAR(20),
@@ -277,26 +279,43 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account)
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
 
+    -- @pd = ngày giá mới nhất TOÀN THỊ TRƯỜNG (mốc định giá "hiện tại"). Lấy MAX trên clustered
+    --   (C_BUSINESS_DATE, C_TICKER) leading-date ⇒ seek dòng cuối, rẻ.
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
     ;WITH h AS (
+        -- Định giá MỖI holding bằng giá ĐÓNG CỬA MỚI NHẤT ≤ @pd CỦA CHÍNH MÃ ĐÓ (per-ticker), KHÔNG
+        -- ép khớp đúng ngày @pd. Vì sao KHÔNG dùng INNER JOIN ... date=@pd:
+        --   mã bị halt/đình chỉ GD/hủy niêm yết/feed thiếu giá ngày @pd ⇒ không có dòng giá @pd
+        --   ⇒ INNER JOIN sẽ LOẠI mã đó ⇒ vị thế biến mất khỏi danh sách + khỏi mẫu số weight (tot.smv)
+        --   ⇒ GIẤU cổ phiếu KH đang sở hữu (sai với sản phẩm segregated).
+        -- OUTER APPLY giữ MỌI holding (vì là APPLY trái, holding không match vẫn ra 1 dòng px NULL):
+        --   • mã có giá @pd            → px = giá @pd (giống hành vi cũ khi feed dày đặc).
+        --   • mã halt/giá trễ hơn @pd  → px = giá last-known (phiên gần nhất ≤ @pd của mã).
+        --   • mã CHƯA TỪNG có giá       → px.C_CLOSE_PRICE = NULL ⇒ mv = NULL (vẫn HIỆN, không giấu).
+        -- Tối ưu cho per-customer ít mã: top-1/mã (KHÔNG dùng window-CTE quét toàn universe giá).
         SELECT t.C_TICKER, t.C_QUANTITY, px.C_CLOSE_PRICE,
                t.C_QUANTITY * px.C_CLOSE_PRICE AS mv
         FROM       T_SI_PORTFOLIO_HOLDING t
-        OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY     -- giá mới nhất ≤ @pd CỦA TỪNG MÃ
+        OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
                      WHERE C_TICKER = t.C_TICKER AND C_BUSINESS_DATE <= @pd
-                     ORDER BY C_BUSINESS_DATE DESC) px                  -- mã halt/thiếu giá @pd vẫn HIỆN (last-known); chưa từng có giá → NULL, KHÔNG bị giấu
+                     ORDER BY C_BUSINESS_DATE DESC) px
         WHERE  t.C_SI_ACCOUNT = @p_si_account
-    ), tot AS (SELECT SUM(mv) smv FROM h),
+    ),
+    -- tot.smv = Σ market value (SUM bỏ qua mv NULL) → mẫu số tính weight. Mã không định giá được
+    --   (mv NULL) KHÔNG vào mẫu số nhưng VẪN được liệt kê (weight NULL) ở RS.
+    tot AS (SELECT SUM(mv) smv FROM h),
+    -- xếp hạng theo market value giảm dần để cắt top-N. mv NULL = thấp nhất ⇒ rơi xuống cuối/“OTHER”.
        ranked AS (SELECT h.*, ROW_NUMBER() OVER (ORDER BY mv DESC) rn FROM h)
+    -- RS: top-N mã lớn nhất + 1 dòng "OTHER" gộp phần còn lại (nếu có). weight = mv / Σmv.
     SELECT C_TICKER, C_QUANTITY, C_CLOSE_PRICE AS C_MARKET_PRICE, mv AS C_MARKET_VALUE,
            CAST(mv / NULLIF(smv,0) AS DECIMAL(12,8)) AS C_WEIGHT, 0 AS C_SORT
     FROM ranked CROSS JOIN tot WHERE rn <= @p_top
     UNION ALL
-    SELECT N'OTHER', NULL, NULL, SUM(mv),
+    SELECT N'OTHER', NULL, NULL, SUM(mv),               -- gộp các mã ngoài top-N thành 1 dòng
            CAST(SUM(mv) / NULLIF(MIN(smv),0) AS DECIMAL(12,8)), 1 AS C_SORT
     FROM ranked CROSS JOIN tot WHERE rn > @p_top
-    HAVING COUNT(*) > 0
+    HAVING COUNT(*) > 0                                  -- không có mã ngoài top-N ⇒ bỏ dòng OTHER
     ORDER BY C_SORT, C_MARKET_VALUE DESC;
     END TRY
     BEGIN CATCH
