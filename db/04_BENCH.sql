@@ -64,7 +64,7 @@ FROM #cust c CROSS JOIN T_MASTER_PORTFOLIO mp;
 INSERT INTO T_SI_PORTFOLIO_HOLDING (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_TICKER,C_QUANTITY,C_AVG_COST)
 SELECT ip.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, mpt.C_TICKER, @qty, @price
 FROM T_SI_PORTFOLIO ip
-JOIN T_MASTER_PORTFOLIO_TICKER mpt ON mpt.C_MASTER_CODE = ip.C_MASTER_CODE;
+INNER JOIN T_MASTER_PORTFOLIO_TICKER mpt ON mpt.C_MASTER_CODE = ip.C_MASTER_CODE;
 
 /*--- state seed: cash=0 + watermark C_LAST_SYNC_DATE=@d (bench BỎ QUA ingest per-KH cho scale;
       GATE đếm watermark; interval history do ingest maintain — KHÔNG seed ở bench) + cashflow INITIAL ---*/

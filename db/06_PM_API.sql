@@ -139,12 +139,12 @@ BEGIN
 
     -- lát @end: accum active đến cuối kỳ
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
-    FROM #kh k JOIN T_SI_NAV_BALANCE e
+    FROM #kh k INNER JOIN T_SI_NAV_BALANCE e
       ON e.C_MASTER_CODE=@p_master_code AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
 
     -- lát @base: up_base + accum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, accum_base=0)
     UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
-    FROM #kh k JOIN T_SI_NAV_BALANCE b
+    FROM #kh k INNER JOIN T_SI_NAV_BALANCE b
       ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
     UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
 
@@ -264,8 +264,8 @@ BEGIN
                    / NULLIF(SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
                                      THEN kw.w END),0) AS DECIMAL(18,8)) AS kc
         FROM #kw kw
-        JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@p_master_code
-        JOIN @samp s2 ON s2.d=b.C_BUSINESS_DATE
+        INNER JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@p_master_code
+        INNER JOIN @samp s2 ON s2.d=b.C_BUSINESS_DATE
         GROUP BY b.C_BUSINESS_DATE
     )
     SELECT  s.d AS C_BUSINESS_DATE,
@@ -461,7 +461,7 @@ BEGIN
     INSERT #md (m, dend)
     SELECT mp.C_MASTER_CODE, MAX(b.C_BUSINESS_DATE)
     FROM T_MASTER_PORTFOLIO mp
-    JOIN T_MASTER_NAV_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
+    INNER JOIN T_MASTER_NAV_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
     WHERE mp.C_STATUS='ACTIVE'
     GROUP BY mp.C_MASTER_CODE;
 
@@ -486,18 +486,18 @@ BEGIN
     SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
            nc.C_LAST_UNIT_PRICE, nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
-    JOIN #md d ON d.m=nc.C_MASTER_CODE
+    INNER JOIN #md d ON d.m=nc.C_MASTER_CODE
     WHERE nc.C_STATUS='ACTIVE';
 
     -- lát @end per master (accum active đến cuối kỳ)
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
-    FROM #kh k JOIN #md d ON d.m=k.m
-    JOIN T_SI_NAV_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
+    FROM #kh k INNER JOIN #md d ON d.m=k.m
+    INNER JOIN T_SI_NAV_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
 
     -- lát @base per master (up_base + accum active đến base; thiếu lát ⇒ up_base=10000, accum_base=0)
     UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
-    FROM #kh k JOIN #md d ON d.m=k.m
-    JOIN T_SI_NAV_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
+    FROM #kh k INNER JOIN #md d ON d.m=k.m
+    INNER JOIN T_SI_NAV_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
     UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
@@ -521,14 +521,14 @@ BEGIN
                  cashdrag = CASE WHEN mc.C_TOTAL_ASSET=0 THEN NULL
                                  ELSE (mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/mc.C_TOTAL_ASSET END
     FROM #mr r
-    JOIN #md d ON d.m=r.m
-    JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
+    INNER JOIN #md d ON d.m=r.m
+    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
     OUTER APPLY dbo.UDF_PM_CONFIG(r.m) cfg;
 
     -- RS1 header
     SELECT COUNT(*) AS C_TOTAL_MASTER,
            (SELECT ISNULL(SUM(C_TOTAL_ACCOUNT),0) FROM T_MASTER_NAV_CURRENT mc
-            JOIN #md d ON d.m=mc.C_MASTER_CODE) AS C_TOTAL_KH
+            INNER JOIN #md d ON d.m=mc.C_MASTER_CODE) AS C_TOTAL_KH
     FROM #md;
 
     -- RS2 tổng toàn hệ
@@ -542,8 +542,8 @@ BEGIN
             CAST(SUM(mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/NULLIF(SUM(mc.C_TOTAL_ASSET),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
             SUM(CASE WHEN r.cashdrag > r.cdThr THEN 1 ELSE 0 END) AS C_CNT_MASTER_CASH_OVER
     FROM #md d
-    JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m
-    JOIN #mr r ON r.m=d.m
+    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m
+    INNER JOIN #mr r ON r.m=d.m
     OUTER APPLY (SELECT C_TOTAL_ASSET aumBase FROM T_MASTER_NAV_BALANCE
                  WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE=d.dbase) bb
     OUTER APPLY (SELECT ISNULL(SUM(C_CASH_IN),0) cin, ISNULL(SUM(C_CASH_OUT),0) cout
@@ -559,8 +559,8 @@ BEGIN
             CAST(r.wte AS DECIMAL(12,6))     AS C_TE_AUMW,
             CAST(r.cashdrag AS DECIMAL(9,6)) AS C_CASH_DRAG
     FROM #mr r
-    JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=r.m
-    JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
+    INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=r.m
+    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
     ORDER BY CASE @p_sort WHEN 'AUM'  THEN mc.C_TOTAL_ASSET END DESC,
              CASE @p_sort WHEN 'RET'  THEN r.wret END DESC,
              CASE @p_sort WHEN 'DEV'  THEN (r.wret-r.rmaster) END DESC,
