@@ -329,14 +329,20 @@ BEGIN
         WHERE C_SI_ACCOUNT=@p_si_account
           AND C_VALID_FROM <= @p_asof AND (C_VALID_TO > @p_asof OR C_VALID_TO IS NULL));
 
-    DECLARE @stock DECIMAL(20,0) = (
-        SELECT SUM(h.C_QUANTITY * px.C_CLOSE_PRICE)
-        FROM T_SI_HOLDING_HIST h
-        OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
-                     WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @p_asof
-                     ORDER BY C_BUSINESS_DATE DESC) px
-        WHERE h.C_SI_ACCOUNT=@p_si_account
-          AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL));
+    -- Holdings reconstruct @asof + giá ≤ asOf — MATERIALIZE 1 LẦN, dùng chung @stock (RS1) + RS2.
+    -- OUTER APPLY top-1/mã KH giữ: tối ưu cho per-customer ít mã (KHÔNG window-CTE vì sẽ quét latest-price
+    -- toàn universe). Trước đây reconstruct chạy 2 lần (@stock + RS2) → gộp còn 1.
+    SELECT h.C_TICKER, h.C_QUANTITY, h.C_AVG_COST,
+           px.C_CLOSE_PRICE AS C_MARKET_PRICE,
+           h.C_QUANTITY * px.C_CLOSE_PRICE AS C_MARKET_VALUE
+    INTO #hold
+    FROM T_SI_HOLDING_HIST h
+    OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
+                 WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @p_asof
+                 ORDER BY C_BUSINESS_DATE DESC) px
+    WHERE h.C_SI_ACCOUNT=@p_si_account
+      AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL);
+    DECLARE @stock DECIMAL(20,0) = (SELECT SUM(C_MARKET_VALUE) FROM #hold);
 
     -- RS1: summary
     --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
@@ -369,18 +375,11 @@ BEGIN
         WHERE C_SI_ACCOUNT=@p_si_account AND C_CHARGE_DATE <= @p_asof
     ) sch;
 
-    -- RS2: holdings reconstruct @p_asof
-    SELECT  h.C_TICKER, h.C_QUANTITY,
-            px.C_CLOSE_PRICE AS C_MARKET_PRICE,
-            h.C_QUANTITY * px.C_CLOSE_PRICE AS C_MARKET_VALUE,
-            CAST(h.C_QUANTITY * px.C_CLOSE_PRICE / NULLIF(@stock,0) AS DECIMAL(12,8)) AS C_WEIGHT,
-            h.C_AVG_COST
-    FROM T_SI_HOLDING_HIST h
-    OUTER APPLY (SELECT TOP 1 C_CLOSE_PRICE FROM T_PRICE_DAILY
-                 WHERE C_TICKER = h.C_TICKER AND C_BUSINESS_DATE <= @p_asof
-                 ORDER BY C_BUSINESS_DATE DESC) px
-    WHERE h.C_SI_ACCOUNT=@p_si_account
-      AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL)
+    -- RS2: holdings reconstruct @p_asof — đọc lại #hold (KHÔNG reconstruct lần 2)
+    SELECT  C_TICKER, C_QUANTITY, C_MARKET_PRICE, C_MARKET_VALUE,
+            CAST(C_MARKET_VALUE / NULLIF(@stock,0) AS DECIMAL(12,8)) AS C_WEIGHT,
+            C_AVG_COST
+    FROM #hold
     ORDER BY C_MARKET_VALUE DESC;
 
     -- RS3: chi tiết cổ tức/phí lưu ký ≤ asOf (sparse, FO đẩy)
@@ -394,9 +393,12 @@ BEGIN
     FROM T_SI_FEE_CHARGE
     WHERE C_SI_ACCOUNT=@p_si_account AND C_CHARGE_DATE <= @p_asof
     ORDER BY C_CHARGE_DATE DESC;
+
+    DROP TABLE #hold;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+        IF OBJECT_ID('tempdb..#hold') IS NOT NULL DROP TABLE #hold;
     END CATCH
 END
 GO
