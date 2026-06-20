@@ -5,9 +5,10 @@ GO
   SDI MODULE — READ API (SQL Server)  | ALL-IN-DB: mỗi API = app EXEC 1 proc
   6 proc đọc cho FR-01..FR-06 (SDI-spec §10). App chỉ serialize JSON, KHÔNG tính.
   Định danh public:
-    - KH:  C_CUST_CODE VARCHAR(10).
+    - KH:  C_CUST_CODE VARCHAR(10) — CHỈ FR-01 (list các sub-account của 1 KH).
     - SUB-ACCOUNT: C_SI_ACCOUNT VARCHAR(20) (mã sub-account, customer-level, = đơn vị API).
-      Master suy từ sub-account (T_SI_PORTFOLIO). Mọi bảng customer-level khóa theo C_SI_ACCOUNT.
+      UNIQUE toàn cục ⇒ các proc per-si (FR-02..06) CHỈ nhận @C_SI_ACCOUNT (KHÔNG cần cust);
+      master + cust suy từ sub-account (T_SI_PORTFOLIO). Ownership/auth do tầng API gác (không qua param).
   Read-only. T0 unit price = 10.000.
 ==============================================================================*/
 
@@ -78,16 +79,14 @@ GO
     RS1: current + range metrics. RS2: dòng master-level mới nhất (tham chiếu).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_DETAIL
-    @C_CUST_CODE  VARCHAR(10),
-    @C_SI_ACCOUNT VARCHAR(20),
+    @C_SI_ACCOUNT VARCHAR(20),               -- si_account UNIQUE toàn cục → đủ định danh (master suy từ đây)
     @RANGE        VARCHAR(20) = 'INCEPTION'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO
-                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
@@ -161,16 +160,14 @@ GO
     + master index (PR) + benchmark (PR). App rebase về dòng đầu.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_PERFORMANCE
-    @C_CUST_CODE  VARCHAR(10),
     @C_SI_ACCOUNT VARCHAR(20),
     @RANGE        VARCHAR(20) = '1Y'
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO
-                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -200,7 +197,6 @@ GO
   FR-04 — GET /customer/{id}/si/{si_account}/info : thông tin đầu tư sub-account
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_INFO
-    @C_CUST_CODE  VARCHAR(10),
     @C_SI_ACCOUNT VARCHAR(20)
 AS
 BEGIN
@@ -221,7 +217,7 @@ BEGIN
             COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) AS C_MGMT_FEE_RATE_EFFECTIVE
     FROM       T_SI_PORTFOLIO ip
     JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    WHERE ip.C_CUST_CODE = @C_CUST_CODE AND ip.C_SI_ACCOUNT = @C_SI_ACCOUNT;
+    WHERE ip.C_SI_ACCOUNT = @C_SI_ACCOUNT;
 END
 GO
 
@@ -230,15 +226,14 @@ GO
     Holdings CURRENT của sub-account (T_SI_PORTFOLIO_HOLDING) × giá mới nhất.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_HOLDINGS
-    @C_CUST_CODE  VARCHAR(10),
     @C_SI_ACCOUNT VARCHAR(20),
     @TOP          INT = 20
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE)
-        BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
+    IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT)
+        BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
 
     DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
 
@@ -267,16 +262,14 @@ GO
     Reconstruct INTERVAL: cash (cash_hist) + stock (holding_hist × giá ≤ asOf).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_ASSET_REPORT
-    @C_CUST_CODE  VARCHAR(10),
     @C_SI_ACCOUNT VARCHAR(20),
     @ASOF         DATE = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO
-                                   WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT AND C_CUST_CODE=@C_CUST_CODE);
-    IF @master IS NULL BEGIN RAISERROR('Sub-account not found for cust/si_account',16,1); RETURN; END
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT);
+    IF @master IS NULL BEGIN RAISERROR('Sub-account not found',16,1); RETURN; END
 
     IF @ASOF IS NULL
         SELECT @ASOF = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@C_SI_ACCOUNT;
