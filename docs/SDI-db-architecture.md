@@ -51,6 +51,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `T_MASTER_INDEX_DAILY` / `T_BENCHMARK_DAILY` | index daily | ~250K | rowstore |
 | `T_PRICE_DAILY` | giá EOD | ~4M | rowstore, index (C_BUSINESS_DATE, C_TICKER) — nhỏ, cache RAM |
 | `T_SI_FEE_LEDGER` | sổ cái phí/thu nhập per-tiểu-khoản (sparse, idempotent): cổ tức + phí lưu ký (FO) + phí ACCRUE BO cắt (BO); group INCOME/PAYABLE, type DIVIDEND/CUSTODY_FEE/MGMT_FEE/TAX/PERF_FEE… | ~triệu/năm | **CCI**, partition năm — nguồn FR-06; J11 Σ lên `T_MASTER_NAV_BALANCE` |
+| `T_SI_FEE_ACCRUAL` | LOG lượng phí ACCRUE per (sub-account × loại phí × NGÀY) — breakdown cho FR-06 RS5 (kê từng khoản phải trả: pending=accrued−paid). Ghi J06b. | ~triệu/năm | **rowstore/CCI**, partition năm — nguồn FR-06 RS5 |
 | `T_FEE_ACCRUAL_CONFIG` | cấu hình loại phí ACCRUE + rate cấp master (PK (C_MASTER_CODE, C_FEE_TYPE); C_RATE, C_DAY_COUNT) — đọc bởi J06 accrue đa-loại | ~vài/master | rowstore (nhỏ, cache RAM) |
 
 **Quyết định customer daily perf (đổi do FO-sync):** vì FO đồng bộ **snapshot overwrite** → holdings KHÔNG còn event-source → **KHÔNG derive được NAV/unit_price quá khứ** → **BẮT BUỘC materialize** `T_SI_NAV_BALANCE` (nav/unit/unit_price/day) để vẽ chart FR-03. Giảm tải: lấy **điểm thưa (tuần/tháng)** hoặc chỉ lưu `unit_price`. Lưu CCI + partition (§7.3).
@@ -270,6 +271,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_REBALANCE_REQUEST | PK_… (GUID) | (clustered) | (C_REQUEST_ID) |
 | T_BENCHMARK_DAILY | PK_… (GUID) | (clustered) | (C_BENCHMARK_CODE,C_BUSINESS_DATE) |
 | **T_SI_FEE_LEDGER** (sổ cái phí/thu nhập: cổ tức+phí lưu ký FO + phí QL BO cắt) | C_FEE_LEDGER_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_BUSINESS_DATE) + (C_BUSINESS_DATE) + filtered-unique (C_SOURCE_EVENT_ID) dedup |
+| **T_SI_FEE_ACCRUAL** (log accrue phí per sub-account×loại×ngày — FR-06 RS5) | (C_SI_ACCOUNT,C_FEE_TYPE,C_BUSINESS_DATE) natural | PK_… (nc) | IX_SI_FEE_ACCRUAL_ACCT (C_SI_ACCOUNT,C_BUSINESS_DATE) INCLUDE type/amount |
 | T_MASTER_NAV_BALANCE / _INDEX_DAILY / _HOLDING_BALANCE / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
 | T_EOD_RUN | PK_EOD_RUN (GUID) | (clustered) | (C_BUSINESS_DATE,C_JOB) |
 

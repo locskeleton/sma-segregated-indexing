@@ -274,6 +274,20 @@ BEGIN
     WHERE w.C_BUSINESS_DATE=@p_d
       AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
 
+    -- J06b LOG ACCRUE per-type (cho sao kê kê từng khoản): lượng accrue TỪNG loại trong ngày @p_d.
+    --   Σ các dòng này = phần += vào C_PAYABLE_FEE ở trên. Idempotent: xoá @p_d trước khi ghi.
+    DELETE FROM T_SI_FEE_ACCRUAL WHERE C_BUSINESS_DATE=@p_d;
+    INSERT INTO T_SI_FEE_ACCRUAL (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_TYPE,C_ACCRUAL_AMOUNT)
+    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, cfg.C_FEE_TYPE,
+           (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
+           * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
+           * (cfg.C_RATE / cfg.C_DAY_COUNT)
+    FROM T_EOD_WORK w
+    INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
+    INNER JOIN T_FEE_ACCRUAL_CONFIG cfg ON cfg.C_MASTER_CODE = w.C_MASTER_CODE AND cfg.C_RATE > 0
+    WHERE w.C_BUSINESS_DATE=@p_d
+      AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
+
     -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
     UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH - C_PAYABLE_FEE
     WHERE C_BUSINESS_DATE=@p_d;

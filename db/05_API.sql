@@ -433,6 +433,20 @@ BEGIN
     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='PAYABLE'
     ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
+    -- RS5: KÊ TỪNG KHOẢN PHẢI TRẢ accrued chưa cắt @asOf (cho sao kê NAV). Per loại ACCRUE:
+    --   pending = Σ accrue(loại,≤asOf, T_SI_FEE_ACCRUAL) − Σ cắt(loại,≤asOf, T_SI_FEE_LEDGER). Σ pending = C_FEE_ACCRUED_TOTAL.
+    SELECT a.C_FEE_TYPE,
+           CAST(a.C_ACCRUED AS DECIMAL(20,4))                     AS C_FEE_ACCRUED,
+           CAST(ISNULL(c.C_PAID,0) AS DECIMAL(20,4))              AS C_FEE_PAID,
+           CAST(a.C_ACCRUED - ISNULL(c.C_PAID,0) AS DECIMAL(20,4)) AS C_FEE_PENDING
+    FROM (SELECT C_FEE_TYPE, SUM(C_ACCRUAL_AMOUNT) AS C_ACCRUED
+          FROM T_SI_FEE_ACCRUAL WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
+          GROUP BY C_FEE_TYPE) a
+    LEFT JOIN (SELECT C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS C_PAID  -- CAST tránh SUM→(38,0) cắt scale khi trừ (bẫy DECIMAL-38)
+               FROM T_SI_FEE_LEDGER WHERE C_SI_ACCOUNT=@p_si_account AND C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_asof
+               GROUP BY C_FEE_TYPE) c ON c.C_FEE_TYPE = a.C_FEE_TYPE
+    ORDER BY a.C_FEE_TYPE;
+
     DROP TABLE #hold;
     END TRY
     BEGIN CATCH

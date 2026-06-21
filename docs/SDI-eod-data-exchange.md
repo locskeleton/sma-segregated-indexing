@@ -85,7 +85,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | 8a | **Current snapshot KH** | `T_SI_NAV_CURRENT` | C_SI_ACCOUNT, unit, cash, last_nav, last_unit_price, status, last_business_date | Push **current/delta** (1 dòng/tiểu khoản). |
 | 8b | **Current snapshot master** | `T_MASTER_NAV_CURRENT` | C_MASTER_CODE, cash, stock_value, total_asset, last_nav, unit, last_unit_price | Push current toàn quỹ (overview/AUM). |
 | 8c | **Master series ngày** | `T_MASTER_NAV_BALANCE`, `T_MASTER_INDEX_DAILY` | nav/unit/up/pnl/return + index_value (PR) | Append dòng master của ngày @d (nhỏ). |
-| 9 | **Lịch sử KH (API pull)** | `T_SI_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_SI_FEE_LEDGER` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`SP_GET_*`) on-demand — **KHÔNG** push bulk lịch sử. |
+| 9 | **Lịch sử KH (API pull)** | `T_SI_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_SI_FEE_LEDGER`, `T_SI_FEE_ACCRUAL` | NAV/UP/return chart, holdings top20, cổ tức/phí, **breakdown phí phải trả per-type (FR-06 RS5)** | Asset/SMO **đọc qua API** (`SP_GET_*`) on-demand — **KHÔNG** push bulk lịch sử. |
 
 > **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `T_SI_NAV_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core.
 
