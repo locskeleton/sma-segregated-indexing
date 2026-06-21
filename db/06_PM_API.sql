@@ -126,17 +126,21 @@ BEGIN
 
     -- khung ngày (hiệu suất T-1)
     DECLARE @end DATE, @cutoff DATE, @base DATE, @X INT;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    DECLARE @first DATE;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @base IS NULL SET @base = @first;
 
     -- master index return kỳ (PR) + #ngày GD (cap 252)
     DECLARE @idxBase DECIMAL(18,6), @idxEnd DECIMAL(18,6), @rMaster DECIMAL(18,10);
-    SELECT @idxBase = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
-    SELECT @idxEnd  = C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@end;
+    -- index @base + @end trong 1 read (IN(base,end) + pivot CASE) thay vì 2 point-read.
+    SELECT @idxBase = MAX(CASE WHEN C_BUSINESS_DATE=@base THEN C_INDEX_VALUE END),
+           @idxEnd  = MAX(CASE WHEN C_BUSINESS_DATE=@end  THEN C_INDEX_VALUE END)
+    FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE IN (@base,@end);
     SET @rMaster = CASE WHEN @idxBase IS NULL OR @idxBase=0 THEN NULL ELSE @idxEnd/@idxBase - 1 END;
     SELECT @X = COUNT(DISTINCT C_BUSINESS_DATE) FROM T_MASTER_INDEX_DAILY
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
@@ -253,12 +257,14 @@ BEGIN
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    DECLARE @first DATE;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @base IS NULL SET @base = @first;
 
     -- auto resolution theo độ dài kỳ
     IF @p_resolution IS NULL
@@ -413,12 +419,14 @@ BEGIN
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    DECLARE @first DATE;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @base IS NULL SET @base = @first;
 
     CREATE TABLE #p (si VARCHAR(20), aum DECIMAL(20,6), pnl DECIMAL(18,10));
     INSERT #p (si, aum, pnl)
@@ -483,12 +491,14 @@ BEGIN
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    DECLARE @first DATE;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @base IS NULL SET @base = @first;
 
     ;WITH k AS (
         SELECT nc.C_CUST_CODE, nc.C_SI_ACCOUNT,
@@ -784,16 +794,20 @@ BEGIN
 
     -- khung ngày + master index return kỳ (PR)
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    DECLARE @first DATE;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    IF @base IS NULL SET @base = @first;
 
     DECLARE @idxBase DECIMAL(18,6), @idxEnd DECIMAL(18,6), @rMaster DECIMAL(18,10);
-    SELECT @idxBase=C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
-    SELECT @idxEnd =C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@end;
+    -- index @base + @end trong 1 read (IN(base,end) + pivot CASE) thay vì 2 point-read.
+    SELECT @idxBase = MAX(CASE WHEN C_BUSINESS_DATE=@base THEN C_INDEX_VALUE END),
+           @idxEnd  = MAX(CASE WHEN C_BUSINESS_DATE=@end  THEN C_INDEX_VALUE END)
+    FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE IN (@base,@end);
     SET @rMaster = CASE WHEN @idxBase IS NULL OR @idxBase=0 THEN NULL ELSE @idxEnd/@idxBase - 1 END;
 
     -- per-KH deviation (BPS) = (TWR KH − return master) × 10000

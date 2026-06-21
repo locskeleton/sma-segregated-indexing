@@ -198,14 +198,15 @@ BEGIN
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
-    DECLARE @end DATE, @cutoff DATE, @base DATE;
+    DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
 
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+    -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
+    SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
+    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE
      WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+    IF @base IS NULL SET @base = @first;
 
     SELECT  cd.C_BUSINESS_DATE,
             cd.C_UNIT_PRICE          AS C_CUST_UNIT_PRICE,   -- TWR sub-account
