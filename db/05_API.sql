@@ -240,6 +240,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
+    IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account)
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
+
     SELECT  ip.PK_SI_PORTFOLIO AS C_SUBACCOUNT_PK_ID,
             ip.C_SI_ACCOUNT,
             mp.C_MASTER_CODE, mp.C_MASTER_NAME, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
