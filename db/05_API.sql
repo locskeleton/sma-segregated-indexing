@@ -99,13 +99,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- ĐỊNH DANH + trạng thái hiện tại: 1 seek clustered PK (C_SI_ACCOUNT) — đọc luôn cho RS1.
-    -- master suy từ T_SI_NAV_CURRENT (có ngay sau FO ingest, KHÔNG cần lịch sử EOD) ⇒ bỏ seek T_SI_PORTFOLIO.
-    DECLARE @master VARCHAR(20),
-            @cur_nav DECIMAL(20,0), @cur_up DECIMAL(18,6), @cur_unit DECIMAL(18,6), @cur_date DATE;
-    SELECT @master   = C_MASTER_CODE, @cur_nav  = C_LAST_NAV, @cur_up = C_LAST_UNIT_PRICE,
-           @cur_unit = C_UNIT,        @cur_date = C_LAST_BUSINESS_DATE
-    FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account;
+    -- master + check tồn tại theo ĐĂNG KÝ (T_SI_PORTFOLIO): tiểu khoản registered nhưng chưa ingest
+    -- vẫn hợp lệ (RS1 sẽ rỗng). si_account UNIQUE toàn cục ⇒ master suy từ đây.
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -158,16 +154,17 @@ BEGIN
             @base_up               AS C_BASE_UNIT_PRICE,
             @end_nav               AS C_END_NAV,
             @end_up                AS C_END_UNIT_PRICE,
-            @cur_nav               AS C_CURRENT_NAV,
-            @cur_up                AS C_CURRENT_UNIT_PRICE,
-            @cur_unit              AS C_CURRENT_UNIT,
-            @cur_date              AS C_CURRENT_DATE,
+            nc.C_LAST_NAV          AS C_CURRENT_NAV,
+            nc.C_LAST_UNIT_PRICE   AS C_CURRENT_UNIT_PRICE,
+            nc.C_UNIT              AS C_CURRENT_UNIT,
+            nc.C_LAST_BUSINESS_DATE AS C_CURRENT_DATE,
             CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
                  ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
             @cf_net                AS C_CF_NET,
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
-                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
+                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT
+    FROM T_SI_NAV_CURRENT nc WHERE nc.C_SI_ACCOUNT=@p_si_account;
 
     -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu)
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
