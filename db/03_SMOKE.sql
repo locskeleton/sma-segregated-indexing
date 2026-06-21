@@ -169,14 +169,15 @@ ELSE
 PRINT '  master EOD@07 payload: ' + ISNULL(@mEOD,'(NULL)');
 DROP TABLE #mE; DROP TABLE #mH;
 
-PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (event riêng; RS1 master index, RS2 benchmark) ---';
+PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (1 result set; master index + benchmark gộp) ---';
 DECLARE @ecI INT, @emI NVARCHAR(400);
-CREATE TABLE #ix (k VARCHAR(20), bd DATE, payload NVARCHAR(MAX));   -- INSERT...EXEC gộp RS1+RS2 (cùng shape)
+CREATE TABLE #ix (typ VARCHAR(20), code VARCHAR(20), bd DATE, payload NVARCHAR(MAX));  -- 4 cột = 1 result set
 INSERT #ix EXEC SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD', @p_err_code=@ecI OUTPUT, @p_err_msg=@emI OUTPUT;
 PRINT '  err='+CAST(@ecI AS VARCHAR(10))+' (kỳ vọng 0)';
-DECLARE @ixSDI NVARCHAR(MAX) = (SELECT payload FROM #ix WHERE k='SDI01');
-IF @ixSDI LIKE '%"index_value":1078.8%'
-    PRINT '  OK index SP: master index SDI01 = 1078.8 (tách khỏi master snapshot, không dup benchmark)';
+DECLARE @ixSDI NVARCHAR(MAX) = (SELECT payload FROM #ix WHERE typ='MASTER_INDEX' AND code='SDI01');
+IF @ixSDI LIKE '%"index_type":"MASTER_INDEX"%' AND @ixSDI LIKE '%"index_value":1078.8%'
+    PRINT '  OK index SP: 1 result set, master index SDI01=1078.8 (index_type=MASTER_INDEX; benchmark cùng schema, dedup)';
 ELSE
     PRINT '  !!! LỖI index SP: ' + ISNULL(@ixSDI,'(NULL)');
+PRINT '  index SDI01 payload: ' + ISNULL(@ixSDI,'(NULL)');
 DROP TABLE #ix;

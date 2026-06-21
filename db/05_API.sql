@@ -580,9 +580,10 @@ GO
   SP_GET_ASSET_INDEX_SNAPSHOT (SDI→Asset sync, EVENT RIÊNG cho index/benchmark)
     Tách khỏi master snapshot vì benchmark dùng CHUNG nhiều master → nếu nhét per-master
     sẽ DUP (mỗi master gửi lại cùng 1 giá trị benchmark). Ở đây phát 1 lần/key.
-    RS1: master index per master (key C_MASTER_CODE) — index_value (PR) + daily_return.
-    RS2: benchmark per benchmark_code (key C_BENCHMARK_CODE, DEDUP) — benchmark_value (PR).
-    App publish 2 RS lên 2 topic riêng. MODE EOD|HISTORY, RECONSTRUCT-ONLY (DATED) → replay y hệt.
+    1 RESULT SET DUY NHẤT: gộp master index DM + benchmark vào CÙNG cấu trúc JSON, phân biệt
+    bằng field `index_type` (MASTER_INDEX | BENCHMARK). 1 dòng/series (DEDUP benchmark theo code).
+    App publish 1 lần (key = type+code). MODE EOD|HISTORY, RECONSTRUCT-ONLY (DATED) → replay y hệt.
+    benchmark KHÔNG có daily_return trong DB (T_BENCHMARK_DAILY chỉ có index_value) → field này NULL.
     ⚠️ PAYLOAD DRAFT — map theo schema Asset thật khi có.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_ASSET_INDEX_SNAPSHOT
@@ -599,28 +600,25 @@ BEGIN
     IF @p_mode NOT IN ('EOD','HISTORY')
         BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
 
-    -- RS1: master index (1 dòng/master)
-    SELECT idx.C_MASTER_CODE, idx.C_BUSINESS_DATE,
-        (SELECT idx.C_MASTER_CODE                          AS master_code,
-                CONVERT(VARCHAR(10), idx.C_BUSINESS_DATE,23) AS business_date,
-                @p_mode                                    AS mode,
-                idx.C_INDEX_VALUE                          AS index_value,
-                idx.C_DAILY_RETURN                         AS index_daily_return
-         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)            AS C_PAYLOAD_JSON
-    FROM T_MASTER_INDEX_DAILY idx
-    WHERE idx.C_BUSINESS_DATE = @p_business_date
-    ORDER BY idx.C_MASTER_CODE;
-
-    -- RS2: benchmark (1 dòng/benchmark_code — DEDUP, không lặp theo master)
-    SELECT bm.C_BENCHMARK_CODE, bm.C_BUSINESS_DATE,
-        (SELECT bm.C_BENCHMARK_CODE                        AS benchmark_code,
-                CONVERT(VARCHAR(10), bm.C_BUSINESS_DATE,23) AS business_date,
-                @p_mode                                    AS mode,
-                bm.C_INDEX_VALUE                           AS benchmark_value
-         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)            AS C_PAYLOAD_JSON
-    FROM T_BENCHMARK_DAILY bm
-    WHERE bm.C_BUSINESS_DATE = @p_business_date
-    ORDER BY bm.C_BENCHMARK_CODE;
+    -- 1 result set: master index (DM) + benchmark gộp cùng schema (index_type phân biệt)
+    SELECT C_INDEX_TYPE, C_CODE, C_BUSINESS_DATE,
+        (SELECT u.C_INDEX_TYPE                              AS index_type,
+                u.C_CODE                                    AS code,
+                CONVERT(VARCHAR(10), u.C_BUSINESS_DATE, 23) AS business_date,
+                @p_mode                                     AS mode,
+                u.C_INDEX_VALUE                             AS index_value,
+                u.C_DAILY_RETURN                            AS daily_return
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)             AS C_PAYLOAD_JSON
+    FROM (
+        SELECT 'MASTER_INDEX' AS C_INDEX_TYPE, idx.C_MASTER_CODE AS C_CODE, idx.C_BUSINESS_DATE,
+               idx.C_INDEX_VALUE, idx.C_DAILY_RETURN
+        FROM T_MASTER_INDEX_DAILY idx WHERE idx.C_BUSINESS_DATE = @p_business_date
+        UNION ALL
+        SELECT 'BENCHMARK', bm.C_BENCHMARK_CODE, bm.C_BUSINESS_DATE,
+               bm.C_INDEX_VALUE, CAST(NULL AS DECIMAL(10,6))   -- benchmark không có daily_return trong DB
+        FROM T_BENCHMARK_DAILY bm WHERE bm.C_BUSINESS_DATE = @p_business_date
+    ) u
+    ORDER BY u.C_INDEX_TYPE, u.C_CODE;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW

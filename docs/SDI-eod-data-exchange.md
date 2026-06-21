@@ -93,7 +93,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 >
 > **Master-level NAV (luồng 8b/8c):** **`SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date,@p_mode`** (db/05_API.sql) — 1 payload JSON/master (key=`C_MASTER_CODE`): master nav/unit/up/return + total_asset/cash breakdown + `total_account` + `benchmark_code` (chỉ tham chiếu). Cho Asset dựng overview/AUM (8b = ngày mới nhất) + đường master TR chart FR-03. RECONSTRUCT-ONLY từ `T_MASTER_NAV_BALANCE` (DATED). Master-level CÓ pending/div hist (khác per-KH).
 >
-> **Index/benchmark (EVENT RIÊNG):** **`SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date,@p_mode`** — RS1 master index per master (key `C_MASTER_CODE`: `index_value`+daily_return), RS2 benchmark per `C_BENCHMARK_CODE` (DEDUP, phát 1 lần/code). **Tách khỏi master snapshot vì benchmark dùng chung nhiều master → nhét chung sẽ DUP.** App publish 2 RS lên 2 topic. RECONSTRUCT-ONLY (`T_MASTER_INDEX_DAILY`/`T_BENCHMARK_DAILY`). Cho 2 đường còn lại chart FR-03 (index PR + benchmark PR). DRAFT payload.
+> **Index/benchmark (EVENT RIÊNG):** **`SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date,@p_mode`** — **1 result set DUY NHẤT** gộp master index DM + benchmark vào CÙNG schema JSON, phân biệt `index_type` (`MASTER_INDEX`|`BENCHMARK`): `{index_type, code, business_date, mode, index_value, daily_return?}`. 1 dòng/series (benchmark DEDUP theo code — phát 1 lần/code, không lặp theo master). **Tách khỏi master snapshot vì benchmark dùng chung nhiều master → nhét chung sẽ DUP.** RECONSTRUCT-ONLY (`T_MASTER_INDEX_DAILY`/`T_BENCHMARK_DAILY`). benchmark không có `daily_return` trong DB → field NULL (FOR JSON bỏ). Cho 2 đường index/benchmark chart FR-03. DRAFT payload.
 
 ---
 
