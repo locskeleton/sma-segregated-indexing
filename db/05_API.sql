@@ -7,8 +7,10 @@ GO
   Định danh public:
     - KH:  C_CUST_CODE VARCHAR(10) — CHỈ FR-01 (list các sub-account của 1 KH).
     - SUB-ACCOUNT: C_SI_ACCOUNT VARCHAR(20) (mã sub-account, customer-level, = đơn vị API).
-      UNIQUE toàn cục ⇒ các proc per-si (FR-02..06) CHỈ nhận @p_si_account (KHÔNG cần cust);
-      master + cust suy từ sub-account (T_SI_PORTFOLIO). Ownership/auth do tầng API gác (không qua param).
+      UNIQUE toàn cục ⇒ các proc per-si (FR-02..06) CHỈ nhận @p_si_account (KHÔNG cần cust).
+      master suy từ DỮ LIỆU: FR-02/03/05/06 lấy từ T_SI_NAV_CURRENT (có sau FO ingest) — tiểu khoản
+      chưa có data ⇒ not-found (không thuộc đường serve). FR-01 (list) + FR-04 (info) đọc T_SI_PORTFOLIO
+      (endpoint registry: join_date/sub_account_no/initial_amount/sip...). Ownership/auth do tầng API gác.
   Read-only. T0 unit price = 10.000.
 ==============================================================================*/
 
@@ -99,9 +101,14 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- master + check tồn tại theo ĐĂNG KÝ (T_SI_PORTFOLIO): tiểu khoản registered nhưng chưa ingest
-    -- vẫn hợp lệ (RS1 sẽ rỗng). si_account UNIQUE toàn cục ⇒ master suy từ đây.
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
+    -- master + trạng thái current: 1 seek clustered PK T_SI_NAV_CURRENT (có sau FO ingest, đọc luôn cho RS1).
+    -- KHÔNG lấy master từ T_SI_PORTFOLIO — tiểu khoản chưa có dữ liệu (chưa ingest/EOD) không thuộc đường
+    -- serve thật (SMO đọc Asset post-EOD) ⇒ không cần handle case đó, NULL → not-found.
+    DECLARE @master VARCHAR(20),
+            @cur_nav DECIMAL(20,0), @cur_up DECIMAL(18,6), @cur_unit DECIMAL(18,6), @cur_date DATE;
+    SELECT @master   = C_MASTER_CODE, @cur_nav  = C_LAST_NAV, @cur_up = C_LAST_UNIT_PRICE,
+           @cur_unit = C_UNIT,        @cur_date = C_LAST_BUSINESS_DATE
+    FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account;
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -154,17 +161,16 @@ BEGIN
             @base_up               AS C_BASE_UNIT_PRICE,
             @end_nav               AS C_END_NAV,
             @end_up                AS C_END_UNIT_PRICE,
-            nc.C_LAST_NAV          AS C_CURRENT_NAV,
-            nc.C_LAST_UNIT_PRICE   AS C_CURRENT_UNIT_PRICE,
-            nc.C_UNIT              AS C_CURRENT_UNIT,
-            nc.C_LAST_BUSINESS_DATE AS C_CURRENT_DATE,
+            @cur_nav               AS C_CURRENT_NAV,
+            @cur_up                AS C_CURRENT_UNIT_PRICE,
+            @cur_unit              AS C_CURRENT_UNIT,
+            @cur_date              AS C_CURRENT_DATE,
             CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
                  ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
             @cf_net                AS C_CF_NET,
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
-                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT
-    FROM T_SI_NAV_CURRENT nc WHERE nc.C_SI_ACCOUNT=@p_si_account;
+                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
 
     -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu)
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
@@ -194,7 +200,8 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
+    -- master suy từ T_SI_NAV_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
@@ -284,7 +291,8 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account)
+    -- tồn tại theo DỮ LIỆU (T_SI_NAV_CURRENT, có sau ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account)
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- @pd = ngày giá mới nhất TOÀN THỊ TRƯỜNG (mốc định giá "hiện tại"). Lấy MAX trên clustered
@@ -348,7 +356,8 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
+    -- master suy từ T_SI_NAV_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     IF @p_asof IS NULL
