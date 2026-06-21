@@ -256,40 +256,24 @@ BEGIN
     ) m ON m.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- J06 ACCRUE phí phải trả (accrue = TRÍCH TRƯỚC). ĐA-LOẠI, config-driven (T_FEE_CONFIG, loại group PAYABLE có rate):
-    --   payable += AUM_gross × (NGÀY DƯƠNG LỊCH kể từ EOD trước) × Σ(C_RATE/C_DAY_COUNT) các loại phí accrue của master.
+    -- J06 ACCRUE phí phải trả (accrue = TRÍCH TRƯỚC). Config-driven GLOBAL (T_FEE_CONFIG, loại group PAYABLE có rate):
+    --   payable += AUM_gross × (NGÀY DƯƠNG LỊCH kể từ EOD trước) × Σ(C_RATE/C_DAY_COUNT) [rate GLOBAL, áp mọi master].
     --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền. C_PAYABLE_FEE = TỔNG accrued mọi loại (chưa cắt).
-    --   THÊM loại phí accrue mới (TAX, PERF_FEE) = INSERT 1 dòng T_FEE_CONFIG (group PAYABLE + rate) → tự vào payable,
-    --     NAV tự đúng, KHÔNG sửa SP. Net-off do SP_INGEST_FEE_CHARGE khi BO cắt (mọi loại group PAYABLE).
+    --   THÊM loại phí accrue mới (TAX, PERF_FEE) = INSERT 1 dòng T_FEE_CONFIG (group PAYABLE + rate) → tự vào payable.
+    --   Breakdown per-type cho sao kê (Option B, 2026-06-21): 1 loại accrue ⇒ pending = chính C_PAYABLE_FEE (FR-06 RS5);
+    --     >1 loại → cần nâng cấp cột JSON per-type ghi tại đây (J06). KHÔNG log dày, KHÔNG reconstruct/xẻ tổng.
     --   IDEMPOTENT: chỉ accrue khi CHƯA compute @p_d (C_LAST_BUSINESS_DATE < @p_d) → re-run không cộng đôi.
-    UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
-        + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
-          * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
-          * r.RATE_PER_DAY
-    FROM T_EOD_WORK w
-    INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
-    INNER JOIN (SELECT C_MASTER_CODE, SUM(C_RATE / C_DAY_COUNT) AS RATE_PER_DAY   -- Σ rate/ngày các loại PAYABLE accrue của master
-                FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0 GROUP BY C_MASTER_CODE) r
-           ON r.C_MASTER_CODE = w.C_MASTER_CODE
-    WHERE w.C_BUSINESS_DATE=@p_d
-      AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
-
-    -- J06b LOG ACCRUE per-type (cho sao kê kê từng khoản): lượng accrue TỪNG loại trong ngày @p_d.
-    --   Σ các dòng này = phần += vào C_PAYABLE_FEE ở trên. INSERT-ONLY idempotent (WHERE NOT EXISTS) —
-    --   KHÔNG xoá dòng ledger (an toàn). Re-run sau roll-forward (s.last=@p_d) → điều kiện accrue false → no-op.
-    --   Crash giữa chừng (s.last<@p_d, đã ghi 1 phần) → chỉ bù dòng còn THIẾU (amount deterministic → khớp).
-    INSERT INTO T_SI_FEE_ACCRUAL (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_TYPE,C_ACCRUAL_AMOUNT)
-    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, cfg.C_FEE_TYPE,
-           (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
-           * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
-           * (cfg.C_RATE / cfg.C_DAY_COUNT)
-    FROM T_EOD_WORK w
-    INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
-    INNER JOIN T_FEE_CONFIG cfg ON cfg.C_MASTER_CODE = w.C_MASTER_CODE AND cfg.C_FEE_GROUP='PAYABLE' AND cfg.C_RATE > 0
-    WHERE w.C_BUSINESS_DATE=@p_d
-      AND NOT EXISTS (SELECT 1 FROM T_SI_FEE_ACCRUAL fa
-                      WHERE fa.C_SI_ACCOUNT=w.C_SI_ACCOUNT AND fa.C_FEE_TYPE=cfg.C_FEE_TYPE AND fa.C_BUSINESS_DATE=@p_d)
-      AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
+    DECLARE @rate_per_day DECIMAL(18,12) = (SELECT SUM(C_RATE / C_DAY_COUNT)
+                                            FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
+    IF @rate_per_day > 0
+        UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
+            + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
+              * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
+              * @rate_per_day
+        FROM T_EOD_WORK w
+        INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
+        WHERE w.C_BUSINESS_DATE=@p_d
+          AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
 
     -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
     UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH - C_PAYABLE_FEE

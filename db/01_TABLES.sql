@@ -25,27 +25,27 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     C_MASTER_NAME        NVARCHAR(200)   NULL,
     C_STATUS         VARCHAR(10)     NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_STATUS DEFAULT 'ACTIVE', -- ACTIVE|CLOSED
     C_INCEPTION_DATE DATE            NULL,
-    -- (phí QL KHÔNG còn cột rate ở đây: chính sách phí cấu hình ở T_FEE_CONFIG theo (master,fee_type).)
+    -- (phí QL KHÔNG còn cột rate ở đây: chính sách phí cấu hình ở T_FEE_CONFIG global theo fee_type.)
     C_BENCHMARK_CODE VARCHAR(20)     NULL,   -- benchmark đối chiếu (vd 'VNINDEX','VN30') → T_BENCHMARK_DAILY
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)
 );
 
--- CATALOG CHÍNH SÁCH PHÍ/THUẾ hệ thống per (master × loại phí) — KHÔNG chỉ cho phí lũy kế.
---   Khai mọi loại phí/thu nhập của master với NHÓM hạch toán + (nếu accrue) rate. Sau này dùng làm nguồn
---   quản lý/cài đặt chính sách phí, thuế cho hệ thống. Thêm loại mới = INSERT 1 dòng, KHÔNG sửa schema/SP.
+-- CATALOG CHÍNH SÁCH PHÍ/THUẾ hệ thống — GLOBAL theo loại phí (1 dòng/loại, áp cho MỌI master).
+--   (Cấu hình per-master sẽ xử lý sau khi cần — hiện global cho đơn giản.) Thêm loại mới = INSERT 1 dòng.
 --   ⚠️ C_FEE_TYPE + C_FEE_GROUP DÙNG CHUNG VOCABULARY với T_SI_INCOME_FEE (mã phí + nhóm phải KHỚP giữa 2 bảng).
 --   ACCRUE (J06): CHỈ loại C_FEE_GROUP='PAYABLE' AND C_RATE>0 → payable += AUM_gross × Σ(C_RATE/C_DAY_COUNT) × ngày.
 --   Loại không rate (custody/thuế GD point-event, hoặc INCOME như cổ tức) → C_RATE NULL ⇒ KHÔNG accrue.
+--   ⚠️ OPTION B (2026-06-21): payable lưu 1 TỔNG GỘP C_PAYABLE_FEE. Hợp lệ khi CHỈ 1 loại accrue (hiện MGMT_FEE);
+--      breakdown sao kê = chính tổng đó. >1 loại → guard @nAccrue>1 (FR-06/snapshot) chặn; nâng cấp = cột JSON per-type.
 CREATE TABLE T_FEE_CONFIG (
-    PK_FEE_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_CONFIG_PKID DEFAULT NEWID(),
-    C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE|TAX|PERF_FEE|CUSTODY_FEE|DIVIDEND|... (KHỚP T_SI_INCOME_FEE)
+    PK_FEE_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_CONFIG_PKID DEFAULT NEWID(),
     C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE (KHỚP C_FEE_GROUP của T_SI_INCOME_FEE)
     C_RATE           DECIMAL(10,6)   NULL,       -- %/NĂM (vd 0.01=1%/năm) cho loại ACCRUE; NULL ⇒ không accrue (point-event/income)
     C_DAY_COUNT      SMALLINT        NOT NULL CONSTRAINT DF_FEE_CONFIG_DAYCOUNT DEFAULT 365,  -- mẫu số quy đổi ngày (accrue)
     C_UPDATED_BY     VARCHAR(64)     NULL,
     C_UPDATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_FEE_CONFIG_TIME DEFAULT GETDATE(),
-    CONSTRAINT PK_FEE_CONFIG PRIMARY KEY CLUSTERED (C_MASTER_CODE, C_FEE_TYPE),
+    CONSTRAINT PK_FEE_CONFIG PRIMARY KEY CLUSTERED (C_FEE_TYPE),
     CONSTRAINT UQ_FEE_CONFIG_GUID UNIQUE (PK_FEE_CONFIG)
 );
 
@@ -74,7 +74,7 @@ CREATE TABLE T_SI_PORTFOLIO (
     C_INITIAL_AMOUNT DECIMAL(20,0)   NULL,    -- TIỀN (VND) cam kết đầu tư ban đầu khi mở tiểu khoản (tham chiếu; dòng tiền thực = T_SI_CASHFLOW_EVENT INITIAL)
     C_SIP_AMOUNT     DECIMAL(20,0)   NULL,    -- TIỀN (VND) nạp định kỳ (SIP) mỗi kỳ theo C_SIP_SCHEDULE
     C_SIP_SCHEDULE   VARCHAR(50)     NULL,
-    -- (KHÔNG có phí cấp tiểu khoản: chính sách phí cấu hình cấp master ở T_FEE_CONFIG theo (master,fee_type).)
+    -- (KHÔNG có phí cấp tiểu khoản: chính sách phí cấu hình ở T_FEE_CONFIG global theo fee_type.)
     C_MIN_INVEST     DECIMAL(20,0)   NULL,    -- TIỀN (VND) tối thiểu phải duy trì
     CONSTRAINT PK_SI_PORTFOLIO PRIMARY KEY CLUSTERED (PK_SI_PORTFOLIO),
     CONSTRAINT UQ_SI_PORTFOLIO_NK UNIQUE (C_SI_ACCOUNT)   -- mã sub-account duy nhất toàn cục
@@ -348,24 +348,12 @@ CREATE INDEX IX_SI_INCOME_FEE_DATE ON T_SI_INCOME_FEE (C_BUSINESS_DATE)
 CREATE UNIQUE INDEX UQ_SI_INCOME_FEE_SRCEVT ON T_SI_INCOME_FEE (C_SOURCE_EVENT_ID)
     WHERE C_SOURCE_EVENT_ID IS NOT NULL;
 
--- LOG ACCRUE PHÍ per (sub-account × loại phí × NGÀY): lượng phí phải trả TRÍCH TRƯỚC trong NGÀY đó cho từng loại.
--- Mục đích: SAO KÊ NAV gửi KH KÊ TỪNG KHOẢN phải trả chính xác @asOf — pending từng loại = Σ accrue(loại,≤asOf)
---   − Σ cắt(loại,≤asOf, T_SI_INCOME_FEE group PAYABLE). Σ mọi loại = C_PAYABLE_FEE (khớp tổng). Ghi ở J06.
--- (C_PAYABLE_FEE tổng vẫn ở T_SI_NAV_CURRENT/NAV_BALANCE cho NAV; bảng này cho BREAKDOWN exact theo loại + ngày.)
-CREATE TABLE T_SI_FEE_ACCRUAL (
-    PK_SI_FEE_ACCRUAL UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_ACCRUAL_PKID DEFAULT NEWID(),
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
-    C_CUST_CODE      VARCHAR(10)     NULL,
-    C_MASTER_CODE    VARCHAR(20)     NULL,
-    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE | TAX | PERF_FEE | ... (group PAYABLE)
-    C_ACCRUAL_AMOUNT DECIMAL(20,6)   NOT NULL,   -- lượng accrue loại này TRONG ngày @business_date
-    CONSTRAINT PK_SI_FEE_ACCRUAL_NK PRIMARY KEY CLUSTERED (C_SI_ACCOUNT, C_FEE_TYPE, C_BUSINESS_DATE),
-    CONSTRAINT UQ_SI_FEE_ACCRUAL_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_ACCRUAL)
-) WITH (DATA_COMPRESSION = PAGE);
--- [sao kê] pending per-type ≤ asOf theo si (Σ accrual; trừ Σ cắt từ ledger).
-CREATE INDEX IX_SI_FEE_ACCRUAL_ACCT ON T_SI_FEE_ACCRUAL (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_FEE_TYPE, C_ACCRUAL_AMOUNT);
+-- (ĐÃ BỎ T_SI_FEE_ACCRUAL — bảng log accrue per-type/ngày bị DENSE như holdings.)
+-- OPTION B (chốt 2026-06-21): payable giữ 1 TỔNG GỘP C_PAYABLE_FEE (NAV_CURRENT/BALANCE). Hiện CHỈ 1 loại phí
+--  accrue (MGMT_FEE) ⇒ breakdown per-type cho sao kê = chính tổng đó: pending(loại) = C_PAYABLE_FEE đã chốt
+--  @ngày, paid = Σ cắt(loại, T_SI_INCOME_FEE PAYABLE), accrued = pending+paid. KHÔNG reconstruct, KHÔNG xẻ-tổng
+--  (Σ round(part) ≠ tổng → lệch đồng-lẻ). FR-06 RS5 + SP_GET_ASSET_SNAPSHOT có guard @nAccrue>1 chặn output sai.
+--  ⚠️ NÂNG CẤP đa-loại: thêm cột JSON per-type trên T_SI_NAV_BALANCE, J06 ghi chính xác từng loại lúc accrue.
 
 /*------------------------------------------------ MASTER-LEVEL DAILY (output) -*/
 CREATE TABLE T_MASTER_INDEX_DAILY (

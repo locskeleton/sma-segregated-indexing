@@ -262,10 +262,10 @@ BEGIN
             ip.C_SIP_AMOUNT,
             ip.C_SIP_SCHEDULE,
             ip.C_MIN_INVEST,
-            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_CONFIG (master, type MGMT_FEE)
+            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_CONFIG (global, type MGMT_FEE)
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    LEFT  JOIN       T_FEE_CONFIG fc ON fc.C_MASTER_CODE = ip.C_MASTER_CODE AND fc.C_FEE_TYPE = 'MGMT_FEE'
+    LEFT  JOIN       T_FEE_CONFIG fc ON fc.C_FEE_TYPE = 'MGMT_FEE'   -- config GLOBAL theo loại phí
     WHERE ip.C_SI_ACCOUNT = @p_si_account;
     END TRY
     BEGIN CATCH
@@ -361,6 +361,12 @@ BEGIN
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
+    -- GUARD Option B: breakdown phí phải trả (RS5) chỉ đúng khi CHỈ 1 loại phí accrue. >1 → cần nâng cấp JSON per-type.
+    DECLARE @nAccrue INT = (SELECT COUNT(*) FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
+    IF @nAccrue > 1 BEGIN SET @p_err_code = 4;
+        SET @p_err_msg = CONCAT(N'Option B chỉ hỗ trợ 1 loại phí accrue; phát hiện ', @nAccrue,
+            N' loại — cần nâng cấp JSON per-type (xem memory mgmt-fee-accrual).'); RAISERROR(@p_err_msg, 16, 1); END
+
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
 
@@ -433,19 +439,23 @@ BEGIN
     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='PAYABLE'
     ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
-    -- RS5: KÊ TỪNG KHOẢN PHẢI TRẢ accrued chưa cắt @asOf (cho sao kê NAV). Per loại ACCRUE:
-    --   pending = Σ accrue(loại,≤asOf, T_SI_FEE_ACCRUAL) − Σ cắt(loại,≤asOf, T_SI_INCOME_FEE). Σ pending = C_FEE_ACCRUED_TOTAL.
-    SELECT a.C_FEE_TYPE,
-           CAST(a.C_ACCRUED AS DECIMAL(20,4))                     AS C_FEE_ACCRUED,
-           CAST(ISNULL(c.C_PAID,0) AS DECIMAL(20,4))              AS C_FEE_PAID,
-           CAST(a.C_ACCRUED - ISNULL(c.C_PAID,0) AS DECIMAL(20,4)) AS C_FEE_PENDING
-    FROM (SELECT C_FEE_TYPE, SUM(C_ACCRUAL_AMOUNT) AS C_ACCRUED
-          FROM T_SI_FEE_ACCRUAL WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
-          GROUP BY C_FEE_TYPE) a
-    LEFT JOIN (SELECT C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS C_PAID  -- CAST tránh SUM→(38,0) cắt scale khi trừ (bẫy DECIMAL-38)
+    -- RS5: KÊ TỪNG KHOẢN PHẢI TRẢ accrued chưa cắt @asOf.
+    --   OPTION B (chốt 2026-06-21): hiện CHỈ 1 loại phí accrue (MGMT_FEE) → pending = ĐÚNG C_PAYABLE_FEE đã
+    --   chốt @asOf (T_SI_NAV_BALANCE) — khớp TUYỆT ĐỐI NAV, KHÔNG reconstruct/không lệch làm tròn. paid = Σ cắt
+    --   loại đó (T_SI_INCOME_FEE group PAYABLE); accrued = pending + paid (khôi phục gross). Σ pending = C_FEE_ACCRUED_TOTAL.
+    --   ⚠️ NÂNG CẤP khi >1 loại accrue: lưu JSON per-type trên T_SI_NAV_BALANCE (ghi lúc J06 accrue) — KHÔNG xẻ từ
+    --      tổng gộp (Σ round(part) ≠ tổng). Guard @nAccrue (đầu proc) chặn output sai-âm-thầm cho tới khi nâng cấp.
+    SELECT cfg.C_FEE_TYPE,
+           CAST(ISNULL(nd.C_PAYABLE_FEE,0) + ISNULL(c.C_PAID,0) AS DECIMAL(20,4)) AS C_FEE_ACCRUED,   -- gross = pending + paid
+           CAST(ISNULL(c.C_PAID,0)                              AS DECIMAL(20,4)) AS C_FEE_PAID,
+           CAST(ISNULL(nd.C_PAYABLE_FEE,0)                      AS DECIMAL(20,4)) AS C_FEE_PENDING     -- = payable đã chốt (exact)
+    FROM T_FEE_CONFIG cfg
+    LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
+    LEFT JOIN (SELECT C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS C_PAID  -- CAST tránh bẫy DECIMAL-38
                FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT=@p_si_account AND C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_asof
-               GROUP BY C_FEE_TYPE) c ON c.C_FEE_TYPE = a.C_FEE_TYPE
-    ORDER BY a.C_FEE_TYPE;
+               GROUP BY C_FEE_TYPE) c ON c.C_FEE_TYPE = cfg.C_FEE_TYPE
+    WHERE cfg.C_FEE_GROUP='PAYABLE' AND cfg.C_RATE > 0
+    ORDER BY cfg.C_FEE_TYPE;
 
     DROP TABLE #hold;
     END TRY
@@ -464,7 +474,7 @@ GO
 
   MODE: 'EOD' (snapshot ngày hôm nay) | 'HISTORY' (đẩy LẠI ngày quá khứ). 2 mode DÙNG CHUNG
     code & payload — chỉ khác @p_business_date. RECONSTRUCT-ONLY từ bảng DATED
-    (T_SI_NAV_BALANCE + T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá + T_SI_FEE_*) ⇒ EOD và replay
+    (T_SI_NAV_BALANCE + T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá + T_SI_INCOME_FEE) ⇒ EOD và replay
     cùng ngày cho RA PAYLOAD Y HỆT. TUYỆT ĐỐI KHÔNG đọc *_CURRENT (đổi mỗi ngày → replay sai).
 
   Driver = các sub-account có dòng NAV_BALANCE @ngày (đã chốt EOD ngày đó).
@@ -488,6 +498,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
         BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu EOD cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); RAISERROR(@p_err_msg, 16, 1); END
 
+    -- GUARD Option B: payable_breakdown chỉ đúng khi CHỈ 1 loại phí accrue. >1 → cần nâng cấp JSON per-type.
+    DECLARE @nAccrue INT = (SELECT COUNT(*) FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
+    IF @nAccrue > 1 BEGIN SET @p_err_code=4;
+        SET @p_err_msg = CONCAT(N'Option B chỉ hỗ trợ 1 loại phí accrue; phát hiện ', @nAccrue,
+            N' loại — cần nâng cấp JSON per-type (xem memory mgmt-fee-accrual).'); RAISERROR(@p_err_msg, 16, 1); END
+
     -- Holdings reconstruct @ngày (per-mã giá mới nhất ≤ ngày — resilient halt, giống FR-05/06)
     SELECT b.C_SI_ACCOUNT, h.C_TICKER, h.C_QUANTITY,
            px.C_CLOSE_PRICE AS C_PRICE,
@@ -501,20 +517,22 @@ BEGIN
                  ORDER BY C_BUSINESS_DATE DESC) px;
     CREATE CLUSTERED INDEX IX_hold ON #hold (C_SI_ACCOUNT);
 
-    -- BREAKDOWN phí phải trả per-type @ngày (cho sao kê kê từng khoản): accrued − đã cắt = pending.
-    -- RECONSTRUCT-ONLY từ bảng DATED (T_SI_FEE_ACCRUAL + T_SI_INCOME_FEE ≤ ngày) → replay y hệt. Driver = loại
-    -- ACCRUE (custody point-event không accrue → không vào breakdown). Σ pending = payable_fee (tổng).
-    SELECT a.C_SI_ACCOUNT, a.C_FEE_TYPE, a.accrued,
-           ISNULL(c.paid,0) AS paid, a.accrued - ISNULL(c.paid,0) AS pending
+    -- BREAKDOWN phí phải trả per-type @ngày (cho sao kê kê từng khoản): pending + đã cắt = accrued gross.
+    -- OPTION B (chốt 2026-06-21): 1 loại phí accrue (MGMT_FEE) → pending = ĐÚNG C_PAYABLE_FEE đã chốt @ngày
+    --   (T_SI_NAV_BALANCE, DATED → replay y hệt) — khớp tuyệt đối payable_fee tổng, KHÔNG reconstruct/lệch làm tròn.
+    --   cắt = T_SI_INCOME_FEE group PAYABLE per loại. Driver = loại PAYABLE có rate (custody/income KHÔNG vào). Σ pending = payable_fee.
+    --   ⚠️ NÂNG CẤP khi >1 loại accrue: lưu JSON per-type trên T_SI_NAV_BALANCE lúc J06 — guard @nAccrue (đầu proc) chặn sai.
+    SELECT nb.C_SI_ACCOUNT, cfg.C_FEE_TYPE,
+           CAST(nb.C_PAYABLE_FEE + ISNULL(c.paid,0) AS DECIMAL(20,6)) AS accrued,   -- gross = pending + paid
+           CAST(ISNULL(c.paid,0)                    AS DECIMAL(20,6)) AS paid,
+           CAST(nb.C_PAYABLE_FEE                    AS DECIMAL(20,6)) AS pending     -- = payable đã chốt (exact)
     INTO #feebreak
-    FROM (SELECT C_SI_ACCOUNT, C_FEE_TYPE, SUM(C_ACCRUAL_AMOUNT) AS accrued
-          FROM T_SI_FEE_ACCRUAL
-          WHERE C_BUSINESS_DATE <= @p_business_date
-            AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
-          GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) a
+    FROM (SELECT C_SI_ACCOUNT, C_PAYABLE_FEE FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date) nb
+    CROSS JOIN T_FEE_CONFIG cfg
     LEFT JOIN (SELECT C_SI_ACCOUNT, C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS paid  -- CAST tránh bẫy DECIMAL-38
                FROM T_SI_INCOME_FEE WHERE C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_business_date
-               GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) c ON c.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND c.C_FEE_TYPE=a.C_FEE_TYPE;
+               GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) c ON c.C_SI_ACCOUNT=nb.C_SI_ACCOUNT AND c.C_FEE_TYPE=cfg.C_FEE_TYPE
+    WHERE cfg.C_FEE_GROUP='PAYABLE' AND cfg.C_RATE > 0;
     CREATE CLUSTERED INDEX IX_fb ON #feebreak (C_SI_ACCOUNT);
 
     -- 1 dòng payload JSON / sub-account
