@@ -84,11 +84,11 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
 | Phí quản lý | Management fee | `C_RATE` (type MGMT_FEE) | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. Rate khai trong `T_FEE_CONFIG` (type MGMT_FEE, group PAYABLE). | spec §9 (J06) |
-| Catalog chính sách phí/thuế | Fee/tax policy catalog | `T_FEE_CONFIG` | **Catalog chính sách phí/thuế chung** cấp master (PK (C_MASTER_CODE, C_FEE_TYPE)): cột `C_FEE_TYPE` + `C_FEE_GROUP`[INCOME\|PAYABLE] (DÙNG CHUNG vocabulary, khớp `T_SI_FEE_LEDGER`), `C_RATE` NULL-able (NULL = không accrue), `C_DAY_COUNT`. J06 chỉ accrue dòng group=PAYABLE & rate>0. Thêm chính sách phí mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
+| Catalog chính sách phí/thuế | Fee/tax policy catalog | `T_FEE_CONFIG` | **Catalog chính sách phí/thuế chung** cấp master (PK (C_MASTER_CODE, C_FEE_TYPE)): cột `C_FEE_TYPE` + `C_FEE_GROUP`[INCOME\|PAYABLE] (DÙNG CHUNG vocabulary, khớp `T_SI_INCOME_FEE`), `C_RATE` NULL-able (NULL = không accrue), `C_DAY_COUNT`. J06 chỉ accrue dòng group=PAYABLE & rate>0. Thêm chính sách phí mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
 | Loại phí | Fee type | `C_FEE_TYPE` | MGMT_FEE \| TAX \| PERF_FEE \| … — phân loại phí accrue (config) + dòng cắt trong ledger. | spec §8 |
 | Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền), ĐA-LOẠI theo config. | spec §9 (J06) |
-| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_LEDGER` (group PAYABLE) | BO cắt tiền phí 1 cục/tháng (mang `fee_type`) → báo về → SDI trừ vào khoản phải trả (trừ tổng mọi loại). | spec §9 ; eod (B) |
-| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_LEDGER` group PAYABLE). Point-event, KHÔNG accrue config. | spec §3 ; eod (B) |
+| Cắt phí (net-off) | Fee charge / net-off | `T_SI_INCOME_FEE` (group PAYABLE) | BO cắt tiền phí 1 cục/tháng (mang `fee_type`) → báo về → SDI trừ vào khoản phải trả (trừ tổng mọi loại). | spec §9 ; eod (B) |
+| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_INCOME_FEE` group PAYABLE). Point-event, KHÔNG accrue config. | spec §3 ; eod (B) |
 | Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. | spec §3 ; eod (B) |
 
 ---

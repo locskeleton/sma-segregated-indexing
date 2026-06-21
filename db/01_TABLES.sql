@@ -33,14 +33,14 @@ CREATE TABLE T_MASTER_PORTFOLIO (
 -- CATALOG CHÍNH SÁCH PHÍ/THUẾ hệ thống per (master × loại phí) — KHÔNG chỉ cho phí lũy kế.
 --   Khai mọi loại phí/thu nhập của master với NHÓM hạch toán + (nếu accrue) rate. Sau này dùng làm nguồn
 --   quản lý/cài đặt chính sách phí, thuế cho hệ thống. Thêm loại mới = INSERT 1 dòng, KHÔNG sửa schema/SP.
---   ⚠️ C_FEE_TYPE + C_FEE_GROUP DÙNG CHUNG VOCABULARY với T_SI_FEE_LEDGER (mã phí + nhóm phải KHỚP giữa 2 bảng).
+--   ⚠️ C_FEE_TYPE + C_FEE_GROUP DÙNG CHUNG VOCABULARY với T_SI_INCOME_FEE (mã phí + nhóm phải KHỚP giữa 2 bảng).
 --   ACCRUE (J06): CHỈ loại C_FEE_GROUP='PAYABLE' AND C_RATE>0 → payable += AUM_gross × Σ(C_RATE/C_DAY_COUNT) × ngày.
 --   Loại không rate (custody/thuế GD point-event, hoặc INCOME như cổ tức) → C_RATE NULL ⇒ KHÔNG accrue.
 CREATE TABLE T_FEE_CONFIG (
     PK_FEE_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_CONFIG_PKID DEFAULT NEWID(),
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE|TAX|PERF_FEE|CUSTODY_FEE|DIVIDEND|... (KHỚP T_SI_FEE_LEDGER)
-    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE (KHỚP C_FEE_GROUP của T_SI_FEE_LEDGER)
+    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE|TAX|PERF_FEE|CUSTODY_FEE|DIVIDEND|... (KHỚP T_SI_INCOME_FEE)
+    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE (KHỚP C_FEE_GROUP của T_SI_INCOME_FEE)
     C_RATE           DECIMAL(10,6)   NULL,       -- %/NĂM (vd 0.01=1%/năm) cho loại ACCRUE; NULL ⇒ không accrue (point-event/income)
     C_DAY_COUNT      SMALLINT        NOT NULL CONSTRAINT DF_FEE_CONFIG_DAYCOUNT DEFAULT 365,  -- mẫu số quy đổi ngày (accrue)
     C_UPDATED_BY     VARCHAR(64)     NULL,
@@ -321,9 +321,9 @@ CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_NAV_BALANCE (C_SI_ACCOUNT, C_BUSINES
 --   C_FEE_GROUP = nhóm hạch toán: 'INCOME' (cộng tài sản) | 'PAYABLE' (phí/phải trả). SUM theo group → tổng nhóm.
 --   C_FEE_TYPE  = khoản cụ thể: DIVIDEND (INCOME); CUSTODY_FEE, MGMT_FEE (PAYABLE); mở rộng thêm KHÔNG cần đẻ bảng.
 -- ⚠️ Accrual phí QL hằng ngày KHÔNG ở đây (vẫn T_SI_NAV_CURRENT.C_PAYABLE_FEE — J06); ledger chỉ event ĐÃ phát sinh.
-CREATE TABLE T_SI_FEE_LEDGER (
-    C_FEE_LEDGER_ID  BIGINT IDENTITY(1,1) NOT NULL,
-    PK_SI_FEE_LEDGER UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_PKID DEFAULT NEWID(),
+CREATE TABLE T_SI_INCOME_FEE (
+    C_INCOME_FEE_ID  BIGINT IDENTITY(1,1) NOT NULL,
+    PK_SI_INCOME_FEE UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_INCOME_FEE_PKID DEFAULT NEWID(),
     C_BUSINESS_DATE  DATE            NOT NULL,   -- ngày phát sinh (cổ tức/phí lưu ký) HOẶC ngày BO cắt (phí QL)
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NULL,       -- denormalized (derive lúc ingest)
@@ -332,25 +332,25 @@ CREATE TABLE T_SI_FEE_LEDGER (
     C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- DIVIDEND | CUSTODY_FEE | MGMT_FEE | (mở rộng)
     C_AMOUNT         DECIMAL(20,0)   NOT NULL,   -- TIỀN (VND) > 0; ý nghĩa ±tài sản theo group (INCOME cộng, PAYABLE trừ)
     C_TICKER         VARCHAR(20)     NULL,       -- cổ tức per-mã (DIVIDEND); NULL cho phí
-    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_SRC DEFAULT 'FO',  -- FO | BO
+    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_SI_INCOME_FEE_SRC DEFAULT 'FO',  -- FO | BO
     C_SOURCE_EVENT_ID VARCHAR(64)    NULL,       -- khóa idempotency (chống Kafka redelivery nhân đôi)
-    C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_CREATED DEFAULT GETDATE(),
-    CONSTRAINT PK_SI_FEE_LEDGER_ID PRIMARY KEY CLUSTERED (C_FEE_LEDGER_ID),
-    CONSTRAINT UQ_SI_FEE_LEDGER_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_LEDGER)
+    C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_SI_INCOME_FEE_CREATED DEFAULT GETDATE(),
+    CONSTRAINT PK_SI_INCOME_FEE_ID PRIMARY KEY CLUSTERED (C_INCOME_FEE_ID),
+    CONSTRAINT UQ_SI_INCOME_FEE_PKID UNIQUE NONCLUSTERED (PK_SI_INCOME_FEE)
 );
 -- [FR-06] lũy kế/chi tiết theo SUB-ACCOUNT ≤ asOf — by si (INCLUDE group/type/ticker để filter+sum).
-CREATE INDEX IX_SI_FEE_LEDGER_ACCT ON T_SI_FEE_LEDGER (C_SI_ACCOUNT, C_BUSINESS_DATE)
+CREATE INDEX IX_SI_INCOME_FEE_ACCT ON T_SI_INCOME_FEE (C_SI_ACCOUNT, C_BUSINESS_DATE)
     INCLUDE (C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT, C_TICKER, C_SOURCE);
 -- EOD/agg theo ngày
-CREATE INDEX IX_SI_FEE_LEDGER_DATE ON T_SI_FEE_LEDGER (C_BUSINESS_DATE)
+CREATE INDEX IX_SI_INCOME_FEE_DATE ON T_SI_INCOME_FEE (C_BUSINESS_DATE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT);
 -- idempotency: source_event_id duy nhất (filtered — FO có thể NULL, BO luôn có)
-CREATE UNIQUE INDEX UQ_SI_FEE_LEDGER_SRCEVT ON T_SI_FEE_LEDGER (C_SOURCE_EVENT_ID)
+CREATE UNIQUE INDEX UQ_SI_INCOME_FEE_SRCEVT ON T_SI_INCOME_FEE (C_SOURCE_EVENT_ID)
     WHERE C_SOURCE_EVENT_ID IS NOT NULL;
 
 -- LOG ACCRUE PHÍ per (sub-account × loại phí × NGÀY): lượng phí phải trả TRÍCH TRƯỚC trong NGÀY đó cho từng loại.
 -- Mục đích: SAO KÊ NAV gửi KH KÊ TỪNG KHOẢN phải trả chính xác @asOf — pending từng loại = Σ accrue(loại,≤asOf)
---   − Σ cắt(loại,≤asOf, T_SI_FEE_LEDGER group PAYABLE). Σ mọi loại = C_PAYABLE_FEE (khớp tổng). Ghi ở J06.
+--   − Σ cắt(loại,≤asOf, T_SI_INCOME_FEE group PAYABLE). Σ mọi loại = C_PAYABLE_FEE (khớp tổng). Ghi ở J06.
 -- (C_PAYABLE_FEE tổng vẫn ở T_SI_NAV_CURRENT/NAV_BALANCE cho NAV; bảng này cho BREAKDOWN exact theo loại + ngày.)
 CREATE TABLE T_SI_FEE_ACCRUAL (
     PK_SI_FEE_ACCRUAL UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_ACCRUAL_PKID DEFAULT NEWID(),
@@ -403,7 +403,7 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ TIỀN bán chờ về
     C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ TIỀN cổ tức chờ về
     C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,                                   -- Σ giá trị cổ phiếu (MTM)
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_FEE_LEDGER on-demand (không lưu rollup master).
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_INCOME_FEE on-demand (không lưu rollup master).
     C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
     C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_TOTAL_ASSET − C_PAYABLE_FEE (NAV net phí)
     C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master

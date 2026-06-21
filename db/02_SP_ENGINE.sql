@@ -130,7 +130,7 @@ BEGIN
             VALUES (n.C_SI_ACCOUNT,@cust,n.C_MASTER_CODE,0,n.C_CASH,n.C_PENDING_CASH,n.C_DIV_CASH,0,0,NULL,'ACTIVE',@d);
 
         /* CỔ TỨC/PHÍ: append, dedup theo C_SOURCE_EVENT_ID (idempotent redelivery) */
-        INSERT INTO T_SI_FEE_LEDGER (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_GROUP,C_FEE_TYPE,C_TICKER,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
+        INSERT INTO T_SI_INCOME_FEE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_GROUP,C_FEE_TYPE,C_TICKER,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
         SELECT @d, f.C_SI_ACCOUNT, @cust, s.C_MASTER_CODE,
                CASE WHEN f.C_TYPE='DIVIDEND' THEN 'INCOME' ELSE 'PAYABLE' END,   -- DIVIDEND=thu nhập; CUSTODY_FEE=phí
                f.C_TYPE, f.C_TICKER, f.C_AMOUNT, 'FO', f.event_id
@@ -141,7 +141,7 @@ BEGIN
             WHERE x.C_TYPE IS NOT NULL
         ) f
         INNER JOIN @sub s ON s.C_SI_ACCOUNT=f.C_SI_ACCOUNT
-        WHERE f.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM T_SI_FEE_LEDGER e WHERE e.C_SOURCE_EVENT_ID=f.event_id);
+        WHERE f.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM T_SI_INCOME_FEE e WHERE e.C_SOURCE_EVENT_ID=f.event_id);
 
         COMMIT;
     END TRY
@@ -157,7 +157,7 @@ GO
 
 -- PHÍ QL (J06, BO-driven, CỐ ĐỊNH — không toggle):
 --   SDI accrue payable trong SP_EOD_COMPUTE theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate>0).
---   BO cắt phí 1 cục/tháng → event Kafka → SP_INGEST_FEE_CHARGE net-off payable (log T_SI_FEE_LEDGER type MGMT_FEE).
+--   BO cắt phí 1 cục/tháng → event Kafka → SP_INGEST_FEE_CHARGE net-off payable (log T_SI_INCOME_FEE type MGMT_FEE).
 --   SDI KHÔNG sinh lịch/ra lệnh. NAV = total_asset − payable. Thuế GD: LUÔN FO net vào cash.
 GO
 
@@ -341,7 +341,7 @@ GO
 
 /*===========================================================================
   PHÍ QUẢN LÝ — INGEST event BO cắt phí (BO-driven). BO cắt 1 cục → báo Kafka →
-  SP_INGEST_FEE_CHARGE: log T_SI_FEE_LEDGER (group PAYABLE, type theo charge) + net-off payable (payable −= amount).
+  SP_INGEST_FEE_CHARGE: log T_SI_INCOME_FEE (group PAYABLE, type theo charge) + net-off payable (payable −= amount).
   BO cắt loại phí nào thì charge mang fee_type đó (default MGMT_FEE). SDI KHÔNG sinh lịch/ra lệnh.
   Idempotent qua source_event_id. Ngoài batch EOD.
   JSON: {"charge_date":"YYYY-MM-DD", "charges":[
@@ -368,10 +368,10 @@ BEGIN
             C_SOURCE_EVENT_ID VARCHAR(64) '$.source_event_id') j;
 
         -- dedup: bỏ event đã nhận (Kafka redelivery → no-op)
-        DELETE c FROM @chg c WHERE EXISTS (SELECT 1 FROM T_SI_FEE_LEDGER e WHERE e.C_SOURCE_EVENT_ID=c.C_SOURCE_EVENT_ID);
+        DELETE c FROM @chg c WHERE EXISTS (SELECT 1 FROM T_SI_INCOME_FEE e WHERE e.C_SOURCE_EVENT_ID=c.C_SOURCE_EVENT_ID);
 
         -- log vào ledger: phí = group PAYABLE, type theo charge (MGMT_FEE/TAX/...), source BO (derive cust/master từ registry)
-        INSERT INTO T_SI_FEE_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_FEE_GROUP,C_FEE_TYPE,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
+        INSERT INTO T_SI_INCOME_FEE (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_FEE_GROUP,C_FEE_TYPE,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
         SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, 'PAYABLE', c.C_FEE_TYPE, c.C_AMOUNT, 'BO', c.C_SOURCE_EVENT_ID
         FROM @chg c LEFT JOIN T_SI_PORTFOLIO ip ON ip.C_SI_ACCOUNT=c.C_SI_ACCOUNT;
 

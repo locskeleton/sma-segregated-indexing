@@ -15,7 +15,7 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 | 🔴 **GROW không chặn (dense/ngày)** | `T_SI_NAV_BALANCE` | +1 dòng/tiểu khoản/EOD (history NAV/unit) | **ngày × KH** ← driver chính (cho FR-03) |
 | 🟠 **GROW theo CHURN (interval, full history)** | `T_SI_HOLDING_HIST`, `T_SI_CASH_HIST` | base H₀/S₀ + **1 dòng mỗi lần đổi** (DIFF tại ingest) | **số lần thay đổi** (rebalance/nạp-rút), KHÔNG theo ngày |
 | 🟠 (nhỏ, không chặn) | `T_MASTER_NAV_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_HOLDING_BALANCE` | +master(×mã)/EOD | ngày × master |
-| 🟠 (sparse) | `T_SI_CASHFLOW_EVENT`, `T_SI_FEE_LEDGER`, `T_SI_UNIT_LEDGER` | theo sự kiện | tần suất nạp/rút/cổ tức |
+| 🟠 (sparse) | `T_SI_CASHFLOW_EVENT`, `T_SI_INCOME_FEE`, `T_SI_UNIT_LEDGER` | theo sự kiện | tần suất nạp/rút/cổ tức |
 | 🟢 **FIXED (overwrite)** | `T_SI_PORTFOLIO_HOLDING` (current, đích FO ingest) | overwrite/ingest | chỉ theo KH |
 | 🟢 | `T_SI_NAV_CURRENT`, `T_MASTER_NAV_CURRENT` | overwrite/config | chỉ theo KH |
 | ⚪ transient | `T_EOD_WORK` | xoá/ghi mỗi run | 1 ngày |

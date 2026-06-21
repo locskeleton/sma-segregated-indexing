@@ -410,7 +410,7 @@ BEGIN
                 SUM(CASE WHEN C_FEE_TYPE  = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
                 SUM(CASE WHEN C_FEE_TYPE  = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE,
                 SUM(CASE WHEN C_FEE_TYPE  = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_MGMT_FEE_PAID  -- phí QL BO đã cắt thực
-        FROM T_SI_FEE_LEDGER
+        FROM T_SI_INCOME_FEE
         WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
     ) fi;
 
@@ -423,18 +423,18 @@ BEGIN
 
     -- RS3: chi tiết THU NHẬP ≤ asOf — group INCOME (DIVIDEND + loại thu nhập thêm sau). GROUP-based → KHÔNG sót loại mới.
     SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
-    FROM T_SI_FEE_LEDGER
+    FROM T_SI_INCOME_FEE
     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='INCOME'
     ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
     -- RS4: chi tiết PHÍ PHẢI TRẢ ≤ asOf — group PAYABLE (CUSTODY_FEE + MGMT_FEE + loại phí thêm sau). GROUP-based.
     SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_AMOUNT, C_SOURCE, C_SOURCE_EVENT_ID
-    FROM T_SI_FEE_LEDGER
+    FROM T_SI_INCOME_FEE
     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='PAYABLE'
     ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
     -- RS5: KÊ TỪNG KHOẢN PHẢI TRẢ accrued chưa cắt @asOf (cho sao kê NAV). Per loại ACCRUE:
-    --   pending = Σ accrue(loại,≤asOf, T_SI_FEE_ACCRUAL) − Σ cắt(loại,≤asOf, T_SI_FEE_LEDGER). Σ pending = C_FEE_ACCRUED_TOTAL.
+    --   pending = Σ accrue(loại,≤asOf, T_SI_FEE_ACCRUAL) − Σ cắt(loại,≤asOf, T_SI_INCOME_FEE). Σ pending = C_FEE_ACCRUED_TOTAL.
     SELECT a.C_FEE_TYPE,
            CAST(a.C_ACCRUED AS DECIMAL(20,4))                     AS C_FEE_ACCRUED,
            CAST(ISNULL(c.C_PAID,0) AS DECIMAL(20,4))              AS C_FEE_PAID,
@@ -443,7 +443,7 @@ BEGIN
           FROM T_SI_FEE_ACCRUAL WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
           GROUP BY C_FEE_TYPE) a
     LEFT JOIN (SELECT C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS C_PAID  -- CAST tránh SUM→(38,0) cắt scale khi trừ (bẫy DECIMAL-38)
-               FROM T_SI_FEE_LEDGER WHERE C_SI_ACCOUNT=@p_si_account AND C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_asof
+               FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT=@p_si_account AND C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_asof
                GROUP BY C_FEE_TYPE) c ON c.C_FEE_TYPE = a.C_FEE_TYPE
     ORDER BY a.C_FEE_TYPE;
 
@@ -502,7 +502,7 @@ BEGIN
     CREATE CLUSTERED INDEX IX_hold ON #hold (C_SI_ACCOUNT);
 
     -- BREAKDOWN phí phải trả per-type @ngày (cho sao kê kê từng khoản): accrued − đã cắt = pending.
-    -- RECONSTRUCT-ONLY từ bảng DATED (T_SI_FEE_ACCRUAL + T_SI_FEE_LEDGER ≤ ngày) → replay y hệt. Driver = loại
+    -- RECONSTRUCT-ONLY từ bảng DATED (T_SI_FEE_ACCRUAL + T_SI_INCOME_FEE ≤ ngày) → replay y hệt. Driver = loại
     -- ACCRUE (custody point-event không accrue → không vào breakdown). Σ pending = payable_fee (tổng).
     SELECT a.C_SI_ACCOUNT, a.C_FEE_TYPE, a.accrued,
            ISNULL(c.paid,0) AS paid, a.accrued - ISNULL(c.paid,0) AS pending
@@ -513,7 +513,7 @@ BEGIN
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
           GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) a
     LEFT JOIN (SELECT C_SI_ACCOUNT, C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS paid  -- CAST tránh bẫy DECIMAL-38
-               FROM T_SI_FEE_LEDGER WHERE C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_business_date
+               FROM T_SI_INCOME_FEE WHERE C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_business_date
                GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) c ON c.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND c.C_FEE_TYPE=a.C_FEE_TYPE;
     CREATE CLUSTERED INDEX IX_fb ON #feebreak (C_SI_ACCOUNT);
 
@@ -553,7 +553,7 @@ BEGIN
     OUTER APPLY (SELECT SUM(CASE WHEN C_FEE_TYPE='DIVIDEND'    THEN C_AMOUNT END) AS div,
                         SUM(CASE WHEN C_FEE_TYPE='CUSTODY_FEE' THEN C_AMOUNT END) AS cust,
                         SUM(CASE WHEN C_FEE_TYPE='MGMT_FEE'    THEN C_AMOUNT END) AS paid
-                 FROM T_SI_FEE_LEDGER WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_BUSINESS_DATE<=@p_business_date) fi
+                 FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_BUSINESS_DATE<=@p_business_date) fi
     WHERE b.C_BUSINESS_DATE=@p_business_date
     ORDER BY b.C_SI_ACCOUNT;
 
