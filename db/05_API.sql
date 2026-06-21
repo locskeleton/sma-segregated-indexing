@@ -99,24 +99,32 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
+    -- ĐỊNH DANH + trạng thái hiện tại: 1 seek clustered PK (C_SI_ACCOUNT) — đọc luôn cho RS1.
+    -- master suy từ T_SI_NAV_CURRENT (có ngay sau FO ingest, KHÔNG cần lịch sử EOD) ⇒ bỏ seek T_SI_PORTFOLIO.
+    DECLARE @master VARCHAR(20),
+            @cur_nav DECIMAL(20,0), @cur_up DECIMAL(18,6), @cur_unit DECIMAL(18,6), @cur_date DATE;
+    SELECT @master   = C_MASTER_CODE, @cur_nav  = C_LAST_NAV, @cur_up = C_LAST_UNIT_PRICE,
+           @cur_unit = C_UNIT,        @cur_date = C_LAST_BUSINESS_DATE
+    FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account;
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
             @end_nav  DECIMAL(20,0), @end_up  DECIMAL(18,6);
 
-    SELECT @end = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
-    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE
-     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff;
-    IF @base IS NULL
-        SELECT @base = MIN(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+    -- mốc CUỐI kỳ + giá trị: 1 read (TOP 1 đuôi index IX_SI_NAV_BALANCE_ACCT (si,date) DESC) gộp date+nav+up.
+    SELECT TOP 1 @end = C_BUSINESS_DATE, @end_nav = C_NAV, @end_up = C_UNIT_PRICE
+    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE DESC;
 
-    SELECT @base_nav = C_NAV, @base_up = C_UNIT_PRICE FROM T_SI_NAV_BALANCE
-     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE = @base;
-    SELECT @end_nav = C_NAV, @end_up = C_UNIT_PRICE FROM T_SI_NAV_BALANCE
-     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE = @end;
+    SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
+
+    -- mốc ĐẦU kỳ + giá trị: 1 read (mốc ≤ cutoff gần nhất); fallback = mốc sớm nhất nếu range trùm cả lịch sử.
+    SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_NAV, @base_up = C_UNIT_PRICE
+    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff
+    ORDER BY C_BUSINESS_DATE DESC;
+    IF @base IS NULL
+        SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_NAV, @base_up = C_UNIT_PRICE
+        FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE ASC;
 
     -- MWR Modified Dietz: cần lịch phiên cho trọng số w_i. Lấy từ T_MASTER_INDEX_DAILY (1 dòng/master/phiên)
     -- thay vì T_PRICE_DAILY (date×TẤT CẢ mã) — cùng tập ngày GD nhưng ~250 dòng thay vì hàng triệu.
@@ -150,17 +158,16 @@ BEGIN
             @base_up               AS C_BASE_UNIT_PRICE,
             @end_nav               AS C_END_NAV,
             @end_up                AS C_END_UNIT_PRICE,
-            nc.C_LAST_NAV          AS C_CURRENT_NAV,
-            nc.C_LAST_UNIT_PRICE   AS C_CURRENT_UNIT_PRICE,
-            nc.C_UNIT              AS C_CURRENT_UNIT,
-            nc.C_LAST_BUSINESS_DATE AS C_CURRENT_DATE,
+            @cur_nav               AS C_CURRENT_NAV,
+            @cur_up                AS C_CURRENT_UNIT_PRICE,
+            @cur_unit              AS C_CURRENT_UNIT,
+            @cur_date              AS C_CURRENT_DATE,
             CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
                  ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
             @cf_net                AS C_CF_NET,
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
-                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT
-    FROM T_SI_NAV_CURRENT nc WHERE nc.C_SI_ACCOUNT=@p_si_account;
+                 ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
 
     -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu)
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
