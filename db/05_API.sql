@@ -420,17 +420,17 @@ BEGIN
     FROM #hold
     ORDER BY C_MARKET_VALUE DESC;
 
-    -- RS3: chi tiết cổ tức/phí lưu ký ≤ asOf (FO đẩy: DIVIDEND, CUSTODY_FEE)
+    -- RS3: chi tiết THU NHẬP ≤ asOf — group INCOME (DIVIDEND + loại thu nhập thêm sau). GROUP-based → KHÔNG sót loại mới.
     SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
     FROM T_SI_FEE_LEDGER
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_TYPE IN ('DIVIDEND','CUSTODY_FEE')
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='INCOME'
     ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
-    -- RS4: chi tiết phí QL BO đã cắt ≤ asOf — ngày cắt, kỳ, số tiền
-    SELECT C_BUSINESS_DATE AS C_CHARGE_DATE, C_PERIOD, C_AMOUNT, C_SOURCE_EVENT_ID
+    -- RS4: chi tiết PHÍ PHẢI TRẢ ≤ asOf — group PAYABLE (CUSTODY_FEE + MGMT_FEE + loại phí thêm sau). GROUP-based.
+    SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_PERIOD, C_AMOUNT, C_SOURCE, C_SOURCE_EVENT_ID
     FROM T_SI_FEE_LEDGER
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_TYPE='MGMT_FEE'
-    ORDER BY C_BUSINESS_DATE DESC;
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='PAYABLE'
+    ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
     DROP TABLE #hold;
     END TRY
