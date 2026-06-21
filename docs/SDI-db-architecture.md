@@ -52,7 +52,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `T_PRICE_DAILY` | giá EOD | ~4M | rowstore, index (C_BUSINESS_DATE, C_TICKER) — nhỏ, cache RAM |
 | `T_SI_FEE_LEDGER` | sổ cái phí/thu nhập per-tiểu-khoản (sparse, idempotent): cổ tức + phí lưu ký (FO) + phí ACCRUE BO cắt (BO); group INCOME/PAYABLE, type DIVIDEND/CUSTODY_FEE/MGMT_FEE/TAX/PERF_FEE… | ~triệu/năm | **CCI**, partition năm — nguồn FR-06; J11 Σ lên `T_MASTER_NAV_BALANCE` |
 | `T_SI_FEE_ACCRUAL` | LOG lượng phí ACCRUE per (sub-account × loại phí × NGÀY) — breakdown cho FR-06 RS5 (kê từng khoản phải trả: pending=accrued−paid). Ghi J06b. | ~triệu/năm | **rowstore/CCI**, partition năm — nguồn FR-06 RS5 |
-| `T_FEE_ACCRUAL_CONFIG` | cấu hình loại phí ACCRUE + rate cấp master (PK (C_MASTER_CODE, C_FEE_TYPE); C_RATE, C_DAY_COUNT) — đọc bởi J06 accrue đa-loại | ~vài/master | rowstore (nhỏ, cache RAM) |
+| `T_FEE_CONFIG` | CATALOG chính sách phí/thuế chung cấp master (PK (C_MASTER_CODE, C_FEE_TYPE); C_FEE_GROUP[INCOME\|PAYABLE], C_RATE NULL-able, C_DAY_COUNT) — type+group khớp `T_SI_FEE_LEDGER`; J06 chỉ accrue dòng group=PAYABLE & rate>0 | ~vài/master | rowstore (nhỏ, cache RAM) |
 
 **Quyết định customer daily perf (đổi do FO-sync):** vì FO đồng bộ **snapshot overwrite** → holdings KHÔNG còn event-source → **KHÔNG derive được NAV/unit_price quá khứ** → **BẮT BUỘC materialize** `T_SI_NAV_BALANCE` (nav/unit/unit_price/day) để vẽ chart FR-03. Giảm tải: lấy **điểm thưa (tuần/tháng)** hoặc chỉ lưu `unit_price`. Lưu CCI + partition (§7.3).
 
@@ -135,8 +135,8 @@ J07_COMPUTE   (câu nặng nhất) MTM TOÀN BỘ + NAV + PnL + Unit, roll-forwa
       NAV = total_asset − payable   (FO net thuế GD; tiền bán chờ về vào tài sản → NAV liên tục khi bán CK)
       PnL ngày = NAV_today − NAV_prev + ra − vào   (phí KHÔNG tính vào ra/vào)
       UNIT: vị thế có CF_t → ΔUnit = CF/unit_price_prev; unit_price = NAV/unit → INSERT T_SI_UNIT_LEDGER (ΔUnit≠0)
-      [J06 phí ACCRUE đa-loại] accrue payable += AUM×(ngày DƯƠNG LỊCH)×Σ(C_RATE/C_DAY_COUNT) mọi loại phí khai
-        trong T_FEE_ACCRUAL_CONFIG của master (config-driven; không config→0). C_PAYABLE_FEE = tổng mọi loại.
+      [J06 phí ACCRUE đa-loại] accrue payable += AUM×(ngày DƯƠNG LỊCH)×Σ(C_RATE/C_DAY_COUNT) mọi dòng PAYABLE rate>0 khai
+        trong T_FEE_CONFIG của master (WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0; INCOME/NULL-rate không accrue). C_PAYABLE_FEE = tổng mọi loại.
         BO cắt phí 1 cục/tháng → event Kafka SP_INGEST_FEE_CHARGE (mang fee_type) → net-off payable (log T_SI_FEE_LEDGER group PAYABLE, type theo fee_type).
         SDI KHÔNG sinh lịch; thêm loại phí accrue = INSERT 1 dòng config. Thuế GD luôn FO net.
 J11_SI_AGG    Σ per master → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất + **[PM] cash_in/cash_out Σ
@@ -256,7 +256,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | Bảng | Clustered PK | GUID public | UNIQUE natural `_NK` |
 |---|---|---|---|
 | T_MASTER_PORTFOLIO | C_MASTER_CODE (natural) | — | — |
-| T_FEE_ACCRUAL_CONFIG | PK_… (GUID) | (clustered) | (C_MASTER_CODE,C_FEE_TYPE) |
+| T_FEE_CONFIG | (C_MASTER_CODE,C_FEE_TYPE) natural | PK_FEE_CONFIG (nc) | (clustered PK) |
 | **T_SI_NAV_BALANCE** ~2,5 tỷ | C_NAV_BALANCE_ID (BIGINT) | PK_… (nc) | (C_BUSINESS_DATE,C_SI_ACCOUNT) |
 | **T_SI_HOLDING_HIST** ~20M | C_HOLDING_HIST_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_TICKER,C_VALID_FROM) +filtered open IX |
 | **T_SI_CASH_HIST** | C_CASH_HIST_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_VALID_FROM) +filtered open IX |

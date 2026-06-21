@@ -262,10 +262,10 @@ BEGIN
             ip.C_SIP_AMOUNT,
             ip.C_SIP_SCHEDULE,
             ip.C_MIN_INVEST,
-            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_ACCRUAL_CONFIG (master, type MGMT_FEE)
+            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_CONFIG (master, type MGMT_FEE)
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    LEFT  JOIN       T_FEE_ACCRUAL_CONFIG fc ON fc.C_MASTER_CODE = ip.C_MASTER_CODE AND fc.C_FEE_TYPE = 'MGMT_FEE'
+    LEFT  JOIN       T_FEE_CONFIG fc ON fc.C_MASTER_CODE = ip.C_MASTER_CODE AND fc.C_FEE_TYPE = 'MGMT_FEE'
     WHERE ip.C_SI_ACCOUNT = @p_si_account;
     END TRY
     BEGIN CATCH

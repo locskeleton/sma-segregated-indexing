@@ -13,11 +13,11 @@ Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống c�
 | **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ thuế GD vào cash). **Nguồn sự thật: holdings + tiền (3 khoản) + cổ tức/phí lưu ký + cashflow.** |
 | **BO** (Back Office) | **Cắt phí** của KH (phí QL/thuế/perf…, 1 cục/tháng) → báo event Kafka cho SDI `{si_account, amount, charge_date, fee_type?}`. SDI net-off vào payable. |
 | **Market data** | Cấp giá EOD, corporate action, chỉ số benchmark (VN-Index…). (Nguồn riêng, không phải FO.) |
-| **SDI** | Nhận holdings + tiền (FO) + event cắt phí (BO) → tính NAV (= tổng tài sản − payable), Unit/Unit Price, PnL, TWR, MWR, Master Index; **accrue payable đa-loại hằng ngày (theo `T_FEE_ACCRUAL_CONFIG`) + net-off khi BO cắt**. → đẩy kết quả sang Asset. |
+| **SDI** | Nhận holdings + tiền (FO) + event cắt phí (BO) → tính NAV (= tổng tài sản − payable), Unit/Unit Price, PnL, TWR, MWR, Master Index; **accrue payable đa-loại hằng ngày (theo `T_FEE_CONFIG`, dòng group=PAYABLE & rate>0) + net-off khi BO cắt**. → đẩy kết quả sang Asset. |
 | **Asset** | Nhận current snapshot + chuỗi master từ SDI; phục vụ **SMO** đọc/hiển thị (read-only, không tính). |
 | **SMO** | Tầng hiển thị, đọc qua Asset. |
 
-**Nguyên tắc nền:** FO đồng bộ **snapshot overwrite** mỗi EOD (không event-source từng lệnh). `NAV = stock_value + FO cash − payable`; FO cash **đã NET** phí GD + thuế GD + SIP → SDI tuyệt đối không trừ lại các khoản đó (tránh double-count). Phí ACCRUE (QL/thuế/perf…) SDI quản riêng qua payable (config `T_FEE_ACCRUAL_CONFIG`), BO cắt → net-off.
+**Nguyên tắc nền:** FO đồng bộ **snapshot overwrite** mỗi EOD (không event-source từng lệnh). `NAV = stock_value + FO cash − payable`; FO cash **đã NET** phí GD + thuế GD + SIP → SDI tuyệt đối không trừ lại các khoản đó (tránh double-count). Phí ACCRUE (QL/thuế/perf…) SDI quản riêng qua payable (catalog `T_FEE_CONFIG`, type+group khớp `T_SI_FEE_LEDGER`), BO cắt → net-off.
 
 ---
 
@@ -157,7 +157,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 1. **Snapshot overwrite, idempotent:** FO nạp toàn bộ holdings THẲNG vào current + cash mỗi EOD; chạy lại 1 ngày cho cùng kết quả (overwrite, không cộng dồn).
 8. **Holdings/cash history tách rời (interval):** DIFF **tại INGEST (per-event Kafka)** current → `T_SI_HOLDING_HIST` & `T_SI_CASH_HIST` (SCD-2 valid_from/valid_to, **full history BẮT BUỘC, no-dup**) — EOD core chỉ đọc current, KHÔNG chạy DIFF.
-2. **FO cash là nguồn tiền duy nhất, đã NET** phí GD + thuế GD + SIP → SDI không re-apply (phí ACCRUE QL/thuế/perf SDI quản riêng qua payable theo `T_FEE_ACCRUAL_CONFIG`).
+2. **FO cash là nguồn tiền duy nhất, đã NET** phí GD + thuế GD + SIP → SDI không re-apply (phí ACCRUE QL/thuế/perf SDI quản riêng qua payable theo `T_FEE_CONFIG`).
 3. **Biến động holdings/ngày** SDI suy ra on-demand (qty(D)−qty(D-1)), KHÔNG cần FO gửi delta.
 4. **Cổ tức/phí & cashflow là sự kiện sparse** — FO chỉ gửi khi phát sinh; capture đúng ngày + số tiền khớp thời điểm FO ghi vào cash.
 5. **J13 RECONCILE là cổng:** Σ holdings/NAV SDI vs FO, Σ customer NAV vs master NAV, Σ unit — lệch > ngưỡng ⇒ **chặn J14 snapshot**.

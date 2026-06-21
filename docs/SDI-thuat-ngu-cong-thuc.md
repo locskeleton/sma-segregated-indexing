@@ -83,8 +83,8 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
-| Phí quản lý | Management fee | `C_RATE` (type MGMT_FEE) | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. Rate khai trong `T_FEE_ACCRUAL_CONFIG` (type MGMT_FEE). | spec §9 (J06) |
-| Cấu hình phí accrue | Fee accrual config | `T_FEE_ACCRUAL_CONFIG` | Bảng cấu hình **loại phí nào ACCRUE + rate + day_count** cấp master (PK (C_MASTER_CODE, C_FEE_TYPE)). Thêm loại phí accrue mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
+| Phí quản lý | Management fee | `C_RATE` (type MGMT_FEE) | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. Rate khai trong `T_FEE_CONFIG` (type MGMT_FEE, group PAYABLE). | spec §9 (J06) |
+| Catalog chính sách phí/thuế | Fee/tax policy catalog | `T_FEE_CONFIG` | **Catalog chính sách phí/thuế chung** cấp master (PK (C_MASTER_CODE, C_FEE_TYPE)): cột `C_FEE_TYPE` + `C_FEE_GROUP`[INCOME\|PAYABLE] (DÙNG CHUNG vocabulary, khớp `T_SI_FEE_LEDGER`), `C_RATE` NULL-able (NULL = không accrue), `C_DAY_COUNT`. J06 chỉ accrue dòng group=PAYABLE & rate>0. Thêm chính sách phí mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
 | Loại phí | Fee type | `C_FEE_TYPE` | MGMT_FEE \| TAX \| PERF_FEE \| … — phân loại phí accrue (config) + dòng cắt trong ledger. | spec §8 |
 | Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền), ĐA-LOẠI theo config. | spec §9 (J06) |
 | Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_LEDGER` (group PAYABLE) | BO cắt tiền phí 1 cục/tháng (mang `fee_type`) → báo về → SDI trừ vào khoản phải trả (trừ tổng mọi loại). | spec §9 ; eod (B) |
@@ -228,9 +228,9 @@ AUM growth % = AUM(hiện tại) / AUM(đầu kỳ) − 1
 
 ### 7.13 Phí ACCRUE đa-loại — accrue & net-off (BO-driven, config-driven)
 ```
-Accrue (EOD J06, mỗi ngày) — đọc T_FEE_ACCRUAL_CONFIG (các loại phí accrue của master):
+Accrue (EOD J06, mỗi ngày) — đọc T_FEE_CONFIG (WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0):
    Phí phải trả += AUM gộp × (số NGÀY DƯƠNG LỊCH kể từ lần tính trước) × Σ_loại (C_RATE / C_DAY_COUNT)
-   (mỗi loại phí có rate + day_count riêng [default 365]; không khai config → loại đó không accrue)
+   (mỗi loại phí có rate + day_count riêng [default 365]; không khai config / rate NULL / group INCOME → loại đó không accrue)
 Net-off (khi BO cắt, ngoài EOD):
    Phí phải trả −= số tiền BO báo đã cắt        (trừ TỔNG mọi loại; thiếu/đủ cứ trừ; phần dư treo tiếp)
 NAV ròng = Tổng tài sản − Phí phải trả          (Phí phải trả = tổng accrued mọi loại)

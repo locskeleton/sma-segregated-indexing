@@ -25,25 +25,28 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     C_MASTER_NAME        NVARCHAR(200)   NULL,
     C_STATUS         VARCHAR(10)     NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_STATUS DEFAULT 'ACTIVE', -- ACTIVE|CLOSED
     C_INCEPTION_DATE DATE            NULL,
-    -- (phí QL KHÔNG còn cột rate ở đây: mọi loại phí ACCRUE cấu hình ở T_FEE_ACCRUAL_CONFIG theo (master,fee_type).)
+    -- (phí QL KHÔNG còn cột rate ở đây: chính sách phí cấu hình ở T_FEE_CONFIG theo (master,fee_type).)
     C_BENCHMARK_CODE VARCHAR(20)     NULL,   -- benchmark đối chiếu (vd 'VNINDEX','VN30') → T_BENCHMARK_DAILY
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)
 );
 
--- CẤU HÌNH PHÍ ACCRUE per (master × loại phí). Loại phí nào có vòng đời "accrue hằng ngày → BO cắt sau"
--- (MGMT_FEE, và mở rộng: TAX, PERF_FEE...) khai 1 dòng ở đây. EOD J06 accrue payable cho TỪNG loại:
---   payable += AUM_gross × Σ(C_RATE/C_DAY_COUNT) × DATEDIFF(ngày). Thêm loại mới = INSERT 1 dòng, KHÔNG sửa schema/SP.
--- Phí point-event (trừ thẳng cash: custody, thuế GD) KHÔNG khai ở đây — không accrue.
-CREATE TABLE T_FEE_ACCRUAL_CONFIG (
-    PK_FEE_ACCRUAL_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_ACCRUAL_CONFIG_PKID DEFAULT NEWID(),
+-- CATALOG CHÍNH SÁCH PHÍ/THUẾ hệ thống per (master × loại phí) — KHÔNG chỉ cho phí lũy kế.
+--   Khai mọi loại phí/thu nhập của master với NHÓM hạch toán + (nếu accrue) rate. Sau này dùng làm nguồn
+--   quản lý/cài đặt chính sách phí, thuế cho hệ thống. Thêm loại mới = INSERT 1 dòng, KHÔNG sửa schema/SP.
+--   ⚠️ C_FEE_TYPE + C_FEE_GROUP DÙNG CHUNG VOCABULARY với T_SI_FEE_LEDGER (mã phí + nhóm phải KHỚP giữa 2 bảng).
+--   ACCRUE (J06): CHỈ loại C_FEE_GROUP='PAYABLE' AND C_RATE>0 → payable += AUM_gross × Σ(C_RATE/C_DAY_COUNT) × ngày.
+--   Loại không rate (custody/thuế GD point-event, hoặc INCOME như cổ tức) → C_RATE NULL ⇒ KHÔNG accrue.
+CREATE TABLE T_FEE_CONFIG (
+    PK_FEE_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_CONFIG_PKID DEFAULT NEWID(),
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE | TAX | PERF_FEE | ... (group hạch toán = PAYABLE)
-    C_RATE           DECIMAL(10,6)   NOT NULL,   -- %/NĂM (vd 0.01 = 1%/năm); 0 ⇒ không accrue
-    C_DAY_COUNT      SMALLINT        NOT NULL CONSTRAINT DF_FEE_ACCRUAL_DAYCOUNT DEFAULT 365,  -- mẫu số quy đổi ngày
+    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE|TAX|PERF_FEE|CUSTODY_FEE|DIVIDEND|... (KHỚP T_SI_FEE_LEDGER)
+    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE (KHỚP C_FEE_GROUP của T_SI_FEE_LEDGER)
+    C_RATE           DECIMAL(10,6)   NULL,       -- %/NĂM (vd 0.01=1%/năm) cho loại ACCRUE; NULL ⇒ không accrue (point-event/income)
+    C_DAY_COUNT      SMALLINT        NOT NULL CONSTRAINT DF_FEE_CONFIG_DAYCOUNT DEFAULT 365,  -- mẫu số quy đổi ngày (accrue)
     C_UPDATED_BY     VARCHAR(64)     NULL,
-    C_UPDATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_FEE_ACCRUAL_CONFIG_TIME DEFAULT GETDATE(),
-    CONSTRAINT PK_FEE_ACCRUAL_CONFIG PRIMARY KEY CLUSTERED (C_MASTER_CODE, C_FEE_TYPE),
-    CONSTRAINT UQ_FEE_ACCRUAL_CONFIG_GUID UNIQUE (PK_FEE_ACCRUAL_CONFIG)
+    C_UPDATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_FEE_CONFIG_TIME DEFAULT GETDATE(),
+    CONSTRAINT PK_FEE_CONFIG PRIMARY KEY CLUSTERED (C_MASTER_CODE, C_FEE_TYPE),
+    CONSTRAINT UQ_FEE_CONFIG_GUID UNIQUE (PK_FEE_CONFIG)
 );
 
 -- Danh mục mẫu (FO tính & feed). Σ C_TARGET_WEIGHT theo (C_MASTER_CODE, C_EFFECTIVE_DATE) = 1.0
@@ -71,7 +74,7 @@ CREATE TABLE T_SI_PORTFOLIO (
     C_INITIAL_AMOUNT DECIMAL(20,0)   NULL,    -- TIỀN (VND) cam kết đầu tư ban đầu khi mở tiểu khoản (tham chiếu; dòng tiền thực = T_SI_CASHFLOW_EVENT INITIAL)
     C_SIP_AMOUNT     DECIMAL(20,0)   NULL,    -- TIỀN (VND) nạp định kỳ (SIP) mỗi kỳ theo C_SIP_SCHEDULE
     C_SIP_SCHEDULE   VARCHAR(50)     NULL,
-    -- (KHÔNG có phí cấp tiểu khoản: phí accrue cấu hình cấp master ở T_FEE_ACCRUAL_CONFIG theo (master,fee_type).)
+    -- (KHÔNG có phí cấp tiểu khoản: chính sách phí cấu hình cấp master ở T_FEE_CONFIG theo (master,fee_type).)
     C_MIN_INVEST     DECIMAL(20,0)   NULL,    -- TIỀN (VND) tối thiểu phải duy trì
     CONSTRAINT PK_SI_PORTFOLIO PRIMARY KEY CLUSTERED (PK_SI_PORTFOLIO),
     CONSTRAINT UQ_SI_PORTFOLIO_NK UNIQUE (C_SI_ACCOUNT)   -- mã sub-account duy nhất toàn cục
