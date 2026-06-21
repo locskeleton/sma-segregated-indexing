@@ -33,7 +33,7 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). | spec §3 |
 | Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. | spec §3 ; eod (J07) |
 | Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). | spec §3 ; pm §2 |
-| Phí phải trả | Payable (accrued) fee | `C_PAYABLE_FEE` | Phí quản lý đã tính dồn nhưng **chưa thu** (khoản phải trả). | spec §3 ; §9 (J06) |
+| Phí phải trả | Payable (accrued) fee | `C_PAYABLE_FEE` | **TỔNG** phí đã tính dồn (accrue) nhưng **chưa thu** của MỌI loại phí accrue (QL/thuế/perf…). | spec §3 ; §9 (J06) |
 | NAV ròng | Net Asset Value (net) | `C_NAV` | `= Tổng tài sản − Phí phải trả`. Giá trị thực thuộc về nhà đầu tư. | spec §3 |
 | NAV gộp | Gross NAV | — | `= Tổng tài sản = NAV ròng + Phí phải trả`. | spec §3 |
 | Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. | spec §8 |
@@ -83,10 +83,12 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
-| Phí quản lý | Management fee | `C_MGMT_FEE_RATE` | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. | spec §9 (J06) |
-| Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền). | spec §9 (J06) |
-| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_LEDGER` (type MGMT_FEE) | BO cắt tiền phí 1 cục/tháng → báo về → SDI trừ vào khoản phải trả (log group PAYABLE). | spec §9 ; eod (B) |
-| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_LEDGER` group PAYABLE). | spec §3 ; eod (B) |
+| Phí quản lý | Management fee | `C_RATE` (type MGMT_FEE) | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. Rate khai trong `T_FEE_ACCRUAL_CONFIG` (type MGMT_FEE). | spec §9 (J06) |
+| Cấu hình phí accrue | Fee accrual config | `T_FEE_ACCRUAL_CONFIG` | Bảng cấu hình **loại phí nào ACCRUE + rate + day_count** cấp master (PK (C_MASTER_CODE, C_FEE_TYPE)). Thêm loại phí accrue mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
+| Loại phí | Fee type | `C_FEE_TYPE` | MGMT_FEE \| TAX \| PERF_FEE \| … — phân loại phí accrue (config) + dòng cắt trong ledger. | spec §8 |
+| Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền), ĐA-LOẠI theo config. | spec §9 (J06) |
+| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_LEDGER` (group PAYABLE) | BO cắt tiền phí 1 cục/tháng (mang `fee_type`) → báo về → SDI trừ vào khoản phải trả (trừ tổng mọi loại). | spec §9 ; eod (B) |
+| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_LEDGER` group PAYABLE). Point-event, KHÔNG accrue config. | spec §3 ; eod (B) |
 | Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. | spec §3 ; eod (B) |
 
 ---
@@ -224,17 +226,18 @@ Net flow = Net in − Net out
 AUM growth % = AUM(hiện tại) / AUM(đầu kỳ) − 1
 ```
 
-### 7.13 Phí quản lý — accrue & net-off (BO-driven)
+### 7.13 Phí ACCRUE đa-loại — accrue & net-off (BO-driven, config-driven)
 ```
-Accrue (EOD J06, mỗi ngày):
-   Phí phải trả += AUM gộp × (mgmt_fee_rate / 365) × (số NGÀY DƯƠNG LỊCH kể từ lần tính trước)
-   (gated: chỉ tính khi mgmt_fee_rate > 0)
+Accrue (EOD J06, mỗi ngày) — đọc T_FEE_ACCRUAL_CONFIG (các loại phí accrue của master):
+   Phí phải trả += AUM gộp × (số NGÀY DƯƠNG LỊCH kể từ lần tính trước) × Σ_loại (C_RATE / C_DAY_COUNT)
+   (mỗi loại phí có rate + day_count riêng [default 365]; không khai config → loại đó không accrue)
 Net-off (khi BO cắt, ngoài EOD):
-   Phí phải trả −= số tiền BO báo đã cắt        (thiếu/đủ cứ trừ; phần dư treo tiếp)
-NAV ròng = Tổng tài sản − Phí phải trả
+   Phí phải trả −= số tiền BO báo đã cắt        (trừ TỔNG mọi loại; thiếu/đủ cứ trừ; phần dư treo tiếp)
+NAV ròng = Tổng tài sản − Phí phải trả          (Phí phải trả = tổng accrued mọi loại)
 ```
-**Ví dụ:** AUM 1.000tr, rate 1%/năm, 31 ngày dương lịch →
-`accrue = 1.000.000.000 × 0,01/365 × 31 = 849.315 đ`. BO cắt 800.000 → phải trả còn treo 49.315 đ.
+**Ví dụ (1 loại MGMT_FEE):** AUM 1.000tr, rate 1%/năm (day_count 365), 31 ngày dương lịch →
+`accrue = 1.000.000.000 × 31 × 0,01/365 = 849.315 đ`. BO cắt 800.000 → phải trả còn treo 49.315 đ.
+**Đa-loại:** thêm TAX 0,1%/năm → `Σ(rate/dc) = (0,01+0,001)/365`; accrue/ngày = AUM × ngày × tổng đó.
 
 ---
 

@@ -226,8 +226,6 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @dayCount SMALLINT = 365;   -- mẫu số rate/ngày (cố định — spec phí QL không còn config)
-
     DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d;
 
     -- seed từ state. Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH (FO sync). KEY = C_SI_ACCOUNT.
@@ -258,22 +256,22 @@ BEGIN
     ) m ON m.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- J06 ACCRUE phí QL (accrue = TRÍCH TRƯỚC; luôn chạy, gated rate>0; net-off do SP_INGEST_FEE_CHARGE khi BO cắt):
-    --   payable += AUM_gross × rate × (NGÀY DƯƠNG LỊCH kể từ EOD trước) / 365.
-    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền.
-    --   RATE: lấy CẤP MASTER (T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE). Phí cấu hình cấp master/global,
-    --     KHÔNG cấp si — cột phí cấp tiểu khoản đã BỎ khỏi T_SI_PORTFOLIO.
+    -- J06 ACCRUE phí phải trả (accrue = TRÍCH TRƯỚC). ĐA-LOẠI, config-driven (T_FEE_ACCRUAL_CONFIG):
+    --   payable += AUM_gross × (NGÀY DƯƠNG LỊCH kể từ EOD trước) × Σ(C_RATE/C_DAY_COUNT) các loại phí accrue của master.
+    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền. C_PAYABLE_FEE = TỔNG accrued mọi loại (chưa cắt).
+    --   THÊM loại phí accrue mới (TAX, PERF_FEE) = INSERT 1 dòng T_FEE_ACCRUAL_CONFIG → tự vào payable, NAV tự đúng,
+    --     KHÔNG sửa SP. Net-off do SP_INGEST_FEE_CHARGE khi BO cắt (mọi loại group PAYABLE).
     --   IDEMPOTENT: chỉ accrue khi CHƯA compute @p_d (C_LAST_BUSINESS_DATE < @p_d) → re-run không cộng đôi.
     UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
         + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
-          * mp.C_MGMT_FEE_RATE
           * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
-          / @dayCount
+          * r.RATE_PER_DAY
     FROM T_EOD_WORK w
-    INNER JOIN T_SI_NAV_CURRENT   s  ON s.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
-    INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = w.C_MASTER_CODE
+    INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
+    INNER JOIN (SELECT C_MASTER_CODE, SUM(C_RATE / C_DAY_COUNT) AS RATE_PER_DAY   -- Σ rate/ngày các loại accrue của master
+                FROM T_FEE_ACCRUAL_CONFIG WHERE C_RATE > 0 GROUP BY C_MASTER_CODE) r
+           ON r.C_MASTER_CODE = w.C_MASTER_CODE
     WHERE w.C_BUSINESS_DATE=@p_d
-      AND mp.C_MGMT_FEE_RATE > 0
       AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
 
     -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
@@ -325,10 +323,11 @@ GO
 
 /*===========================================================================
   PHÍ QUẢN LÝ — INGEST event BO cắt phí (BO-driven). BO cắt 1 cục → báo Kafka →
-  SP_INGEST_FEE_CHARGE: log T_SI_FEE_LEDGER (group PAYABLE / type MGMT_FEE) + net-off payable (payable −= amount).
-  SDI KHÔNG sinh lịch/ra lệnh. Idempotent qua source_event_id. Ngoài batch EOD.
+  SP_INGEST_FEE_CHARGE: log T_SI_FEE_LEDGER (group PAYABLE, type theo charge) + net-off payable (payable −= amount).
+  BO cắt loại phí nào thì charge mang fee_type đó (default MGMT_FEE). SDI KHÔNG sinh lịch/ra lệnh.
+  Idempotent qua source_event_id. Ngoài batch EOD.
   JSON: {"charge_date":"YYYY-MM-DD", "charges":[
-           {"si_account","amount","period"(opt),"source_event_id"}, ...]}
+           {"si_account","amount","fee_type"(opt,default MGMT_FEE),"period"(opt),"source_event_id"}, ...]}
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_FEE_CHARGE @p_json NVARCHAR(MAX)
 AS
@@ -338,23 +337,24 @@ BEGIN
     BEGIN TRY
         BEGIN TRAN;
 
-        DECLARE @chg TABLE (C_SI_ACCOUNT VARCHAR(20), C_AMOUNT DECIMAL(20,0),
+        DECLARE @chg TABLE (C_SI_ACCOUNT VARCHAR(20), C_AMOUNT DECIMAL(20,0), C_FEE_TYPE VARCHAR(20),
                             C_CHARGE_DATE DATE, C_PERIOD CHAR(6), C_SOURCE_EVENT_ID VARCHAR(64) PRIMARY KEY);
-        INSERT INTO @chg (C_SI_ACCOUNT,C_AMOUNT,C_CHARGE_DATE,C_PERIOD,C_SOURCE_EVENT_ID)
-        SELECT j.C_SI_ACCOUNT, j.C_AMOUNT,
+        INSERT INTO @chg (C_SI_ACCOUNT,C_AMOUNT,C_FEE_TYPE,C_CHARGE_DATE,C_PERIOD,C_SOURCE_EVENT_ID)
+        SELECT j.C_SI_ACCOUNT, j.C_AMOUNT, COALESCE(j.C_FEE_TYPE,'MGMT_FEE'),
                COALESCE(TRY_CONVERT(DATE,j.C_CHARGE_DATE), @hdr_date, CAST(GETDATE() AS DATE)),
                j.C_PERIOD, j.C_SOURCE_EVENT_ID
         FROM OPENJSON(@p_json,'$.charges') WITH (
             C_SI_ACCOUNT VARCHAR(20) '$.si_account', C_AMOUNT DECIMAL(20,0) '$.amount',
+            C_FEE_TYPE VARCHAR(20) '$.fee_type',
             C_CHARGE_DATE VARCHAR(10) '$.charge_date', C_PERIOD CHAR(6) '$.period',
             C_SOURCE_EVENT_ID VARCHAR(64) '$.source_event_id') j;
 
         -- dedup: bỏ event đã nhận (Kafka redelivery → no-op)
         DELETE c FROM @chg c WHERE EXISTS (SELECT 1 FROM T_SI_FEE_LEDGER e WHERE e.C_SOURCE_EVENT_ID=c.C_SOURCE_EVENT_ID);
 
-        -- log vào ledger: phí QL = group PAYABLE / type MGMT_FEE, source BO (derive cust/master từ registry)
+        -- log vào ledger: phí = group PAYABLE, type theo charge (MGMT_FEE/TAX/...), source BO (derive cust/master từ registry)
         INSERT INTO T_SI_FEE_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_FEE_GROUP,C_FEE_TYPE,C_PERIOD,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
-        SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, 'PAYABLE', 'MGMT_FEE', c.C_PERIOD, c.C_AMOUNT, 'BO', c.C_SOURCE_EVENT_ID
+        SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, 'PAYABLE', c.C_FEE_TYPE, c.C_PERIOD, c.C_AMOUNT, 'BO', c.C_SOURCE_EVENT_ID
         FROM @chg c LEFT JOIN T_SI_PORTFOLIO ip ON ip.C_SI_ACCOUNT=c.C_SI_ACCOUNT;
 
         -- net-off payable (thiếu đủ cứ trừ; residual treo → carry sang kỳ sau)

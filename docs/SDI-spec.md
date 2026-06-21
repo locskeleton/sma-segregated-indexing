@@ -62,8 +62,8 @@ Tổng vốn đầu tư = Σ NAV vào − Σ NAV ra                      (net ca
 
 - **NAV = Tổng tài sản − phí phải trả** (công thức chuẩn hệ thống). **Tổng tài sản = Chứng khoán + Tiền**; **Tiền = tiền mặt (`C_CASH`) + tiền bán chờ về (`C_PENDING_CASH`) + cổ tức tiền (`C_DIV_CASH`)** — 3 khoản FO đồng bộ EOD. Tiền bán chờ về nằm trong tài sản ⇒ bán CK ngày T (stock giảm, tiền-bán-chờ-về tăng bù) → **NAV liên tục, không hụt giả rồi hồi sau T+2**.
 - **FO là nguồn tiền DUY NHẤT** (cả 3 khoản). SDI mirror số FO đẩy về, không tự cộng/trừ; không suy cash từ Δ holdings.
-- **Phí**: thuế GD do FO net vào cash khi khớp; phí QL SDI quản qua `payable` (§9). **KHÔNG** accrue/trừ lại receivables (chúng đã là tài sản KH).
-- **Thuế GD**: FO trừ vào cash khi khớp lệnh (ngoài SDI, luôn net). **Phí quản lý (BO-driven)**: SDI **accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH** (continuous, NAV drag mượt — không theo phiên GD); **BO cắt phí 1 cục/tháng → báo event Kafka** → SDI **net-off** `payable` (log `T_SI_FEE_LEDGER` group PAYABLE type MGMT_FEE), thiếu đủ cứ trừ (residual carry). **SDI KHÔNG sinh lịch/ra lệnh** (BO sở hữu việc cắt). Accrue gated bởi `mgmt_fee_rate` (=0 → không phí); day_count = 365 cố định. Xem §8/§9.
+- **Phí**: thuế GD do FO net vào cash khi khớp; phí ACCRUE (QL/thuế/perf…) SDI quản qua `payable` (§9). **KHÔNG** accrue/trừ lại receivables (chúng đã là tài sản KH).
+- **Thuế GD**: FO trừ vào cash khi khớp lệnh (ngoài SDI, luôn net). **Phí ACCRUE đa-loại (BO-driven, config-driven)**: SDI **accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH** (continuous, NAV drag mượt — không theo phiên GD) cho MỌI loại phí khai trong `T_FEE_ACCRUAL_CONFIG` của master (mỗi loại có rate + day_count riêng); **BO cắt phí 1 cục/tháng → báo event Kafka** → SDI **net-off** `payable` (log `T_SI_FEE_LEDGER` group PAYABLE, type theo `fee_type` của charge), thiếu đủ cứ trừ (residual carry). **SDI KHÔNG sinh lịch/ra lệnh** (BO sở hữu việc cắt). Loại phí nào accrue = INSERT 1 dòng config (không khai → không accrue). Xem §8/§9.
 - **`CF_t` chỉ lấy từ cashflow event** (nhãn DEPOSIT/SIP/WITHDRAW) — **không** suy từ Δ tổng tiền. Event phải khớp đúng ngày + số tiền với thời điểm FO phản ánh vào cash.
 - Phí phạt rút sớm: do FO trừ vào cash, KHÔNG tính vào cashflow.
 
@@ -88,7 +88,7 @@ Tổng tiền chỉ để tính NAV. Các thành phần tiền lưu **theo loạ
 | **NAV vào** (`cash_in`) | tiền KH bơm vào: nộp lần đầu, nộp thêm, SIP, lãi Infy | external cashflow | ✅ |
 | **NAV ra** (`cash_out`) | tiền KH rút | external cashflow | ✅ |
 | **Income** | cổ tức/lãi do tài sản quỹ sinh ra | PnL (qua NAV) | ❌ |
-| **Chi phí** | phí quản lý, thuế GD, phí phạt rút sớm | FO trừ vào cash (SDI không re-apply) | ❌ |
+| **Chi phí** | phí quản lý/thuế/perf (accrue qua payable), thuế GD, phí phạt rút sớm | accrue→payable (loại khai config) hoặc FO trừ vào cash (SDI không re-apply) | ❌ |
 
 - `net_cashflow (CF_t) = cash_in − cash_out` — **external, per (KH×master) = per tiểu khoản, per ngày**, lấy từ event có nhãn.
 - **Cổ tức tiền mặt**: income — vào NAV qua thành phần Tiền, **accrue tại ngày EX** (ghi phải thu), tự động vào PnL. KHÔNG tag là cash_in.
@@ -199,9 +199,10 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = `DECIMAL(20,0)` (không thập phân); **phí lũy kế theo ngày (payable/accrued, net-off định kỳ) = `DECIMAL(20,6)`** (giữ thập phân, chỉ làm tròn VND khi cắt cash); giá = `DECIMAL(18,4)`; % / return / fee_rate = `DECIMAL(10,6)`; unit & unit_price = `DECIMAL(18,6)`; weight = `DECIMAL(12,8)`. **Hai cấp:** master (`C_MASTER_CODE`, bảng `T_MASTER_*`) / sub-account = tiểu khoản (`C_SI_ACCOUNT`, bảng `T_SI_*`).
 
 ### Master / cấu hình
-- **`T_MASTER_PORTFOLIO`** (**`C_MASTER_CODE` PK** — mã danh mục MASTER, khóa chính + khóa public, KHÔNG surrogate; name, status[ACTIVE|CLOSED], inception_date, mgmt_fee_rate, benchmark_code) — các bảng khác tham chiếu master theo `C_MASTER_CODE`; bảng tổng hợp master-level: `T_MASTER_NAV_BALANCE`/`T_MASTER_HOLDING_BALANCE`/`T_MASTER_INDEX_DAILY`/`T_MASTER_NAV_CURRENT`. **Sub-account** (`T_SI_PORTFOLIO`): `C_SI_ACCOUNT` (mã sub-account, UNIQUE) + `C_MASTER_CODE` + `C_CUST_CODE` + close_date; filtered-unique 1 ACTIVE/(cust,master). Customer-level tables khóa theo `C_SI_ACCOUNT`.
+- **`T_MASTER_PORTFOLIO`** (**`C_MASTER_CODE` PK** — mã danh mục MASTER, khóa chính + khóa public, KHÔNG surrogate; name, status[ACTIVE|CLOSED], inception_date, benchmark_code) — các bảng khác tham chiếu master theo `C_MASTER_CODE`; bảng tổng hợp master-level: `T_MASTER_NAV_BALANCE`/`T_MASTER_HOLDING_BALANCE`/`T_MASTER_INDEX_DAILY`/`T_MASTER_NAV_CURRENT`. **Phí không còn cột ở đây** — cấu hình ở `T_FEE_ACCRUAL_CONFIG`. **Sub-account** (`T_SI_PORTFOLIO`): `C_SI_ACCOUNT` (mã sub-account, UNIQUE) + `C_MASTER_CODE` + `C_CUST_CODE` + close_date; filtered-unique 1 ACTIVE/(cust,master). Customer-level tables khóa theo `C_SI_ACCOUNT`.
+- **`T_FEE_ACCRUAL_CONFIG`** (**PK (`C_MASTER_CODE`, `C_FEE_TYPE`)** + GUID `PK_…`; `C_FEE_TYPE`[MGMT_FEE|TAX|PERF_FEE|…], `C_RATE` (%/năm), `C_DAY_COUNT` (default 365), `C_UPDATED_BY`/`C_UPDATED_TIME`) — **cấu hình loại phí nào ACCRUE + rate, cấp master**. J06 đọc bảng này accrue ĐA-LOẠI. **Thêm loại phí accrue mới = INSERT 1 dòng, KHÔNG sửa schema/SP.** Loại phí trừ thẳng cash (custody/thuế GD) KHÔNG khai ở đây.
 - **`T_MASTER_PORTFOLIO_TICKER`** (`C_MASTER_CODE`, effective_date, ticker; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
-- **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04). **Phí QL KHÔNG cấp si** — cấu hình cấp master (`T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE`).
+- **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04). **Phí KHÔNG cấp si** — cấu hình accrue cấp master (`T_FEE_ACCRUAL_CONFIG`).
 
 ### Market data
 - **`T_PRICE_DAILY`** (ticker, business_date PK; **ref_price** NOT NULL, close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường]) — **gộp corporate action vào bảng giá**: `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia), là mẫu số daily-return J12 → engine self-contained, KHÔNG tra bản ghi ngày trước. `is_ex_rights` = metadata. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
@@ -214,7 +215,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_SI_CASH_HIST`** (`C_SI_ACCOUNT`, valid_from; valid_to, cash) — **HISTORY cash theo INTERVAL** (full, no-dup; đối xứng holding_hist). DIFF state.cash vs dòng open **tại INGEST**.
 - **State per-KH `T_SI_NAV_CURRENT`** (roll-forward) giữ **3 khoản tiền FO đồng bộ**: `C_CASH` (tiền mặt) + `C_PENDING_CASH` (tiền bán chờ về, tổng) + `C_DIV_CASH` (cổ tức tiền) → `Tiền = Σ 3 khoản`; `total_asset = stock + Tiền`; `NAV = total_asset − payable`. (T0/T1/T2 chi tiết: chưa lưu, phát sinh sau bổ sung.)
 - **`T_SI_CASHFLOW_EVENT`** (event_id PK; `C_SI_ACCOUNT`, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow; dùng cho **CF_t** (PnL/unit), KHÔNG cộng lại cash (cash từ FO sync).
-- **`T_SI_FEE_LEDGER`** (fee_ledger_id BIGINT PK; business_date, `C_SI_ACCOUNT`, group[INCOME|PAYABLE], type[DIVIDEND|CUSTODY_FEE|MGMT_FEE], ticker[opt], period[opt], amount, source[FO|BO], source_event_id [dedup], created_time) — **SỔ CÁI phí/thu nhập per-KH (sparse, idempotent)** gộp cổ tức + phí lưu ký + phí QL. DIVIDEND→group INCOME (cộng tài sản); CUSTODY_FEE/MGMT_FEE→group PAYABLE (SUM theo group = tổng nhóm). Dòng tiền/sự kiện ngoài, KHÔNG derive được → capture lúc phát sinh cho **báo cáo tài sản FR-06**. **2 đường ghi**: FO đẩy DIVIDEND/CUSTODY_FEE (source FO, qua `SP_INGEST_CUSTOMER`); **phí QL do BO cắt** → MGMT_FEE (source BO, qua `SP_INGEST_FEE_CHARGE` → `payable −= amount` net-off; thiếu đủ cứ trừ, residual carry; **KHÔNG status lifecycle** — BO sở hữu việc cắt, SDI chỉ net-off). Idempotent qua `source_event_id`. (Accrual phí QL hằng ngày VẪN ở `T_SI_NAV_CURRENT.C_PAYABLE_FEE` — ledger chỉ chứa event ĐÃ phát sinh.)
+- **`T_SI_FEE_LEDGER`** (fee_ledger_id BIGINT PK; business_date, `C_SI_ACCOUNT`, group[INCOME|PAYABLE], type[DIVIDEND|CUSTODY_FEE|MGMT_FEE|TAX|PERF_FEE|…], ticker[opt], period[opt], amount, source[FO|BO], source_event_id [dedup], created_time) — **SỔ CÁI phí/thu nhập per-KH (sparse, idempotent)** gộp cổ tức + phí lưu ký + phí ACCRUE đã cắt. DIVIDEND→group INCOME (cộng tài sản); CUSTODY_FEE + các loại phí cắt (MGMT_FEE/TAX/PERF_FEE…)→group PAYABLE (SUM theo group = tổng nhóm). Dòng tiền/sự kiện ngoài, KHÔNG derive được → capture lúc phát sinh cho **báo cáo tài sản FR-06**. **2 đường ghi**: FO đẩy DIVIDEND/CUSTODY_FEE (source FO, qua `SP_INGEST_CUSTOMER`); **phí ACCRUE do BO cắt** → type theo `fee_type` của charge (default MGMT_FEE; source BO, qua `SP_INGEST_FEE_CHARGE` → `payable −= amount` net-off, trừ tổng mọi loại; thiếu đủ cứ trừ, residual carry; **KHÔNG status lifecycle** — BO sở hữu việc cắt, SDI chỉ net-off). Idempotent qua `source_event_id`. (Accrual phí hằng ngày VẪN ở `T_SI_NAV_CURRENT.C_PAYABLE_FEE` — ledger chỉ chứa event ĐÃ phát sinh.)
 - **`T_SI_UNIT_LEDGER`** (`C_SI_ACCOUNT`, business_date; cf_net, delta_unit, unit) — ghi dòng khi unit thay đổi (cashflow). Unit full precision.
 
 ### Per-KH daily performance (LỊCH SỬ — materialize)
@@ -231,7 +232,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_EOD_RUN`** (business_date, job PK; status[PENDING|RUNNING|DONE|FAILED], rows, started_at, ended_at, message) — theo dõi & resume batch EOD (§9.2).
 - **`T_EOD_PIPELINE`** (business_date PK; mkt_data/fo_ingest [+total/received cust_code]/index/eod/reconcile/asset_sync status + overall) — **control toàn pipeline /ngày**. `SP_EOD_SET_SOURCE_READY`: **MKT_DATA** (BO báo ready → SDI pull API BO 1 lần, KHÔNG Kafka/không đếm → cờ READY); **FO_INGEST** (`@p_total_record`=tổng cust_code break event; SDI đếm received distinct, READY khi received>=total). **Master index TÁCH luồng riêng** `SP_EOD_RUN_INDEX` (BO ready → tính+lưu index, INDEX=DONE, app sync Asset). `SP_EOD_RUN` chỉ chạy khi MKT/FO=READY + INDEX=DONE; reconcile gate; `SP_EOD_SET_ASSET_SYNCED` app báo publish; chỉ COMPLETED khi reconcile PASS + asset DONE. `SP_EOD_RESET` chạy lại.
 - **`T_EOD_RECON_BREAK`** (business_date, check_name, master/si, value_sdi/value_check/diff) — chi tiết dòng lệch đối soát (J13 GHI, không throw); nghiệp vụ tra cứu. Có break ⇒ SP_EOD_RUN chặn publish.
-- *(Đã BỎ `T_SDI_CONFIG`)* — spec phí QL chốt cố định, không còn toggle/knob: accrue luôn (gated `mgmt_fee_rate`), basis = AUM gross, day_count = 365 hardcode.
+- *(Đã BỎ `T_SDI_CONFIG`)* — phí ACCRUE chuyển sang **config-driven đa-loại** ở `T_FEE_ACCRUAL_CONFIG`: loại phí nào accrue + rate + day_count (default 365) khai cấp master; basis = AUM gross. Không còn toggle/knob hardcode.
 
 ### Customer-level: MATERIALIZE (do FO-sync)
 NAV/Unit Price/PnL theo ngày của KH được **lưu vào `T_SI_NAV_BALANCE`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.
@@ -253,7 +254,7 @@ Index: `(C_SI_ACCOUNT, business_date)` cho customer-level; `(C_MASTER_CODE, busi
 ### 9.1 Công thức pipeline (mức tính toán)
 ```
 Tổng tài sản = stock_value + tiền mặt + tiền bán chờ về + cổ tức tiền
-NAV          = Tổng tài sản − phí phải trả   (FO net thuế GD; phí QL qua payable, §6/§9)
+NAV          = Tổng tài sản − phí phải trả   (FO net thuế GD; phí accrue đa-loại qua payable, §6/§9)
 PnL ngày     = NAV cuối − NAV đầu + NAV ra − NAV vào   (phí KHÔNG tính vào NAV ra/vào)
 ΔUnit        = net CF / UnitPrice_(t-1) ; Unit = Unit_(t-1)+ΔUnit (full) ; UnitPrice = NAV/Unit
 Master NAV/Unit  = Σ per master ; Master UnitPrice = Master NAV / Master Unit
@@ -270,8 +271,8 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J0** | `GATE` chờ đủ FO ingest | INGEST | received (watermark=@d) vs expected (tiểu khoản ACTIVE) | chặn EOD nếu thiếu | – | – | ✅ (thiếu→alert) |
 | ~~J1/J1b~~ | ~~`STAGE`/`SYNC_FO`~~ **(CHUYỂN sang INGEST realtime)** | — | FO sync giờ qua Kafka per-KH, không batch STAGE/SYNC | — | – | – | – |
 | **J2** | `VALIDATE` (giá/market) | J0 | giá/CA/model_weight (market feed) | log lỗi | ✅ | – | ✅ (thiếu giá/trùng key/qty âm) |
-| **J6** | `ACCRUE_FEE` *(chạy trong J07)* | J07 | payable state + mgmt_fee_rate | accrue payable += AUM×rate×(ngày dương lịch)/365 (continuous; rate=0→0). Net-off riêng khi nhận **event BO cắt phí** (Kafka → `SP_INGEST_FEE_CHARGE`, ngoài batch) | ✅ | ‖ | – |
-| **INGEST-FEE** | `SP_INGEST_FEE_CHARGE` (Kafka, event BO cắt phí, ngoài batch) | — | event {si_account, amount, charge_date, period?} | `payable −= amount` (net-off) + log `T_SI_FEE_LEDGER` (group PAYABLE, type MGMT_FEE; dedup source_event_id) | ✅ | ‖ | ✅ (dedup) |
+| **J6** | `ACCRUE_FEE` *(chạy trong J07)* | J07 | payable state + `T_FEE_ACCRUAL_CONFIG` (master) | accrue payable += AUM×(ngày dương lịch)×Σ(rate/day_count) mọi loại phí accrue của master (config-driven; không config→0). Net-off riêng khi nhận **event BO cắt phí** (Kafka → `SP_INGEST_FEE_CHARGE`, ngoài batch) | ✅ | ‖ | – |
+| **INGEST-FEE** | `SP_INGEST_FEE_CHARGE` (Kafka, event BO cắt phí, ngoài batch) | — | event {si_account, amount, charge_date, fee_type?, period?} | `payable −= amount` (net-off, trừ tổng mọi loại) + log `T_SI_FEE_LEDGER` (group PAYABLE, type theo fee_type [default MGMT_FEE]; dedup source_event_id) | ✅ | ‖ | ✅ (dedup) |
 | **J7** | `MTM` định giá lại toàn bộ | INGEST | T_SI_PORTFOLIO_HOLDING + giá @d | stock_value per vị thế (#nav_today) | ✅ | ‖ | – |
 | **J8** | `CALC_NAV` | J7 | stock_value, state (tiền mặt + tiền bán chờ về + cổ tức tiền) | total_asset = stock + 3 khoản tiền; NAV = total_asset − payable | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
@@ -297,7 +298,7 @@ J0 GATE → J7 ─ J8 → J9
                                     └─ J12B
                           J8 → J14 ───────┴─ J15 → J16
 ```
-(J6 ACCRUE_FEE: SDI accrue payable theo NGÀY DƯƠNG LỊCH (gated mgmt_fee_rate), NAV = total_asset − payable; **BO cắt phí → event Kafka `SP_INGEST_FEE_CHARGE` → net-off payable** (log `T_SI_FEE_LEDGER` group PAYABLE type MGMT_FEE). SDI KHÔNG sinh lịch/ra lệnh. Không còn toggle — spec cố định.)
+(J6 ACCRUE_FEE: SDI accrue payable theo NGÀY DƯƠNG LỊCH cho MỌI loại phí khai trong `T_FEE_ACCRUAL_CONFIG` (config-driven; `payable += AUM × DATEDIFF × Σ(rate/day_count)`), `C_PAYABLE_FEE` = tổng phí phải trả mọi loại, NAV = total_asset − payable; **BO cắt phí → event Kafka `SP_INGEST_FEE_CHARGE` (mang `fee_type`) → net-off payable** (log `T_SI_FEE_LEDGER` group PAYABLE, type theo fee_type). SDI KHÔNG sinh lịch/ra lệnh. Thêm loại phí accrue = INSERT 1 dòng config.)
 - **INGEST (thay J1/J1b/J14b)**: FO bắn Kafka per-KH (1 event=1 KH) cuối ngày trước EOD → `SP_INGEST_CUSTOMER` xử lý NGAY: cash→state + holdings→current + **interval history** + cổ tức/phí (dedup), set watermark. Idempotent (so-trạng-thái / fee dedup). **Forward-only** (event quá khứ→THROW; history sẽ làm sau: FO resync full D→nay + replay). Cashflow nạp/rút SDI-side (ghi thẳng, không Kafka). CA chỉ dùng cho **J12 index**; cashflow dùng cho **CF_t** (J9/J10).
 - **J0 GATE**: đếm received (state có watermark=@d) vs expected (tiểu khoản ACTIVE) → đủ mới chạy, thiếu thì alert.
 - **J12 (Master Index)** chỉ cần giá + model_weight → song song nhánh customer.
@@ -321,9 +322,9 @@ J0 GATE → J7 ─ J8 → J9
 | FR-01 Tổng quan đa tiểu khoản | GET /customer/{id}/si-overview | `SP_GET_SI_OVERVIEW` | sum T_MASTER_NAV_BALANCE + derive customer NAV (current từ T_SI_NAV_CURRENT) |
 | FR-02 Chi tiết 1 tiểu khoản | GET /customer/{id}/si/{si} | `SP_GET_SI_DETAIL` | derive customer NAV/PnL + TWR + MWR + T_MASTER_NAV_BALANCE |
 | FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | `SP_GET_SI_PERFORMANCE` | T_MASTER_NAV_BALANCE (TR) + T_MASTER_INDEX_DAILY (PR) + benchmark VN-Index (PR), chuỗi [mốc..cuối] |
-| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | `SP_GET_SI_INFO` | T_SI_PORTFOLIO + master |
+| FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | `SP_GET_SI_INFO` | T_SI_PORTFOLIO + master (`C_MGMT_FEE_RATE_EFFECTIVE` đọc từ `T_FEE_ACCRUAL_CONFIG`, type MGMT_FEE) |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | `SP_GET_SI_HOLDINGS` | **holdings CURRENT của KH** (T_SI_PORTFOLIO_HOLDING × giá mới nhất) top20 + "OTHER" — sản phẩm segregated nên đọc holdings KH (≠ master-aggregate T_MASTER_HOLDING_BALANCE) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | T_SI_NAV_BALANCE (NAV+payable) + T_SI_FEE_LEDGER (cổ tức/phí lưu ký group INCOME/PAYABLE + phí QL BO cắt type MGMT_FEE) + payable accrued (RS4 chi tiết) + cash/stock reconstruct (T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá theo interval) |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | T_SI_NAV_BALANCE (NAV+payable) + T_SI_FEE_LEDGER (cổ tức/phí lưu ký group INCOME/PAYABLE + phí BO cắt mọi loại group PAYABLE) + `C_FEE_ACCRUED_TOTAL` (tổng phí phải trả accrued chưa cắt, RS4 chi tiết) + cash/stock reconstruct (T_SI_CASH_HIST + T_SI_HOLDING_HIST×giá theo interval) |
 
 ---
 

@@ -262,9 +262,10 @@ BEGIN
             ip.C_SIP_AMOUNT,
             ip.C_SIP_SCHEDULE,
             ip.C_MIN_INVEST,
-            mp.C_MGMT_FEE_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- phí QL cấp master (không còn override cấp si)
+            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_ACCRUAL_CONFIG (master, type MGMT_FEE)
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
+    LEFT  JOIN       T_FEE_ACCRUAL_CONFIG fc ON fc.C_MASTER_CODE = ip.C_MASTER_CODE AND fc.C_FEE_TYPE = 'MGMT_FEE'
     WHERE ip.C_SI_ACCOUNT = @p_si_account;
     END TRY
     BEGIN CATCH
@@ -384,8 +385,8 @@ BEGIN
     DECLARE @stock DECIMAL(20,0) = (SELECT SUM(C_MARKET_VALUE) FROM #hold);
 
     -- RS1: summary
-    --   Rollup theo NHÓM (fee_group): C_ACCUM_INCOME = Σ thu nhập (INCOME); C_ACCUM_FEE_PAYABLE = Σ phí phải trả (PAYABLE).
-    --   Chi tiết theo KHOẢN (fee_type): dividend / custody / mgmt_paid. Phí QL 2 trường: đã cắt (PAID) vs đang treo (ACCRUED).
+    --   Rollup theo NHÓM (fee_group): C_ACCUM_INCOME = Σ thu nhập (INCOME); C_ACCUM_FEE_PAYABLE = Σ phí ĐÃ phát sinh (PAYABLE, ledger).
+    --   Chi tiết ĐÃ CẮT theo type: dividend/custody/mgmt_paid. C_FEE_ACCRUED_TOTAL = TỔNG phí phải trả ACCRUED chưa cắt (mọi loại, từ payable).
     SELECT  @p_asof                  AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
@@ -400,7 +401,7 @@ BEGIN
             fi.C_ACCUM_DIVIDEND,
             fi.C_ACCUM_CUSTODY_FEE,
             ISNULL(fi.C_MGMT_FEE_PAID, 0)  AS C_ACCUM_MGMT_FEE_PAID,
-            ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_MGMT_FEE_ACCRUED
+            ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_FEE_ACCRUED_TOTAL   -- TỔNG phí phải trả accrued chưa cắt @asOf (mọi loại: mgmt+tax+...)
     FROM (SELECT 1 x) z
     LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
     OUTER APPLY (
