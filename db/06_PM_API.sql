@@ -146,19 +146,19 @@ BEGIN
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
     IF @X > 252 SET @X = 252;
 
-    -- net in/out kỳ (base, end]
-    DECLARE @cashIn DECIMAL(20,0), @cashOut DECIMAL(20,0);
-    SELECT @cashIn = ISNULL(SUM(C_CASH_IN),0), @cashOut = ISNULL(SUM(C_CASH_OUT),0)
-    FROM T_MASTER_NAV_BALANCE
-    WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end;
-
-    -- AUM hiện tại + base + cash drag (master current/daily)
-    DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT, @aumBase DECIMAL(20,0);
+    -- AUM hiện tại + tiền (tầng master — KHÔNG SUM SI)
+    DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT;
     SELECT @aumNow = C_TOTAL_ASSET, @nKH = C_TOTAL_ACCOUNT,
            @tienNow = C_CASH + C_PENDING_CASH + C_DIV_CASH
     FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@p_master_code;
-    SELECT @aumBase = C_TOTAL_ASSET FROM T_MASTER_NAV_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@base;
+
+    -- net in/out (base,end] + AUM @base: 1 read T_MASTER_NAV_BALANCE [base,end] (gộp 2 read cũ).
+    DECLARE @cashIn DECIMAL(20,0), @cashOut DECIMAL(20,0), @aumBase DECIMAL(20,0);
+    SELECT @cashIn  = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_IN  END),0),
+           @cashOut = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_OUT END),0),
+           @aumBase = MAX(CASE WHEN C_BUSINESS_DATE = @base THEN C_TOTAL_ASSET END)
+    FROM T_MASTER_NAV_BALANCE
+    WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE >= @base AND C_BUSINESS_DATE <= @end;
 
     -- per-KH (end-weight): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end).
     --   TE = STDEV(active) qua (base,end] = hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, accum_base=0.
@@ -190,13 +190,11 @@ BEGIN
         * SQRT(CASE WHEN (n_e-n_b) > 252 THEN 252 ELSE (n_e-n_b) END)
       END;
 
-    -- tổng hợp per-KH
-    DECLARE @sumAum DECIMAL(38,6), @wRet DECIMAL(18,10), @wTE FLOAT, @sumAumTE DECIMAL(38,6);
-    SELECT @sumAum = SUM(aum),
-           @wRet   = SUM((up_end/NULLIF(up_base,0) - 1) * aum) / NULLIF(SUM(aum),0)
+    -- tổng hợp per-KH (AUM-weighted): KH return + TE. (master AUM = @aumNow tầng master, KHÔNG SUM SI.)
+    DECLARE @wRet DECIMAL(18,10), @wTE FLOAT;
+    SELECT @wRet = SUM((up_end/NULLIF(up_base,0) - 1) * aum) / NULLIF(SUM(aum),0)
     FROM #kh WHERE up_base IS NOT NULL AND up_base <> 0;
-    SELECT @sumAumTE = SUM(CASE WHEN te IS NOT NULL THEN aum END),
-           @wTE = SUM(CASE WHEN te IS NOT NULL THEN te * aum END) / NULLIF(SUM(CASE WHEN te IS NOT NULL THEN aum END),0)
+    SELECT @wTE = SUM(CASE WHEN te IS NOT NULL THEN te * aum END) / NULLIF(SUM(CASE WHEN te IS NOT NULL THEN aum END),0)
     FROM #kh;
 
     DECLARE @nTEover INT, @nCashOver INT, @nDevHi INT, @nDevLo INT;
@@ -542,10 +540,11 @@ BEGIN
     BEGIN TRY
 
     -- khung ngày per-master (ACTIVE)
-    CREATE TABLE #md (m VARCHAR(20), dend DATE, dcut DATE, dbase DATE,
+    CREATE TABLE #md (m VARCHAR(20), dend DATE, dfirst DATE, dcut DATE, dbase DATE,
                       idxBase DECIMAL(18,6), idxEnd DECIMAL(18,6), X INT);
-    INSERT #md (m, dend)
-    SELECT mp.C_MASTER_CODE, MAX(b.C_BUSINESS_DATE)
+    -- dend(MAX)+dfirst(MIN) trong 1 pass → dbase fallback dùng dfirst (bỏ subquery MIN).
+    INSERT #md (m, dend, dfirst)
+    SELECT mp.C_MASTER_CODE, MAX(b.C_BUSINESS_DATE), MIN(b.C_BUSINESS_DATE)
     FROM T_MASTER_PORTFOLIO mp
     INNER JOIN T_MASTER_NAV_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
     WHERE mp.C_STATUS='ACTIVE'
@@ -555,13 +554,24 @@ BEGIN
     UPDATE m SET dbase = COALESCE(
         (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
           WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE<=m.dcut),
-        (SELECT MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=m.m))
+        m.dfirst)
     FROM #md m;
-    UPDATE m SET idxBase = (SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE=m.dbase),
-                 idxEnd  = (SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE=m.dend),
-                 X = (SELECT CASE WHEN COUNT(DISTINCT C_BUSINESS_DATE)>252 THEN 252 ELSE COUNT(DISTINCT C_BUSINESS_DATE) END
-                      FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE>m.dbase AND C_BUSINESS_DATE<=m.dend)
-    FROM #md m;
+    -- index @base/@end + #ngày GD: 1 read/master (1 pass [dbase,dend]) thay vì 3 subquery.
+    -- flag (isBase/isEnd/aft) tính ở lớp con z để aggregate KHÔNG chứa outer-ref (tránh lỗi 8124).
+    UPDATE m SET idxBase = x.idxBase, idxEnd = x.idxEnd,
+                 X = CASE WHEN x.nd > 252 THEN 252 ELSE x.nd END
+    FROM #md m
+    CROSS APPLY (
+        SELECT MAX(CASE WHEN isBase=1 THEN v END) AS idxBase,
+               MAX(CASE WHEN isEnd=1  THEN v END) AS idxEnd,
+               COUNT(DISTINCT CASE WHEN aft=1 THEN d END) AS nd
+        FROM (SELECT C_INDEX_VALUE AS v, C_BUSINESS_DATE AS d,
+                     CASE WHEN C_BUSINESS_DATE=m.dbase THEN 1 ELSE 0 END AS isBase,
+                     CASE WHEN C_BUSINESS_DATE=m.dend  THEN 1 ELSE 0 END AS isEnd,
+                     CASE WHEN C_BUSINESS_DATE>m.dbase THEN 1 ELSE 0 END AS aft
+              FROM T_MASTER_INDEX_DAILY
+              WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE>=m.dbase AND C_BUSINESS_DATE<=m.dend) z
+    ) x;
 
     -- per-KH metrics (toàn hệ): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum đọc 2 LÁT
     --   (@base/@end theo master của KH) — KHÔNG quét toàn lịch sử.
@@ -595,10 +605,11 @@ BEGIN
 
     -- per-master rollup
     DECLARE @cdThrDefault DECIMAL(9,6) = 0.05;
-    CREATE TABLE #mr (m VARCHAR(20), aum DECIMAL(38,6), wret FLOAT, rmaster FLOAT,
+    -- #mr KHÔNG giữ master AUM (lấy mc.C_TOTAL_ASSET tầng master ở RS2/RS3, không SUM SI).
+    CREATE TABLE #mr (m VARCHAR(20), wret FLOAT, rmaster FLOAT,
                       wte FLOAT, cashdrag FLOAT, cdThr DECIMAL(9,6));
-    INSERT #mr (m, aum, wret, wte)
-    SELECT k.m, SUM(k.aum),
+    INSERT #mr (m, wret, wte)
+    SELECT k.m,
            SUM(CASE WHEN k.up_base>0 THEN (k.up_end/k.up_base-1)*k.aum END)/NULLIF(SUM(CASE WHEN k.up_base>0 THEN k.aum END),0),
            SUM(CASE WHEN k.te IS NOT NULL THEN k.te*k.aum END)/NULLIF(SUM(CASE WHEN k.te IS NOT NULL THEN k.aum END),0)
     FROM #kh k GROUP BY k.m;
@@ -619,22 +630,26 @@ BEGIN
 
     -- RS2 tổng toàn hệ
     SELECT  CAST(SUM(mc.C_TOTAL_ASSET) AS DECIMAL(38,0)) AS C_TOTAL_AUM,
-            CAST(SUM(bb.aumBase) AS DECIMAL(38,0))       AS C_TOTAL_AUM_BASE,
-            CASE WHEN SUM(bb.aumBase)=0 THEN NULL
-                 ELSE CAST(SUM(mc.C_TOTAL_ASSET)*1.0/NULLIF(SUM(bb.aumBase),0) - 1 AS DECIMAL(18,6)) END AS C_AUM_GROWTH_PCT,
-            CAST(SUM(fl.cin) AS DECIMAL(38,0))  AS C_NET_IN,
-            CAST(SUM(fl.cout) AS DECIMAL(38,0)) AS C_NET_OUT,
-            CAST(SUM(fl.cin)-SUM(fl.cout) AS DECIMAL(38,0)) AS C_NET_FLOW,
+            CAST(SUM(x.aumBase) AS DECIMAL(38,0))        AS C_TOTAL_AUM_BASE,
+            CASE WHEN SUM(x.aumBase)=0 THEN NULL
+                 ELSE CAST(SUM(mc.C_TOTAL_ASSET)*1.0/NULLIF(SUM(x.aumBase),0) - 1 AS DECIMAL(18,6)) END AS C_AUM_GROWTH_PCT,
+            CAST(SUM(x.cin) AS DECIMAL(38,0))  AS C_NET_IN,
+            CAST(SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_OUT,
+            CAST(SUM(x.cin)-SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_FLOW,
             CAST(SUM(mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/NULLIF(SUM(mc.C_TOTAL_ASSET),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
             SUM(CASE WHEN r.cashdrag > r.cdThr THEN 1 ELSE 0 END) AS C_CNT_MASTER_CASH_OVER
     FROM #md d
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m
     INNER JOIN #mr r ON r.m=d.m
-    OUTER APPLY (SELECT C_TOTAL_ASSET aumBase FROM T_MASTER_NAV_BALANCE
-                 WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE=d.dbase) bb
-    OUTER APPLY (SELECT ISNULL(SUM(C_CASH_IN),0) cin, ISNULL(SUM(C_CASH_OUT),0) cout
-                 FROM T_MASTER_NAV_BALANCE
-                 WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE>d.dbase AND C_BUSINESS_DATE<=d.dend) fl;
+    -- aumBase(point) + net in/out(range) 1 read T_MASTER_NAV_BALANCE [dbase,dend] (gộp 2 OUTER APPLY cũ).
+    OUTER APPLY (SELECT MAX(CASE WHEN isBase=1 THEN ta END) aumBase,
+                        ISNULL(SUM(CASE WHEN aft=1 THEN cin END),0) cin,
+                        ISNULL(SUM(CASE WHEN aft=1 THEN cout END),0) cout
+                 FROM (SELECT C_TOTAL_ASSET AS ta, C_CASH_IN AS cin, C_CASH_OUT AS cout,
+                              CASE WHEN C_BUSINESS_DATE=d.dbase THEN 1 ELSE 0 END AS isBase,
+                              CASE WHEN C_BUSINESS_DATE>d.dbase THEN 1 ELSE 0 END AS aft
+                       FROM T_MASTER_NAV_BALANCE
+                       WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE>=d.dbase AND C_BUSINESS_DATE<=d.dend) z) x;
 
     -- RS3 list master
     SELECT  mp.C_MASTER_CODE, mp.C_MASTER_NAME, mc.C_TOTAL_ACCOUNT AS C_TOTAL_ACCOUNT,
