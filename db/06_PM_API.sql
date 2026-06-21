@@ -60,7 +60,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     MERGE T_MASTER_PM_CONFIG AS t
     USING (SELECT @p_master_code AS m) AS s ON t.C_MASTER_CODE = s.m
@@ -112,7 +112,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- cấu hình ngưỡng hiệu lực
     DECLARE @teLow DECIMAL(10,6), @teHigh DECIMAL(10,6), @teAlert DECIMAL(10,6),
@@ -249,7 +249,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -410,7 +410,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
@@ -480,7 +480,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     SELECT @end = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
@@ -675,7 +675,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
     BEGIN
         SET @p_err_code = 1; SET @p_err_msg = N'Master not found: ' + ISNULL(@p_master_code,N'(null)');
-        THROW 50001, N'validation', 1;
+        RAISERROR(@p_err_msg, 16, 1);
     END
 
     -- ngày mặc định = phiên holdings gần nhất của master
@@ -684,7 +684,7 @@ BEGIN
     IF @p_date IS NULL
     BEGIN
         SET @p_err_code = 2; SET @p_err_msg = N'Chưa có holdings balance cho master.';
-        THROW 50002, N'validation', 1;
+        RAISERROR(@p_err_msg, 16, 1);
     END
 
     -- ngưỡng cấu hình (NULL = alert type tắt)
@@ -772,9 +772,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
     IF @p_bucket_bps <= 0 OR @p_cap_bps <= 0
-        BEGIN SET @p_err_code = 3; SET @p_err_msg = N'bucket_bps/cap_bps phải > 0'; THROW 50003, N'validation', 1; END
+        BEGIN SET @p_err_code = 3; SET @p_err_msg = N'bucket_bps/cap_bps phải > 0'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- ngưỡng A/B hiệu lực (override 3 tầng)
     DECLARE @devHi DECIMAL(10,2), @devLo DECIMAL(10,2);

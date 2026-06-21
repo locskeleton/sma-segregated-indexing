@@ -100,7 +100,7 @@ BEGIN
     BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
     DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
@@ -191,7 +191,7 @@ BEGIN
     BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
     DECLARE @end DATE, @cutoff DATE, @base DATE;
@@ -277,7 +277,7 @@ BEGIN
     BEGIN TRY
 
     IF NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account)
-        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
+        BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- @pd = ngày giá mới nhất TOÀN THỊ TRƯỜNG (mốc định giá "hiện tại"). Lấy MAX trên clustered
     --   (C_BUSINESS_DATE, C_TICKER) leading-date ⇒ seek dòng cuối, rẻ.
@@ -341,7 +341,7 @@ BEGIN
     BEGIN TRY
 
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT=@p_si_account);
-    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; THROW 50001, N'validation', 1; END
+    IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
@@ -453,9 +453,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF @p_mode NOT IN ('EOD','HISTORY')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; RAISERROR(@p_err_msg, 16, 1); END
     IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
-        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu EOD cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); THROW 50003,N'validation',1; END
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu EOD cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); RAISERROR(@p_err_msg, 16, 1); END
 
     -- Holdings reconstruct @ngày (per-mã giá mới nhất ≤ ngày — resilient halt, giống FR-05/06)
     SELECT b.C_SI_ACCOUNT, h.C_TICKER, h.C_QUANTITY,
@@ -539,9 +539,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF @p_mode NOT IN ('EOD','HISTORY')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; RAISERROR(@p_err_msg, 16, 1); END
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
-        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu master EOD ngày '+CONVERT(VARCHAR(10),@p_business_date,23); THROW 50003,N'validation',1; END
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu master EOD ngày '+CONVERT(VARCHAR(10),@p_business_date,23); RAISERROR(@p_err_msg, 16, 1); END
 
     SELECT b.C_MASTER_CODE, b.C_BUSINESS_DATE,
         (SELECT
@@ -597,7 +597,7 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
     IF @p_mode NOT IN ('EOD','HISTORY')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- 1 bản ghi: JSON ARRAY, mỗi phần tử = 1 master (index DM + benchmark của master đó)
     SELECT ISNULL((

@@ -699,7 +699,7 @@ BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
     IF @p_source NOT IN ('MKT_DATA','FO_INGEST')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; THROW 50020,N'validation',1; END
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; RAISERROR(@p_err_msg, 16, 1); END
 
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
         INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
@@ -713,7 +713,7 @@ BEGIN
     ELSE  -- FO_INGEST: completeness theo total cust_code
     BEGIN
         IF @p_total_record IS NULL
-            BEGIN SET @p_err_code=2; SET @p_err_msg=N'FO_INGEST cần @p_total_record (tổng cust_code break event)'; THROW 50023,N'validation',1; END
+            BEGIN SET @p_err_code=2; SET @p_err_msg=N'FO_INGEST cần @p_total_record (tổng cust_code break event)'; RAISERROR(@p_err_msg, 16, 1); END
         DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_NAV_CURRENT
                                  WHERE C_LAST_SYNC_DATE=@p_business_date);
         DECLARE @ok BIT = CASE WHEN @received >= @p_total_record THEN 1 ELSE 0 END;
@@ -751,9 +751,9 @@ BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
     IF @p_status NOT IN ('DONE','FAILED')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_status phải DONE hoặc FAILED'; THROW 50021,N'validation',1; END
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_status phải DONE hoặc FAILED'; RAISERROR(@p_err_msg, 16, 1); END
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date AND C_EOD_STATUS='DONE')
-        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa EOD DONE — không thể đánh dấu Asset synced'; THROW 50022,N'validation',1; END
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa EOD DONE — không thể đánh dấu Asset synced'; RAISERROR(@p_err_msg, 16, 1); END
 
     UPDATE T_EOD_PIPELINE
     SET C_ASSET_SYNC_STATUS=@p_status, C_ASSET_SYNC_AT=GETDATE(),
