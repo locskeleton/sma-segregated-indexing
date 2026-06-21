@@ -516,3 +516,67 @@ BEGIN
     END CATCH
 END
 GO
+
+/*===========================================================================
+  SP_GET_ASSET_MASTER_SNAPSHOT (SDI→Asset sync, luồng 8b/8c) — payload MASTER-level/ngày.
+    1 dòng/master → app publish Kafka (key = C_MASTER_CODE). Cho Asset dựng:
+      - overview/AUM cấp quỹ (8b current = dòng ngày mới nhất),
+      - chuỗi so sánh chart FR-03: master TR (unit_price) + master index (PR) + benchmark (PR).
+    MODE EOD | HISTORY (=replay ngày quá khứ) — RECONSTRUCT-ONLY từ bảng DATED
+      (T_MASTER_NAV_BALANCE + T_MASTER_INDEX_DAILY + T_BENCHMARK_DAILY) ⇒ replay y hệt.
+    Master-level lưu ĐỦ breakdown (cash/pending/div/stock/total_asset) trong NAV_BALANCE
+      (khác per-KH) → payload đầy đủ. ⚠️ PAYLOAD DRAFT — map theo schema Asset thật khi có.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_ASSET_MASTER_SNAPSHOT
+    @p_business_date DATE,
+    @p_mode          VARCHAR(10)   = 'EOD',
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+    IF @p_mode NOT IN ('EOD','HISTORY')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; THROW 50002,N'validation',1; END
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu master EOD ngày '+CONVERT(VARCHAR(10),@p_business_date,23); THROW 50003,N'validation',1; END
+
+    SELECT b.C_MASTER_CODE, b.C_BUSINESS_DATE,
+        (SELECT
+            b.C_MASTER_CODE                              AS master_code,
+            mp.C_MASTER_NAME                             AS master_name,
+            CONVERT(VARCHAR(10), b.C_BUSINESS_DATE, 23)  AS business_date,
+            @p_mode                                      AS mode,
+            b.C_NAV          AS master_nav,
+            b.C_UNIT         AS master_unit,
+            b.C_UNIT_PRICE   AS master_unit_price,       -- master TR (đường "hiệu suất master" chart FR-03)
+            b.C_DAILY_PNL    AS master_daily_pnl,
+            b.C_DAILY_RETURN AS master_daily_return,
+            b.C_TOTAL_ASSET  AS total_asset,
+            b.C_CASH         AS cash,
+            b.C_PENDING_CASH AS pending_cash,            -- master-level CÓ lịch sử (khác per-KH)
+            b.C_DIV_CASH     AS div_cash,
+            b.C_STOCK_VALUE  AS stock_value,
+            b.C_PAYABLE_FEE  AS payable_fee,
+            b.C_TOTAL_ACCOUNT AS total_account,
+            b.C_CASH_IN      AS cash_in,
+            b.C_CASH_OUT     AS cash_out,
+            idx.C_INDEX_VALUE   AS index_value,          -- master index PR (đường "danh mục mẫu")
+            idx.C_DAILY_RETURN  AS index_daily_return,
+            mp.C_BENCHMARK_CODE AS benchmark_code,
+            bm.C_INDEX_VALUE    AS benchmark_value       -- benchmark PR (đường "VN-Index")
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)          AS C_PAYLOAD_JSON
+    FROM       T_MASTER_NAV_BALANCE b
+    INNER JOIN T_MASTER_PORTFOLIO   mp  ON mp.C_MASTER_CODE = b.C_MASTER_CODE
+    LEFT JOIN  T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE = b.C_MASTER_CODE AND idx.C_BUSINESS_DATE = b.C_BUSINESS_DATE
+    LEFT JOIN  T_BENCHMARK_DAILY    bm  ON bm.C_BENCHMARK_CODE = mp.C_BENCHMARK_CODE AND bm.C_BUSINESS_DATE = b.C_BUSINESS_DATE
+    WHERE b.C_BUSINESS_DATE = @p_business_date
+    ORDER BY b.C_MASTER_CODE;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
+END
+GO

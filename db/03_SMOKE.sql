@@ -152,3 +152,19 @@ ELSE
     PRINT '  !!! LỖI REPLAY: payload EOD@07 != HISTORY@07';
 PRINT '  EOD@07 payload: ' + ISNULL(@jEOD,'(NULL)');
 DROP TABLE #snapE; DROP TABLE #snapH;
+
+PRINT '--- SDI→ASSET MASTER SNAPSHOT: SP_GET_ASSET_MASTER_SNAPSHOT (8b/8c, EOD@07 + replay) ---';
+DECLARE @ecM INT, @emM NVARCHAR(400);
+CREATE TABLE #mE (m VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
+CREATE TABLE #mH (m VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
+INSERT #mE EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',    @p_err_code=@ecM OUTPUT, @p_err_msg=@emM OUTPUT;
+INSERT #mH EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_mode='HISTORY', @p_err_code=@ecM OUTPUT, @p_err_msg=@emM OUTPUT;
+DECLARE @mEOD NVARCHAR(MAX) = (SELECT payload FROM #mE WHERE m='SDI01');
+DECLARE @mHIS NVARCHAR(MAX) = (SELECT payload FROM #mH WHERE m='SDI01');
+PRINT '  err='+CAST(@ecM AS VARCHAR(10))+' (kỳ vọng 0); kỳ vọng master_nav=11280000 index_value=1078.8';
+IF REPLACE(@mEOD,'"mode":"EOD"','"mode":"HISTORY"') = @mHIS
+    PRINT '  OK REPLAY master: EOD@07 == HISTORY@07 (chỉ khác mode)';
+ELSE
+    PRINT '  !!! LỖI REPLAY master';
+PRINT '  master EOD@07 payload: ' + ISNULL(@mEOD,'(NULL)');
+DROP TABLE #mE; DROP TABLE #mH;
