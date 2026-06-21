@@ -348,7 +348,10 @@ CREATE TABLE T_MASTER_INDEX_DAILY (
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_INDEX_VALUE    DECIMAL(18,6)   NOT NULL,   -- Index danh mục mẫu (PR, daily-rebalanced): Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref. Gốc 1000.
-    C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- lợi suất index ngày = FACTOR − 1. Là R_master cho deviation + active return (J12B/TE)
+    C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- lợi suất index NGÀY-TRÊN-NGÀY = FACTOR − 1 = Index_t/Index_(t-1) − 1
+                                                  --   (so với hôm trước qua P_ref = close hôm trước / giá sau chia ngày ex-rights).
+                                                  --   DÙNG Ở: J12B SP_EOD_TE_ACCUM — active return = C_DAILY_RETURN(KH) − C_DAILY_RETURN(index này)
+                                                  --   → tích lũy prefix-sum (Σa, Σa²) tính TE (tracking error) cho PM tool US1/US2. KHÔNG bỏ được.
     CONSTRAINT PK_MASTER_INDEX_DAILY PRIMARY KEY CLUSTERED (PK_MASTER_INDEX_DAILY),
     CONSTRAINT UQ_MASTER_INDEX_DAILY_NK UNIQUE (C_BUSINESS_DATE, C_MASTER_CODE)
 );
