@@ -58,11 +58,11 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 Toàn luồng /ngày track ở **`T_EOD_PIPELINE`** (1 dòng/ngày): upstream → EOD → đối soát → Asset.
 ```sql
 DECLARE @ec INT, @em NVARCHAR(400);
--- 1) BO market data ready (break event kèm TOTAL = số cust_code gửi). SDI tự đếm RECEIVED, READY khi >= TOTAL.
-EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='MKT_DATA', @p_total_record=50000, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- 1) BO báo market data ready → app pull API BO 1 lần → mark READY (KHÔNG total/đếm — dữ liệu thị trường).
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='MKT_DATA', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 -- 2) MASTER INDEX — LUỒNG RIÊNG (chỉ cần BO): tính + lưu → app publish index sang Asset luôn.
 EXEC SP_EOD_RUN_INDEX @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
--- 3) FO ready (tiền/tài sản KH; total = số cust_code)
+-- 3) FO ready — completeness: @p_total_record = tổng cust_code FO gửi (break event); SDI đếm received, READY khi >=.
 EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='FO_INGEST', @p_total_record=50000, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 -- 4) EOD customer (CHẶN nếu chưa MKT/FO=READY + INDEX=DONE → @ec=10). @ec=-2 = reconcile BREAK.
 EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
@@ -70,7 +70,7 @@ EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_ms
 EXEC SP_EOD_SET_ASSET_SYNCED @p_business_date='2026-01-06', @p_status='DONE', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 -- sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (xóa job+break, recompute)
 ```
-**Trạng thái `T_EOD_PIPELINE`**: MKT_DATA/FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
+**Trạng thái `T_EOD_PIPELINE`**: MKT_DATA (PENDING|READY — pull API BO, không đếm) + FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
 EOD (PENDING|RUNNING|DONE|FAILED) → RECONCILE (PENDING|PASS|**BREAK**) → ASSET_SYNC (PENDING|DONE|FAILED);
 overall WAITING_DATA→READY→EOD_RUNNING→(RECONCILE_BREAK | EOD_DONE)→COMPLETED. **Chỉ COMPLETED khi reconcile PASS + asset DONE.**
 

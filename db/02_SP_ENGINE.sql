@@ -684,10 +684,13 @@ GO
 ===========================================================================*/
 
 -- BO/FO báo nguồn đã sync xong cho ngày @p_business_date → set READY (tiền đề chạy EOD).
+--   MKT_DATA (BO): chỉ cờ READY (SDI đã pull market data từ API BO 1 lần) — KHÔNG đếm record.
+--   FO_INGEST (FO): completeness — @p_total_record = tổng cust_code FO gửi; SDI đếm received cust_code
+--     distinct (watermark); READY khi received >= total (else err=4).
 CREATE OR ALTER PROCEDURE SP_EOD_SET_SOURCE_READY
     @p_business_date DATE,
     @p_source        VARCHAR(20),               -- 'MKT_DATA' (BO) | 'FO_INGEST' (FO)
-    @p_total_record  INT,                        -- TOTAL cust_code BO/FO khai báo trong break event
+    @p_total_record  INT           = NULL,       -- BẮT BUỘC cho FO_INGEST (tổng cust_code); BỎ QUA cho MKT_DATA
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
     @p_err_msg       NVARCHAR(400) OUTPUT
@@ -698,32 +701,31 @@ BEGIN
     IF @p_source NOT IN ('MKT_DATA','FO_INGEST')
         BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; THROW 50020,N'validation',1; END
 
-    -- RECEIVED = số cust_code DISTINCT SDI đã nhận data @ngày (watermark C_LAST_SYNC_DATE).
-    -- ⚠️ Dùng watermark FO ingest cho CẢ HAI nguồn (đơn vị = cust_code). BO (market data) nếu có
-    --    nguồn đếm cust riêng thì đổi query này cho MKT_DATA — hiện dùng chung (DRAFT).
-    DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_NAV_CURRENT
-                             WHERE C_LAST_SYNC_DATE=@p_business_date);
-    DECLARE @ok BIT = CASE WHEN @received >= @p_total_record THEN 1 ELSE 0 END;
-
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
         INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
 
     IF @p_source='MKT_DATA'
-        UPDATE T_EOD_PIPELINE SET C_MKT_DATA_TOTAL=@p_total_record, C_MKT_DATA_RECEIVED=@received,
-               C_MKT_DATA_STATUS = CASE WHEN @ok=1 THEN 'READY' ELSE 'PENDING' END,
-               C_MKT_DATA_AT     = CASE WHEN @ok=1 THEN GETDATE() ELSE C_MKT_DATA_AT END,
+    BEGIN
+        -- BO event ready → SDI đã pull market data 1 lần (giá/index/benchmark). Cờ READY, không đếm.
+        UPDATE T_EOD_PIPELINE SET C_MKT_DATA_STATUS='READY', C_MKT_DATA_AT=GETDATE(),
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
-    ELSE
+    END
+    ELSE  -- FO_INGEST: completeness theo total cust_code
+    BEGIN
+        IF @p_total_record IS NULL
+            BEGIN SET @p_err_code=2; SET @p_err_msg=N'FO_INGEST cần @p_total_record (tổng cust_code break event)'; THROW 50023,N'validation',1; END
+        DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_NAV_CURRENT
+                                 WHERE C_LAST_SYNC_DATE=@p_business_date);
+        DECLARE @ok BIT = CASE WHEN @received >= @p_total_record THEN 1 ELSE 0 END;
         UPDATE T_EOD_PIPELINE SET C_FO_INGEST_TOTAL=@p_total_record, C_FO_INGEST_RECEIVED=@received,
                C_FO_INGEST_STATUS = CASE WHEN @ok=1 THEN 'READY' ELSE 'PENDING' END,
                C_FO_INGEST_AT     = CASE WHEN @ok=1 THEN GETDATE() ELSE C_FO_INGEST_AT END,
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
-
-    IF @ok=0
-    BEGIN
-        SET @p_err_code=4;   -- chưa đủ record → KHÔNG READY (không THROW; tình huống nghiệp vụ)
-        SET @p_err_msg=CONCAT(@p_source, N': received ', @received, '/', @p_total_record,
-                              N' cust_code — CHƯA đủ, chưa READY.');
+        IF @ok=0
+        BEGIN
+            SET @p_err_code=4;   -- chưa đủ → KHÔNG READY (không THROW; tình huống nghiệp vụ)
+            SET @p_err_msg=CONCAT(N'FO_INGEST: received ', @received, '/', @p_total_record, N' cust_code — CHƯA đủ.');
+        END
     END
 
     -- cả 2 READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)

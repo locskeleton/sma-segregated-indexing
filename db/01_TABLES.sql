@@ -429,13 +429,12 @@ CREATE TABLE T_EOD_RUN (
 --   MKT_DATA + FO_INGEST = READY; chỉ COMPLETED khi đối soát PASS + Asset sync DONE.
 CREATE TABLE T_EOD_PIPELINE (
     C_BUSINESS_DATE      DATE         NOT NULL,
-    -- Completeness gate: break event của BO/FO kèm TOTAL = số cust_code gửi; SDI tự đếm RECEIVED
-    --   (số cust_code distinct đã nhận @ngày); READY khi RECEIVED >= TOTAL. Đơn vị = cust_code (mỗi
-    --   cust break nhỏ thành các tiểu khoản tham gia master).
+    -- MKT_DATA (dữ liệu thị trường): BO gửi event báo ready → SDI TỰ GỌI API BO pull 1 LẦN (giá/index/
+    --   benchmark), KHÔNG qua Kafka, KHÔNG per-cust → chỉ cờ READY sau khi pull xong (không đếm record).
     C_MKT_DATA_STATUS    VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_MKT  DEFAULT 'PENDING',  -- PENDING|READY (BO)
-    C_MKT_DATA_TOTAL     INT          NULL,        -- total cust_code BO khai báo (break event)
-    C_MKT_DATA_RECEIVED  INT          NULL,        -- cust_code SDI đếm nhận được
     C_MKT_DATA_AT        DATETIME     NULL,
+    -- FO_INGEST: ingest per-cust qua Kafka; break event kèm TOTAL = số cust_code gửi. SDI tự đếm
+    --   RECEIVED = #cust_code distinct nhận @ngày; READY khi RECEIVED >= TOTAL. Đơn vị = cust_code.
     C_FO_INGEST_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_FO   DEFAULT 'PENDING',  -- PENDING|READY (FO)
     C_FO_INGEST_TOTAL    INT          NULL,        -- total cust_code FO khai báo (break event)
     C_FO_INGEST_RECEIVED INT          NULL,        -- cust_code SDI đếm nhận được
