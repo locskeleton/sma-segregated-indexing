@@ -230,7 +230,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 
 ### Control / orchestration
 - **`T_EOD_RUN`** (business_date, job PK; status[PENDING|RUNNING|DONE|FAILED], rows, started_at, ended_at, message) — theo dõi & resume batch EOD (§9.2).
-- **`T_EOD_PIPELINE`** (business_date PK; mkt_data/fo_ingest/eod/reconcile/asset_sync status + overall) — **control toàn pipeline /ngày**: SP_EOD_RUN chỉ chạy khi MKT_DATA+FO_INGEST=READY (`SP_EOD_SET_SOURCE_READY` BO/FO báo); reconcile gate; `SP_EOD_SET_ASSET_SYNCED` app báo publish; chỉ COMPLETED khi reconcile PASS + asset DONE. `SP_EOD_RESET` để chạy lại sau khi sửa nguồn.
+- **`T_EOD_PIPELINE`** (business_date PK; mkt_data/fo_ingest [+total/received cust_code]/index/eod/reconcile/asset_sync status + overall) — **control toàn pipeline /ngày**: `SP_EOD_SET_SOURCE_READY @p_total_record` (BO/FO báo kèm total cust_code; SDI đếm received distinct, READY khi received>=total); **master index TÁCH luồng riêng** `SP_EOD_RUN_INDEX` (BO ready → tính+lưu index, set INDEX=DONE, app sync Asset); `SP_EOD_RUN` chỉ chạy khi MKT/FO=READY + INDEX=DONE; reconcile gate; `SP_EOD_SET_ASSET_SYNCED` app báo publish; chỉ COMPLETED khi reconcile PASS + asset DONE. `SP_EOD_RESET` chạy lại.
 - **`T_EOD_RECON_BREAK`** (business_date, check_name, master/si, value_sdi/value_check/diff) — chi tiết dòng lệch đối soát (J13 GHI, không throw); nghiệp vụ tra cứu. Có break ⇒ SP_EOD_RUN chặn publish.
 - *(Đã BỎ `T_SDI_CONFIG`)* — spec phí QL chốt cố định, không còn toggle/knob: accrue luôn (gated `mgmt_fee_rate`), basis = AUM gross, day_count = 365 hardcode.
 
@@ -278,7 +278,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J9** | `CALC_PNL` | J8 | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
 | **J10** | `CALC_UNIT` | J8 | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; T_SI_UNIT_LEDGER; **T_SI_NAV_BALANCE** (lịch sử per-KH) | ✅ | ‖ | – |
 | **J11** | `SI_AGG` tổng hợp master | J8, J10 | cash/pending/div/stock/NAV/unit per tiểu khoản + T_SI_FEE_INCOME + T_SI_CASHFLOW_EVENT | **T_MASTER_NAV_BALANCE** (composition + NAV + hiệu suất + cổ tức/phí Σ + **[PM] cash_in/cash_out Σ + total_account + total_asset gồm receivables**) + **T_MASTER_NAV_CURRENT** (upsert) | ✅ | ‖ | – |
-| **J12** | `SI_INDEX` + benchmark | J2 | model_weight, giá, VN-Index | T_MASTER_INDEX_DAILY, T_BENCHMARK_DAILY | ✅ | ‖ | – |
+| **J12** | `SI_INDEX` master index — **LUỒNG RIÊNG `SP_EOD_RUN_INDEX`** (BO ready, KHÔNG trong pipeline customer) | giá+weight | model_weight, giá | T_MASTER_INDEX_DAILY | ✅ | ‖ | – |
 | **J12B** | `TE_ACCUM` lũy kế active return *(PM)* | J10, J12 | `daily_return` KH (J10) − `daily_return` index (J12); accum @prev | **T_SI_NAV_BALANCE** cập nhật `accum_active_ret/_sq + ret_day_count` (TE prefix-sum cho serve-layer PM). Idempotent: accum@d=accum@prev+a@d | ✅ | – | – |
 | **J13** | `RECONCILE` đối soát (RECORDER) | J11 | NAV âm/unit≤0; Σ customer NAV vs master NAV | **GHI `T_EOD_RECON_BREAK`** (KHÔNG throw) | ✅ | – | ✅ (có break → SP_EOD_RUN chặn publish, RECONCILE=BREAK) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | T_MASTER_HOLDING_BALANCE (top20+mã khác) | ✅ | ‖ | – |

@@ -78,8 +78,9 @@ DROP TABLE #cust, #tk;
 
 /*--- CHẠY EOD (đây là phần được đo qua T_EOD_RUN) ---*/
 DECLARE @ec INT, @em NVARCHAR(400);
-EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='MKT_DATA',  @p_total_record=@nCust, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_RUN_INDEX @d, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;   -- BO ready → master index (luồng riêng)
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='FO_INGEST', @p_total_record=@nCust, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN @d, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('!!! EOD FAILED ec=',@ec,' ',@em);
 

@@ -585,14 +585,17 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
-    -- PRECONDITION: upstream phải READY (BO market data + FO ingest) mới được chạy EOD.
-    DECLARE @mkt VARCHAR(10), @fo VARCHAR(10);
-    SELECT @mkt=C_MKT_DATA_STATUS, @fo=C_FO_INGEST_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d;
-    IF @mkt IS NULL OR @mkt<>'READY' OR @fo<>'READY'
+    -- PRECONDITION: BO market data READY + FO ingest READY + master INDEX đã tính (J12 chạy ở
+    --   luồng RIÊNG SP_EOD_RUN_INDEX, KHÔNG còn trong pipeline này). J12B TE cần index daily_return.
+    DECLARE @mkt VARCHAR(10), @fo VARCHAR(10), @idx VARCHAR(10);
+    SELECT @mkt=C_MKT_DATA_STATUS, @fo=C_FO_INGEST_STATUS, @idx=C_INDEX_STATUS
+    FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d;
+    IF @mkt IS NULL OR @mkt<>'READY' OR @fo<>'READY' OR @idx<>'DONE'
     BEGIN
         SET @p_err_code = 10;
-        SET @p_err_msg = CONCAT(N'Precondition chưa đủ: MKT_DATA=', ISNULL(@mkt,'(chưa khởi tạo)'),
-                                N', FO_INGEST=', ISNULL(@fo,'(chưa khởi tạo)'), N' (cần READY cả hai).');
+        SET @p_err_msg = CONCAT(N'Precondition chưa đủ: MKT_DATA=', ISNULL(@mkt,'(null)'),
+                                N', FO_INGEST=', ISNULL(@fo,'(null)'), N', INDEX=', ISNULL(@idx,'(null)'),
+                                N' (cần MKT/FO=READY + INDEX=DONE; index tính qua SP_EOD_RUN_INDEX).');
         RETURN;   -- KHÔNG chạy EOD
     END
 
@@ -604,8 +607,8 @@ BEGIN
         EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
         EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
         EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
-        EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
-        EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (TE prefix-sum)
+        -- (J12 SI_INDEX ĐÃ TÁCH sang SP_EOD_RUN_INDEX — chạy khi BO ready, độc lập pipeline customer)
+        EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (đọc index đã tính sẵn)
         EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- recorder break (KHÔNG throw)
 
         -- CỔNG ĐỐI SOÁT: có break ⇒ CHẶN publish, KHÔNG chạy J14.
@@ -639,6 +642,43 @@ END
 GO
 
 /*===========================================================================
+  SP_EOD_RUN_INDEX — LUỒNG RIÊNG tính master index (J12), trigger khi BO market data READY.
+    ĐỘC LẬP pipeline customer: chỉ cần giá (BO) + target weight (config), KHÔNG cần FO/holdings KH.
+    Tính + lưu T_MASTER_INDEX_DAILY → set C_INDEX_STATUS=DONE. App publish index sang Asset bằng
+    SP_GET_ASSET_INDEX_SNAPSHOT ngay sau đó (1 luồng: BO ready → index → Asset).
+    err: 0=OK, 10=MKT_DATA chưa READY, -1=runtime. KHÔNG THROW.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_RUN_INDEX
+    @p_business_date DATE,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    DECLARE @d DATE = @p_business_date;
+
+    DECLARE @mkt VARCHAR(10) = (SELECT C_MKT_DATA_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d);
+    IF @mkt IS NULL OR @mkt<>'READY'
+    BEGIN
+        SET @p_err_code=10;
+        SET @p_err_msg=CONCAT(N'MKT_DATA chưa READY (=', ISNULL(@mkt,'(null)'), N') — chưa tính được index.');
+        RETURN;
+    END
+
+    BEGIN TRY
+        EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';   -- tính + lưu T_MASTER_INDEX_DAILY (idempotent + log T_EOD_RUN)
+        UPDATE T_EOD_PIPELINE SET C_INDEX_STATUS='DONE', C_INDEX_AT=GETDATE(), C_UPDATED_AT=GETDATE()
+        WHERE C_BUSINESS_DATE=@d;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
+    END CATCH
+END
+GO
+
+/*===========================================================================
   PIPELINE CONTROL — đánh dấu upstream ready / asset synced / reset re-run.
   Convention API (gọi bởi BO/FO/app/ops): @p_user + @p_err_code/@p_err_msg OUT, KHÔNG THROW.
 ===========================================================================*/
@@ -647,6 +687,7 @@ GO
 CREATE OR ALTER PROCEDURE SP_EOD_SET_SOURCE_READY
     @p_business_date DATE,
     @p_source        VARCHAR(20),               -- 'MKT_DATA' (BO) | 'FO_INGEST' (FO)
+    @p_total_record  INT,                        -- TOTAL cust_code BO/FO khai báo trong break event
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
     @p_err_msg       NVARCHAR(400) OUTPUT
@@ -657,16 +698,33 @@ BEGIN
     IF @p_source NOT IN ('MKT_DATA','FO_INGEST')
         BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; THROW 50020,N'validation',1; END
 
-    -- tạo dòng pipeline nếu chưa có
+    -- RECEIVED = số cust_code DISTINCT SDI đã nhận data @ngày (watermark C_LAST_SYNC_DATE).
+    -- ⚠️ Dùng watermark FO ingest cho CẢ HAI nguồn (đơn vị = cust_code). BO (market data) nếu có
+    --    nguồn đếm cust riêng thì đổi query này cho MKT_DATA — hiện dùng chung (DRAFT).
+    DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_NAV_CURRENT
+                             WHERE C_LAST_SYNC_DATE=@p_business_date);
+    DECLARE @ok BIT = CASE WHEN @received >= @p_total_record THEN 1 ELSE 0 END;
+
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
         INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
 
     IF @p_source='MKT_DATA'
-        UPDATE T_EOD_PIPELINE SET C_MKT_DATA_STATUS='READY', C_MKT_DATA_AT=GETDATE(),
+        UPDATE T_EOD_PIPELINE SET C_MKT_DATA_TOTAL=@p_total_record, C_MKT_DATA_RECEIVED=@received,
+               C_MKT_DATA_STATUS = CASE WHEN @ok=1 THEN 'READY' ELSE 'PENDING' END,
+               C_MKT_DATA_AT     = CASE WHEN @ok=1 THEN GETDATE() ELSE C_MKT_DATA_AT END,
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
     ELSE
-        UPDATE T_EOD_PIPELINE SET C_FO_INGEST_STATUS='READY', C_FO_INGEST_AT=GETDATE(),
+        UPDATE T_EOD_PIPELINE SET C_FO_INGEST_TOTAL=@p_total_record, C_FO_INGEST_RECEIVED=@received,
+               C_FO_INGEST_STATUS = CASE WHEN @ok=1 THEN 'READY' ELSE 'PENDING' END,
+               C_FO_INGEST_AT     = CASE WHEN @ok=1 THEN GETDATE() ELSE C_FO_INGEST_AT END,
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
+
+    IF @ok=0
+    BEGIN
+        SET @p_err_code=4;   -- chưa đủ record → KHÔNG READY (không THROW; tình huống nghiệp vụ)
+        SET @p_err_msg=CONCAT(@p_source, N': received ', @received, '/', @p_total_record,
+                              N' cust_code — CHƯA đủ, chưa READY.');
+    END
 
     -- cả 2 READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)
     UPDATE T_EOD_PIPELINE SET C_OVERALL_STATUS='READY'

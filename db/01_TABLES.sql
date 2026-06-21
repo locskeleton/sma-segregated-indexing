@@ -429,11 +429,20 @@ CREATE TABLE T_EOD_RUN (
 --   MKT_DATA + FO_INGEST = READY; chỉ COMPLETED khi đối soát PASS + Asset sync DONE.
 CREATE TABLE T_EOD_PIPELINE (
     C_BUSINESS_DATE      DATE         NOT NULL,
-    C_MKT_DATA_STATUS    VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_MKT  DEFAULT 'PENDING',  -- PENDING|READY (BO: giá/index/benchmark/CA)
+    -- Completeness gate: break event của BO/FO kèm TOTAL = số cust_code gửi; SDI tự đếm RECEIVED
+    --   (số cust_code distinct đã nhận @ngày); READY khi RECEIVED >= TOTAL. Đơn vị = cust_code (mỗi
+    --   cust break nhỏ thành các tiểu khoản tham gia master).
+    C_MKT_DATA_STATUS    VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_MKT  DEFAULT 'PENDING',  -- PENDING|READY (BO)
+    C_MKT_DATA_TOTAL     INT          NULL,        -- total cust_code BO khai báo (break event)
+    C_MKT_DATA_RECEIVED  INT          NULL,        -- cust_code SDI đếm nhận được
     C_MKT_DATA_AT        DATETIME     NULL,
-    C_FO_INGEST_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_FO   DEFAULT 'PENDING',  -- PENDING|READY (FO: tiền+tài sản đủ)
+    C_FO_INGEST_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_FO   DEFAULT 'PENDING',  -- PENDING|READY (FO)
+    C_FO_INGEST_TOTAL    INT          NULL,        -- total cust_code FO khai báo (break event)
+    C_FO_INGEST_RECEIVED INT          NULL,        -- cust_code SDI đếm nhận được
     C_FO_INGEST_AT       DATETIME     NULL,
-    C_EOD_STATUS         VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_EOD  DEFAULT 'PENDING',  -- PENDING|RUNNING|DONE|FAILED
+    C_INDEX_STATUS       VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_IDX  DEFAULT 'PENDING',  -- PENDING|DONE: master index TÍNH RIÊNG (BO ready), KHÔNG trong pipeline customer
+    C_INDEX_AT           DATETIME     NULL,
+    C_EOD_STATUS         VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_EOD  DEFAULT 'PENDING',  -- PENDING|RUNNING|DONE|FAILED (J07→J11→J12B→J13→J14, KHÔNG còn J12 index)
     C_EOD_AT             DATETIME     NULL,
     C_RECONCILE_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_REC  DEFAULT 'PENDING',  -- PENDING|PASS|BREAK
     C_RECONCILE_AT       DATETIME     NULL,
