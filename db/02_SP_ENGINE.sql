@@ -345,7 +345,7 @@ GO
   BO cắt loại phí nào thì charge mang fee_type đó (default MGMT_FEE). SDI KHÔNG sinh lịch/ra lệnh.
   Idempotent qua source_event_id. Ngoài batch EOD.
   JSON: {"charge_date":"YYYY-MM-DD", "charges":[
-           {"si_account","amount","fee_type"(opt,default MGMT_FEE),"period"(opt),"source_event_id"}, ...]}
+           {"si_account","amount","fee_type"(opt,default MGMT_FEE),"source_event_id"}, ...]}
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_FEE_CHARGE @p_json NVARCHAR(MAX)
 AS
@@ -356,23 +356,23 @@ BEGIN
         BEGIN TRAN;
 
         DECLARE @chg TABLE (C_SI_ACCOUNT VARCHAR(20), C_AMOUNT DECIMAL(20,0), C_FEE_TYPE VARCHAR(20),
-                            C_CHARGE_DATE DATE, C_PERIOD CHAR(6), C_SOURCE_EVENT_ID VARCHAR(64) PRIMARY KEY);
-        INSERT INTO @chg (C_SI_ACCOUNT,C_AMOUNT,C_FEE_TYPE,C_CHARGE_DATE,C_PERIOD,C_SOURCE_EVENT_ID)
+                            C_CHARGE_DATE DATE, C_SOURCE_EVENT_ID VARCHAR(64) PRIMARY KEY);
+        INSERT INTO @chg (C_SI_ACCOUNT,C_AMOUNT,C_FEE_TYPE,C_CHARGE_DATE,C_SOURCE_EVENT_ID)
         SELECT j.C_SI_ACCOUNT, j.C_AMOUNT, COALESCE(j.C_FEE_TYPE,'MGMT_FEE'),
                COALESCE(TRY_CONVERT(DATE,j.C_CHARGE_DATE), @hdr_date, CAST(GETDATE() AS DATE)),
-               j.C_PERIOD, j.C_SOURCE_EVENT_ID
+               j.C_SOURCE_EVENT_ID
         FROM OPENJSON(@p_json,'$.charges') WITH (
             C_SI_ACCOUNT VARCHAR(20) '$.si_account', C_AMOUNT DECIMAL(20,0) '$.amount',
             C_FEE_TYPE VARCHAR(20) '$.fee_type',
-            C_CHARGE_DATE VARCHAR(10) '$.charge_date', C_PERIOD CHAR(6) '$.period',
+            C_CHARGE_DATE VARCHAR(10) '$.charge_date',
             C_SOURCE_EVENT_ID VARCHAR(64) '$.source_event_id') j;
 
         -- dedup: bỏ event đã nhận (Kafka redelivery → no-op)
         DELETE c FROM @chg c WHERE EXISTS (SELECT 1 FROM T_SI_FEE_LEDGER e WHERE e.C_SOURCE_EVENT_ID=c.C_SOURCE_EVENT_ID);
 
         -- log vào ledger: phí = group PAYABLE, type theo charge (MGMT_FEE/TAX/...), source BO (derive cust/master từ registry)
-        INSERT INTO T_SI_FEE_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_FEE_GROUP,C_FEE_TYPE,C_PERIOD,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
-        SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, 'PAYABLE', c.C_FEE_TYPE, c.C_PERIOD, c.C_AMOUNT, 'BO', c.C_SOURCE_EVENT_ID
+        INSERT INTO T_SI_FEE_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_FEE_GROUP,C_FEE_TYPE,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
+        SELECT c.C_SI_ACCOUNT, ip.C_CUST_CODE, ip.C_MASTER_CODE, c.C_CHARGE_DATE, 'PAYABLE', c.C_FEE_TYPE, c.C_AMOUNT, 'BO', c.C_SOURCE_EVENT_ID
         FROM @chg c LEFT JOIN T_SI_PORTFOLIO ip ON ip.C_SI_ACCOUNT=c.C_SI_ACCOUNT;
 
         -- net-off payable (thiếu đủ cứ trừ; residual treo → carry sang kỳ sau)
