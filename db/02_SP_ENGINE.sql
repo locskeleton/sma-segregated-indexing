@@ -306,23 +306,36 @@ BEGIN
     FROM T_SI_NAV_CURRENT s
     INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d;
 
-    -- unit ledger (chỉ ngày có cashflow) — INSERT-ONLY idempotent (WHERE NOT EXISTS), KHÔNG xoá dòng sổ.
-    --   re-run: dòng (si,@p_d) đã có → bỏ qua; crash giữa chừng → bù dòng còn thiếu (giá trị deterministic).
-    INSERT INTO T_SI_UNIT_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
-    SELECT w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,@p_d,(w.C_CF_IN-w.C_CF_OUT),w.C_DELTA_UNIT,w.C_UNIT
-    FROM T_EOD_WORK w
-    WHERE w.C_BUSINESS_DATE=@p_d AND (w.C_CF_IN-w.C_CF_OUT)<>0
-      AND NOT EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER ul
-                      WHERE ul.C_SI_ACCOUNT=w.C_SI_ACCOUNT AND ul.C_BUSINESS_DATE=@p_d);
+    -- unit ledger (chỉ ngày có cashflow) — MERGE idempotent + SỬA-SỐ-AN-TOÀN (tính lại @p_d → UPDATE, KHÔNG dup),
+    --   thay DELETE+INSERT. Key (si,@p_d). Source = T_EOD_WORK @p_d có cashflow (cf<>0).
+    --   ⚠️ WHEN NOT MATCHED BY SOURCE có ĐIỀU KIỆN tgt.C_BUSINESS_DATE=@p_d → CHỈ xoá trong @p_d (cf đổi về 0
+    --      khi tính lại thì gỡ dòng cũ); TUYỆT ĐỐI không đụng ngày khác (thiếu điều kiện này = xoá sạch lịch sử).
+    MERGE T_SI_UNIT_LEDGER AS tgt
+    USING (SELECT C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, (C_CF_IN - C_CF_OUT) AS CF_NET, C_DELTA_UNIT, C_UNIT
+           FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d AND (C_CF_IN - C_CF_OUT)<>0) AS src
+       ON tgt.C_SI_ACCOUNT = src.C_SI_ACCOUNT AND tgt.C_BUSINESS_DATE = @p_d
+    WHEN MATCHED THEN UPDATE SET
+        tgt.C_CF_NET = src.CF_NET, tgt.C_DELTA_UNIT = src.C_DELTA_UNIT, tgt.C_UNIT = src.C_UNIT
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
+        VALUES (src.C_SI_ACCOUNT,src.C_CUST_CODE,src.C_MASTER_CODE,@p_d,src.CF_NET,src.C_DELTA_UNIT,src.C_UNIT)
+    WHEN NOT MATCHED BY SOURCE AND tgt.C_BUSINESS_DATE = @p_d THEN DELETE;
 
-    -- LỊCH SỬ per sub-account (materialize để vẽ chart FR-03) — INSERT-ONLY idempotent (WHERE NOT EXISTS), KHÔNG xoá.
-    --   QUAN TRỌNG: re-run J07 (sau J12B) sẽ GIỮ dòng cũ → KHÔNG wipe cột accum TE mà J12B đã UPDATE vào dòng này.
-    INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_PAYABLE_FEE,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
-    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, w.C_NAV, w.C_PAYABLE_FEE, w.C_UNIT, w.C_UNIT_PRICE, w.C_DAILY_PNL,
-           CASE WHEN w.C_LAST_UNIT_PRICE>0 THEN w.C_UNIT_PRICE/w.C_LAST_UNIT_PRICE - 1 END
-    FROM T_EOD_WORK w
-    WHERE w.C_BUSINESS_DATE=@p_d
-      AND NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE nb WHERE nb.C_SI_ACCOUNT=w.C_SI_ACCOUNT AND nb.C_BUSINESS_DATE=@p_d);
+    -- LỊCH SỬ per sub-account (chart FR-03) — MERGE idempotent + SỬA-SỐ-AN-TOÀN. CHỈ UPDATE cột COMPUTE sở hữu
+    --   (NAV/payable/unit/unit_price/pnl/daily_return); KHÔNG đụng C_ACCUM_ACTIVE_RET* — J12B/SP_EOD_TE_ACCUM ghi
+    --   sau vào CHÍNH dòng này, nên tính lại J07 KHÔNG wipe accum TE (đây là lý do KHÔNG dùng DELETE+INSERT).
+    --   KHÔNG DELETE: mọi SI ACTIVE luôn có dòng → tránh xoá nhầm dòng đang giữ accum.
+    MERGE T_SI_NAV_BALANCE AS tgt
+    USING (SELECT C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, C_NAV, C_PAYABLE_FEE, C_UNIT, C_UNIT_PRICE, C_DAILY_PNL,
+                  CASE WHEN C_LAST_UNIT_PRICE>0 THEN C_UNIT_PRICE/C_LAST_UNIT_PRICE - 1 END AS DAILY_RET
+           FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d) AS src
+       ON tgt.C_SI_ACCOUNT = src.C_SI_ACCOUNT AND tgt.C_BUSINESS_DATE = @p_d
+    WHEN MATCHED THEN UPDATE SET
+        tgt.C_NAV = src.C_NAV, tgt.C_PAYABLE_FEE = src.C_PAYABLE_FEE, tgt.C_UNIT = src.C_UNIT,
+        tgt.C_UNIT_PRICE = src.C_UNIT_PRICE, tgt.C_DAILY_PNL = src.C_DAILY_PNL, tgt.C_DAILY_RETURN = src.DAILY_RET
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_PAYABLE_FEE,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+        VALUES (@p_d,src.C_SI_ACCOUNT,src.C_CUST_CODE,src.C_MASTER_CODE,src.C_NAV,src.C_PAYABLE_FEE,src.C_UNIT,src.C_UNIT_PRICE,src.C_DAILY_PNL,src.DAILY_RET);
 
 END
 GO
@@ -803,7 +816,10 @@ AS
 BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
-    DELETE FROM T_EOD_RUN         WHERE C_BUSINESS_DATE=@p_business_date;   -- mọi job chạy lại (job idempotent: DELETE+INSERT theo @d)
+    DELETE FROM T_EOD_RUN         WHERE C_BUSINESS_DATE=@p_business_date;   -- mọi job chạy lại (compute MERGE theo @d: idempotent + sửa-số)
+    -- ⚠️ HẠN CHẾ: RESET KHÔNG un-roll T_SI_NAV_CURRENT (C_LAST_NAV/C_UNIT/C_LAST_BUSINESS_DATE đã roll sang @d).
+    --   Re-run COMPUTE @d sẽ lấy mốc "hôm qua" = chính @d → PnL/Unit SAI. Tính-lại-sửa-số đúng cần un-roll state
+    --   (đọc lại NAV_BALANCE ngày trước phục hồi C_LAST_*) — CHƯA làm, là issue riêng.
     DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_business_date;
     UPDATE T_EOD_PIPELINE
     SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL,
