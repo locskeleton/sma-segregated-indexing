@@ -67,8 +67,8 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | 2 | **Model weight** | `T_MASTER_PORTFOLIO_TICKER` | C_MASTER_CODE, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
 | 3 | **Holdings** (trong event KH) | → `T_SI_PORTFOLIO_HOLDING` (current) + diff `T_SI_HOLDING_HIST` | C_SI_ACCOUNT, ticker, quantity, avg_cost | Mỗi event mang holdings từng sub-account của KH; ingest overwrite current + đóng/mở interval (no-dup). |
 | 4 | **Tiền (3 khoản)** (trong event KH) | → state `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff `T_SI_CASH_HIST` | C_SI_ACCOUNT, **tiền mặt, tiền bán chờ về, cổ tức tiền** | FO đồng bộ 3 khoản → `Tiền = Σ`. Tiền mặt đã NET thuế/phí. Tiền bán chờ về (T0+T1+T2, lưu **tổng**) + cổ tức tiền **vào tài sản** → `total_asset = stock + Tiền`, `NAV = total_asset − payable`. |
-| 5 | **Cổ tức + phí lưu ký** | `T_SI_FEE_INCOME` | business_date, C_SI_ACCOUNT, type[DIVIDEND\|CUSTODY_FEE], ticker, amount, event_id | **SPARSE** — chỉ ngày có sự kiện. Cho FR-06. (Phí QL KHÔNG ở đây — BO cắt, xem luồng BO→SDI.) |
-| 5b | **Phí QL đã cắt** (BO→SDI) | `T_SI_FEE_CHARGE` → net-off `payable` | si_account, amount, charge_date, period?, source_event_id | **Event Kafka từ BO** (`SP_INGEST_FEE_CHARGE`). BO cắt 1 cục/tháng; SDI net-off payable (dedup source_event_id). |
+| 5 | **Cổ tức + phí lưu ký** (FO→SDI) | `T_SI_FEE_LEDGER` | business_date, C_SI_ACCOUNT, group[INCOME\|PAYABLE], type[DIVIDEND\|CUSTODY_FEE], ticker, amount, source_event_id | **SPARSE** — chỉ ngày có sự kiện. Cho FR-06. DIVIDEND→INCOME, CUSTODY_FEE→PAYABLE (source FO). (Phí QL BO cắt cũng đổ vào bảng này — xem 5b.) |
+| 5b | **Phí QL đã cắt** (BO→SDI) | `T_SI_FEE_LEDGER` (type MGMT_FEE, group PAYABLE) → net-off `payable` | si_account, amount, charge_date, period?, source_event_id | **Event Kafka từ BO** (`SP_INGEST_FEE_CHARGE`). BO cắt 1 cục/tháng; charge_date→C_BUSINESS_DATE; SDI net-off payable (dedup source_event_id). |
 | 6 | **Cashflow** | `T_SI_CASHFLOW_EVENT` | C_SI_ACCOUNT, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
 
 ### C. Market data → SDI (feed EOD)
@@ -85,7 +85,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | 8a | **Current snapshot KH** | `T_SI_NAV_CURRENT` | C_SI_ACCOUNT, unit, cash, last_nav, last_unit_price, status, last_business_date | Push **current/delta** (1 dòng/tiểu khoản). |
 | 8b | **Current snapshot master** | `T_MASTER_NAV_CURRENT` | C_MASTER_CODE, cash, stock_value, total_asset, last_nav, unit, last_unit_price | Push current toàn quỹ (overview/AUM). |
 | 8c | **Master series ngày** | `T_MASTER_NAV_BALANCE`, `T_MASTER_INDEX_DAILY` | nav/unit/up/pnl/return + index_value (PR) | Append dòng master của ngày @d (nhỏ). |
-| 9 | **Lịch sử KH (API pull)** | `T_SI_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_SI_FEE_INCOME` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`SP_GET_*`) on-demand — **KHÔNG** push bulk lịch sử. |
+| 9 | **Lịch sử KH (API pull)** | `T_SI_NAV_BALANCE`, `T_MASTER_HOLDING_BALANCE`, `T_SI_FEE_LEDGER` | NAV/UP/return chart, holdings top20, cổ tức/phí | Asset/SMO **đọc qua API** (`SP_GET_*`) on-demand — **KHÔNG** push bulk lịch sử. |
 
 > **Điểm mấu chốt:** FO→SDI nặng (per-mã, dense, nạp THẲNG current); SDI→Asset nhẹ (per-tiểu-khoản current). Lịch sử dài hạn = `T_SI_NAV_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve API. Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core.
 

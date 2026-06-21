@@ -385,7 +385,7 @@ BEGIN
 
     -- RS1: summary
     --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
-    --     C_ACCUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (từ T_SI_FEE_CHARGE)
+    --     C_ACCUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (T_SI_FEE_LEDGER type MGMT_FEE)
     --     C_MGMT_FEE_ACCRUED   = phí QL accrued chưa net-off @ asOf (payable đang treo)
     SELECT  @p_asof                  AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
@@ -398,21 +398,17 @@ BEGIN
             ISNULL(@cash,0) + ISNULL(@stock,0) AS C_TOTAL_ASSET,
             fi.C_ACCUM_DIVIDEND,
             fi.C_ACCUM_CUSTODY_FEE,
-            ISNULL(sch.C_MGMT_FEE_PAID, 0) AS C_ACCUM_MGMT_FEE_PAID,
+            ISNULL(fi.C_MGMT_FEE_PAID, 0)  AS C_ACCUM_MGMT_FEE_PAID,
             ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_MGMT_FEE_ACCRUED
     FROM (SELECT 1 x) z
     LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
     OUTER APPLY (
-        SELECT  SUM(CASE WHEN C_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
-                SUM(CASE WHEN C_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE
-        FROM T_SI_FEE_INCOME
+        SELECT  SUM(CASE WHEN C_FEE_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
+                SUM(CASE WHEN C_FEE_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE,
+                SUM(CASE WHEN C_FEE_TYPE = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_MGMT_FEE_PAID  -- phí QL BO đã cắt thực
+        FROM T_SI_FEE_LEDGER
         WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
-    ) fi
-    OUTER APPLY (
-        SELECT  SUM(C_AMOUNT) AS C_MGMT_FEE_PAID                 -- phí QL BO đã cắt thực (log)
-        FROM T_SI_FEE_CHARGE
-        WHERE C_SI_ACCOUNT=@p_si_account AND C_CHARGE_DATE <= @p_asof
-    ) sch;
+    ) fi;
 
     -- RS2: holdings reconstruct @p_asof — đọc lại #hold (KHÔNG reconstruct lần 2)
     SELECT  C_TICKER, C_QUANTITY, C_MARKET_PRICE, C_MARKET_VALUE,
@@ -421,17 +417,17 @@ BEGIN
     FROM #hold
     ORDER BY C_MARKET_VALUE DESC;
 
-    -- RS3: chi tiết cổ tức/phí lưu ký ≤ asOf (sparse, FO đẩy)
-    SELECT C_BUSINESS_DATE, C_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
-    FROM T_SI_FEE_INCOME
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
-    ORDER BY C_BUSINESS_DATE DESC, C_TYPE;
+    -- RS3: chi tiết cổ tức/phí lưu ký ≤ asOf (FO đẩy: DIVIDEND, CUSTODY_FEE)
+    SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
+    FROM T_SI_FEE_LEDGER
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_TYPE IN ('DIVIDEND','CUSTODY_FEE')
+    ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
 
     -- RS4: chi tiết phí QL BO đã cắt ≤ asOf — ngày cắt, kỳ, số tiền
-    SELECT C_CHARGE_DATE, C_PERIOD, C_AMOUNT, C_SOURCE_EVENT_ID
-    FROM T_SI_FEE_CHARGE
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_CHARGE_DATE <= @p_asof
-    ORDER BY C_CHARGE_DATE DESC;
+    SELECT C_BUSINESS_DATE AS C_CHARGE_DATE, C_PERIOD, C_AMOUNT, C_SOURCE_EVENT_ID
+    FROM T_SI_FEE_LEDGER
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_TYPE='MGMT_FEE'
+    ORDER BY C_BUSINESS_DATE DESC;
 
     DROP TABLE #hold;
     END TRY
@@ -506,7 +502,7 @@ BEGIN
             ISNULL(st.stock_value, 0)                       AS stock_value,
             ISNULL(fi.div, 0)                               AS accum_dividend,
             ISNULL(fi.cust, 0)                              AS accum_custody_fee,
-            ISNULL(sch.paid, 0)                            AS mgmt_fee_paid,
+            ISNULL(fi.paid, 0)                             AS mgmt_fee_paid,
             b.C_PAYABLE_FEE                                  AS mgmt_fee_accrued,
             JSON_QUERY(ISNULL((SELECT hh.C_TICKER AS ticker, hh.C_QUANTITY AS qty,
                                       hh.C_PRICE AS price, hh.C_MV AS market_value
@@ -517,11 +513,10 @@ BEGIN
     LEFT JOIN T_SI_CASH_HIST ch ON ch.C_SI_ACCOUNT=b.C_SI_ACCOUNT
            AND ch.C_VALID_FROM <= @p_business_date AND (ch.C_VALID_TO > @p_business_date OR ch.C_VALID_TO IS NULL)
     OUTER APPLY (SELECT SUM(C_MV) AS stock_value FROM #hold WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT) st
-    OUTER APPLY (SELECT SUM(CASE WHEN C_TYPE='DIVIDEND' THEN C_AMOUNT END) AS div,
-                        SUM(CASE WHEN C_TYPE='CUSTODY_FEE' THEN C_AMOUNT END) AS cust
-                 FROM T_SI_FEE_INCOME WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_BUSINESS_DATE<=@p_business_date) fi
-    OUTER APPLY (SELECT SUM(C_AMOUNT) AS paid FROM T_SI_FEE_CHARGE
-                 WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_CHARGE_DATE<=@p_business_date) sch
+    OUTER APPLY (SELECT SUM(CASE WHEN C_FEE_TYPE='DIVIDEND'    THEN C_AMOUNT END) AS div,
+                        SUM(CASE WHEN C_FEE_TYPE='CUSTODY_FEE' THEN C_AMOUNT END) AS cust,
+                        SUM(CASE WHEN C_FEE_TYPE='MGMT_FEE'    THEN C_AMOUNT END) AS paid
+                 FROM T_SI_FEE_LEDGER WHERE C_SI_ACCOUNT=b.C_SI_ACCOUNT AND C_BUSINESS_DATE<=@p_business_date) fi
     WHERE b.C_BUSINESS_DATE=@p_business_date
     ORDER BY b.C_SI_ACCOUNT;
 

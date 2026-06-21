@@ -85,8 +85,8 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 |---|---|---|---|---|
 | Phí quản lý | Management fee | `C_MGMT_FEE_RATE` | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. | spec §9 (J06) |
 | Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền). | spec §9 (J06) |
-| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_CHARGE` | BO cắt tiền phí 1 cục/tháng → báo về → SDI trừ vào khoản phải trả. | spec §9 ; eod (B) |
-| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_INCOME`). | spec §3 ; eod (B) |
+| Cắt phí (net-off) | Fee charge / net-off | `T_SI_FEE_LEDGER` (type MGMT_FEE) | BO cắt tiền phí 1 cục/tháng → báo về → SDI trừ vào khoản phải trả (log group PAYABLE). | spec §9 ; eod (B) |
+| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_FEE_LEDGER` group PAYABLE). | spec §3 ; eod (B) |
 | Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. | spec §3 ; eod (B) |
 
 ---

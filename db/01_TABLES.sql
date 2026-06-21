@@ -297,50 +297,38 @@ CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_NAV_BALANCE (C_MASTER_CODE, C_BUSI
 CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_NAV_BALANCE (C_SI_ACCOUNT, C_BUSINESS_DATE)
     INCLUDE (C_NAV, C_PAYABLE_FEE, C_UNIT, C_UNIT_PRICE, C_DAILY_RETURN);
 
--- Sổ cái CỔ TỨC + PHÍ per sub-account, SPARSE — FO đẩy về (ingest, dedup C_SOURCE_EVENT_ID).
-CREATE TABLE T_SI_FEE_INCOME (
-    PK_SI_FEE_INCOME UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_INCOME_PKID DEFAULT NEWID(),
-    C_EVENT_ID       BIGINT IDENTITY(1,1) NOT NULL,
-    C_BUSINESS_DATE  DATE            NOT NULL,
+-- SỔ CÁI PHÍ/THU NHẬP per sub-account (SPARSE, idempotent). GỘP: cổ tức + phí lưu ký (FO đẩy qua
+-- SP_INGEST_CUSTOMER) + phí QL BO cắt (BO đẩy qua SP_INGEST_FEE_CHARGE → net-off payable). Phân loại 2 cấp:
+--   C_FEE_GROUP = nhóm hạch toán: 'INCOME' (cộng tài sản) | 'PAYABLE' (phí/phải trả). SUM theo group → tổng nhóm.
+--   C_FEE_TYPE  = khoản cụ thể: DIVIDEND (INCOME); CUSTODY_FEE, MGMT_FEE (PAYABLE); mở rộng thêm KHÔNG cần đẻ bảng.
+-- ⚠️ Accrual phí QL hằng ngày KHÔNG ở đây (vẫn T_SI_NAV_CURRENT.C_PAYABLE_FEE — J06); ledger chỉ event ĐÃ phát sinh.
+CREATE TABLE T_SI_FEE_LEDGER (
+    C_FEE_LEDGER_ID  BIGINT IDENTITY(1,1) NOT NULL,
+    PK_SI_FEE_LEDGER UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_PKID DEFAULT NEWID(),
+    C_BUSINESS_DATE  DATE            NOT NULL,   -- ngày phát sinh (cổ tức/phí lưu ký) HOẶC ngày BO cắt (phí QL)
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
-    C_CUST_CODE      VARCHAR(10)     NOT NULL,
-    C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_TYPE           VARCHAR(20)     NOT NULL,  -- DIVIDEND (cổ tức tiền) | CUSTODY_FEE (phí lưu ký). Phí QL KHÔNG ở đây → log riêng T_SI_FEE_CHARGE (BO cắt).
-    C_TICKER         VARCHAR(20)     NULL,
-    C_AMOUNT         DECIMAL(20,0)   NOT NULL,  -- TIỀN (VND); DIVIDEND cộng tài sản, CUSTODY_FEE trừ. Lũy kế hiển thị FR-06.
-    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_CFI_SRC DEFAULT 'FO',
-    C_SOURCE_EVENT_ID VARCHAR(64)    NULL,      -- khóa idempotency FO (chống Kafka redelivery nhân đôi)
-    C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_CFI_CREATED DEFAULT GETDATE(),
-    CONSTRAINT PK_SI_FEE_INCOME PRIMARY KEY CLUSTERED (PK_SI_FEE_INCOME),
-    CONSTRAINT UQ_SI_FEE_INCOME_NK UNIQUE (C_EVENT_ID)
+    C_CUST_CODE      VARCHAR(10)     NULL,       -- denormalized (derive lúc ingest)
+    C_MASTER_CODE    VARCHAR(20)     NULL,
+    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE — nhóm hạch toán (SUM theo nhóm = tổng phải trả/thu nhập)
+    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- DIVIDEND | CUSTODY_FEE | MGMT_FEE | (mở rộng)
+    C_AMOUNT         DECIMAL(20,0)   NOT NULL,   -- TIỀN (VND) > 0; ý nghĩa ±tài sản theo group (INCOME cộng, PAYABLE trừ)
+    C_TICKER         VARCHAR(20)     NULL,       -- cổ tức per-mã (DIVIDEND); NULL cho phí
+    C_PERIOD         CHAR(6)         NULL,       -- kỳ 'YYYYMM' (MGMT_FEE); NULL cho khoản khác
+    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_SRC DEFAULT 'FO',  -- FO | BO
+    C_SOURCE_EVENT_ID VARCHAR(64)    NULL,       -- khóa idempotency (chống Kafka redelivery nhân đôi)
+    C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_SI_FEE_LEDGER_CREATED DEFAULT GETDATE(),
+    CONSTRAINT PK_SI_FEE_LEDGER_ID PRIMARY KEY CLUSTERED (C_FEE_LEDGER_ID),
+    CONSTRAINT UQ_SI_FEE_LEDGER_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_LEDGER)
 );
-CREATE INDEX IX_SI_FEE_INCOME_DATE ON T_SI_FEE_INCOME (C_BUSINESS_DATE)
-    INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_TYPE, C_AMOUNT);  -- EOD/agg theo ngày
--- [FR-06] cổ tức/phí lưu ký lũy kế theo SUB-ACCOUNT ≤ asOf — by si.
-CREATE INDEX IX_SI_FEE_INCOME_ACCT ON T_SI_FEE_INCOME (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_TYPE, C_AMOUNT, C_TICKER, C_SOURCE);
-CREATE UNIQUE INDEX UQ_SI_FEE_INCOME_SRCEVT ON T_SI_FEE_INCOME (C_SOURCE_EVENT_ID)
+-- [FR-06] lũy kế/chi tiết theo SUB-ACCOUNT ≤ asOf — by si (INCLUDE group/type/ticker/period để filter+sum).
+CREATE INDEX IX_SI_FEE_LEDGER_ACCT ON T_SI_FEE_LEDGER (C_SI_ACCOUNT, C_BUSINESS_DATE)
+    INCLUDE (C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT, C_TICKER, C_PERIOD, C_SOURCE);
+-- EOD/agg theo ngày
+CREATE INDEX IX_SI_FEE_LEDGER_DATE ON T_SI_FEE_LEDGER (C_BUSINESS_DATE)
+    INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT);
+-- idempotency: source_event_id duy nhất (filtered — FO có thể NULL, BO luôn có)
+CREATE UNIQUE INDEX UQ_SI_FEE_LEDGER_SRCEVT ON T_SI_FEE_LEDGER (C_SOURCE_EVENT_ID)
     WHERE C_SOURCE_EVENT_ID IS NOT NULL;
-
--- LOG PHÍ QL DO BO CẮT (BO-driven). BO cắt phí 1 cục/tháng → báo event Kafka → SDI ingest
--- (SP_INGEST_FEE_CHARGE) → net-off payable (payable −= amount; thiếu đủ cứ trừ, residual carry).
--- SDI KHÔNG sinh lịch/ra lệnh (BO sở hữu). Idempotent qua C_SOURCE_EVENT_ID. KHÔNG status lifecycle.
-CREATE TABLE T_SI_FEE_CHARGE (
-    C_FEE_CHARGE_ID  BIGINT IDENTITY(1,1) NOT NULL,
-    PK_SI_FEE_CHARGE UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_PKID DEFAULT NEWID(),
-    C_SI_ACCOUNT     VARCHAR(20)   NOT NULL,
-    C_CUST_CODE      VARCHAR(10)   NULL,            -- denormalized (derive từ T_SI_PORTFOLIO khi ingest)
-    C_MASTER_CODE    VARCHAR(20)   NULL,
-    C_CHARGE_DATE    DATE          NOT NULL,        -- ngày BO cắt (báo về)
-    C_PERIOD         CHAR(6)       NULL,            -- 'YYYYMM' kỳ phí (BO báo nếu có)
-    C_AMOUNT         DECIMAL(20,0) NOT NULL,        -- số tiền BO cắt thực (VND)
-    C_SOURCE_EVENT_ID VARCHAR(64)  NOT NULL,        -- khóa idempotency (chống Kafka redelivery)
-    C_CREATED_TIME   DATETIME      NOT NULL CONSTRAINT DF_SI_FEE_CHG_CREATED DEFAULT GETDATE(),
-    CONSTRAINT PK_SI_FEE_CHARGE_ID PRIMARY KEY CLUSTERED (C_FEE_CHARGE_ID),
-    CONSTRAINT UQ_SI_FEE_CHARGE_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_CHARGE),
-    CONSTRAINT UQ_SI_FEE_CHARGE_SRCEVT UNIQUE (C_SOURCE_EVENT_ID)   -- dedup BO event
-);
-CREATE INDEX IX_SI_FEE_CHARGE_ACCT ON T_SI_FEE_CHARGE (C_SI_ACCOUNT, C_CHARGE_DATE) INCLUDE (C_AMOUNT);
 
 /*------------------------------------------------ MASTER-LEVEL DAILY (output) -*/
 CREATE TABLE T_MASTER_INDEX_DAILY (
@@ -378,7 +366,7 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ TIỀN bán chờ về
     C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ TIỀN cổ tức chờ về
     C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,                                   -- Σ giá trị cổ phiếu (MTM)
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_FEE_INCOME on-demand (không lưu rollup master).
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_FEE_LEDGER on-demand (không lưu rollup master).
     C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
     C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_TOTAL_ASSET − C_PAYABLE_FEE (NAV net phí)
     C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master
