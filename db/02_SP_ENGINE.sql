@@ -259,8 +259,8 @@ BEGIN
     -- J06 ACCRUE phí QL (accrue = TRÍCH TRƯỚC; luôn chạy, gated rate>0; net-off do SP_INGEST_FEE_CHARGE khi BO cắt):
     --   payable += AUM_gross × rate × (NGÀY DƯƠNG LỊCH kể từ EOD trước) / 365.
     --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền.
-    --   RATE: lấy CẤP MASTER (T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE) — KHÔNG đọc rate cấp tiểu khoản
-    --     (T_SI_PORTFOLIO.C_MGMT_FEE_RATE) nữa: phí cấu hình cấp master/global, không cấp si. (Cột si vẫn còn, tạm không dùng.)
+    --   RATE: lấy CẤP MASTER (T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE). Phí cấu hình cấp master/global,
+    --     KHÔNG cấp si — cột phí cấp tiểu khoản đã BỎ khỏi T_SI_PORTFOLIO.
     --   IDEMPOTENT: chỉ accrue khi CHƯA compute @p_d (C_LAST_BUSINESS_DATE < @p_d) → re-run không cộng đôi.
     UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
         + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)

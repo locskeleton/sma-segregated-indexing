@@ -255,7 +255,7 @@ BEGIN
             ip.C_SIP_AMOUNT,
             ip.C_SIP_SCHEDULE,
             ip.C_MIN_INVEST,
-            COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) AS C_MGMT_FEE_RATE_EFFECTIVE
+            mp.C_MGMT_FEE_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- phí QL cấp master (không còn override cấp si)
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
     WHERE ip.C_SI_ACCOUNT = @p_si_account;

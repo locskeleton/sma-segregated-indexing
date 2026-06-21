@@ -56,8 +56,8 @@ INSERT INTO T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE)
 SELECT tk, @d, @price, @price FROM #tk;   -- bench 1 phiên: ref=close (factor=1, không assert index)
 
 /*--- sub-account (KH × master). C_SI_ACCOUNT = CONCAT('SUB',cust,master) (unique/KH×master) ---*/
-INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS,C_MGMT_FEE_RATE)
-SELECT CONCAT('SUB',FORMAT(c.n,'00000000'),mp.C_MASTER_CODE), CONCAT('KH',FORMAT(c.n,'00000000')), mp.C_MASTER_CODE, @d, 'ACTIVE', 0.01
+INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS)
+SELECT CONCAT('SUB',FORMAT(c.n,'00000000'),mp.C_MASTER_CODE), CONCAT('KH',FORMAT(c.n,'00000000')), mp.C_MASTER_CODE, @d, 'ACTIVE'
 FROM #cust c CROSS JOIN T_MASTER_PORTFOLIO mp;
 
 /*--- holdings: seed THẲNG vào current (bench bulk, thay ingest per-KH). MTM J07 đọc bảng này. ---*/

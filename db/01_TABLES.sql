@@ -55,7 +55,7 @@ CREATE TABLE T_SI_PORTFOLIO (
     C_INITIAL_AMOUNT DECIMAL(20,0)   NULL,    -- TIỀN (VND) cam kết đầu tư ban đầu khi mở tiểu khoản (tham chiếu; dòng tiền thực = T_SI_CASHFLOW_EVENT INITIAL)
     C_SIP_AMOUNT     DECIMAL(20,0)   NULL,    -- TIỀN (VND) nạp định kỳ (SIP) mỗi kỳ theo C_SIP_SCHEDULE
     C_SIP_SCHEDULE   VARCHAR(50)     NULL,
-    C_MGMT_FEE_RATE  DECIMAL(10,6)   NULL,    -- phí QL %/NĂM override riêng tiểu khoản; NULL = lấy theo T_MASTER_PORTFOLIO (J06 dùng COALESCE)
+    -- (KHÔNG có phí cấp tiểu khoản: phí QL cấu hình cấp master/global — T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE.)
     C_MIN_INVEST     DECIMAL(20,0)   NULL,    -- TIỀN (VND) tối thiểu phải duy trì
     CONSTRAINT PK_SI_PORTFOLIO PRIMARY KEY CLUSTERED (PK_SI_PORTFOLIO),
     CONSTRAINT UQ_SI_PORTFOLIO_NK UNIQUE (C_SI_ACCOUNT)   -- mã sub-account duy nhất toàn cục
