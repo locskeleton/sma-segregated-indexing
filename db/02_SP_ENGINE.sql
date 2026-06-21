@@ -275,8 +275,12 @@ BEGIN
       AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
 
     -- J06b LOG ACCRUE per-type (cho sao kê kê từng khoản): lượng accrue TỪNG loại trong ngày @p_d.
-    --   Σ các dòng này = phần += vào C_PAYABLE_FEE ở trên. Idempotent: xoá @p_d trước khi ghi.
-    DELETE FROM T_SI_FEE_ACCRUAL WHERE C_BUSINESS_DATE=@p_d;
+    --   Σ các dòng này = phần += vào C_PAYABLE_FEE ở trên. Idempotent: chỉ xoá @p_d của các tiểu khoản
+    --   SẮP accrue lại (cùng điều kiện INSERT) → re-run sau roll-forward (s.last=@p_d) KHÔNG xoá nhầm log đã ghi.
+    DELETE fa FROM T_SI_FEE_ACCRUAL fa
+    INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = fa.C_SI_ACCOUNT
+    WHERE fa.C_BUSINESS_DATE=@p_d
+      AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
     INSERT INTO T_SI_FEE_ACCRUAL (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_TYPE,C_ACCRUAL_AMOUNT)
     SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, cfg.C_FEE_TYPE,
            (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
