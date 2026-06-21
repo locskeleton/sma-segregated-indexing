@@ -466,26 +466,33 @@ END
 GO
 
 /*===========================================================================
-  J13 — RECONCILE (cổng publish): sanity checks; lỗi → THROW chặn publish
+  J13 — RECONCILE (RECORDER): GHI chi tiết break vào T_EOD_RECON_BREAK (idempotent), KHÔNG THROW.
+        SP_EOD_RUN đọc bảng break SAU bước này để quyết: có break ⇒ RECONCILE_STATUS=BREAK +
+        CHẶN publish (không chạy J14). KHÔNG throw ở đây để break được COMMIT (sống sót), không bị
+        rollback theo transaction của SP_EOD_STEP. Đọc data ĐÃ committed của J07/J11 (T_EOD_WORK,
+        T_MASTER_NAV_BALANCE) — đó là lý do mỗi step commit riêng.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RECONCILE @p_d DATE
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @bad INT;
-    -- NAV âm hoặc unit<=0 nhưng NAV>0 (bất thường)
-    SELECT @bad = COUNT(*) FROM T_EOD_WORK
+    DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d;   -- idempotent (re-run)
+
+    -- Check 1: NAV âm hoặc unit<=0 với NAV>0 (per-KH) → ghi từng dòng
+    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_MESSAGE)
+    SELECT @p_d, 'NAV_NEGATIVE', C_MASTER_CODE, C_SI_ACCOUNT, C_NAV,
+           CONCAT(N'NAV=', C_NAV, N' UNIT=', C_UNIT, N' bất thường')
+    FROM T_EOD_WORK
     WHERE C_BUSINESS_DATE=@p_d AND (C_NAV < 0 OR (C_UNIT<=0 AND C_NAV>0));
-    IF @bad > 0
-        THROW 50013, 'RECONCILE: phát hiện vị thế NAV âm hoặc unit<=0 với NAV>0.', 1;
-    -- Σ customer NAV per SI khớp T_MASTER_NAV_BALANCE (derive cùng nguồn → phải khớp)
-    SELECT @bad = COUNT(*)
+
+    -- Check 2: NAV master != Σ NAV khách (chênh > 1 VND) → ghi từng master lệch
+    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
+    SELECT @p_d, 'SI_NAV_MISMATCH', p.C_MASTER_CODE, p.C_NAV, a.NAV, p.C_NAV - a.NAV,
+           N'NAV master != Σ NAV khách (derive cùng nguồn → phải khớp)'
     FROM T_MASTER_NAV_BALANCE p
     INNER JOIN (SELECT C_MASTER_CODE, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
-      ON a.C_MASTER_CODE=p.C_MASTER_CODE AND p.C_BUSINESS_DATE=@p_d
-    WHERE ABS(p.C_NAV - a.NAV) > 1;   -- ngưỡng làm tròn 1 VND
-    IF @bad > 0
-        THROW 50014, 'RECONCILE: SI NAV != Σ customer NAV.', 1;
+      ON a.C_MASTER_CODE=p.C_MASTER_CODE
+    WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_NAV - a.NAV) > 1;
 END
 GO
 
@@ -570,7 +577,7 @@ GO
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RUN
     @p_business_date DATE,
-    @p_err_code      INT           OUTPUT,   -- 0=OK, -1=lỗi (step nào FAILED xem T_EOD_RUN)
+    @p_err_code      INT           OUTPUT,   -- 0=OK, -1=lỗi runtime, -2=reconcile BREAK, 10=precondition chưa đủ
     @p_err_msg       NVARCHAR(400) OUTPUT
 AS
 BEGIN
@@ -578,22 +585,151 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
+    -- PRECONDITION: upstream phải READY (BO market data + FO ingest) mới được chạy EOD.
+    DECLARE @mkt VARCHAR(10), @fo VARCHAR(10);
+    SELECT @mkt=C_MKT_DATA_STATUS, @fo=C_FO_INGEST_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d;
+    IF @mkt IS NULL OR @mkt<>'READY' OR @fo<>'READY'
+    BEGIN
+        SET @p_err_code = 10;
+        SET @p_err_msg = CONCAT(N'Precondition chưa đủ: MKT_DATA=', ISNULL(@mkt,'(chưa khởi tạo)'),
+                                N', FO_INGEST=', ISNULL(@fo,'(chưa khởi tạo)'), N' (cần READY cả hai).');
+        RETURN;   -- KHÔNG chạy EOD
+    END
+
+    UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='RUNNING', C_OVERALL_STATUS='EOD_RUNNING',
+           C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
+
     BEGIN TRY
         -- (INGEST: FO event per-KH đã vào qua SP_INGEST_CUSTOMER → cash/holdings/history sẵn trong current + interval)
         EXEC SP_EOD_STEP @d, 'J0_GATE',      'SP_EOD_GATE';            -- chờ đủ FO ingest (received=expected) — cổng vào
-        -- (ĐÃ BỎ J01_SYNC_FO + J14B_HISTORY) — chuyển sang SP_INGEST_CUSTOMER (per-event realtime)
-        -- (J06 PHÍ QL accrue nằm TRONG J07_COMPUTE; net-off do SP_INGEST_FEE_CHARGE khi BO cắt — không job riêng)
         EXEC SP_EOD_STEP @d, 'J07_COMPUTE',  'SP_EOD_COMPUTE';         -- MTM→NAV→PnL→Unit + roll-forward + perf per-KH
         EXEC SP_EOD_STEP @d, 'J11_SI_AGG',   'SP_EOD_SI_AGG';
         EXEC SP_EOD_STEP @d, 'J12_SI_INDEX', 'SP_EOD_SI_INDEX';
         EXEC SP_EOD_STEP @d, 'J12B_TE_ACCUM', 'SP_EOD_TE_ACCUM';           -- lũy kế active return per-KH (TE prefix-sum)
-        EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- cổng
+        EXEC SP_EOD_STEP @d, 'J13_RECONCILE','SP_EOD_RECONCILE';       -- recorder break (KHÔNG throw)
+
+        -- CỔNG ĐỐI SOÁT: có break ⇒ CHẶN publish, KHÔNG chạy J14.
+        DECLARE @nbreak INT = (SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@d);
+        IF @nbreak > 0
+        BEGIN
+            UPDATE T_EOD_PIPELINE SET C_RECONCILE_STATUS='BREAK', C_RECONCILE_AT=GETDATE(), C_BREAK_COUNT=@nbreak,
+                   C_EOD_STATUS='FAILED', C_OVERALL_STATUS='RECONCILE_BREAK', C_UPDATED_AT=GETDATE(),
+                   C_MESSAGE=CONCAT(N'Reconcile BREAK: ', @nbreak, N' dòng (xem T_EOD_RECON_BREAK)')
+            WHERE C_BUSINESS_DATE=@d;
+            SET @p_err_code = -2;
+            SET @p_err_msg = CONCAT(N'RECONCILE BREAK: ', @nbreak, N' dòng lệch — chặn publish. Xem T_EOD_RECON_BREAK.');
+            RETURN;   -- KHÔNG chạy J14/publish
+        END
+        UPDATE T_EOD_PIPELINE SET C_RECONCILE_STATUS='PASS', C_RECONCILE_AT=GETDATE(), C_BREAK_COUNT=0,
+               C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
+
         EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
-        -- J15 PUBLISH: push sang Asset (current snapshot + SI series) — adapter riêng
+
+        -- EOD xong (chưa publish — Asset sync do app làm rồi gọi SP_EOD_SET_ASSET_SYNCED).
+        UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='DONE', C_EOD_AT=GETDATE(), C_OVERALL_STATUS='EOD_DONE',
+               C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT > 0 ROLLBACK;   -- phòng hờ (SP_EOD_STEP thường đã rollback tran của nó)
+        UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='FAILED', C_OVERALL_STATUS='FAILED',
+               C_UPDATED_AT=GETDATE(), C_MESSAGE=ERROR_MESSAGE() WHERE C_BUSINESS_DATE=@d;
         SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE();   -- trả lỗi về caller, KHÔNG THROW. Step FAILED đã log T_EOD_RUN.
+    END CATCH
+END
+GO
+
+/*===========================================================================
+  PIPELINE CONTROL — đánh dấu upstream ready / asset synced / reset re-run.
+  Convention API (gọi bởi BO/FO/app/ops): @p_user + @p_err_code/@p_err_msg OUT, KHÔNG THROW.
+===========================================================================*/
+
+-- BO/FO báo nguồn đã sync xong cho ngày @p_business_date → set READY (tiền đề chạy EOD).
+CREATE OR ALTER PROCEDURE SP_EOD_SET_SOURCE_READY
+    @p_business_date DATE,
+    @p_source        VARCHAR(20),               -- 'MKT_DATA' (BO) | 'FO_INGEST' (FO)
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+    IF @p_source NOT IN ('MKT_DATA','FO_INGEST')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; THROW 50020,N'validation',1; END
+
+    -- tạo dòng pipeline nếu chưa có
+    IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
+        INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
+
+    IF @p_source='MKT_DATA'
+        UPDATE T_EOD_PIPELINE SET C_MKT_DATA_STATUS='READY', C_MKT_DATA_AT=GETDATE(),
+               C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
+    ELSE
+        UPDATE T_EOD_PIPELINE SET C_FO_INGEST_STATUS='READY', C_FO_INGEST_AT=GETDATE(),
+               C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
+
+    -- cả 2 READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)
+    UPDATE T_EOD_PIPELINE SET C_OVERALL_STATUS='READY'
+    WHERE C_BUSINESS_DATE=@p_business_date AND C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY'
+      AND C_OVERALL_STATUS='WAITING_DATA';
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
+    END CATCH
+END
+GO
+
+-- App báo kết quả publish sang Asset cho ngày @p_business_date.
+CREATE OR ALTER PROCEDURE SP_EOD_SET_ASSET_SYNCED
+    @p_business_date DATE,
+    @p_status        VARCHAR(10),               -- 'DONE' | 'FAILED'
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+    IF @p_status NOT IN ('DONE','FAILED')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_status phải DONE hoặc FAILED'; THROW 50021,N'validation',1; END
+    IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date AND C_EOD_STATUS='DONE')
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa EOD DONE — không thể đánh dấu Asset synced'; THROW 50022,N'validation',1; END
+
+    UPDATE T_EOD_PIPELINE
+    SET C_ASSET_SYNC_STATUS=@p_status, C_ASSET_SYNC_AT=GETDATE(),
+        C_OVERALL_STATUS = CASE WHEN @p_status='DONE' THEN 'COMPLETED' ELSE C_OVERALL_STATUS END,
+        C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user
+    WHERE C_BUSINESS_DATE=@p_business_date;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
+    END CATCH
+END
+GO
+
+-- RESET re-run: sau khi sửa nguồn (FO/BO), xóa trạng thái job + break để EOD tính LẠI từ đầu.
+--   GIỮ cờ nguồn (MKT_DATA/FO_INGEST) nếu nguồn vẫn ready; reset EOD/RECONCILE/ASSET về PENDING.
+CREATE OR ALTER PROCEDURE SP_EOD_RESET
+    @p_business_date DATE,
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+    DELETE FROM T_EOD_RUN         WHERE C_BUSINESS_DATE=@p_business_date;   -- mọi job chạy lại (job idempotent: DELETE+INSERT theo @d)
+    DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_business_date;
+    UPDATE T_EOD_PIPELINE
+    SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL,
+        C_RECONCILE_STATUS='PENDING', C_RECONCILE_AT=NULL, C_BREAK_COUNT=0,
+        C_ASSET_SYNC_STATUS='PENDING', C_ASSET_SYNC_AT=NULL,
+        C_OVERALL_STATUS = CASE WHEN C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY' THEN 'READY' ELSE 'WAITING_DATA' END,
+        C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user, C_MESSAGE=N'RESET để chạy lại'
+    WHERE C_BUSINESS_DATE=@p_business_date;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
     END CATCH
 END
 GO

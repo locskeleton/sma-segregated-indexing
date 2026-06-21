@@ -35,11 +35,15 @@ VALUES ('SUB00001001','KH00001001','SDI01','2026-01-02','INITIAL',10000000);
 
 /*--- Phiên 02: ingest (cash 0, holdings AAA 60000 / BBB 80000) rồi EOD ---*/
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-02","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-02', @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-02', @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-02', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 2026-01-02 FAILED ec=',@ec,' ',@em);
 
 /*--- Phiên 05: holdings KHÔNG đổi → ingest no-dup interval ---*/
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-05","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-05', @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-05', @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-05', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 2026-01-05 FAILED ec=',@ec,' ',@em);
 
@@ -47,11 +51,15 @@ IF @ec<>0 PRINT CONCAT('  !!! EOD 2026-01-05 FAILED ec=',@ec,' ',@em);
 DECLARE @ev06 NVARCHAR(MAX) = N'{"cust_code":"KH00001001","business_date":"2026-01-06","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}],"fees":[{"event_id":"FO-D06-1","type":"DIVIDEND","ticker":"AAA","amount":50000},{"event_id":"FO-D06-2","type":"CUSTODY_FEE","amount":1000}]}]}';
 EXEC SP_INGEST_CUSTOMER @ev06;
 EXEC SP_INGEST_CUSTOMER @ev06;   -- redelivery: phải no-op, fee KHÔNG nhân đôi
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 2026-01-06 FAILED ec=',@ec,' ',@em);
 
 /*--- Phiên 07: BBB tái cân bằng 80000→90000 (FO gửi holdings mới) → interval close/open ---*/
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH00001001","business_date":"2026-01-07","sub_accounts":[{"si_account":"SUB00001001","cash":0,"holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":90000,"avg_cost":50}],"fees":[]}]}';
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-07', @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-07', @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-07', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 2026-01-07 FAILED ec=',@ec,' ',@em);
 
@@ -186,3 +194,45 @@ ELSE
 PRINT '  index array: ' + ISNULL(@ixarr,'(NULL)');
 DELETE FROM T_BENCHMARK_DAILY WHERE C_BENCHMARK_CODE='VNINDEX' AND C_BUSINESS_DATE='2026-01-07';
 DROP TABLE #ix;
+
+PRINT '';
+PRINT '======== EOD PIPELINE CONTROL (T_EOD_PIPELINE + break + reset) ========';
+DECLARE @ecP INT, @emP NVARCHAR(400);
+
+-- (A) Happy: sau 4 phiên chạy, ngày 07 phải EOD_DONE + RECONCILE=PASS
+DECLARE @ov VARCHAR(20), @rec VARCHAR(10), @eod VARCHAR(10);
+SELECT @eod=C_EOD_STATUS, @rec=C_RECONCILE_STATUS, @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
+IF @eod='DONE' AND @rec='PASS' AND @ov='EOD_DONE'
+    PRINT '  OK pipeline @07: EOD_STATUS=DONE RECONCILE=PASS overall=EOD_DONE';
+ELSE PRINT CONCAT('  !!! pipeline @07 sai: eod=',@eod,' rec=',@rec,' overall=',@ov);
+
+-- (B) Precondition gate: ngày chưa có nguồn READY → SP_EOD_RUN trả err=10, KHÔNG chạy
+EXEC SP_EOD_RUN '2099-01-01', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+IF @ecP=10 PRINT CONCAT('  OK precondition chặn: err=10 (', @emP, ')');
+ELSE PRINT CONCAT('  !!! precondition KHÔNG chặn: err=', @ecP);
+
+-- (C) Break recorder: bơm lệch NAV master @07 rồi chạy J13 trực tiếp → ghi break SI_NAV_MISMATCH
+UPDATE T_MASTER_NAV_BALANCE SET C_NAV = C_NAV + 5000000 WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-07';
+EXEC SP_EOD_RECONCILE '2026-01-07';
+IF EXISTS (SELECT 1 FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-07' AND C_CHECK_NAME='SI_NAV_MISMATCH')
+    PRINT '  OK break recorder: ghi SI_NAV_MISMATCH vào T_EOD_RECON_BREAK (chi tiết chênh)';
+ELSE PRINT '  !!! break recorder KHÔNG ghi break';
+-- khôi phục + dọn break (trả data về đúng)
+UPDATE T_MASTER_NAV_BALANCE SET C_NAV = C_NAV - 5000000 WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-07';
+EXEC SP_EOD_RECONCILE '2026-01-07';   -- chạy lại → 0 break (data đã đúng)
+IF NOT EXISTS (SELECT 1 FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-07')
+    PRINT '  OK break clear sau khi data đúng: T_EOD_RECON_BREAK rỗng';
+ELSE PRINT '  !!! break vẫn còn sau khi data đúng';
+
+-- (D) Asset synced → COMPLETED
+EXEC SP_EOD_SET_ASSET_SYNCED @p_business_date='2026-01-07', @p_status='DONE', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+SELECT @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
+IF @ecP=0 AND @ov='COMPLETED' PRINT '  OK asset synced: overall=COMPLETED';
+ELSE PRINT CONCAT('  !!! asset synced sai: err=',@ecP,' overall=',@ov);
+
+-- (E) Reset: xóa job + đưa pipeline 07 về PENDING/READY (giữ nguồn)
+EXEC SP_EOD_RESET @p_business_date='2026-01-07', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+SELECT @eod=C_EOD_STATUS, @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
+IF @eod='PENDING' AND @ov='READY' AND NOT EXISTS (SELECT 1 FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07')
+    PRINT '  OK reset: EOD_STATUS=PENDING overall=READY, T_EOD_RUN @07 đã xóa (sẵn sàng chạy lại)';
+ELSE PRINT CONCAT('  !!! reset sai: eod=',@eod,' overall=',@ov);

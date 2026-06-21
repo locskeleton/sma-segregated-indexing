@@ -54,14 +54,26 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 02_SP_ENGINE.sql
 sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 ```
 
-## EOD: app gọi 1 proc
+## EOD: pipeline control (T_EOD_PIPELINE) + app gọi 1 proc
+Toàn luồng /ngày track ở **`T_EOD_PIPELINE`** (1 dòng/ngày): upstream → EOD → đối soát → Asset.
 ```sql
 DECLARE @ec INT, @em NVARCHAR(400);
+-- 1) upstream báo sẵn (tiền đề chạy EOD): BO market data + FO tiền/tài sản
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='FO_INGEST', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- 2) chạy EOD (CHẶN nếu chưa đủ 2 nguồn READY → @ec=10). @ec=-2 = reconcile BREAK (xem T_EOD_RECON_BREAK).
 EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
--- @ec=0 OK; <>0 lỗi (xem @em + T_EOD_RUN job FAILED)
+-- 3) app publish Kafka sang Asset xong → báo lại
+EXEC SP_EOD_SET_ASSET_SYNCED @p_business_date='2026-01-06', @p_status='DONE', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- @ec=0 OK; sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (xóa job+break, recompute)
 ```
-Master gọi tuần tự (idempotent + transaction + log `T_EOD_RUN`, resume từ job lỗi):
-`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE accum → J13 reconcile (cổng) → J14 snapshot`.
+**Trạng thái `T_EOD_PIPELINE`**: MKT_DATA/FO_INGEST (PENDING|READY) → EOD (PENDING|RUNNING|DONE|FAILED) →
+RECONCILE (PENDING|PASS|**BREAK**) → ASSET_SYNC (PENDING|DONE|FAILED); overall WAITING_DATA→READY→EOD_RUNNING→
+(RECONCILE_BREAK | EOD_DONE)→COMPLETED. **Chỉ COMPLETED khi đối soát PASS + Asset sync DONE.**
+
+Master gọi tuần tự (idempotent + transaction/step + log `T_EOD_RUN`, resume từ job lỗi):
+`J0 gate (chờ đủ FO ingest) → J07 compute (MTM→NAV→PnL→Unit, roll-forward, perf per-KH) → J11 SI agg → J12 SI index → J12B TE accum → J13 reconcile (recorder break) → [CỔNG: có break ⇒ chặn, KHÔNG chạy J14] → J14 snapshot`.
+(J13 GHI chi tiết lệch vào **`T_EOD_RECON_BREAK`** — KHÔNG throw để break được commit; `SP_EOD_RUN` đọc bảng break sau J13 → có break ⇒ RECONCILE=BREAK + chặn publish. Data J07-J12B đã commit từng step → nghiệp vụ soi break trên data đó; sửa nguồn → `SP_EOD_RESET` → chạy lại.)
 (J12B `SP_EOD_TE_ACCUM` [PM tool]: lũy kế per-KH `C_ACCUM_ACTIVE_RET/_SQ` + `C_RET_DAY_COUNT` vào `T_SI_NAV_BALANCE` — active return = KH return − master index return; chạy sau J12 vì cần index daily return. Cho phép tính TE qua range BẤT KỲ bằng HIỆU 2 mốc base/end (prefix-sum) → serve-layer PM đọc 2 lát thay vì quét lịch sử. Idempotent: accum@d = accum@prev + a@d. Bench medium ~676ms/phiên.)
 (J06 phí QL = **BO-driven, CỐ ĐỊNH (no toggle)**: SDI accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH trong J07 (`payable += AUM_gross × rate × DATEDIFF(ngày)/365`, gated `rate>0`, day_count=365 hardcode). BO cắt phí 1 cục/tháng → event Kafka → `SP_INGEST_FEE_CHARGE` net-off payable (log `T_SI_FEE_CHARGE`, dedup `C_SOURCE_EVENT_ID`). **NAV = total_asset − payable**; total_asset = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables). Thuế GD luôn FO net. Đã BỎ `T_SDI_CONFIG`/`T_SI_FEE_SCHEDULE`/`SP_EOD_FEE_CHARGE`.)
 
