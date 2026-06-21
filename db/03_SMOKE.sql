@@ -169,15 +169,20 @@ ELSE
 PRINT '  master EOD@07 payload: ' + ISNULL(@mEOD,'(NULL)');
 DROP TABLE #mE; DROP TABLE #mH;
 
-PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (1 result set; master index + benchmark gộp) ---';
+PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (1 bản ghi = JSON array, mỗi master gộp index+benchmark) ---';
 DECLARE @ecI INT, @emI NVARCHAR(400);
-CREATE TABLE #ix (typ VARCHAR(20), code VARCHAR(20), bd DATE, payload NVARCHAR(MAX));  -- 4 cột = 1 result set
+-- seed 1 benchmark daily để test benchmark_value join theo benchmark_code của master
+INSERT T_BENCHMARK_DAILY (C_BENCHMARK_CODE,C_BUSINESS_DATE,C_INDEX_VALUE) VALUES ('VNINDEX','2026-01-07',1250.5);
+CREATE TABLE #ix (payload NVARCHAR(MAX));   -- 1 row, 1 col = JSON array
 INSERT #ix EXEC SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD', @p_err_code=@ecI OUTPUT, @p_err_msg=@emI OUTPUT;
+DECLARE @ixarr NVARCHAR(MAX) = (SELECT payload FROM #ix);
 PRINT '  err='+CAST(@ecI AS VARCHAR(10))+' (kỳ vọng 0)';
-DECLARE @ixSDI NVARCHAR(MAX) = (SELECT payload FROM #ix WHERE typ='MASTER_INDEX' AND code='SDI01');
-IF @ixSDI LIKE '%"index_type":"MASTER_INDEX"%' AND @ixSDI LIKE '%"index_value":1078.8%'
-    PRINT '  OK index SP: 1 result set, master index SDI01=1078.8 (index_type=MASTER_INDEX; benchmark cùng schema, dedup)';
+IF LEFT(@ixarr,1)='[' AND RIGHT(@ixarr,1)=']'
+   AND @ixarr LIKE '%"master_code":"SDI01"%' AND @ixarr LIKE '%"index_value":1078.8%'
+   AND @ixarr LIKE '%"benchmark_code":"VNINDEX"%' AND @ixarr LIKE '%"benchmark_value":1250.5%'
+    PRINT '  OK index SP: JSON array, master SDI01 gộp index=1078.8 + benchmark VNINDEX=1250.5';
 ELSE
-    PRINT '  !!! LỖI index SP: ' + ISNULL(@ixSDI,'(NULL)');
-PRINT '  index SDI01 payload: ' + ISNULL(@ixSDI,'(NULL)');
+    PRINT '  !!! LỖI index SP: ' + ISNULL(@ixarr,'(NULL)');
+PRINT '  index array: ' + ISNULL(@ixarr,'(NULL)');
+DELETE FROM T_BENCHMARK_DAILY WHERE C_BENCHMARK_CODE='VNINDEX' AND C_BUSINESS_DATE='2026-01-07';
 DROP TABLE #ix;
