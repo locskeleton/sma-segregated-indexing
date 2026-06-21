@@ -384,9 +384,8 @@ BEGIN
     DECLARE @stock DECIMAL(20,0) = (SELECT SUM(C_MARKET_VALUE) FROM #hold);
 
     -- RS1: summary
-    --   Phí QL trả ĐỦ 2 trường (tầng báo cáo tự chọn hiển thị):
-    --     C_ACCUM_MGMT_FEE_PAID  = phí QL BO đã cắt lũy kế ≤ asOf  (T_SI_FEE_LEDGER type MGMT_FEE)
-    --     C_MGMT_FEE_ACCRUED   = phí QL accrued chưa net-off @ asOf (payable đang treo)
+    --   Rollup theo NHÓM (fee_group): C_ACCUM_INCOME = Σ thu nhập (INCOME); C_ACCUM_FEE_PAYABLE = Σ phí phải trả (PAYABLE).
+    --   Chi tiết theo KHOẢN (fee_type): dividend / custody / mgmt_paid. Phí QL 2 trường: đã cắt (PAID) vs đang treo (ACCRUED).
     SELECT  @p_asof                  AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
@@ -396,6 +395,8 @@ BEGIN
             ISNULL(@cash, 0)       AS C_CASH,
             ISNULL(@stock, 0)      AS C_STOCK_VALUE,
             ISNULL(@cash,0) + ISNULL(@stock,0) AS C_TOTAL_ASSET,
+            ISNULL(fi.C_ACCUM_INCOME, 0)       AS C_ACCUM_INCOME,        -- Σ theo group INCOME (tổng thu nhập)
+            ISNULL(fi.C_ACCUM_FEE_PAYABLE, 0)  AS C_ACCUM_FEE_PAYABLE,   -- Σ theo group PAYABLE (tổng phí phải trả)
             fi.C_ACCUM_DIVIDEND,
             fi.C_ACCUM_CUSTODY_FEE,
             ISNULL(fi.C_MGMT_FEE_PAID, 0)  AS C_ACCUM_MGMT_FEE_PAID,
@@ -403,9 +404,11 @@ BEGIN
     FROM (SELECT 1 x) z
     LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
     OUTER APPLY (
-        SELECT  SUM(CASE WHEN C_FEE_TYPE = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
-                SUM(CASE WHEN C_FEE_TYPE = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE,
-                SUM(CASE WHEN C_FEE_TYPE = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_MGMT_FEE_PAID  -- phí QL BO đã cắt thực
+        SELECT  SUM(CASE WHEN C_FEE_GROUP = 'INCOME'  THEN C_AMOUNT END) AS C_ACCUM_INCOME,       -- rollup nhóm
+                SUM(CASE WHEN C_FEE_GROUP = 'PAYABLE' THEN C_AMOUNT END) AS C_ACCUM_FEE_PAYABLE,  -- rollup nhóm
+                SUM(CASE WHEN C_FEE_TYPE  = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
+                SUM(CASE WHEN C_FEE_TYPE  = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE,
+                SUM(CASE WHEN C_FEE_TYPE  = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_MGMT_FEE_PAID  -- phí QL BO đã cắt thực
         FROM T_SI_FEE_LEDGER
         WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
     ) fi;
