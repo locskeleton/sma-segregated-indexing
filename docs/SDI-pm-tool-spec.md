@@ -70,13 +70,13 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 | SP | US | Tham số | Trả |
 |---|---|---|---|
 | `SP_GET_PM_OVERVIEW_ALL` | US1 | `@p_range` | RS1 header (#master,#KH); RS2 tổng (AUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master (AUM/#KH/hiệu suất master/hiệu suất KH/dev/TE/cash-drag, sort) |
-| `SP_GET_MASTER_OVERVIEW` | US2 | `@p_master_code, @p_range, @p_dev_threshold_high?, @p_dev_threshold_low?` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B. **Ngưỡng A/B override 3 tầng**: param tra cứu (what-if) → config per-master → default. PM kéo ngưỡng lúc tra cứu KHÔNG ghi đè config (chỉ đổi #đếm; giá trị deviation giữ nguyên) |
+| `SP_GET_MASTER_OVERVIEW` | US2 | `@p_master_code, @p_range, @p_dev_threshold_high?, @p_dev_threshold_low?` | AUM+growth, net in/out, AUM-weighted TE+badge+#vượt, cash drag+#vượt Y, deviation+#vượt A/B. **Ngưỡng A/B = tham số SP**, default +100/−100 BPS (KHÔNG ở config); PM truyền override lúc tra cứu (what-if) → chỉ đổi #đếm, giá trị deviation giữ nguyên |
 | `SP_GET_MASTER_PERFORMANCE` | US3 | `@p_master_code, @p_range, @p_resolution` (NULL=auto: D/W/M theo độ dài kỳ) | RS1 chuỗi: master index (PR) + `C_KH_COMPOSITE` (DM tổng KH AUM-weighted end-weight, base=1.0) + benchmark (PR) — app rebase 0%; RS2 mốc rebalance |
 | `SP_GET_MASTER_REBALANCE_DETAIL` | US3 click | `@p_master_code, @p_date` | RS1 target weight cũ→mới per mã (`T_MASTER_PORTFOLIO_TICKER`, FULL OUTER → mã ra/vào); RS2 net delta holdings THỰC TẾ per mã từ **`T_MASTER_HOLDING_BALANCE`** (@phiên ≤ eff vs phiên trước) — master-level daily holdings, chính xác hơn agg per-KH hist |
 | `SP_GET_MASTER_PNL_DIST` | US4 | `@p_master_code, @p_range` | #lãi/#lỗ + tỷ lệ, histogram buckets, AUM-weighted avg %PnL, trung vị |
 | `SP_GET_MASTER_TOP_KH` | US5 | `@p_master_code, @p_range, @p_topn, @p_dir` | rank mã KH theo %PnL (TR) |
 | `SP_GET_MASTER_ALERTS` | (alert) | `@p_master_code, @p_date`(NULL=phiên mới nhất)`, @p_user, @p_err_code OUT, @p_err_msg OUT` | cảnh báo composition: actual (`T_MASTER_HOLDING_BALANCE`) vs target (`T_MASTER_PORTFOLIO_TICKER`) + Σ ngành (`T_TICKER_INDUSTRY`). RS1 summary (#vượt symbol/drift/industry + ngưỡng); RS2 per-mã (actual/target/drift+cờ); RS3 per-ngành (Σweight+cờ). Ngưỡng NULL ⇒ alert tắt. **Proc API theo convention mới** (err qua OUT, 0=OK; KHÔNG THROW) |
-| `SP_GET_MASTER_DEVIATION_DIST` | §3.8 | `@p_master_code, @p_range, @p_dev_threshold_high?, @p_dev_threshold_low?, @p_bucket_bps=5, @p_cap_bps=25, @p_user, @p_err_code OUT, @p_err_msg OUT` | phân phối Performance Deviation per-KH (`(TWR KH − return master)×10000` BPS). RS1: #KH + dev AUM-weighted + **trung vị + σ** + #>A/#<B; RS2: histogram bucket BPS (width/cap config, axis liên tục + 2 overflow). Ngưỡng A/B override 3 tầng (giống US2) |
+| `SP_GET_MASTER_DEVIATION_DIST` | §3.8 | `@p_master_code, @p_range, @p_dev_threshold_high?, @p_dev_threshold_low?, @p_bucket_bps=5, @p_cap_bps=25, @p_user, @p_err_code OUT, @p_err_msg OUT` | phân phối Performance Deviation per-KH (`(TWR KH − return master)×10000` BPS). RS1: #KH + dev AUM-weighted + **trung vị + σ** + #>A/#<B; RS2: histogram bucket BPS (width/cap config, axis liên tục + 2 overflow). Ngưỡng A/B = tham số SP, default +100/−100 BPS (giống US2) |
 | `SP_SET_MASTER_PM_CONFIG` | (cấu hình) | `@p_master_code, ngưỡng...` | upsert ngưỡng PM per-master (gồm drift/symbol/industry weight) |
 
 > Mọi SP trong bảng đều thêm bộ tham số API chuẩn `@p_user`, `@p_err_code INT OUT`, `@p_err_msg NVARCHAR(400) OUT` (convention: lỗi trả qua OUT, `0`=OK, KHÔNG THROW). Caller phải truyền 2 tham số OUTPUT (bắt buộc).
@@ -97,8 +97,9 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
 ## 5. Schema
 
 - **`T_MASTER_PM_CONFIG`** (per-master, PM cài đặt — **bảng RIÊNG của PM tool**, sở hữu ở doc này):
-  `C_MASTER_CODE` (UNIQUE/PK) · `C_TE_BADGE_LOW` · `C_TE_BADGE_HIGH` · `C_TE_ALERT_THRESHOLD` · `C_CASH_DRAG_THRESHOLD` (Y) · `C_DEV_THRESHOLD_HIGH` (A) · `C_DEV_THRESHOLD_LOW` (B) · `C_DRIFT_THRESHOLD` · `C_SYMBOL_WEIGHT_ALERT` · `C_INDUSTRY_WEIGHT_ALERT` · `C_UPDATED_BY` · `C_UPDATED_TIME`.
-  - Fallback: master chưa cấu hình → default hệ thống (`UDF_PM_CONFIG` hardcode cho TE/cash-drag/deviation). Chỉ giữ current + updated_by/time (không lịch sử).
+  `C_MASTER_CODE` (UNIQUE/PK) · `C_TE_BADGE_LOW` · `C_TE_BADGE_HIGH` · `C_TE_ALERT_THRESHOLD` · `C_CASH_DRAG_THRESHOLD` (Y) · `C_DRIFT_THRESHOLD` · `C_SYMBOL_WEIGHT_ALERT` · `C_INDUSTRY_WEIGHT_ALERT` · `C_UPDATED_BY` · `C_UPDATED_TIME`.
+  - **Deviation A/B KHÔNG ở config** (khớp BRD cấu hình master): nhận qua tham số SP, default tại SP (+100/−100 BPS); caller truyền override lúc tra cứu. KHÔNG đọc config.
+  - Fallback: master chưa cấu hình → default hệ thống (`UDF_PM_CONFIG` hardcode cho TE/cash-drag). Chỉ giữ current + updated_by/time (không lịch sử).
   - **`C_DRIFT_THRESHOLD` / `C_SYMBOL_WEIGHT_ALERT` / `C_INDUSTRY_WEIGHT_ALERT`** (ratio, vd 0.15=15%): NULL=chưa cấu hình ⇒ alert type TẮT (không default). **Consumer = `SP_GET_MASTER_ALERTS`** (đã build): drift/symbol so actual vs target weight; industry Σ theo `T_TICKER_INDUSTRY`.
 - **`T_TICKER_INDUSTRY`** (dimension mã→ngành: `C_TICKER` PK, `C_INDUSTRY_CODE`, `C_INDUSTRY_NAME`) — cho industryWeight alert. **Seed hiện ở smoke; nguồn nạp THẬT (FO/market data) = task data-ops chưa làm.**
 - **3 cột TE prefix-sum trên `T_SI_NAV_BALANCE`** (`accum_active_ret`, `accum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
@@ -129,7 +130,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 
 ## 8. Quyết định (đã chốt khi duyệt — trước open)
 - **TE alert threshold RIÊNG** (`C_TE_ALERT_THRESHOLD`, không = badge_high). ✅
-- **Default ngưỡng hệ thống** (UDF_PM_CONFIG, fallback khi cột NULL): TE badge low=0.02/high=0.05; TE alert=0.05; cash drag Y=0.05; deviation A=+100 BPS / B=−100 BPS. ✅
+- **Default ngưỡng hệ thống**: TE badge low=0.02/high=0.05; TE alert=0.05; cash drag Y=0.05 (UDF_PM_CONFIG, fallback khi cột NULL). **Deviation A=+100 / B=−100 BPS = default tại tham số SP** (US2/DEVIATION_DIST), KHÔNG qua config — caller truyền override. ✅
 - **"DM tổng KH" = end-weight cố định** (`Wᵢ=AUMᵢ,end/ΣAUM`); chuỗi US3: `value_t = Σ Wᵢ·(UPᵢ,t/UPᵢ,base) / Σ Wᵢ(present)` (equi-join sample-date set-based — KHÔNG OUTER APPLY per-KH; renormalize Σweight present → KH join/đóng giữa kỳ không méo), base=1.0. ✅
 - **Resolution US3**: NULL=auto (kỳ >90 ngày→tháng, >21→tuần, còn lại→ngày); chọn phiên cuối mỗi bucket + luôn gồm base/end. ✅
 

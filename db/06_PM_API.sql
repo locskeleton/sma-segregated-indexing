@@ -24,8 +24,7 @@ RETURNS TABLE AS RETURN
             CAST(COALESCE(c.C_TE_BADGE_HIGH,       0.050000) AS DECIMAL(10,6)) AS C_TE_BADGE_HIGH,
             CAST(COALESCE(c.C_TE_ALERT_THRESHOLD,  0.050000) AS DECIMAL(10,6)) AS C_TE_ALERT_THRESHOLD,
             CAST(COALESCE(c.C_CASH_DRAG_THRESHOLD, 0.050000) AS DECIMAL(9,6))  AS C_CASH_DRAG_THRESHOLD,
-            CAST(COALESCE(c.C_DEV_THRESHOLD_HIGH,  100.00)   AS DECIMAL(10,2)) AS C_DEV_THRESHOLD_HIGH,
-            CAST(COALESCE(c.C_DEV_THRESHOLD_LOW,  -100.00)   AS DECIMAL(10,2)) AS C_DEV_THRESHOLD_LOW,
+            -- (deviation A/B bỏ khỏi config — SP nhận qua tham số, default tại SP +100/-100 BPS)
             -- ngưỡng cảnh báo cấu hình: KHÔNG default (NULL = chưa cấu hình → consumer tương lai tự xử)
             CAST(c.C_DRIFT_THRESHOLD       AS DECIMAL(9,6)) AS C_DRIFT_THRESHOLD,
             CAST(c.C_SYMBOL_WEIGHT_ALERT   AS DECIMAL(9,6)) AS C_SYMBOL_WEIGHT_ALERT,
@@ -45,8 +44,6 @@ CREATE OR ALTER PROCEDURE SP_SET_MASTER_PM_CONFIG
     @p_te_badge_high        DECIMAL(10,6) = NULL,
     @p_te_alert_threshold   DECIMAL(10,6) = NULL,
     @p_cash_drag_threshold  DECIMAL(9,6)  = NULL,
-    @p_dev_threshold_high   DECIMAL(10,2) = NULL,
-    @p_dev_threshold_low    DECIMAL(10,2) = NULL,
     @p_drift_threshold       DECIMAL(9,6) = NULL,
     @p_symbol_weight_alert   DECIMAL(9,6) = NULL,
     @p_industry_weight_alert DECIMAL(9,6) = NULL,
@@ -69,8 +66,6 @@ BEGIN
         C_TE_BADGE_HIGH       = @p_te_badge_high,
         C_TE_ALERT_THRESHOLD  = @p_te_alert_threshold,
         C_CASH_DRAG_THRESHOLD = @p_cash_drag_threshold,
-        C_DEV_THRESHOLD_HIGH  = @p_dev_threshold_high,
-        C_DEV_THRESHOLD_LOW   = @p_dev_threshold_low,
         C_DRIFT_THRESHOLD       = @p_drift_threshold,
         C_SYMBOL_WEIGHT_ALERT   = @p_symbol_weight_alert,
         C_INDUSTRY_WEIGHT_ALERT = @p_industry_weight_alert,
@@ -78,11 +73,11 @@ BEGIN
         C_UPDATED_TIME        = GETDATE()
     WHEN NOT MATCHED THEN INSERT
         (C_MASTER_CODE, C_TE_BADGE_LOW, C_TE_BADGE_HIGH, C_TE_ALERT_THRESHOLD,
-         C_CASH_DRAG_THRESHOLD, C_DEV_THRESHOLD_HIGH, C_DEV_THRESHOLD_LOW,
+         C_CASH_DRAG_THRESHOLD,
          C_DRIFT_THRESHOLD, C_SYMBOL_WEIGHT_ALERT, C_INDUSTRY_WEIGHT_ALERT, C_UPDATED_BY)
         VALUES
         (@p_master_code, @p_te_badge_low, @p_te_badge_high, @p_te_alert_threshold,
-         @p_cash_drag_threshold, @p_dev_threshold_high, @p_dev_threshold_low,
+         @p_cash_drag_threshold,
          @p_drift_threshold, @p_symbol_weight_alert, @p_industry_weight_alert, @p_updated_by);
 
     SELECT @p_master_code AS C_MASTER_CODE, * FROM dbo.UDF_PM_CONFIG(@p_master_code);
@@ -101,8 +96,8 @@ GO
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_OVERVIEW
     @p_master_code VARCHAR(20),
     @p_range         VARCHAR(20) = 'INCEPTION',
-    @p_dev_threshold_high DECIMAL(10,2) = NULL,   -- override A lúc tra cứu (what-if); NULL = lấy config per-master
-    @p_dev_threshold_low  DECIMAL(10,2) = NULL,   -- override B lúc tra cứu; NULL = lấy config
+    @p_dev_threshold_high DECIMAL(10,2) = 100.00,   -- A (>A = vượt trội); default +100 BPS, caller truyền override
+    @p_dev_threshold_low  DECIMAL(10,2) = -100.00,  -- B (<B = tụt); default -100 BPS
     @p_user        VARCHAR(64)   = NULL,
     @p_err_code    INT           OUTPUT,
     @p_err_msg     NVARCHAR(400) OUTPUT
@@ -114,15 +109,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @p_master_code)
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Master not found'; RAISERROR(@p_err_msg, 16, 1); END
 
-    -- cấu hình ngưỡng hiệu lực
-    DECLARE @teLow DECIMAL(10,6), @teHigh DECIMAL(10,6), @teAlert DECIMAL(10,6),
-            @cdThr DECIMAL(9,6),  @devHi  DECIMAL(10,2), @devLo  DECIMAL(10,2);
+    -- cấu hình ngưỡng hiệu lực (TE/cash-drag từ config). Deviation A/B nhận thẳng từ tham số (default tại SP).
+    DECLARE @teLow DECIMAL(10,6), @teHigh DECIMAL(10,6), @teAlert DECIMAL(10,6), @cdThr DECIMAL(9,6);
     SELECT @teLow=C_TE_BADGE_LOW, @teHigh=C_TE_BADGE_HIGH, @teAlert=C_TE_ALERT_THRESHOLD,
-           @cdThr=C_CASH_DRAG_THRESHOLD, @devHi=C_DEV_THRESHOLD_HIGH, @devLo=C_DEV_THRESHOLD_LOW
+           @cdThr=C_CASH_DRAG_THRESHOLD
     FROM dbo.UDF_PM_CONFIG(@p_master_code);
-    -- override 3 tầng ngưỡng deviation: param tra cứu > config per-master > default (đã COALESCE trong UDF)
-    SET @devHi = COALESCE(@p_dev_threshold_high, @devHi);
-    SET @devLo = COALESCE(@p_dev_threshold_low,  @devLo);
+    DECLARE @devHi DECIMAL(10,2) = @p_dev_threshold_high, @devLo DECIMAL(10,2) = @p_dev_threshold_low;
 
     -- khung ngày (hiệu suất T-1)
     DECLARE @end DATE, @cutoff DATE, @base DATE, @X INT;
@@ -784,8 +776,8 @@ GO
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_DEVIATION_DIST
     @p_master_code VARCHAR(20),
     @p_range         VARCHAR(20) = 'INCEPTION',
-    @p_dev_threshold_high DECIMAL(10,2) = NULL,   -- override A (>A = vượt trội); NULL = config
-    @p_dev_threshold_low  DECIMAL(10,2) = NULL,   -- override B (<B = tụt); NULL = config
+    @p_dev_threshold_high DECIMAL(10,2) = 100.00,   -- A (>A = vượt trội); default +100 BPS, caller truyền override
+    @p_dev_threshold_low  DECIMAL(10,2) = -100.00,  -- B (<B = tụt); default -100 BPS
     @p_bucket_bps    INT = 5,                      -- bề rộng bucket (BPS)
     @p_cap_bps       INT = 25,                     -- biên histogram (±); ngoài biên → overflow
     @p_user        VARCHAR(64)   = NULL,
@@ -801,11 +793,8 @@ BEGIN
     IF @p_bucket_bps <= 0 OR @p_cap_bps <= 0
         BEGIN SET @p_err_code = 3; SET @p_err_msg = N'bucket_bps/cap_bps phải > 0'; RAISERROR(@p_err_msg, 16, 1); END
 
-    -- ngưỡng A/B hiệu lực (override 3 tầng)
-    DECLARE @devHi DECIMAL(10,2), @devLo DECIMAL(10,2);
-    SELECT @devHi=C_DEV_THRESHOLD_HIGH, @devLo=C_DEV_THRESHOLD_LOW FROM dbo.UDF_PM_CONFIG(@p_master_code);
-    SET @devHi = COALESCE(@p_dev_threshold_high, @devHi);
-    SET @devLo = COALESCE(@p_dev_threshold_low,  @devLo);
+    -- ngưỡng A/B nhận thẳng từ tham số (default tại SP +100/-100 BPS, KHÔNG đọc config)
+    DECLARE @devHi DECIMAL(10,2) = @p_dev_threshold_high, @devLo DECIMAL(10,2) = @p_dev_threshold_low;
 
     -- khung ngày + master index return kỳ (PR)
     DECLARE @end DATE, @cutoff DATE, @base DATE;

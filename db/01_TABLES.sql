@@ -491,8 +491,7 @@ CREATE TABLE T_MASTER_PM_CONFIG (
     C_TE_BADGE_HIGH      DECIMAL(10,6)   NULL,   -- ngưỡng AUM-weighted TE badge med/high (ratio)
     C_TE_ALERT_THRESHOLD DECIMAL(10,6)   NULL,   -- ngưỡng TE per-KH để ĐẾM #KH vượt (riêng — không = badge_high)
     C_CASH_DRAG_THRESHOLD DECIMAL(9,6)   NULL,   -- Y: ngưỡng cash drag (ratio, vd 0.05) đếm #KH vượt
-    C_DEV_THRESHOLD_HIGH DECIMAL(10,2)   NULL,   -- A: ngưỡng deviation cao (BPS) đếm #KH dev>A (vượt trội)
-    C_DEV_THRESHOLD_LOW  DECIMAL(10,2)   NULL,   -- B: ngưỡng deviation thấp (BPS) đếm #KH dev<B (tụt)
+    -- (deviation A/B KHÔNG để ở config — khớp BRD cấu hình master; SP truyền qua tham số, default tại SP.)
     -- Ngưỡng cảnh báo cấu hình (ratio, vd 0.15 = 15%). NULL = chưa cấu hình. CHƯA có consumer tính alert
     -- (drift/symbol/industry weight) — config plumbing trước, computation + dimension ngành = task sau.
     C_DRIFT_THRESHOLD       DECIMAL(9,6) NULL,   -- độ trôi trọng số THỰC vs MỤC TIÊU → cảnh báo cần rebalance

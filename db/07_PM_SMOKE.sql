@@ -103,9 +103,9 @@ EXEC SP_EOD_TE_ACCUM @D3;
 GO
 
 DECLARE @ec INT, @em NVARCHAR(400);
-PRINT '======== P1: SP_SET_MASTER_PM_CONFIG (set HIGH dev=200, giữ còn lại default) ========';
-EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_dev_threshold_high=200.00, @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-PRINT '-- reset về toàn default cho các assert dưới --';
+PRINT '======== P1: SP_SET_MASTER_PM_CONFIG (set cash_drag=0.10, giữ còn lại default) ========';
+EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_cash_drag_threshold=0.10, @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+PRINT '-- reset về toàn default cho các assert dưới (deviation A/B nay là tham số SP, default +100/-100) --';
 EXEC SP_SET_MASTER_PM_CONFIG @p_master_code='M1', @p_updated_by='smoke', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;  -- all NULL → default
 
 PRINT '';
