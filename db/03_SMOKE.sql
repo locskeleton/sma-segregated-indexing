@@ -161,10 +161,22 @@ INSERT #mE EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_m
 INSERT #mH EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_mode='HISTORY', @p_err_code=@ecM OUTPUT, @p_err_msg=@emM OUTPUT;
 DECLARE @mEOD NVARCHAR(MAX) = (SELECT payload FROM #mE WHERE m='SDI01');
 DECLARE @mHIS NVARCHAR(MAX) = (SELECT payload FROM #mH WHERE m='SDI01');
-PRINT '  err='+CAST(@ecM AS VARCHAR(10))+' (kỳ vọng 0); kỳ vọng master_nav=11280000 index_value=1078.8';
+PRINT '  err='+CAST(@ecM AS VARCHAR(10))+' (kỳ vọng 0); kỳ vọng master_nav=11280000 (index/benchmark TÁCH sang SP riêng)';
 IF REPLACE(@mEOD,'"mode":"EOD"','"mode":"HISTORY"') = @mHIS
     PRINT '  OK REPLAY master: EOD@07 == HISTORY@07 (chỉ khác mode)';
 ELSE
     PRINT '  !!! LỖI REPLAY master';
 PRINT '  master EOD@07 payload: ' + ISNULL(@mEOD,'(NULL)');
 DROP TABLE #mE; DROP TABLE #mH;
+
+PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (event riêng; RS1 master index, RS2 benchmark) ---';
+DECLARE @ecI INT, @emI NVARCHAR(400);
+CREATE TABLE #ix (k VARCHAR(20), bd DATE, payload NVARCHAR(MAX));   -- INSERT...EXEC gộp RS1+RS2 (cùng shape)
+INSERT #ix EXEC SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD', @p_err_code=@ecI OUTPUT, @p_err_msg=@emI OUTPUT;
+PRINT '  err='+CAST(@ecI AS VARCHAR(10))+' (kỳ vọng 0)';
+DECLARE @ixSDI NVARCHAR(MAX) = (SELECT payload FROM #ix WHERE k='SDI01');
+IF @ixSDI LIKE '%"index_value":1078.8%'
+    PRINT '  OK index SP: master index SDI01 = 1078.8 (tách khỏi master snapshot, không dup benchmark)';
+ELSE
+    PRINT '  !!! LỖI index SP: ' + ISNULL(@ixSDI,'(NULL)');
+DROP TABLE #ix;
