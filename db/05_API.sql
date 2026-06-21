@@ -501,6 +501,22 @@ BEGIN
                  ORDER BY C_BUSINESS_DATE DESC) px;
     CREATE CLUSTERED INDEX IX_hold ON #hold (C_SI_ACCOUNT);
 
+    -- BREAKDOWN phí phải trả per-type @ngày (cho sao kê kê từng khoản): accrued − đã cắt = pending.
+    -- RECONSTRUCT-ONLY từ bảng DATED (T_SI_FEE_ACCRUAL + T_SI_FEE_LEDGER ≤ ngày) → replay y hệt. Driver = loại
+    -- ACCRUE (custody point-event không accrue → không vào breakdown). Σ pending = payable_fee (tổng).
+    SELECT a.C_SI_ACCOUNT, a.C_FEE_TYPE, a.accrued,
+           ISNULL(c.paid,0) AS paid, a.accrued - ISNULL(c.paid,0) AS pending
+    INTO #feebreak
+    FROM (SELECT C_SI_ACCOUNT, C_FEE_TYPE, SUM(C_ACCRUAL_AMOUNT) AS accrued
+          FROM T_SI_FEE_ACCRUAL
+          WHERE C_BUSINESS_DATE <= @p_business_date
+            AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_business_date)
+          GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) a
+    LEFT JOIN (SELECT C_SI_ACCOUNT, C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS paid  -- CAST tránh bẫy DECIMAL-38
+               FROM T_SI_FEE_LEDGER WHERE C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_business_date
+               GROUP BY C_SI_ACCOUNT, C_FEE_TYPE) c ON c.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND c.C_FEE_TYPE=a.C_FEE_TYPE;
+    CREATE CLUSTERED INDEX IX_fb ON #feebreak (C_SI_ACCOUNT);
+
     -- 1 dòng payload JSON / sub-account
     SELECT b.C_SI_ACCOUNT, b.C_BUSINESS_DATE,
         (SELECT
@@ -521,7 +537,10 @@ BEGIN
             ISNULL(fi.div, 0)                               AS accum_dividend,
             ISNULL(fi.cust, 0)                              AS accum_custody_fee,
             ISNULL(fi.paid, 0)                             AS mgmt_fee_paid,
-            b.C_PAYABLE_FEE                                  AS mgmt_fee_accrued,
+            -- kê TỪNG khoản phải trả accrued chưa cắt per-type (Σ pending = payable_fee tổng ở trên)
+            JSON_QUERY(ISNULL((SELECT fb.C_FEE_TYPE AS fee_type, fb.accrued, fb.paid, fb.pending
+                               FROM #feebreak fb WHERE fb.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+                               FOR JSON PATH), N'[]'))      AS payable_breakdown,
             JSON_QUERY(ISNULL((SELECT hh.C_TICKER AS ticker, hh.C_QUANTITY AS qty,
                                       hh.C_PRICE AS price, hh.C_MV AS market_value
                                FROM #hold hh WHERE hh.C_SI_ACCOUNT=b.C_SI_ACCOUNT
@@ -538,11 +557,12 @@ BEGIN
     WHERE b.C_BUSINESS_DATE=@p_business_date
     ORDER BY b.C_SI_ACCOUNT;
 
-    DROP TABLE #hold;
+    DROP TABLE #hold; DROP TABLE #feebreak;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
         IF OBJECT_ID('tempdb..#hold') IS NOT NULL DROP TABLE #hold;
+        IF OBJECT_ID('tempdb..#feebreak') IS NOT NULL DROP TABLE #feebreak;
     END CATCH
 END
 GO
