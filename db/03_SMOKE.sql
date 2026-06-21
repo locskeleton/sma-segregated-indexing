@@ -240,3 +240,57 @@ SELECT @eod=C_EOD_STATUS, @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSIN
 IF @eod='PENDING' AND @ov='READY' AND NOT EXISTS (SELECT 1 FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07')
     PRINT '  OK reset: EOD_STATUS=PENDING overall=READY, T_EOD_RUN @07 đã xóa (sẵn sàng chạy lại)';
 ELSE PRINT CONCAT('  !!! reset sai: eod=',@eod,' overall=',@ov);
+
+PRINT '';
+PRINT '======== PHÍ PHẢI TRẢ — breakdown Option B + guard @nAccrue (FR-06 RS5 / asset snapshot) ========';
+-- Scenario ISOLATED: SI riêng (SUBFEE01) + ngày riêng (2026-02-02/03) → KHÔNG đụng SDI01 (fee-free) ở trên.
+-- Option B: pending = C_PAYABLE_FEE đã chốt (exact, khớp NAV); paid = Σ cắt loại; accrued = pending + paid.
+INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('MGMT_FEE','PAYABLE',0.01);  -- 1 loại accrue
+INSERT INTO T_SI_NAV_CURRENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_UNIT,C_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_STATUS,C_LAST_SYNC_DATE)
+ VALUES ('SUBFEE01','KHFEE','SDI01',1000,0,602.739726,11000000,'ACTIVE','2026-02-03');
+INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_PAYABLE_FEE,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+ VALUES ('2026-02-02','SUBFEE01','KHFEE','SDI01',11000000,302.739726,1000,11000,0,0),
+        ('2026-02-03','SUBFEE01','KHFEE','SDI01',11000000,602.739726,1000,11000,0,0);
+INSERT INTO T_SI_INCOME_FEE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_FEE_GROUP,C_FEE_TYPE,C_AMOUNT,C_SOURCE,C_SOURCE_EVENT_ID)
+ VALUES ('2026-02-02','SUBFEE01','KHFEE','SDI01','PAYABLE','MGMT_FEE',300,'BO','SMK-MGMT-1');   -- đã cắt 300
+INSERT INTO T_SI_CASH_HIST (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_VALID_FROM,C_CASH) VALUES ('SUBFEE01','KHFEE','SDI01','2026-02-02',0);
+
+DECLARE @ecF INT, @emF NVARCHAR(400);
+-- (A) Snapshot @2026-02-03: payable_breakdown[0] phải = {MGMT_FEE, pending=602.7397(==payable_fee), paid=300, accrued=902.7397}
+CREATE TABLE #snapF (C_SI_ACCOUNT VARCHAR(20), C_BUSINESS_DATE DATE, C_PAYLOAD_JSON NVARCHAR(MAX));
+INSERT INTO #snapF EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+DECLARE @pjF NVARCHAR(MAX) = (SELECT C_PAYLOAD_JSON FROM #snapF WHERE C_SI_ACCOUNT='SUBFEE01');
+DECLARE @pf  DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_fee')                 AS DECIMAL(20,6));
+DECLARE @bty VARCHAR(20)   =          JSON_VALUE(@pjF,'$.payable_breakdown[0].fee_type');
+DECLARE @bpe DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].pending') AS DECIMAL(20,6));
+DECLARE @bpa DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].paid')    AS DECIMAL(20,6));
+DECLARE @bac DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].accrued') AS DECIMAL(20,6));
+IF @ecF=0 AND @bty='MGMT_FEE' AND ABS(@bpe-@pf)<0.001 AND ABS(@bpe-602.739726)<0.001
+        AND ABS(@bpa-300)<0.001 AND ABS(@bac-902.739726)<0.001 AND ABS(@bac-(@bpe+@bpa))<0.001
+    PRINT CONCAT('  OK snapshot breakdown: MGMT_FEE pending=',@bpe,' (==payable_fee=',@pf,') paid=',@bpa,' accrued=',@bac);
+ELSE PRINT CONCAT('  !!! snapshot breakdown sai: err=',@ecF,' type=',@bty,' pending=',@bpe,' payable_fee=',@pf,' paid=',@bpa,' accrued=',@bac);
+DROP TABLE #snapF;
+
+-- (B) GUARD @nAccrue>1: thêm loại phí accrue thứ 2 (TAX) → FR-06 + snapshot phải trả err=4 (chặn output sai)
+INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('TAX','PAYABLE',0.005);
+EXEC SP_GET_ASSET_REPORT @p_si_account='SUBFEE01', @p_asof='2026-02-03', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+IF @ecF=4 PRINT CONCAT('  OK guard FR-06: err=4 (',@emF,')');
+ELSE PRINT CONCAT('  !!! guard FR-06 KHÔNG chặn: err=',@ecF);
+EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+IF @ecF=4 PRINT '  OK guard snapshot: err=4';
+ELSE PRINT CONCAT('  !!! guard snapshot KHÔNG chặn: err=',@ecF);
+DELETE FROM T_FEE_CONFIG WHERE C_FEE_TYPE='TAX';   -- dọn: trả về 1 loại accrue
+
+-- (C) Custody (PAYABLE, KHÔNG rate) KHÔNG được trip guard và KHÔNG vào breakdown (chỉ point-event, không accrue)
+INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('CUSTODY_FEE','PAYABLE',NULL);
+EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+IF @ecF=0 PRINT '  OK custody (no rate) KHÔNG trip guard (vẫn 1 loại accrue)';
+ELSE PRINT CONCAT('  !!! custody no-rate sai: err=',@ecF);
+DELETE FROM T_FEE_CONFIG WHERE C_FEE_TYPE='CUSTODY_FEE';
+
+-- CLEANUP: gỡ config MGMT_FEE (GLOBAL!) + data SUBFEE01 → trả DB về fee-free, KHÔNG ảnh hưởng script chạy sau (07_PM_SMOKE)
+DELETE FROM T_FEE_CONFIG    WHERE C_FEE_TYPE='MGMT_FEE';
+DELETE FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT='SUBFEE01';
+DELETE FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUBFEE01';
+DELETE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT='SUBFEE01';
+DELETE FROM T_SI_CASH_HIST  WHERE C_SI_ACCOUNT='SUBFEE01';
