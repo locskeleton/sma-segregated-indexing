@@ -202,7 +202,22 @@ END
 GO
 
 /*===========================================================================
-  J07–J10 — COMPUTE: MTM → NAV → PnL → Unit/UnitPrice → roll-forward state
+  SP_EOD_COMPUTE — LÕI tính cuối ngày 1 phiên @p_d cho TỪNG tiểu khoản (si_account):
+    J06 accrue phí → J07 MTM → J08 NAV → J09 PnL → J10 Unit/UnitPrice → roll-forward + ghi lịch sử.
+
+  THUẬT NGỮ (đọc trước khi sửa — viết tắt nhiều):
+    • MTM (Mark-to-Market) = ĐỊNH GIÁ THỊ TRƯỜNG: định giá danh mục cổ phiếu theo giá ĐÓNG CỬA
+        cuối phiên = Σ(số lượng × giá đóng cửa). Kết quả = "stock value" (C_STOCK_VALUE).
+    • Tổng tài sản (AUM gross) = stock value + tiền mặt + tiền bán chờ về (T+) + cổ tức tiền chờ về.
+    • accrue (J06) = TRÍCH TRƯỚC phí quản lý theo NGÀY DƯƠNG LỊCH, cộng dồn vào "payable" mỗi phiên.
+    • payable (C_PAYABLE_FEE) = phí QL ĐÃ trích trước NHƯNG BO CHƯA cắt thực — khoản PHẢI TRẢ (trừ khỏi NAV).
+    • NAV (Net Asset Value) = giá trị tài sản RÒNG = Tổng tài sản − payable.
+    • CF (cashflow) = dòng tiền KH nạp (CF_IN) / rút (CF_OUT) trong phiên.
+    • PnL (Profit & Loss) = lãi/lỗ TIỀN trong ngày, ĐÃ LOẠI ảnh hưởng nạp/rút (= NAV − NAV_prev + ra − vào).
+    • Unit / Unit Price = ĐƠN VỊ QUỸ / GIÁ MỖI ĐƠN VỊ (= NAV/Unit). Unit chỉ thay đổi do nạp/rút
+        (KHÔNG do biến động giá) ⇒ Unit Price phản ánh THUẦN lãi/lỗ đầu tư.
+    • TWR (Time-Weighted Return) = lợi suất theo Unit Price (UP_t/UP_(t-1) − 1) — không bị méo bởi cashflow.
+    • roll-forward state = ghi đè trạng thái current (T_SI_NAV_CURRENT) sang cuối phiên @p_d làm mốc phiên sau.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE @p_d DATE
 AS
@@ -229,7 +244,8 @@ BEGIN
     ) cf ON cf.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- J07 MTM (câu nặng nhất — set-based; prod chạy batch-mode trên columnstore) — group theo sub-account
+    -- J07 MTM = ĐỊNH GIÁ THỊ TRƯỜNG cổ phiếu: stock value = Σ(số lượng × giá đóng cửa @p_d), group theo
+    --   sub-account. (Câu nặng nhất — set-based; prod chạy batch-mode trên columnstore.)
     UPDATE w SET w.C_STOCK_VALUE = m.SV
     FROM T_EOD_WORK w
     INNER JOIN (
@@ -240,21 +256,22 @@ BEGIN
     ) m ON m.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- J06 ACCRUE phí QL (luôn chạy, gated rate>0; net-off do SP_INGEST_FEE_CHARGE khi BO cắt):
+    -- J06 ACCRUE phí QL (accrue = TRÍCH TRƯỚC; luôn chạy, gated rate>0; net-off do SP_INGEST_FEE_CHARGE khi BO cắt):
     --   payable += AUM_gross × rate × (NGÀY DƯƠNG LỊCH kể từ EOD trước) / 365.
-    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền. rate: override tiểu khoản > master.
+    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền.
+    --   RATE: lấy CẤP MASTER (T_MASTER_PORTFOLIO.C_MGMT_FEE_RATE) — KHÔNG đọc rate cấp tiểu khoản
+    --     (T_SI_PORTFOLIO.C_MGMT_FEE_RATE) nữa: phí cấu hình cấp master/global, không cấp si. (Cột si vẫn còn, tạm không dùng.)
     --   IDEMPOTENT: chỉ accrue khi CHƯA compute @p_d (C_LAST_BUSINESS_DATE < @p_d) → re-run không cộng đôi.
     UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
         + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
-          * COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE)
+          * mp.C_MGMT_FEE_RATE
           * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
           / @dayCount
     FROM T_EOD_WORK w
     INNER JOIN T_SI_NAV_CURRENT   s  ON s.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
-    INNER JOIN T_SI_PORTFOLIO     ip ON ip.C_SI_ACCOUNT  = w.C_SI_ACCOUNT
     INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = w.C_MASTER_CODE
     WHERE w.C_BUSINESS_DATE=@p_d
-      AND COALESCE(ip.C_MGMT_FEE_RATE, mp.C_MGMT_FEE_RATE) > 0
+      AND mp.C_MGMT_FEE_RATE > 0
       AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
 
     -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
