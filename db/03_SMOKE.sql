@@ -298,15 +298,25 @@ DELETE FROM T_SI_CASH_HIST  WHERE C_SI_ACCOUNT='SUBFEE01';
 PRINT '';
 PRINT '======== DELETE+INSERT idempotent unit_ledger + nav_balance (tính lại KHÔNG dup; accum reset→J12B set lại; DELETE scoped) ========';
 -- (A) re-run COMPUTE @07: DELETE+INSERT lại → KHÔNG dup dòng; accum bị reset DEFAULT 0 (sentinel mất) — CÓ CHỦ ĐÍCH.
+-- IDEMPOTENT VALUE CHECK (un-roll anchor): NAV/PnL/Unit/return @07 phải Y HỆT sau tính-lại (anchor đọc NAV_BALANCE @06,
+--   KHÔNG bị roll-forward làm lệch). Trước fix: PnL→0, Unit cộng đôi cashflow. Bắt regression số liệu chạy đi chạy lại.
+DECLARE @nav0 DECIMAL(20,0),@pnl0 DECIMAL(20,0),@unit0 DECIMAL(18,6),@ret0 DECIMAL(10,6);
+SELECT @nav0=C_NAV,@pnl0=C_DAILY_PNL,@unit0=C_UNIT,@ret0=C_DAILY_RETURN FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07';
 UPDATE T_SI_NAV_BALANCE SET C_ACCUM_ACTIVE_RET=0.123456 WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07'; -- sentinel giả J12B
 DECLARE @nbB INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE='2026-01-07');
 DECLARE @ulB INT=(SELECT COUNT(*) FROM T_SI_UNIT_LEDGER);
-EXEC SP_EOD_COMPUTE '2026-01-07';   -- gọi trực tiếp (bỏ DONE-guard) → ép DELETE+INSERT lại
+EXEC SP_EOD_COMPUTE '2026-01-07';   -- tính lại lần 1
+EXEC SP_EOD_COMPUTE '2026-01-07';   -- tính lại lần 2 (chạy đi chạy lại nhiều lần)
 DECLARE @nbA INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE='2026-01-07');
 DECLARE @ulA INT=(SELECT COUNT(*) FROM T_SI_UNIT_LEDGER);
 DECLARE @accReset FLOAT=(SELECT C_ACCUM_ACTIVE_RET FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
+DECLARE @nav1 DECIMAL(20,0),@pnl1 DECIMAL(20,0),@unit1 DECIMAL(18,6),@ret1 DECIMAL(10,6);
+SELECT @nav1=C_NAV,@pnl1=C_DAILY_PNL,@unit1=C_UNIT,@ret1=C_DAILY_RETURN FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07';
 IF @nbA=@nbB AND @ulA=@ulB PRINT CONCAT('  OK re-run KHÔNG dup: nav_balance ',@nbB,'→',@nbA,'; unit_ledger ',@ulB,'→',@ulA);
 ELSE PRINT CONCAT('  !!! re-run DUP: nav_balance ',@nbB,'→',@nbA,'; unit_ledger ',@ulB,'→',@ulA);
+IF @nav1=@nav0 AND @pnl1=@pnl0 AND @unit1=@unit0 AND @ret1=@ret0
+    PRINT CONCAT('  OK IDEMPOTENT: NAV/PnL/Unit/return @07 KHÔNG đổi sau 2 lần tính lại (NAV=',@nav1,' PnL=',@pnl1,' UP_ret=',@ret1,')');
+ELSE PRINT CONCAT('  !!! LỆCH SỐ khi tính lại: NAV ',@nav0,'→',@nav1,' PnL ',@pnl0,'→',@pnl1,' Unit ',@unit0,'→',@unit1,' ret ',@ret0,'→',@ret1);
 IF ABS(@accReset)<0.0000001 PRINT '  OK J07 DELETE+INSERT tạo dòng mới sạch (accum reset DEFAULT 0, sentinel mất)';
 ELSE PRINT CONCAT('  !!! J07 KHÔNG tạo lại dòng (accum còn ',@accReset,') → DELETE+INSERT không chạy?');
 -- J12B set lại accum sau J07 reset, và IDEMPOTENT (chạy nhiều lần cho cùng kết quả → re-run pipeline an toàn).

@@ -240,10 +240,21 @@ BEGIN
 
     DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d;
 
-    -- seed từ state. Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH (FO sync). KEY = C_SI_ACCOUNT.
+    -- seed:
+    --   • TÀI SẢN @D (cash/pending/div + payable) ← STATE HIỆN TẠI T_SI_NAV_CURRENT (FO sync + BO net-off): đúng cho @D.
+    --   • ANCHOR PnL/Unit (C_LAST_NAV/C_LAST_UNIT_PRICE/C_UNIT_PREV) ← CUỐI ngày GD TRƯỚC, đọc từ T_SI_NAV_BALANCE @prev.
+    --     LÝ DO: roll-forward (cuối proc) ghi đè NAV_CURRENT.C_LAST_* = giá trị ngày @D. Nếu seed anchor từ NAV_CURRENT,
+    --     TÍNH LẠI @D (RESET re-run / chạy đi chạy lại) sẽ lấy nhầm mốc "hôm qua"=@D → PnL=0, Unit cộng đôi cashflow.
+    --     Đọc NAV_BALANCE @prev (bất biến qua các lần chạy @D) ⇒ IDEMPOTENT: chạy bao nhiêu lần cũng RA SỐ Y HỆT.
+    --     SI mới (chưa có dòng @prev) → pb NULL → C_UNIT_PREV=0/C_LAST_UNIT_PRICE=NULL → nhánh init (unit=NAV/10000).
+    DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
     INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
-    SELECT @p_d,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT
-    FROM T_SI_NAV_CURRENT WHERE C_STATUS='ACTIVE';
+    SELECT @p_d, s.C_SI_ACCOUNT, s.C_CUST_CODE, s.C_MASTER_CODE,
+           s.C_CASH, s.C_PENDING_CASH, s.C_DIV_CASH, s.C_PAYABLE_FEE,
+           ISNULL(pb.C_NAV, 0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT, 0)   -- anchor từ NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll)
+    FROM T_SI_NAV_CURRENT s
+    LEFT JOIN T_SI_NAV_BALANCE pb ON pb.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND pb.C_BUSINESS_DATE=@prev
+    WHERE s.C_STATUS='ACTIVE';
 
     -- CF của ngày (cho PnL & unit) — group theo sub-account
     UPDATE w SET w.C_CF_IN = cf.CF_IN, w.C_CF_OUT = cf.CF_OUT
