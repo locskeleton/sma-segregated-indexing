@@ -12,6 +12,12 @@ GO
       chưa có data ⇒ not-found (không thuộc đường serve). FR-01 (list) + FR-04 (info) đọc T_SI_PORTFOLIO
       (endpoint registry: join_date/sub_account_no/initial_amount/sip...). Ownership/auth do tầng API gác.
   Read-only. T0 unit price = 10.000.
+
+  *** ERR-CODE CONVENTION (chuẩn hoá date-guard toàn hệ, Mức 4) ***
+    0=OK · 1=not found (entity) · 2=tham số sai (mode) / alerts no-holdings · 3=không có data EOD cho NGÀY
+    (snapshot family: asset/master/index) · 4=fee multi-accrue guard (Option B) · 5=NGÀY-bừa-bãi cho entity
+    (FR-06 asof / rebalance @date: ngày nghỉ·tương lai·trước-mở·sau-đóng — chặn trả NAV=NULL+asset>0 im lặng).
+    [EOD pipeline: 10=precondition chưa đủ / NGÀY không phải ngày giao dịch (UDF_IS_TRADING_DATE=0).]
 ==============================================================================*/
 
 /*---------------------------------------------- UDF: range filter → ngày cutoff */
@@ -370,6 +376,15 @@ BEGIN
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
 
+    -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_NAV_BALANCE) cho ĐÚNG sub-account này. 1 check chặn cả:
+    --   ngày nghỉ/gap, ngày tương lai, ngày TRƯỚC khi mở TK, ngày SAU khi đóng TK → tránh trả NAV=NULL mà
+    --   total_asset>0 (holding định giá theo giá ≤ asof) — bất nhất, KH thấy được. Default @p_asof=MAX nên luôn qua.
+    IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
+    BEGIN SET @p_err_code = 5;
+        SET @p_err_msg = CONCAT(N'Không có dữ liệu EOD cho sub-account ', @p_si_account, N' @ ',
+            CONVERT(VARCHAR(10),@p_asof,23), N' (ngày nghỉ/tương lai/trước khi mở/sau khi đóng TK).');
+        RAISERROR(@p_err_msg, 16, 1); END
+
     DECLARE @cash DECIMAL(20,0) = (
         SELECT C_CASH FROM T_SI_CASH_HIST
         WHERE C_SI_ACCOUNT=@p_si_account
@@ -666,6 +681,9 @@ BEGIN
     BEGIN TRY
     IF @p_mode NOT IN ('EOD','HISTORY')
         BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; RAISERROR(@p_err_msg, 16, 1); END
+    -- DATE GUARD (err=3, nhất quán snapshot family): không có index @ngày → ngày nghỉ/tương lai/chưa tính.
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE=@p_business_date)
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu index cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); RAISERROR(@p_err_msg, 16, 1); END
 
     -- 1 bản ghi: JSON ARRAY, mỗi phần tử = 1 master (index DM + benchmark của master đó)
     SELECT ISNULL((

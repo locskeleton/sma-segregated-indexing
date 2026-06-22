@@ -328,3 +328,25 @@ ELSE PRINT '  !!! KHÔNG gỡ dòng cf=0 @06';
 IF EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-02')
     PRINT '  OK DELETE scoped: ngày khác (01-02 INITIAL) KHÔNG bị xoá';
 ELSE PRINT '  !!! DELETE xoá NHẦM ngày khác (01-02)';
+
+PRINT '';
+PRINT '======== DATE GUARD ngày-bừa-bãi (Mức 4): FR-06 err=5, index snapshot err=3, rebalance err=5, EOD trading-day err=10 ========';
+DECLARE @ecD INT, @emD NVARCHAR(400);
+-- FR-06: ngày hợp lệ (01-07 có NAV_BALANCE) → err=0; gap/tương lai/trước-mở → err=5 (chặn NAV=NULL+asset>0 im lặng)
+EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-07',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
+IF @ecD=0 PRINT '  OK FR-06 ngày GD hợp lệ @01-07 → err=0'; ELSE PRINT CONCAT('  !!! FR-06 ngày hợp lệ sai: err=',@ecD);
+EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-03',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;  -- gap (không có NAV_BALANCE)
+IF @ecD=5 PRINT '  OK FR-06 ngày nghỉ/gap @01-03 → err=5'; ELSE PRINT CONCAT('  !!! FR-06 gap KHÔNG chặn: err=',@ecD);
+EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-12-31',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;  -- tương lai
+IF @ecD=5 PRINT '  OK FR-06 ngày tương lai → err=5'; ELSE PRINT CONCAT('  !!! FR-06 tương lai KHÔNG chặn: err=',@ecD);
+EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;  -- trước khi mở
+IF @ecD=5 PRINT '  OK FR-06 ngày trước khi mở TK → err=5'; ELSE PRINT CONCAT('  !!! FR-06 trước-mở KHÔNG chặn: err=',@ecD);
+-- index snapshot: tương lai → err=3
+EXEC SP_GET_ASSET_INDEX_SNAPSHOT '2026-12-31','EOD',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
+IF @ecD=3 PRINT '  OK index snapshot ngày tương lai → err=3'; ELSE PRINT CONCAT('  !!! index snapshot KHÔNG chặn: err=',@ecD);
+-- rebalance detail: trước inception → err=5
+EXEC SP_GET_MASTER_REBALANCE_DETAIL 'SDI01','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
+IF @ecD=5 PRINT '  OK rebalance_detail ngày trước inception → err=5'; ELSE PRINT CONCAT('  !!! rebalance KHÔNG chặn: err=',@ecD);
+-- SP_EOD_RUN: ngày KHÔNG phải ngày GD (2099, không có giá) → err=10 + thông điệp trading-day
+EXEC SP_EOD_RUN '2099-06-15',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
+IF @ecD=10 PRINT CONCAT('  OK SP_EOD_RUN ngày không-GD → err=10 (',@emD,')'); ELSE PRINT CONCAT('  !!! SP_EOD_RUN không chặn ngày không-GD: err=',@ecD);

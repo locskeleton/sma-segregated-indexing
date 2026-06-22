@@ -345,6 +345,14 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
+    -- DATE GUARD (err=5): master phải có rebalance/holdings ≤ @p_date (chặn ngày trước inception / master chưa có data).
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE<=@p_date)
+       AND NOT EXISTS (SELECT 1 FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@p_date)
+    BEGIN SET @p_err_code=5;
+        SET @p_err_msg = CONCAT(N'Không có dữ liệu rebalance/holdings cho master ', @p_master_code, N' ≤ ',
+            CONVERT(VARCHAR(10),@p_date,23), N' (ngày trước inception / master không tồn tại).');
+        RAISERROR(@p_err_msg, 16, 1); END
+
     -- effective_date hiệu lực = lớn nhất ≤ @p_date ; kỳ trước = lớn nhất < eff
     DECLARE @eff DATE, @prevEff DATE;
     SELECT @eff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER

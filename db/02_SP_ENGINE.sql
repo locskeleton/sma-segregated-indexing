@@ -24,6 +24,18 @@ BEGIN
 END
 GO
 
+/*---------------------------------------------------- UDF: ngày có phải ngày GIAO DỊCH không
+  (helper chuẩn hoá cho date-guard toàn hệ): 1 nếu BO đã publish giá @d (T_PRICE_DAILY có dòng) → ngày GD;
+  0 nếu ngày nghỉ/cuối tuần/tương lai/chưa có data. Dùng ở SP_EOD_RUN + read API để chặn ngày-bừa-bãi. */
+CREATE OR ALTER FUNCTION UDF_IS_TRADING_DATE (@d DATE)
+RETURNS BIT
+AS
+BEGIN
+    RETURN CASE WHEN @d IS NOT NULL AND EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE=@d)
+                THEN 1 ELSE 0 END;
+END
+GO
+
 /*---------------------------------------------------- helper: log T_EOD_RUN  */
 CREATE OR ALTER PROCEDURE SP_EOD_LOG
     @p_d DATE, @p_job VARCHAR(40), @p_status VARCHAR(10),
@@ -613,6 +625,16 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
+
+    -- DATE GUARD: chặn chạy EOD cho ngày KHÔNG phải ngày giao dịch (nghỉ/cuối tuần/tương lai/chưa có giá).
+    --   Báo sớm + rõ nghĩa thay vì rơi vào precondition chung. (BO publish giá ⇒ T_PRICE_DAILY có dòng.)
+    IF dbo.UDF_IS_TRADING_DATE(@d) = 0
+    BEGIN
+        SET @p_err_code = 10;
+        SET @p_err_msg = CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@d,23),
+            N' KHÔNG phải ngày giao dịch (chưa có giá T_PRICE_DAILY) — không chạy EOD.');
+        RETURN;
+    END
 
     -- PRECONDITION: BO market data READY + FO ingest READY + master INDEX đã tính (J12 chạy ở
     --   luồng RIÊNG SP_EOD_RUN_INDEX, KHÔNG còn trong pipeline này). J12B TE cần index daily_return.
