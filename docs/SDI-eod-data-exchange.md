@@ -2,7 +2,7 @@
 
 Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống cần trao đổi: ai gửi gì cho ai, payload cụ thể, và **báo cáo định lượng** theo 3 kịch bản small / medium / large.
 
-> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ asset/perf sang Asset**. BO/FO/Market đẩy dữ liệu **THẲNG sang Asset** (Asset tự tính). Tài liệu này nay tập trung **FO/Market/BO → SDI** (SDI phục vụ UI riêng qua read API). Gap đối chiếu 2 hệ: [SDI-asset-gap.md](./SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (2 producer per-SI + master ĐÃ GỠ). BO/FO/Market đẩy dữ liệu **THẲNG sang Asset** (Asset tự tính); **BO còn đẩy phí QL lũy kế/ngày → Asset có payable, tự tính NAV ròng**. **SDI VẪN đẩy riêng Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, luồng price-ready BO) — luồng SDI→Asset DUY NHẤT còn lại. Tài liệu này tập trung **FO/Market/BO → SDI** (SDI phục vụ UI riêng qua read API). Đối chiếu 2 hệ + điểm reconcile: [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 > Liên quan: [SDI-spec.md](./SDI-spec.md) (công thức, job EOD J0–J14 + ingest), [SDI-db-architecture.md](./SDI-db-architecture.md) (kiến trúc DB, roll-forward, set-based).
 
@@ -13,10 +13,10 @@ Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống c�
 | Hệ thống | Vai trò trong luồng EOD |
 |---|---|
 | **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ thuế GD vào cash). **Nguồn sự thật: holdings + tiền (3 khoản) + cổ tức/phí lưu ký + cashflow.** |
-| **BO** (Back Office) | **Cắt phí** của KH (phí QL/thuế/perf…, 1 cục/tháng) → báo event Kafka cho SDI `{si_account, amount, charge_date, fee_type?}`. SDI net-off vào payable. |
+| **BO** (Back Office) | **Cắt phí** của KH (phí QL/thuế/perf…, 1 cục/tháng) → báo event Kafka cho SDI `{si_account, amount, charge_date, fee_type?}`. SDI net-off vào payable. **BRD 2026-06-22: BO còn đẩy phí QL LŨY KẾ theo ngày (accrued) THẲNG sang Asset** (ngoài event cắt) → Asset có payable, tự tính NAV ròng. |
 | **Market data** | Cấp giá EOD, corporate action, chỉ số benchmark (VN-Index…). (Nguồn riêng, không phải FO.) |
 | **SDI** | Nhận holdings + tiền (FO) + event cắt phí (BO) → tính NAV (= tổng tài sản − payable), Unit/Unit Price, PnL, TWR, MWR, Master Index; **accrue payable đa-loại hằng ngày (theo `T_FEE_CONFIG`, dòng group=PAYABLE & rate>0) + net-off khi BO cắt**. Phục vụ **giao diện riêng của SDI** (NAV/index/perf) qua read API (FR-01..06, PM). |
-| **Asset** | **Nhận dữ liệu THẲNG từ BO/FO/Market (BRD 2026-06-22) → Asset tự tính** (tài sản gộp). SDI **KHÔNG còn đẩy** asset/perf sang Asset. Xem [SDI-asset-gap.md](./SDI-asset-gap.md). |
+| **Asset** | **Nhận dữ liệu THẲNG từ BO/FO/Market (BRD 2026-06-22) → Asset tự tính** (tài sản gộp + NAV ròng + Unit/UnitPrice/TWR/return). SDI **KHÔNG còn đẩy** tài sản KH/NAV-perf master sang Asset, **CHỈ còn đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, price-ready BO). Asset đủ data; còn lại là điểm reconcile (payable BO-vs-SDI, TWR methodology). Xem [SDI-asset-gap.md](./SDI-asset-gap.md). |
 | **SMO** | Tầng hiển thị (đọc qua Asset). |
 
 **Nguyên tắc nền:** FO đồng bộ **snapshot overwrite** mỗi EOD (không event-source từng lệnh). `NAV = stock_value + FO cash − payable`; FO cash **đã NET** phí GD + thuế GD + SIP → SDI tuyệt đối không trừ lại các khoản đó (tránh double-count). Phí ACCRUE (QL/thuế/perf…) SDI quản riêng qua payable (catalog `T_FEE_CONFIG`, type+group khớp `T_SI_INCOME_FEE`), BO cắt → net-off.
@@ -44,13 +44,15 @@ Mkt ──(7) giá EOD + corporate action + benchmark ────────�
         │       → J11 master agg → J12 Index → J12B TE accum → J13 RECONCILE (cổng publish nội bộ) → J14 build snapshot (nội bộ)
         ▼
 SDI ──▶ giao diện riêng SDI (read API FR-01..06, PM) — NAV/index/perf
+SDI ──(8d) Master Index snapshot (SP_GET_ASSET_INDEX_SNAPSHOT, khi BO price-ready) ──▶ Asset   ✅ GIỮ
+BO  ──(BO→Asset) phí QL lũy kế/ngày (accrued) + event cắt phí ─────────────────────▶ Asset   ✅ MỚI
 
-   ❌ (8)/(9) SDI → Asset (current snapshot + master series + API pull) — ĐÃ GỠ per BRD 2026-06-22.
-      BO/FO/Market nay đẩy THẲNG sang Asset, Asset tự tính. Xem SDI-asset-gap.md.
+   ❌ (8a per-SI tài sản)/(8b·8c master NAV-perf)/(9 API pull) SDI → Asset — ĐÃ GỠ per BRD 2026-06-22.
+      BO/FO/Market nay đẩy THẲNG sang Asset, Asset tự tính NAV ròng + Unit/TWR. Xem SDI-asset-gap.md.
         └────────────────────────────────────────────────────────────┘
 ```
 
-Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market đẩy EOD qua INGEST (Kafka per-KH)** → SDI EOD tính + **J13 reconcile là cổng publish nội bộ** (break > ngưỡng ⇒ chặn publish kết quả EOD). **(8)/(9) SDI→Asset ĐÃ GỠ (BRD 2026-06-22):** BO/FO/Market đẩy thẳng sang Asset, Asset tự tính; SDI chỉ phục vụ UI riêng qua read API. Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
+Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market đẩy EOD qua INGEST (Kafka per-KH)** → SDI EOD tính + **J13 reconcile là cổng publish nội bộ** (break > ngưỡng ⇒ chặn publish kết quả EOD). **(8a/8b/8c/9) SDI→Asset ĐÃ GỠ (BRD 2026-06-22):** per-SI tài sản + master NAV/perf không còn push (BO/FO/Market đẩy thẳng, Asset tự tính). **Vẫn GIỮ (8d): SDI đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`) khi BO price-ready — luồng SDI→Asset DUY NHẤT còn lại. **BO còn đẩy phí QL accrued/ngày → Asset**. Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -82,11 +84,15 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 | 7a | **Giá EOD (gộp CA)** | `T_PRICE_DAILY` | ticker, business_date, **ref_price** (NOT NULL), close_price, **is_ex_rights** (1/0) | Theo **universe mã** (không theo KH). `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia) → J12 self-contained, không tra ngày trước. `is_ex_rights` = metadata đánh dấu ngày có quyền. Bỏ bảng CA riêng — type/ratio/cash_div đã vào NAV qua FO sync. |
 | 7b | **Benchmark** | `T_BENCHMARK_DAILY` | benchmark_code (VNINDEX…), business_date, index_value | 1 dòng/benchmark/ngày. |
 
-### D. ~~SDI → Asset (J14 SNAPSHOT)~~ — ĐÃ GỠ per BRD 2026-06-22
+### D. SDI → Asset — chỉ còn Master Index (BRD 2026-06-22)
 
-> **❌ Luồng SDI → Asset (8a/8b/8c/9) ĐÃ GỠ khỏi code (BRD 2026-06-22).** BO, FO, Market data nay **đẩy dữ liệu THẲNG sang Asset** và **Asset tự tính** (tài sản gộp). 3 producer Kafka SDI→Asset đã **gỡ khỏi `db/05_API.sql`**: `SP_GET_ASSET_SNAPSHOT`, `SP_GET_ASSET_MASTER_SNAPSHOT`, `SP_GET_ASSET_INDEX_SNAPSHOT` (KHÔNG còn tồn tại). SDI **giữ engine + read API** (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) phục vụ **giao diện riêng của SDI** (vẫn hiển thị NAV/index/perf). Asset muốn có NAV ròng/index/perf → **Asset tự dựng** (3 GAP SDI-unique). Xem **[SDI-asset-gap.md](./SDI-asset-gap.md)**.
+> **GỠ 2 producer / GIỮ 1 (BRD 2026-06-22).** BO, FO, Market data nay **đẩy dữ liệu THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR/return). **Đã GỠ khỏi `db/05_API.sql` 2 producer:** `SP_GET_ASSET_SNAPSHOT` (8a — per-SI tài sản KH), `SP_GET_ASSET_MASTER_SNAPSHOT` (8b/8c — master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** (8d — Master Index): SDI **vẫn đẩy danh mục mẫu sang Asset** theo **luồng RIÊNG kích khi BO báo price-ready** (path `SP_EOD_RUN_INDEX`) — đây là luồng SDI→Asset DUY NHẤT còn lại.
 >
-> *(Bảng cũ liệt kê 8a current snapshot KH `T_SI_NAV_CURRENT` / 8b current snapshot master `T_MASTER_NAV_CURRENT` / 8c master series `T_MASTER_NAV_BALANCE`+`T_MASTER_INDEX_DAILY` / 9 lịch sử KH API pull, cùng 2 ghi chú mô hình SDI→Asset 2026-06-21 mô tả 3 producer trên — tất cả KHÔNG còn áp dụng.)*
+> **Asset ĐỦ data, KHÔNG thiếu gap:** payable = **BO đẩy phí QL lũy kế/ngày** (accrued) → Asset tự tính NAV ròng; Master Index = SDI vẫn đẩy (8d); Unit/UnitPrice/TWR/return = Asset tự tính từ NAV series + cashflow (FO). Còn lại chỉ là **điểm reconcile** (R1 payable BO-vs-SDI: rate/day_count/AUM/quy ước ngày dương lịch; R3 TWR methodology khớp seed+công thức SDI) — **không phải "thiếu dữ liệu"**. Xem **[SDI-asset-gap.md](./SDI-asset-gap.md)** (nguồn sự thật reconcile).
+>
+> SDI **giữ engine + read API** (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) phục vụ **giao diện riêng của SDI** (NAV/index/perf) — không đổi.
+>
+> *(Bảng cũ liệt kê 8a current snapshot KH `T_SI_NAV_CURRENT` / 8b current snapshot master `T_MASTER_NAV_CURRENT` / 8c master series `T_MASTER_NAV_BALANCE` / 9 lịch sử KH API pull — KHÔNG còn áp dụng. Master Index series `T_MASTER_INDEX_DAILY` VẪN đẩy qua 8d.)*
 
 > **Điểm mấu chốt (vẫn đúng):** FO→SDI nặng (per-mã, dense, nạp THẲNG current). Lịch sử dài hạn = `T_SI_NAV_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve **read API cho UI SDI** (FR-01..06). Holdings/cash history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core.
 
@@ -160,7 +166,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 3. **Biến động holdings/ngày** SDI suy ra on-demand (qty(D)−qty(D-1)), KHÔNG cần FO gửi delta.
 4. **Cổ tức/phí & cashflow là sự kiện sparse** — FO chỉ gửi khi phát sinh; capture đúng ngày + số tiền khớp thời điểm FO ghi vào cash.
 5. **J13 RECONCILE là cổng publish nội bộ:** Σ holdings/NAV SDI vs FO, Σ customer NAV vs master NAV, Σ unit — lệch > ngưỡng ⇒ **chặn publish kết quả EOD** (RECONCILE=BREAK, không COMPLETED). *(Trước đây "chặn J14 snapshot push Asset"; nay không còn push SDI→Asset — reconcile vẫn là cổng nội bộ.)*
-6. ~~**SDI→Asset chỉ push current/delta + chuỗi master**~~ **ĐÃ GỠ (BRD 2026-06-22):** SDI không còn đẩy asset/perf sang Asset (BO/FO/Market đẩy thẳng, Asset tự tính). Lịch sử KH SDI giữ và serve qua **read API cho UI riêng của SDI**. Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
+6. **SDI→Asset: chỉ còn Master Index (BRD 2026-06-22).** Đã GỠ 2 producer push tài sản KH + master NAV/perf (`SP_GET_ASSET_SNAPSHOT`, `SP_GET_ASSET_MASTER_SNAPSHOT`) — BO/FO/Market đẩy thẳng, Asset tự tính. **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`**: SDI đẩy Master Index khi BO price-ready (luồng `SP_EOD_RUN_INDEX`). BO còn đẩy phí QL accrued/ngày → Asset. Lịch sử KH SDI giữ + serve qua **read API cho UI riêng của SDI**. Reconcile R1/R3 — xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 7. **J0 GATE** chờ đủ nguồn (FO holdings+cash, model_weight, giá, CA, benchmark, cashflow) sẵn sàng cho @d mới chạy.
 
 ---

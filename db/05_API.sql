@@ -14,10 +14,12 @@ GO
   Read-only. T0 unit price = 10.000.
 
   *** ERR-CODE CONVENTION (date-guard) ***
-    0=OK · 1=not found (entity) · 2=alerts no-holdings (06_PM) · 4=fee multi-accrue guard (Option B) ·
-    5=NGÀY-bừa-bãi cho entity (FR-06 asof / rebalance @date: ngày nghỉ·tương lai·trước-mở·sau-đóng —
-    chặn trả NAV=NULL+asset>0 im lặng). [EOD pipeline: 10=precondition / NGÀY không phải ngày GD.]
-    (Đã gỡ SDI→Asset sync producer + err=3 'snapshot no-data' theo BRD 2026-06-22 — xem SDI-asset-gap.md.)
+    0=OK · 1=not found (entity) · 2=alerts no-holdings (06_PM) / @p_mode sai · 3=không có data index @NGÀY
+    (SP_GET_ASSET_INDEX_SNAPSHOT) · 4=fee multi-accrue guard (Option B) · 5=NGÀY-bừa-bãi cho entity
+    (FR-06 asof / rebalance @date: ngày nghỉ·tương lai·trước-mở·sau-đóng — chặn NAV=NULL+asset>0 im lặng).
+    [EOD pipeline: 10=precondition / NGÀY không phải ngày GD.]
+    (BRD 2026-06-22: gỡ producer ASSET + MASTER snapshot; GIỮ INDEX snapshot (đẩy riêng khi BO price-ready).
+     BO trả phí QL lũy kế/ngày thẳng Asset. Xem docs/SDI-asset-gap.md.)
 ==============================================================================*/
 
 /*---------------------------------------------- UDF: range filter → ngày cutoff */
@@ -477,6 +479,54 @@ BEGIN
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
         IF OBJECT_ID('tempdb..#hold') IS NOT NULL DROP TABLE #hold;
+    END CATCH
+END
+GO
+
+/*===========================================================================
+  SP_GET_ASSET_INDEX_SNAPSHOT (SDI→Asset sync, EVENT RIÊNG cho index/benchmark)
+    Trả 1 BẢN GHI DUY NHẤT = 1 JSON ARRAY; mỗi phần tử = 1 master GỘP index DM + benchmark
+    của master đó: {master_code, business_date, index_value (DM), benchmark_code, benchmark_value}.
+    App publish 1 message/ngày (cả mảng). MODE EOD|HISTORY, RECONSTRUCT-ONLY (DATED) → replay y hệt
+    (mode KHÔNG nằm trong payload → EOD & HISTORY ra mảng GIỐNG HỆT).
+    benchmark_value join theo benchmark_code của master (LEFT — master chưa có benchmark/giá → NULL).
+    ⚠️ PAYLOAD DRAFT — map theo schema Asset thật khi có.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_ASSET_INDEX_SNAPSHOT
+    @p_business_date DATE,
+    @p_mode          VARCHAR(10)   = 'EOD',
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+    IF @p_mode NOT IN ('EOD','HISTORY')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_mode phải EOD hoặc HISTORY'; RAISERROR(@p_err_msg, 16, 1); END
+    -- DATE GUARD (err=3, nhất quán snapshot family): không có index @ngày → ngày nghỉ/tương lai/chưa tính.
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE=@p_business_date)
+        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Không có dữ liệu index cho ngày '+CONVERT(VARCHAR(10),@p_business_date,23); RAISERROR(@p_err_msg, 16, 1); END
+
+    -- 1 bản ghi: JSON ARRAY, mỗi phần tử = 1 master (index DM + benchmark của master đó)
+    SELECT ISNULL((
+        SELECT idx.C_MASTER_CODE                          AS master_code,
+               CONVERT(VARCHAR(10), idx.C_BUSINESS_DATE, 23) AS business_date,
+               idx.C_INDEX_VALUE                          AS index_value,      -- index danh mục master (PR)
+               mp.C_BENCHMARK_CODE                        AS benchmark_code,
+               bm.C_INDEX_VALUE                           AS benchmark_value   -- giá benchmark (PR) của master
+        FROM       T_MASTER_INDEX_DAILY idx
+        INNER JOIN T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE   = idx.C_MASTER_CODE
+        LEFT JOIN  T_BENCHMARK_DAILY    bm ON bm.C_BENCHMARK_CODE = mp.C_BENCHMARK_CODE
+                                          AND bm.C_BUSINESS_DATE  = idx.C_BUSINESS_DATE
+        WHERE idx.C_BUSINESS_DATE = @p_business_date
+        ORDER BY idx.C_MASTER_CODE
+        FOR JSON PATH
+    ), N'[]') AS C_PAYLOAD_JSON;
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
     END CATCH
 END
 GO

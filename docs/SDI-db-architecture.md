@@ -2,7 +2,7 @@
 
 Bổ trợ cho [SDI-spec.md](./SDI-spec.md). Tập trung: chịu tải dữ liệu lớn + chạy batch chốt EOD trong cửa sổ đêm.
 
-> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ asset/perf sang Asset** (BO/FO/Market đẩy thẳng sang Asset, Asset tự tính). 3 producer Kafka SDI→Asset đã gỡ khỏi `db/05_API.sql`. EOD engine vẫn build các bảng nội bộ (`T_SI_NAV_BALANCE`, `T_MASTER_*`) phục vụ read API cho UI riêng của SDI. Gap đối chiếu 2 hệ: [SDI-asset-gap.md](./SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (BO/FO/Market đẩy thẳng, Asset tự tính). Đã gỡ khỏi `db/05_API.sql` **2 producer** (`SP_GET_ASSET_SNAPSHOT` per-SI, `SP_GET_ASSET_MASTER_SNAPSHOT` master); **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset khi BO price-ready (luồng RIÊNG, SDI→Asset DUY NHẤT còn lại). BO còn đẩy phí QL accrued/ngày → Asset. EOD engine vẫn build các bảng nội bộ (`T_SI_NAV_BALANCE`, `T_MASTER_*`) phục vụ read API cho UI riêng của SDI. Đối chiếu + reconcile R1/R3: [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -145,7 +145,7 @@ J11_SI_AGG    Σ per master → T_MASTER_NAV_BALANCE (composition + NAV + hiệu
               + total_account + total_asset gồm receivables**); upsert T_MASTER_NAV_CURRENT
 J12_SI_INDEX  Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 master × ~25 mã — nhẹ) → T_MASTER_INDEX_DAILY
 J13_RECONCILE đối soát Σ holding qty (SDI) vs FO → bảng break; CHẶN snapshot nếu lệch quá ngưỡng
-J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_NAV_BALANCE; build T_MASTER_HOLDING_BALANCE (top20). ~~push delta Asset~~ ĐÃ GỠ (BRD 2026-06-22 — BO/FO/Market đẩy thẳng Asset; xem docs/SDI-asset-gap.md)
+J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_NAV_BALANCE; build T_MASTER_HOLDING_BALANCE (top20). ~~push tài sản KH + master NAV/perf → Asset~~ ĐÃ GỠ (BRD 2026-06-22 — BO/FO/Market đẩy thẳng). Master Index VẪN đẩy Asset qua luồng RIÊNG SP_EOD_RUN_INDEX (SP_GET_ASSET_INDEX_SNAPSHOT), KHÔNG trong J14. Xem docs/SDI-asset-gap.md
 ```
 
 - **INGEST per-event**: interval history maintain tại đây (DIFF current vs open-row), **KHÔNG** trong EOD → EOD core nhẹ hẳn (xem [growth-projection §7](./SDI-data-growth-projection.md)).

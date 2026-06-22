@@ -4,7 +4,7 @@ Engine tính tài sản, hiệu suất danh mục master và từng khách hàng
 
 > 📖 Tra cứu nhanh thuật ngữ (VN/EN) + mọi công thức kèm ví dụ: [SDI-thuat-ngu-cong-thuc.md](./SDI-thuat-ngu-cong-thuc.md).
 >
-> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ asset/perf sang Asset** (BO/FO/Market đẩy thẳng sang Asset, Asset tự tính). 3 producer Kafka SDI→Asset (`SP_GET_ASSET_SNAPSHOT`/`_MASTER_SNAPSHOT`/`_INDEX_SNAPSHOT`) đã gỡ khỏi `db/05_API.sql`. Engine + read API (FR-01..06, PM) GIỮ NGUYÊN. Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (BO/FO/Market đẩy thẳng, Asset tự tính). Đã GỠ khỏi `db/05_API.sql` **2 producer**: `SP_GET_ASSET_SNAPSHOT` (per-SI tài sản), `SP_GET_ASSET_MASTER_SNAPSHOT` (master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset theo luồng RIÊNG khi BO price-ready (`SP_EOD_RUN_INDEX`); đây là luồng SDI→Asset DUY NHẤT còn lại. **BO còn đẩy phí QL accrued/ngày → Asset** (Asset tự tính NAV ròng). Engine + read API (FR-01..06, PM) GIỮ NGUYÊN. Còn lại = điểm reconcile (R1 payable, R3 TWR) — xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -23,7 +23,7 @@ FO: tính tỷ trọng danh mục mẫu  +  đặt lệnh MP TRỰC TIẾP trên
 SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, Master Index  →  read API (UI riêng SDI)
 ```
 
-> **BRD 2026-06-22:** SDI **không còn push Asset**. Asset nhận BO/FO/Market trực tiếp & tự tính (xem [SDI-asset-gap.md](./SDI-asset-gap.md)). SDI phục vụ giao diện riêng qua read API.
+> **BRD 2026-06-22:** SDI **không còn push tài sản KH/NAV-perf master sang Asset** (Asset nhận BO/FO/Market trực tiếp & tự tính); **vẫn GIỮ push Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, khi BO price-ready). Xem [SDI-asset-gap.md](./SDI-asset-gap.md). SDI phục vụ giao diện riêng qua read API.
 
 | Việc | Chủ |
 |---|---|
@@ -289,7 +289,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J13** | `RECONCILE` đối soát (RECORDER) | J11 | NAV âm/unit≤0; Σ customer NAV vs master NAV | **GHI `T_EOD_RECON_BREAK`** (KHÔNG throw) | ✅ | – | ✅ (có break → SP_EOD_RUN chặn publish, RECONCILE=BREAK) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | T_MASTER_HOLDING_BALANCE (top20+mã khác) | ✅ | ‖ | – |
 | ~~J14b~~ | ~~`HISTORY`~~ **(CHUYỂN sang INGEST realtime)** | — | interval CASH_HIST/HOLDING_HIST maintain TẠI ingest per-event; `SP_EOD_HISTORY` chỉ còn utility bulk-backfill | — | – | – | – |
-| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_NAV_CURRENT`; SWITCH/MERGE master-level (publish nội bộ cho read API). ~~push snapshot + master series → Asset~~ **ĐÃ GỠ (BRD 2026-06-22)** — BO/FO/Market đẩy thẳng Asset, xem [SDI-asset-gap.md](./SDI-asset-gap.md) | ✅ | – | ✅ |
+| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_NAV_CURRENT`; SWITCH/MERGE master-level (publish nội bộ cho read API). ~~push tài sản KH + master NAV/perf → Asset~~ **ĐÃ GỠ (BRD 2026-06-22)** — BO/FO/Market đẩy thẳng Asset. **Master Index VẪN đẩy Asset** qua luồng RIÊNG `SP_EOD_RUN_INDEX` (`SP_GET_ASSET_INDEX_SNAPSHOT`, BO price-ready), KHÔNG trong J15. Xem [SDI-asset-gap.md](./SDI-asset-gap.md) | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark T_EOD_RUN done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
 ### 9.3 Thứ tự, song song & orchestration
@@ -341,7 +341,7 @@ J0 GATE → J7 ─ J8 → J9
 ## 11. Scale (100 master, 200K KH × 5 master, 10 năm)
 
 > Chi tiết kiến trúc DB + EOD ở quy mô lớn cho SQL Server: [SDI-db-architecture.md](./SDI-db-architecture.md) (roll-forward state, set-based, columnstore, partitioning).
-> Hợp đồng trao đổi dữ liệu EOD FO/Market/BO→SDI (payload từng bên + định lượng small/medium/large): [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md). *(SDI→Asset đã gỡ — BRD 2026-06-22; gap đối chiếu: [SDI-asset-gap.md](./SDI-asset-gap.md)).*
+> Hợp đồng trao đổi dữ liệu EOD FO/Market/BO→SDI (payload từng bên + định lượng small/medium/large): [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md). *(SDI→Asset: gỡ 2 producer tài sản KH + master NAV/perf, GIỮ Master Index — BRD 2026-06-22; đối chiếu + reconcile R1/R3: [SDI-asset-gap.md](./SDI-asset-gap.md)).*
 > Dự phóng tăng trưởng dữ liệu 1M/1Q/1Y (KH tăng đều/nóng): [SDI-data-growth-projection.md](./SDI-data-growth-projection.md).
 > Dashboard PM quản lý master (US1–US5, SP serve, TE/deviation/cash-drag, config ngưỡng): [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md).
 

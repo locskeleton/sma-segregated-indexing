@@ -142,8 +142,20 @@ ELSE
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-01-08';   -- dọn scratch
 DELETE FROM T_PRICE_DAILY       WHERE C_BUSINESS_DATE='2026-01-08';
 
--- (ĐÃ GỠ test SDI→ASSET SNAPSHOT/MASTER/INDEX — BRD 2026-06-22: bỏ luồng SDI→Asset sync; BO/FO đẩy thẳng Asset.
---  3 producer SP_GET_ASSET_(SNAPSHOT|MASTER_SNAPSHOT|INDEX_SNAPSHOT) đã xoá khỏi 05_API. Xem docs/SDI-asset-gap.md.)
+-- (BRD 2026-06-22: GỠ producer SDI→Asset ASSET + MASTER snapshot — BO/FO đẩy thẳng Asset; BO trả phí QL lũy kế/ngày.
+--  GIỮ INDEX snapshot — SDI vẫn đẩy riêng khi BO price-ready. Xem docs/SDI-asset-gap.md.)
+PRINT '--- SDI→ASSET INDEX SNAPSHOT (GIỮ): SP_GET_ASSET_INDEX_SNAPSHOT (1 bản ghi = JSON array index+benchmark/master) ---';
+DECLARE @ecI INT, @emI NVARCHAR(400);
+INSERT T_BENCHMARK_DAILY (C_BENCHMARK_CODE,C_BUSINESS_DATE,C_INDEX_VALUE) VALUES ('VNINDEX','2026-01-07',1250.5);
+CREATE TABLE #ix (payload NVARCHAR(MAX));
+INSERT #ix EXEC SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD', @p_err_code=@ecI OUTPUT, @p_err_msg=@emI OUTPUT;
+DECLARE @ixarr NVARCHAR(MAX) = (SELECT payload FROM #ix);
+IF @ecI=0 AND LEFT(@ixarr,1)='[' AND @ixarr LIKE '%"master_code":"SDI01"%' AND @ixarr LIKE '%"index_value":1078.8%'
+   AND @ixarr LIKE '%"benchmark_code":"VNINDEX"%' AND @ixarr LIKE '%"benchmark_value":1250.5%'
+    PRINT '  OK index SP: JSON array SDI01 gộp index=1078.8 + benchmark VNINDEX=1250.5';
+ELSE PRINT '  !!! LỖI index SP: '+ISNULL(@ixarr,'(NULL)');
+DELETE FROM T_BENCHMARK_DAILY WHERE C_BENCHMARK_CODE='VNINDEX' AND C_BUSINESS_DATE='2026-01-07';
+DROP TABLE #ix;
 
 PRINT '';
 PRINT '======== EOD PIPELINE CONTROL (T_EOD_PIPELINE + break + reset) ========';
@@ -276,7 +288,7 @@ IF EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER WHERE C_SI_ACCOUNT='SUB00001001' AND C
 ELSE PRINT '  !!! DELETE xoá NHẦM ngày khác (01-02)';
 
 PRINT '';
-PRINT '======== DATE GUARD ngày-bừa-bãi: FR-06 err=5, rebalance err=5, EOD trading-day err=10 ========';
+PRINT '======== DATE GUARD ngày-bừa-bãi: FR-06 err=5, index err=3, rebalance err=5, EOD trading-day err=10 ========';
 DECLARE @ecD INT, @emD NVARCHAR(400);
 -- FR-06: ngày hợp lệ (01-07 có NAV_BALANCE) → err=0; gap/tương lai/trước-mở → err=5 (chặn NAV=NULL+asset>0 im lặng)
 EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-07',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
@@ -287,6 +299,9 @@ EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-12-31',@p_err_code=@ecD OUTPUT,@p_e
 IF @ecD=5 PRINT '  OK FR-06 ngày tương lai → err=5'; ELSE PRINT CONCAT('  !!! FR-06 tương lai KHÔNG chặn: err=',@ecD);
 EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;  -- trước khi mở
 IF @ecD=5 PRINT '  OK FR-06 ngày trước khi mở TK → err=5'; ELSE PRINT CONCAT('  !!! FR-06 trước-mở KHÔNG chặn: err=',@ecD);
+-- index snapshot (GIỮ): tương lai → err=3
+EXEC SP_GET_ASSET_INDEX_SNAPSHOT '2026-12-31','EOD',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
+IF @ecD=3 PRINT '  OK index snapshot ngày tương lai → err=3'; ELSE PRINT CONCAT('  !!! index snapshot KHÔNG chặn: err=',@ecD);
 -- rebalance detail: trước inception → err=5
 EXEC SP_GET_MASTER_REBALANCE_DETAIL 'SDI01','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
 IF @ecD=5 PRINT '  OK rebalance_detail ngày trước inception → err=5'; ELSE PRINT CONCAT('  !!! rebalance KHÔNG chặn: err=',@ecD);
