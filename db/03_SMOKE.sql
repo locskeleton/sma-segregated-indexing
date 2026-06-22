@@ -142,62 +142,8 @@ ELSE
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-01-08';   -- dọn scratch
 DELETE FROM T_PRICE_DAILY       WHERE C_BUSINESS_DATE='2026-01-08';
 
-PRINT '--- SDI→ASSET SNAPSHOT: SP_GET_ASSET_SNAPSHOT (EOD @07, HISTORY @06, replay-identical) ---';
-DECLARE @ecS INT, @emS NVARCHAR(400);
-PRINT '-- EOD @2026-01-07 (kỳ vọng 1 KH; nav=11280000; holdings AAA 60000/BBB 90000) --';
-EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',
-     @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
-PRINT '  err='+CAST(@ecS AS VARCHAR(10))+' (kỳ vọng 0)';
-PRINT '-- HISTORY @2026-01-06 (replay; nav=10760000; holdings AAA 60000/BBB 80000) --';
-EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-06', @p_mode='HISTORY',
-     @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
--- REPLAY INVARIANT: payload EOD@07 và HISTORY@07 phải GIỐNG HỆT (chỉ khác field "mode")
-CREATE TABLE #snapE (si VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
-CREATE TABLE #snapH (si VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
-INSERT #snapE EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',    @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
-INSERT #snapH EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-01-07', @p_mode='HISTORY', @p_err_code=@ecS OUTPUT, @p_err_msg=@emS OUTPUT;
-DECLARE @jEOD NVARCHAR(MAX) = (SELECT payload FROM #snapE WHERE si='SUB00001001');
-DECLARE @jHIS NVARCHAR(MAX) = (SELECT payload FROM #snapH WHERE si='SUB00001001');
-IF REPLACE(@jEOD,'"mode":"EOD"','"mode":"HISTORY"') = @jHIS
-    PRINT '  OK REPLAY: payload EOD@07 == HISTORY@07 (chỉ khác mode) → reconstruct-only ổn';
-ELSE
-    PRINT '  !!! LỖI REPLAY: payload EOD@07 != HISTORY@07';
-PRINT '  EOD@07 payload: ' + ISNULL(@jEOD,'(NULL)');
-DROP TABLE #snapE; DROP TABLE #snapH;
-
-PRINT '--- SDI→ASSET MASTER SNAPSHOT: SP_GET_ASSET_MASTER_SNAPSHOT (8b/8c, EOD@07 + replay) ---';
-DECLARE @ecM INT, @emM NVARCHAR(400);
-CREATE TABLE #mE (m VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
-CREATE TABLE #mH (m VARCHAR(20), bd DATE, payload NVARCHAR(MAX));
-INSERT #mE EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD',    @p_err_code=@ecM OUTPUT, @p_err_msg=@emM OUTPUT;
-INSERT #mH EXEC SP_GET_ASSET_MASTER_SNAPSHOT @p_business_date='2026-01-07', @p_mode='HISTORY', @p_err_code=@ecM OUTPUT, @p_err_msg=@emM OUTPUT;
-DECLARE @mEOD NVARCHAR(MAX) = (SELECT payload FROM #mE WHERE m='SDI01');
-DECLARE @mHIS NVARCHAR(MAX) = (SELECT payload FROM #mH WHERE m='SDI01');
-PRINT '  err='+CAST(@ecM AS VARCHAR(10))+' (kỳ vọng 0); kỳ vọng master_nav=11280000 (index/benchmark TÁCH sang SP riêng)';
-IF REPLACE(@mEOD,'"mode":"EOD"','"mode":"HISTORY"') = @mHIS
-    PRINT '  OK REPLAY master: EOD@07 == HISTORY@07 (chỉ khác mode)';
-ELSE
-    PRINT '  !!! LỖI REPLAY master';
-PRINT '  master EOD@07 payload: ' + ISNULL(@mEOD,'(NULL)');
-DROP TABLE #mE; DROP TABLE #mH;
-
-PRINT '--- SDI→ASSET INDEX SNAPSHOT: SP_GET_ASSET_INDEX_SNAPSHOT (1 bản ghi = JSON array, mỗi master gộp index+benchmark) ---';
-DECLARE @ecI INT, @emI NVARCHAR(400);
--- seed 1 benchmark daily để test benchmark_value join theo benchmark_code của master
-INSERT T_BENCHMARK_DAILY (C_BENCHMARK_CODE,C_BUSINESS_DATE,C_INDEX_VALUE) VALUES ('VNINDEX','2026-01-07',1250.5);
-CREATE TABLE #ix (payload NVARCHAR(MAX));   -- 1 row, 1 col = JSON array
-INSERT #ix EXEC SP_GET_ASSET_INDEX_SNAPSHOT @p_business_date='2026-01-07', @p_mode='EOD', @p_err_code=@ecI OUTPUT, @p_err_msg=@emI OUTPUT;
-DECLARE @ixarr NVARCHAR(MAX) = (SELECT payload FROM #ix);
-PRINT '  err='+CAST(@ecI AS VARCHAR(10))+' (kỳ vọng 0)';
-IF LEFT(@ixarr,1)='[' AND RIGHT(@ixarr,1)=']'
-   AND @ixarr LIKE '%"master_code":"SDI01"%' AND @ixarr LIKE '%"index_value":1078.8%'
-   AND @ixarr LIKE '%"benchmark_code":"VNINDEX"%' AND @ixarr LIKE '%"benchmark_value":1250.5%'
-    PRINT '  OK index SP: JSON array, master SDI01 gộp index=1078.8 + benchmark VNINDEX=1250.5';
-ELSE
-    PRINT '  !!! LỖI index SP: ' + ISNULL(@ixarr,'(NULL)');
-PRINT '  index array: ' + ISNULL(@ixarr,'(NULL)');
-DELETE FROM T_BENCHMARK_DAILY WHERE C_BENCHMARK_CODE='VNINDEX' AND C_BUSINESS_DATE='2026-01-07';
-DROP TABLE #ix;
+-- (ĐÃ GỠ test SDI→ASSET SNAPSHOT/MASTER/INDEX — BRD 2026-06-22: bỏ luồng SDI→Asset sync; BO/FO đẩy thẳng Asset.
+--  3 producer SP_GET_ASSET_(SNAPSHOT|MASTER_SNAPSHOT|INDEX_SNAPSHOT) đã xoá khỏi 05_API. Xem docs/SDI-asset-gap.md.)
 
 PRINT '';
 PRINT '======== EOD PIPELINE CONTROL (T_EOD_PIPELINE + break + reset) ========';
@@ -242,7 +188,7 @@ IF @eod='PENDING' AND @ov='READY' AND NOT EXISTS (SELECT 1 FROM T_EOD_RUN WHERE 
 ELSE PRINT CONCAT('  !!! reset sai: eod=',@eod,' overall=',@ov);
 
 PRINT '';
-PRINT '======== PHÍ PHẢI TRẢ — breakdown Option B + guard @nAccrue (FR-06 RS5 / asset snapshot) ========';
+PRINT '======== PHÍ PHẢI TRẢ — breakdown Option B + guard @nAccrue (FR-06 RS5) ========';
 -- Scenario ISOLATED: SI riêng (SUBFEE01) + ngày riêng (2026-02-02/03) → KHÔNG đụng SDI01 (fee-free) ở trên.
 -- Option B: pending = C_PAYABLE_FEE đã chốt (exact, khớp NAV); paid = Σ cắt loại; accrued = pending + paid.
 INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('MGMT_FEE','PAYABLE',0.01);  -- 1 loại accrue
@@ -256,34 +202,24 @@ INSERT INTO T_SI_INCOME_FEE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_C
 INSERT INTO T_SI_CASH_HIST (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_VALID_FROM,C_CASH) VALUES ('SUBFEE01','KHFEE','SDI01','2026-02-02',0);
 
 DECLARE @ecF INT, @emF NVARCHAR(400);
--- (A) Snapshot @2026-02-03: payable_breakdown[0] phải = {MGMT_FEE, pending=602.7397(==payable_fee), paid=300, accrued=902.7397}
-CREATE TABLE #snapF (C_SI_ACCOUNT VARCHAR(20), C_BUSINESS_DATE DATE, C_PAYLOAD_JSON NVARCHAR(MAX));
-INSERT INTO #snapF EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
-DECLARE @pjF NVARCHAR(MAX) = (SELECT C_PAYLOAD_JSON FROM #snapF WHERE C_SI_ACCOUNT='SUBFEE01');
-DECLARE @pf  DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_fee')                 AS DECIMAL(20,6));
-DECLARE @bty VARCHAR(20)   =          JSON_VALUE(@pjF,'$.payable_breakdown[0].fee_type');
-DECLARE @bpe DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].pending') AS DECIMAL(20,6));
-DECLARE @bpa DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].paid')    AS DECIMAL(20,6));
-DECLARE @bac DECIMAL(20,6) = TRY_CAST(JSON_VALUE(@pjF,'$.payable_breakdown[0].accrued') AS DECIMAL(20,6));
-IF @ecF=0 AND @bty='MGMT_FEE' AND ABS(@bpe-@pf)<0.001 AND ABS(@bpe-602.739726)<0.001
-        AND ABS(@bpa-300)<0.001 AND ABS(@bac-902.739726)<0.001 AND ABS(@bac-(@bpe+@bpa))<0.001
-    PRINT CONCAT('  OK snapshot breakdown: MGMT_FEE pending=',@bpe,' (==payable_fee=',@pf,') paid=',@bpa,' accrued=',@bac);
-ELSE PRINT CONCAT('  !!! snapshot breakdown sai: err=',@ecF,' type=',@bty,' pending=',@bpe,' payable_fee=',@pf,' paid=',@bpa,' accrued=',@bac);
-DROP TABLE #snapF;
+-- (A) breakdown nguồn FR-06 RS5 đọc: pending=C_PAYABLE_FEE@asof, paid=Σ cắt loại, accrued=pending+paid; FR-06 chạy err=0.
+DECLARE @pendF DECIMAL(20,6)=(SELECT C_PAYABLE_FEE FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUBFEE01' AND C_BUSINESS_DATE='2026-02-03');
+DECLARE @paidF DECIMAL(20,6)=(SELECT ISNULL(SUM(C_AMOUNT),0) FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT='SUBFEE01' AND C_FEE_GROUP='PAYABLE' AND C_FEE_TYPE='MGMT_FEE' AND C_BUSINESS_DATE<='2026-02-03');
+EXEC SP_GET_ASSET_REPORT @p_si_account='SUBFEE01', @p_asof='2026-02-03', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+IF @ecF=0 AND ABS(@pendF-602.739726)<0.001 AND ABS(@paidF-300)<0.001
+    PRINT CONCAT('  OK FR-06 breakdown: pending(=C_PAYABLE_FEE)=',@pendF,' paid=',@paidF,' accrued=',@pendF+@paidF,' (err=0)');
+ELSE PRINT CONCAT('  !!! FR-06 breakdown sai: err=',@ecF,' pending=',@pendF,' paid=',@paidF);
 
--- (B) GUARD @nAccrue>1: thêm loại phí accrue thứ 2 (TAX) → FR-06 + snapshot phải trả err=4 (chặn output sai)
+-- (B) GUARD @nAccrue>1: thêm loại phí accrue thứ 2 (TAX) → FR-06 phải trả err=4 (chặn output sai)
 INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('TAX','PAYABLE',0.005);
 EXEC SP_GET_ASSET_REPORT @p_si_account='SUBFEE01', @p_asof='2026-02-03', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
 IF @ecF=4 PRINT CONCAT('  OK guard FR-06: err=4 (',@emF,')');
 ELSE PRINT CONCAT('  !!! guard FR-06 KHÔNG chặn: err=',@ecF);
-EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
-IF @ecF=4 PRINT '  OK guard snapshot: err=4';
-ELSE PRINT CONCAT('  !!! guard snapshot KHÔNG chặn: err=',@ecF);
 DELETE FROM T_FEE_CONFIG WHERE C_FEE_TYPE='TAX';   -- dọn: trả về 1 loại accrue
 
--- (C) Custody (PAYABLE, KHÔNG rate) KHÔNG được trip guard và KHÔNG vào breakdown (chỉ point-event, không accrue)
+-- (C) Custody (PAYABLE, KHÔNG rate) KHÔNG trip guard (vẫn 1 loại accrue) → FR-06 err=0
 INSERT INTO T_FEE_CONFIG (C_FEE_TYPE,C_FEE_GROUP,C_RATE) VALUES ('CUSTODY_FEE','PAYABLE',NULL);
-EXEC SP_GET_ASSET_SNAPSHOT @p_business_date='2026-02-03', @p_mode='EOD', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
+EXEC SP_GET_ASSET_REPORT @p_si_account='SUBFEE01', @p_asof='2026-02-03', @p_err_code=@ecF OUTPUT, @p_err_msg=@emF OUTPUT;
 IF @ecF=0 PRINT '  OK custody (no rate) KHÔNG trip guard (vẫn 1 loại accrue)';
 ELSE PRINT CONCAT('  !!! custody no-rate sai: err=',@ecF);
 DELETE FROM T_FEE_CONFIG WHERE C_FEE_TYPE='CUSTODY_FEE';
@@ -340,7 +276,7 @@ IF EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER WHERE C_SI_ACCOUNT='SUB00001001' AND C
 ELSE PRINT '  !!! DELETE xoá NHẦM ngày khác (01-02)';
 
 PRINT '';
-PRINT '======== DATE GUARD ngày-bừa-bãi (Mức 4): FR-06 err=5, index snapshot err=3, rebalance err=5, EOD trading-day err=10 ========';
+PRINT '======== DATE GUARD ngày-bừa-bãi: FR-06 err=5, rebalance err=5, EOD trading-day err=10 ========';
 DECLARE @ecD INT, @emD NVARCHAR(400);
 -- FR-06: ngày hợp lệ (01-07 có NAV_BALANCE) → err=0; gap/tương lai/trước-mở → err=5 (chặn NAV=NULL+asset>0 im lặng)
 EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-07',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
@@ -351,9 +287,6 @@ EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-12-31',@p_err_code=@ecD OUTPUT,@p_e
 IF @ecD=5 PRINT '  OK FR-06 ngày tương lai → err=5'; ELSE PRINT CONCAT('  !!! FR-06 tương lai KHÔNG chặn: err=',@ecD);
 EXEC SP_GET_ASSET_REPORT 'SUB00001001','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;  -- trước khi mở
 IF @ecD=5 PRINT '  OK FR-06 ngày trước khi mở TK → err=5'; ELSE PRINT CONCAT('  !!! FR-06 trước-mở KHÔNG chặn: err=',@ecD);
--- index snapshot: tương lai → err=3
-EXEC SP_GET_ASSET_INDEX_SNAPSHOT '2026-12-31','EOD',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
-IF @ecD=3 PRINT '  OK index snapshot ngày tương lai → err=3'; ELSE PRINT CONCAT('  !!! index snapshot KHÔNG chặn: err=',@ecD);
 -- rebalance detail: trước inception → err=5
 EXEC SP_GET_MASTER_REBALANCE_DETAIL 'SDI01','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
 IF @ecD=5 PRINT '  OK rebalance_detail ngày trước inception → err=5'; ELSE PRINT CONCAT('  !!! rebalance KHÔNG chặn: err=',@ecD);

@@ -2,6 +2,8 @@
 
 Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `EXEC` proc.
 
+> **⚠️ BRD 2026-06-22 — SDI→Asset đã GỠ:** BO/FO/Market nay đẩy dữ liệu **THẲNG sang Asset** và **Asset tự tính**. SDI **KHÔNG còn đồng bộ asset/perf sang Asset**. 3 producer Kafka SDI→Asset đã gỡ khỏi `05_API.sql`: `SP_GET_ASSET_SNAPSHOT`, `SP_GET_ASSET_MASTER_SNAPSHOT`, `SP_GET_ASSET_INDEX_SNAPSHOT`. Read API (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) GIỮ NGUYÊN — phục vụ **giao diện riêng của SDI**. **`SP_GET_ASSET_REPORT` (FR-06) là read API báo cáo tài sản KH — GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` đã gỡ). Bước asset-sync trong pipeline (ASSET_SYNC / `SP_EOD_SET_ASSET_SYNCED` / "publish sang Asset" bên dưới) phản ánh mô hình CŨ — không còn push SDI→Asset. Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).
+
 ## Naming convention
 | Đối tượng | Quy ước |
 |---|---|
@@ -20,7 +22,7 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 ```
 01_TABLES.sql      -- DDL bảng (T_/C_/PK_, PAGE compression; prod: + partition/columnstore)
 02_SP_ENGINE.sql   -- engine core: UDF + SP_EOD_* + master SP_EOD_RUN + dispatcher SP_EOD_STEP
-05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho Asset/SMO
+05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho UI riêng SDI (BRD 2026-06-22: 3 producer SP_GET_ASSET_*SNAPSHOT đã gỡ)
 06_PM_API.sql      -- read API PM (master-keyed): UDF_PM_CONFIG + SP_GET_MASTER_*/PM_OVERVIEW_ALL + SP_SET_MASTER_PM_CONFIG
 03_SMOKE.sql       -- smoke test core (1 SI, 1 KH, 4 phiên) — verify số đúng
 07_PM_SMOKE.sql    -- smoke PM (1 master × 3 KH × 3 phiên) — verify AUM-weighted/TE/deviation/dist/top-N
@@ -130,4 +132,4 @@ Serve-layer **on-read** cho PM theo dõi cấp **master** (spec: `docs/SDI-pm-to
 
 Công thức (spec §2): AUM = total_asset = `C_LAST_NAV+C_PAYABLE_FEE` (per KH); DM tổng KH = AUM-weighted end-weight (`ΣWᵢ·PnLᵢ`, PnL=TWR unit_price); deviation = (R_KH−R_master_index)×10000 BPS; TE per-KH = `STDEV(R_KH,t−R_master,t)×√X` (X=#ngày GD, cap 252), master = AUM-weighted. Ngưỡng per-master `T_MASTER_PM_CONFIG` (NULL→default `UDF_PM_CONFIG`). Verify: `07_PM_SMOKE.sql` (3 KH, số tính tay — KH_ret=.08/master=.071/dev=90BPS/TE≈.0297 MED/histogram/top-N đúng).
 
-> Chưa implement (mở rộng): ingestion file FO → `T_SI_PORTFOLIO_HOLDING` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_SI_INCOME_FEE` (cổ tức/phí, `BULK INSERT`), J15 publish→Asset, XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_SI_NAV_BALANCE` CCI + interval hist partition theo `valid_from`).
+> Chưa implement (mở rộng): ingestion file FO → `T_SI_PORTFOLIO_HOLDING` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_SI_INCOME_FEE` (cổ tức/phí, `BULK INSERT`), XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_SI_NAV_BALANCE` CCI + interval hist partition theo `valid_from`). *(J15 publish→Asset đã bỏ khỏi phạm vi — SDI→Asset gỡ per BRD 2026-06-22, xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).)*

@@ -1,8 +1,10 @@
 # SDI — Asset & Performance Engine — Specification
 
-Engine tính tài sản, hiệu suất danh mục master và từng khách hàng cho sản phẩm **SMA chỉ số** (separately managed account). Cấp dữ liệu cho Asset → SMO.
+Engine tính tài sản, hiệu suất danh mục master và từng khách hàng cho sản phẩm **SMA chỉ số** (separately managed account). Phục vụ **giao diện riêng của SDI** (NAV/index/perf) qua read API.
 
 > 📖 Tra cứu nhanh thuật ngữ (VN/EN) + mọi công thức kèm ví dụ: [SDI-thuat-ngu-cong-thuc.md](./SDI-thuat-ngu-cong-thuc.md).
+>
+> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ asset/perf sang Asset** (BO/FO/Market đẩy thẳng sang Asset, Asset tự tính). 3 producer Kafka SDI→Asset (`SP_GET_ASSET_SNAPSHOT`/`_MASTER_SNAPSHOT`/`_INDEX_SNAPSHOT`) đã gỡ khỏi `db/05_API.sql`. Engine + read API (FR-01..06, PM) GIỮ NGUYÊN. Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -18,8 +20,10 @@ FO: tính tỷ trọng danh mục mẫu  +  đặt lệnh MP TRỰC TIẾP trên
     (không gom + phân bổ; khớp → cổ phiếu, không khớp → tiền của KH)
         │ feed EOD: model_weight + ĐỒNG BỘ holdings+cash toàn bộ TK (SDI không quản lý từng lệnh khớp)
         ▼
-SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, Master Index  →  push Asset  →  SMO (read-only)
+SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, PnL, TWR, MWR, Master Index  →  read API (UI riêng SDI)
 ```
+
+> **BRD 2026-06-22:** SDI **không còn push Asset**. Asset nhận BO/FO/Market trực tiếp & tự tính (xem [SDI-asset-gap.md](./SDI-asset-gap.md)). SDI phục vụ giao diện riêng qua read API.
 
 | Việc | Chủ |
 |---|---|
@@ -27,7 +31,7 @@ SDI: holdings (FO nạp thẳng current) + cash → tính NAV, Unit/Unit Price, 
 | Tính tỷ trọng danh mục mẫu (luôn 100% cổ phiếu) | **FO** |
 | Đặt & khớp lệnh MP trên TK từng KH | **FO** |
 | Tính NAV / Unit / PnL / TWR / MWR / Master Index | SDI |
-| Đọc & hiển thị | SMO (qua Asset, không tính toán) |
+| Đọc & hiển thị (UI riêng của SDI) | SDI read API (FR-01..06, PM) |
 
 - **Custody = segregated**: tiền & cổ phiếu nằm thật trong tiểu khoản KH (KH sở hữu hợp pháp).
 - **SDI = engine tính thuần**: không quyết tỷ trọng, không sinh/khớp lệnh.
@@ -285,7 +289,7 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | **J13** | `RECONCILE` đối soát (RECORDER) | J11 | NAV âm/unit≤0; Σ customer NAV vs master NAV | **GHI `T_EOD_RECON_BREAK`** (KHÔNG throw) | ✅ | – | ✅ (có break → SP_EOD_RUN chặn publish, RECONCILE=BREAK) |
 | **J14** | `BUILD_SNAPSHOT` | J8 | holdings | T_MASTER_HOLDING_BALANCE (top20+mã khác) | ✅ | ‖ | – |
 | ~~J14b~~ | ~~`HISTORY`~~ **(CHUYỂN sang INGEST realtime)** | — | interval CASH_HIST/HOLDING_HIST maintain TẠI ingest per-event; `SP_EOD_HISTORY` chỉ còn utility bulk-backfill | — | – | – | – |
-| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_NAV_CURRENT`; SWITCH/MERGE master-level; push current snapshot + master series → Asset | ✅ | – | ✅ |
+| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_NAV_CURRENT`; SWITCH/MERGE master-level (publish nội bộ cho read API). ~~push snapshot + master series → Asset~~ **ĐÃ GỠ (BRD 2026-06-22)** — BO/FO/Market đẩy thẳng Asset, xem [SDI-asset-gap.md](./SDI-asset-gap.md) | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark T_EOD_RUN done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
 ### 9.3 Thứ tự, song song & orchestration
@@ -315,9 +319,11 @@ J0 GATE → J7 ─ J8 → J9
 
 ---
 
-## 10. API cho Asset/SMO
+## 10. API cho UI riêng của SDI
 
 > Mỗi API = **app gọi 1 stored proc** (`SP_GET_*`, xem `db/05_API.sql`) — tính/derive trong DB; app chỉ trả JSON, không tính. Định danh: KH=`C_CUST_CODE`, đơn vị = `C_SI_ACCOUNT` (sub-account); master suy từ sub-account.
+>
+> **BRD 2026-06-22:** các read API dưới phục vụ **giao diện riêng của SDI** (KHÔNG còn serve Asset/SMO — Asset tự tính từ BO/FO/Market trực tiếp). Toàn bộ FR-01..06 + PM API GIỮ NGUYÊN. **FR-06 `SP_GET_ASSET_REPORT` = read API báo cáo tài sản KH (GIỮ)** — đừng nhầm với `SP_GET_ASSET_SNAPSHOT` (producer Kafka đã gỡ). Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 | FR | API | Proc | Nguồn |
 |---|---|---|---|
@@ -335,13 +341,13 @@ J0 GATE → J7 ─ J8 → J9
 ## 11. Scale (100 master, 200K KH × 5 master, 10 năm)
 
 > Chi tiết kiến trúc DB + EOD ở quy mô lớn cho SQL Server: [SDI-db-architecture.md](./SDI-db-architecture.md) (roll-forward state, set-based, columnstore, partitioning).
-> Hợp đồng trao đổi dữ liệu EOD FO↔SDI↔Asset (payload từng bên + định lượng small/medium/large): [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md).
+> Hợp đồng trao đổi dữ liệu EOD FO/Market/BO→SDI (payload từng bên + định lượng small/medium/large): [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md). *(SDI→Asset đã gỡ — BRD 2026-06-22; gap đối chiếu: [SDI-asset-gap.md](./SDI-asset-gap.md)).*
 > Dự phóng tăng trưởng dữ liệu 1M/1Q/1Y (KH tăng đều/nóng): [SDI-data-growth-projection.md](./SDI-data-growth-projection.md).
 > Dashboard PM quản lý master (US1–US5, SP serve, TE/deviation/cash-drag, config ngưỡng): [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md).
 
 | Dữ liệu | Ước lượng |
 |---|---|
-| Master Index / Performance / Asset snapshot | ~250K dòng/loại |
+| Master Index / Performance / master snapshot (nội bộ) | ~250K dòng/loại |
 | Cashflow / execution / holding event | ~100M+ |
 | Unit ledger | ~120M |
 | Customer NAV/UP/% daily | **materialize** `T_SI_NAV_BALANCE` (~2,5 tỷ, CCI) — bắt buộc do FO-sync |
