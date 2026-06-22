@@ -238,8 +238,9 @@ BEGIN
     FROM T_EOD_WORK w
     INNER JOIN (
         SELECT C_SI_ACCOUNT,
-               SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN 0 ELSE C_AMOUNT END) AS CF_IN,
-               SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_OUT
+               -- 2 dòng ĐẢO nhau (dễ đọc nhầm là giống): CF_OUT = chỉ WITHDRAW; CF_IN = mọi loại KHÁC withdraw.
+               SUM(CASE WHEN C_EVENT_TYPE =  'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_OUT,  -- TIỀN RA (rút)
+               SUM(CASE WHEN C_EVENT_TYPE <> 'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_IN    -- TIỀN VÀO (INITIAL/TOPUP/SIP/INTEREST_IN). ⚠️ thêm loại OUTFLOW mới phải sửa ĐÂY (else=IN là catch-all)
         FROM T_SI_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@p_d GROUP BY C_SI_ACCOUNT
     ) cf ON cf.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
