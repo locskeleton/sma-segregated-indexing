@@ -79,9 +79,11 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 
 ### C. Market data → SDI (feed EOD)
 
+> **Cơ chế nạp giá (an toàn 2 lớp):** app gọi **`SP_INGEST_PRICE_DAILY(@p_json, @p_business_date, @p_expected_count?)`** (db/02_SP_ENGINE.sql) — 1 batch JSON. **(1) Type-safe:** `OPENJSON WITH` ép kiểu (string sai/thiếu → NULL → bắt ở validate). **(2) All-or-nothing:** validate TOÀN batch trước (ticker rỗng / ref·close NULL hoặc ≤0 / is_ex_rights ∉{0,1} / TRÙNG mã / lệch `@p_expected_count`) → sai bất kỳ ⇒ **TỪ CHỐI cả batch, KHÔNG ghi dòng nào** (err 20/21/22); hợp lệ → `MERGE` upsert (date,ticker) atomic, idempotent. ⇒ **không bao giờ nạp một-phần**. Chốt chặn cuối: **completeness gate trong `SP_EOD_RUN_INDEX`** — thiếu giá DÙ 1 mã danh mục mẫu (active) @d ⇒ `err=11`, **KHÔNG tính index** (tránh master index SAI). `SP_INGEST_PRICE_DAILY` chỉ NẠP giá, KHÔNG set MKT_DATA READY (app gọi `SP_EOD_SET_SOURCE_READY` sau).
+
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 7a | **Giá EOD (gộp CA)** | `T_PRICE_DAILY` | ticker, business_date, **ref_price** (NOT NULL), close_price, **is_ex_rights** (1/0) | Theo **universe mã** (không theo KH). `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia) → J12 self-contained, không tra ngày trước. `is_ex_rights` = metadata đánh dấu ngày có quyền. Bỏ bảng CA riêng — type/ratio/cash_div đã vào NAV qua FO sync. |
+| 7a | **Giá EOD (gộp CA)** — `SP_INGEST_PRICE_DAILY` | `T_PRICE_DAILY` | ticker, business_date, **ref_price** (NOT NULL), close_price, **is_ex_rights** (1/0, default 0) | Theo **universe mã** (không theo KH). `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia) → J12 self-contained, không tra ngày trước. `is_ex_rights` = metadata đánh dấu ngày có quyền. Bỏ bảng CA riêng — type/ratio/cash_div đã vào NAV qua FO sync. |
 | 7b | **Benchmark** | `T_BENCHMARK_DAILY` | benchmark_code (VNINDEX…), business_date, index_value | 1 dòng/benchmark/ngày. |
 
 ### D. SDI → Asset — chỉ còn Master Index (BRD 2026-06-22)

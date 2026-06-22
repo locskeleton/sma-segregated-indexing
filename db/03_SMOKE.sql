@@ -308,3 +308,43 @@ IF @ecD=5 PRINT '  OK rebalance_detail ngày trước inception → err=5'; ELSE
 -- SP_EOD_RUN: ngày KHÔNG phải ngày GD (2099, không có giá) → err=10 + thông điệp trading-day
 EXEC SP_EOD_RUN '2099-06-15',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
 IF @ecD=10 PRINT CONCAT('  OK SP_EOD_RUN ngày không-GD → err=10 (',@emD,')'); ELSE PRINT CONCAT('  !!! SP_EOD_RUN không chặn ngày không-GD: err=',@ecD);
+
+PRINT '';
+PRINT '======== INGEST GIÁ EOD: SP_INGEST_PRICE_DAILY (atomic+validate) + completeness gate index ========';
+DECLARE @ecP2 INT, @emP2 NVARCHAR(400);
+-- (A) batch HỢP LỆ → err=0, 3 mã vào T_PRICE_DAILY (PX2 thiếu is_ex_rights → default 0)
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"PX1","ref_price":100,"close_price":102,"is_ex_rights":0},{"ticker":"PX2","ref_price":50,"close_price":51},{"ticker":"PX3","ref_price":120,"close_price":118,"is_ex_rights":1}]','2026-03-02',NULL,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=0 AND (SELECT COUNT(*) FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER IN ('PX1','PX2','PX3'))=3
+   AND (SELECT C_IS_EX_RIGHTS FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER='PX2')=0
+   PRINT '  OK ingest batch hợp lệ: 3 mã (PX2 thiếu is_ex_rights → 0)';
+ELSE PRINT CONCAT('  !!! ingest hợp lệ sai: err=',@ecP2,' ',@emP2);
+-- (B) batch SAI (PX5 close=0) → err=21, KHÔNG ghi MÃ NÀO (PX4 hợp lệ cũng KHÔNG vào)
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"PX4","ref_price":10,"close_price":11},{"ticker":"PX5","ref_price":10,"close_price":0}]','2026-03-02',NULL,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=21 AND NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER IN ('PX4','PX5'))
+   PRINT '  OK batch SAI bị từ chối CẢ batch (PX4 hợp lệ cũng KHÔNG ghi) → err=21, atomic';
+ELSE PRINT CONCAT('  !!! batch sai xử lý sai: err=',@ecP2,' (PX4 lọt vào?)');
+-- (C) idempotent upsert: gọi lại đổi close PX1 102→105 → ghi đè, KHÔNG dup
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"PX1","ref_price":100,"close_price":105}]','2026-03-02',NULL,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=0 AND (SELECT C_CLOSE_PRICE FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER='PX1')=105
+   AND (SELECT COUNT(*) FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER='PX1')=1
+   PRINT '  OK upsert idempotent: PX1 close 102→105, KHÔNG dup';
+ELSE PRINT CONCAT('  !!! upsert sai: err=',@ecP2);
+-- (D) count mismatch (nhận 1 != dự kiến 5) → err=22
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"PX1","ref_price":100,"close_price":105}]','2026-03-02',5,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=22 PRINT '  OK count guard: nhận 1 != dự kiến 5 → err=22 (chặn payload thiếu/cắt)'; ELSE PRINT CONCAT('  !!! count guard sai: err=',@ecP2);
+-- (E) trùng mã trong batch → err=21
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"PXD","ref_price":1,"close_price":1},{"ticker":"PXD","ref_price":2,"close_price":2}]','2026-03-02',NULL,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=21 AND NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE='2026-03-02' AND C_TICKER='PXD')
+   PRINT '  OK trùng mã trong batch → err=21 (không ghi)'; ELSE PRINT CONCAT('  !!! dup-ticker xử lý sai: err=',@ecP2);
+-- (F) JSON sai → err=20
+EXEC SP_INGEST_PRICE_DAILY N'khong-phai-json','2026-03-02',NULL,NULL,@ecP2 OUTPUT,@emP2 OUTPUT;
+IF @ecP2=20 PRINT '  OK JSON sai → err=20'; ELSE PRINT CONCAT('  !!! json guard sai: err=',@ecP2);
+-- (G) COMPLETENESS GATE: ngày chưa nạp đủ giá mã danh mục mẫu → SP_EOD_RUN_INDEX err=11 (chặn index sai)
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-03-09',@p_source='MKT_DATA',@p_err_code=@ecP2 OUTPUT,@p_err_msg=@emP2 OUTPUT;
+EXEC SP_EOD_RUN_INDEX '2026-03-09',@p_err_code=@ecP2 OUTPUT,@p_err_msg=@emP2 OUTPUT;
+IF @ecP2=11 PRINT '  OK completeness gate: thiếu giá mã danh mục mẫu @09 → index BỊ CHẶN err=11';
+ELSE PRINT CONCAT('  !!! gate KHÔNG chặn khi thiếu giá: err=',@ecP2,' ',@emP2);
+-- cleanup
+DELETE FROM T_PRICE_DAILY  WHERE C_BUSINESS_DATE='2026-03-02';
+DELETE FROM T_EOD_RUN      WHERE C_BUSINESS_DATE='2026-03-09';
+DELETE FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-03-09';

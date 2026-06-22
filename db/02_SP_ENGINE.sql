@@ -407,6 +407,94 @@ END
 GO
 
 /*===========================================================================
+  SP_INGEST_PRICE_DAILY — nạp GIÁ EOD (close + ref + ex-rights) từ Market vào T_PRICE_DAILY.
+    AN TOÀN 2 yếu tố:
+    (1) TYPE-SAFE: input JSON string → OPENJSON WITH ÉP KIỂU; sai kiểu/thiếu field → NULL → bắt ở validate
+        (không tin string thô). (2) ALL-OR-NOTHING: validate TOÀN batch TRƯỚC; sai bất kỳ (ticker rỗng,
+        ref/close NULL hoặc ≤0, is_ex_rights ∉{0,1}, TRÙNG mã, hoặc lệch @p_expected_count) → TỪ CHỐI CẢ
+        batch, KHÔNG ghi 1 dòng → tránh nạp một-phần làm master index SAI. Hợp lệ → MERGE upsert (date,ticker)
+        1 statement (atomic) + XACT_ABORT ON. IDEMPOTENT: gọi lại cùng ngày = ghi đè.
+    JSON: [{"ticker":"AAA","ref_price":110.0,"close_price":112.0,"is_ex_rights":0}, ...]
+        ref_price = giá tham chiếu đầu phiên (ex-rights = giá SAU chia); is_ex_rights 1=ngày có quyền (default 0).
+    ⚠️ Chỉ NẠP giá — KHÔNG set MKT_DATA READY (app gọi SP_EOD_SET_SOURCE_READY sau). Đủ-mã-hay-chưa do
+        completeness gate trong SP_EOD_RUN_INDEX chốt (thiếu mã danh mục mẫu → chặn tính index).
+    err: 0 OK · 20 JSON sai · 21 validate FAIL (liệt kê lỗi đầu) · 22 lệch số mã dự kiến · -1 runtime.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_INGEST_PRICE_DAILY
+    @p_json           NVARCHAR(MAX),
+    @p_business_date  DATE,
+    @p_expected_count INT           = NULL,   -- (optional) số mã app dự định gửi → chặn payload thiếu/bị cắt
+    @p_user           VARCHAR(64)   = NULL,
+    @p_err_code       INT           OUTPUT,
+    @p_err_msg        NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+        IF @p_business_date IS NULL
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
+        IF @p_json IS NULL OR ISJSON(@p_json) <> 1
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không phải JSON hợp lệ'; RETURN; END
+
+        -- PARSE type-safe (OPENJSON WITH ép kiểu) + đánh dấu trùng mã (rn>1)
+        DECLARE @src TABLE (C_TICKER VARCHAR(20), C_REF_PRICE DECIMAL(18,4), C_CLOSE_PRICE DECIMAL(18,4),
+                            C_IS_EX_RIGHTS TINYINT, rn INT);
+        INSERT @src (C_TICKER, C_REF_PRICE, C_CLOSE_PRICE, C_IS_EX_RIGHTS, rn)
+        SELECT j.ticker, j.ref_price, j.close_price, ISNULL(j.is_ex_rights, 0),   -- thiếu is_ex_rights = phiên thường (0)
+               ROW_NUMBER() OVER (PARTITION BY j.ticker ORDER BY (SELECT NULL))
+        FROM OPENJSON(@p_json) WITH (
+            ticker       VARCHAR(20)   '$.ticker',
+            ref_price    DECIMAL(18,4) '$.ref_price',
+            close_price  DECIMAL(18,4) '$.close_price',
+            is_ex_rights TINYINT       '$.is_ex_rights'
+        ) j;
+
+        DECLARE @n INT = (SELECT COUNT(*) FROM @src);
+        IF @n = 0 BEGIN SET @p_err_code=21; SET @p_err_msg=N'Batch rỗng (0 mã) — từ chối'; RETURN; END
+
+        -- VALIDATE toàn batch (all-or-nothing): lấy lỗi ĐẦU TIÊN để báo
+        DECLARE @bad NVARCHAR(300) = (
+            SELECT TOP 1 CASE
+                WHEN C_TICKER IS NULL OR LTRIM(C_TICKER)=''      THEN N'ticker rỗng'
+                WHEN rn > 1                                       THEN CONCAT(N'ticker TRÙNG: ', C_TICKER)
+                WHEN C_REF_PRICE IS NULL OR C_REF_PRICE <= 0     THEN CONCAT(N'ref_price không hợp lệ @', C_TICKER)
+                WHEN C_CLOSE_PRICE IS NULL OR C_CLOSE_PRICE <= 0 THEN CONCAT(N'close_price không hợp lệ @', C_TICKER)
+                WHEN C_IS_EX_RIGHTS NOT IN (0,1)                 THEN CONCAT(N'is_ex_rights phải 0/1 @', C_TICKER)
+                END
+            FROM @src
+            WHERE C_TICKER IS NULL OR LTRIM(C_TICKER)='' OR rn>1
+               OR C_REF_PRICE IS NULL OR C_REF_PRICE<=0
+               OR C_CLOSE_PRICE IS NULL OR C_CLOSE_PRICE<=0
+               OR C_IS_EX_RIGHTS NOT IN (0,1));
+        IF @bad IS NOT NULL
+            BEGIN SET @p_err_code=21;
+                SET @p_err_msg=CONCAT(N'Validate FAIL — batch BỊ TỪ CHỐI (không ghi dòng nào): ', @bad);
+                RETURN; END
+
+        -- COUNT guard: chặn payload thiếu/bị cắt giữa chừng (app báo trước số mã)
+        IF @p_expected_count IS NOT NULL AND @n <> @p_expected_count
+            BEGIN SET @p_err_code=22;
+                SET @p_err_msg=CONCAT(N'Số mã nhận ', @n, N' != dự kiến ', @p_expected_count, N' — batch BỊ TỪ CHỐI');
+                RETURN; END
+
+        -- ATOMIC upsert (MERGE 1 statement; XACT_ABORT ON → lỗi runtime rollback toàn bộ)
+        MERGE T_PRICE_DAILY AS t
+        USING (SELECT C_TICKER, C_REF_PRICE, C_CLOSE_PRICE, C_IS_EX_RIGHTS FROM @src) s
+           ON t.C_BUSINESS_DATE = @p_business_date AND t.C_TICKER = s.C_TICKER
+        WHEN MATCHED THEN UPDATE SET
+            t.C_REF_PRICE=s.C_REF_PRICE, t.C_CLOSE_PRICE=s.C_CLOSE_PRICE, t.C_IS_EX_RIGHTS=s.C_IS_EX_RIGHTS
+        WHEN NOT MATCHED THEN
+            INSERT (C_TICKER, C_BUSINESS_DATE, C_REF_PRICE, C_CLOSE_PRICE, C_IS_EX_RIGHTS)
+            VALUES (s.C_TICKER, @p_business_date, s.C_REF_PRICE, s.C_CLOSE_PRICE, s.C_IS_EX_RIGHTS);
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END
+    END CATCH
+END
+GO
+
+/*===========================================================================
   J11 — SI AGGREGATE → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất + cổ tức/phí)
          + upsert T_MASTER_NAV_CURRENT (snapshot current cấp SI cho serving)
 ===========================================================================*/
@@ -725,6 +813,26 @@ BEGIN
     BEGIN
         SET @p_err_code=10;
         SET @p_err_msg=CONCAT(N'MKT_DATA chưa READY (=', ISNULL(@mkt,'(null)'), N') — chưa tính được index.');
+        RETURN;
+    END
+
+    -- COMPLETENESS GATE (chốt chặn index SAI): MỌI mã thành phần danh mục mẫu (rổ hiệu lực ≤ @d, master ACTIVE)
+    --   PHẢI có giá @d trong T_PRICE_DAILY. Thiếu DÙ 1 mã → KHÔNG tính index (tránh factor lệch do nạp giá thiếu).
+    DECLARE @missing NVARCHAR(400) = (
+        SELECT STRING_AGG(req.C_TICKER, ',') WITHIN GROUP (ORDER BY req.C_TICKER)
+        FROM (
+            SELECT DISTINCT t.C_TICKER
+            FROM T_MASTER_PORTFOLIO_TICKER t
+            INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=t.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+            WHERE t.C_EFFECTIVE_DATE = (SELECT MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER t2
+                                        WHERE t2.C_MASTER_CODE=t.C_MASTER_CODE AND t2.C_EFFECTIVE_DATE<=@d)
+        ) req
+        WHERE NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY p WHERE p.C_TICKER=req.C_TICKER AND p.C_BUSINESS_DATE=@d));
+    IF @missing IS NOT NULL
+    BEGIN
+        SET @p_err_code=11;
+        SET @p_err_msg=CONCAT(N'Thiếu giá @', CONVERT(VARCHAR(10),@d,23), N' cho mã danh mục mẫu: ',
+                              LEFT(@missing,300), N' — KHÔNG tính index (tránh sai).');
         RETURN;
     END
 
