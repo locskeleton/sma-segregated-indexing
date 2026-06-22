@@ -841,9 +841,11 @@ BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
     DELETE FROM T_EOD_RUN         WHERE C_BUSINESS_DATE=@p_business_date;   -- mọi job chạy lại (compute DELETE+INSERT theo @d: idempotent + sửa-số)
-    -- ⚠️ HẠN CHẾ: RESET KHÔNG un-roll T_SI_NAV_CURRENT (C_LAST_NAV/C_UNIT/C_LAST_BUSINESS_DATE đã roll sang @d).
-    --   Re-run COMPUTE @d sẽ lấy mốc "hôm qua" = chính @d → PnL/Unit SAI. Tính-lại-sửa-số đúng cần un-roll state
-    --   (đọc lại NAV_BALANCE ngày trước phục hồi C_LAST_*) — CHƯA làm, là issue riêng.
+    -- IDEMPOTENT re-run: KHÔNG cần un-roll T_SI_NAV_CURRENT. SP_EOD_COMPUTE seed anchor PnL/Unit từ
+    --   T_SI_NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll) → tính lại @d ra số Y HỆT dù NAV_CURRENT đã roll sang @d.
+    --   ⚠️ Phạm vi: re-run NGÀY HIỆN TẠI (tài sản cash/pending/div trong NAV_CURRENT vẫn của @d). Recompute NGÀY
+    --     QUÁ KHỨ từ đầu KHÔNG hỗ trợ đầy đủ (pending_cash/div_cash chưa có lịch sử interval) — replay lịch sử
+    --     dùng SP_GET_ASSET_SNAPSHOT mode=HISTORY (reconstruct-only đọc NAV_BALANCE, không tính lại → không lệch).
     DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_business_date;
     UPDATE T_EOD_PIPELINE
     SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL,
