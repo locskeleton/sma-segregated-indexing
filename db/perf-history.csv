@@ -14,3 +14,13 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-19T15:23:17Z,3276606,"docs(pm-tool): spec PM dashboard quản lý master (US1-5, SP serve, TE/deviation/cash-drag)",small,1000,60000,1119,NULL,773,50,16,36,184,NULL
 2026-06-20T02:04:08Z,85bfe21,"perf(pm-tool): fix US3 composite OUTER APPLY→equi-join + P5 bench scale thật",small,1000,60000,1150,NULL,713,67,20,27,187,NULL
 2026-06-20T02:04:59Z,85bfe21,"perf(pm-tool): fix US3 composite OUTER APPLY→equi-join + P5 bench scale thật",medium,10000,1250000,10476,NULL,7640,124,17,130,1693,NULL
+2026-06-21T23:58:14Z,bf1ac00,"fix(eod): unit_ledger + nav_balance MERGE — tính-lại-sửa-số an toàn, giữ accum TE",medium,10000,1250000,10711,NULL,7950,140,80,70,1717,NULL
+2026-06-21T23:58:52Z,bf1ac00,"fix(eod): unit_ledger + nav_balance MERGE — tính-lại-sửa-số an toàn, giữ accum TE",medium,10000,1250000,10516,NULL,7740,253,63,37,1703,NULL
+2026-06-21T23:59:19Z,bf1ac00,"fix(eod): unit_ledger + nav_balance MERGE — tính-lại-sửa-số an toàn, giữ accum TE",medium,10000,1250000,10266,NULL,7604,193,43,63,1840,NULL
+2026-06-22T00:03:48Z,bf1ac00,"fix(eod): unit_ledger + nav_balance MERGE — tính-lại-sửa-số an toàn, giữ accum TE",large,50000,6250000,46254,NULL,37087,480,37,187,6560,NULL
+2026-06-22T00:06:08Z,bf1ac00,"fix(eod): unit_ledger + nav_balance MERGE — tính-lại-sửa-số an toàn, giữ accum TE",large,50000,6250000,45300,NULL,35873,597,36,210,6650,NULL
+2026-06-22T01:13:45Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",medium,10000,1250000,9251,NULL,6603,180,30,124,1690,NULL
+2026-06-22T01:14:11Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",medium,10000,1250000,9488,NULL,6860,184,44,127,1640,NULL
+2026-06-22T01:14:38Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",medium,10000,1250000,9351,NULL,6716,187,40,110,1647,NULL
+2026-06-22T01:16:43Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",large,50000,6250000,40387,NULL,31194,556,37,333,6400,NULL
+2026-06-22T01:18:52Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",large,50000,6250000,41058,NULL,31813,710,46,286,6396,NULL
