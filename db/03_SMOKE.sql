@@ -296,28 +296,35 @@ DELETE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT='SUBFEE01';
 DELETE FROM T_SI_CASH_HIST  WHERE C_SI_ACCOUNT='SUBFEE01';
 
 PRINT '';
-PRINT '======== MERGE idempotent unit_ledger + nav_balance (tính lại KHÔNG dup, GIỮ accum TE, DELETE scoped) ========';
--- (A) re-run COMPUTE @07: nav_balance/unit_ledger phải UPDATE-in-place (KHÔNG dup dòng) + GIỮ cột accum của J12B.
+PRINT '======== DELETE+INSERT idempotent unit_ledger + nav_balance (tính lại KHÔNG dup; accum reset→J12B set lại; DELETE scoped) ========';
+-- (A) re-run COMPUTE @07: DELETE+INSERT lại → KHÔNG dup dòng; accum bị reset DEFAULT 0 (sentinel mất) — CÓ CHỦ ĐÍCH.
 UPDATE T_SI_NAV_BALANCE SET C_ACCUM_ACTIVE_RET=0.123456 WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07'; -- sentinel giả J12B
 DECLARE @nbB INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE='2026-01-07');
 DECLARE @ulB INT=(SELECT COUNT(*) FROM T_SI_UNIT_LEDGER);
-EXEC SP_EOD_COMPUTE '2026-01-07';   -- gọi trực tiếp (bỏ DONE-guard) → ép đường MERGE WHEN MATCHED
+EXEC SP_EOD_COMPUTE '2026-01-07';   -- gọi trực tiếp (bỏ DONE-guard) → ép DELETE+INSERT lại
 DECLARE @nbA INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE='2026-01-07');
 DECLARE @ulA INT=(SELECT COUNT(*) FROM T_SI_UNIT_LEDGER);
-DECLARE @accT FLOAT=(SELECT C_ACCUM_ACTIVE_RET FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
+DECLARE @accReset FLOAT=(SELECT C_ACCUM_ACTIVE_RET FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
 IF @nbA=@nbB AND @ulA=@ulB PRINT CONCAT('  OK re-run KHÔNG dup: nav_balance ',@nbB,'→',@nbA,'; unit_ledger ',@ulB,'→',@ulA);
 ELSE PRINT CONCAT('  !!! re-run DUP: nav_balance ',@nbB,'→',@nbA,'; unit_ledger ',@ulB,'→',@ulA);
-IF ABS(@accT-0.123456)<0.0000001 PRINT '  OK MERGE GIỮ C_ACCUM_ACTIVE_RET (J07 tính lại KHÔNG wipe accum TE)';
-ELSE PRINT CONCAT('  !!! MERGE WIPE accum TE: ',@accT);
+IF ABS(@accReset)<0.0000001 PRINT '  OK J07 DELETE+INSERT tạo dòng mới sạch (accum reset DEFAULT 0, sentinel mất)';
+ELSE PRINT CONCAT('  !!! J07 KHÔNG tạo lại dòng (accum còn ',@accReset,') → DELETE+INSERT không chạy?');
+-- J12B set lại accum sau J07 reset, và IDEMPOTENT (chạy nhiều lần cho cùng kết quả → re-run pipeline an toàn).
+EXEC SP_EOD_TE_ACCUM '2026-01-07';
+DECLARE @a1 FLOAT=(SELECT C_ACCUM_ACTIVE_RET FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
+EXEC SP_EOD_TE_ACCUM '2026-01-07';
+DECLARE @a2 FLOAT=(SELECT C_ACCUM_ACTIVE_RET FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
+IF @a1=@a2 PRINT CONCAT('  OK J12B set lại accum sau J07 reset + IDEMPOTENT (chạy 2 lần =',@a1,')');
+ELSE PRINT CONCAT('  !!! J12B KHÔNG idempotent: ',@a1,' vs ',@a2);
 
--- (B) DELETE scoped: bơm 1 dòng unit_ledger GIẢ @01-06 (ngày SUB KHÔNG có cashflow) → tính lại @06 phải XOÁ nó,
---     nhưng KHÔNG đụng dòng ngày khác (01-02 có INITIAL cashflow phải còn).
+-- (B) DELETE scoped + cf→0: bơm 1 dòng unit_ledger GIẢ @01-06 (ngày SUB KHÔNG có cashflow) → tính lại @06 phải XOÁ nó
+--     (cf=0 ⇒ không insert lại), nhưng KHÔNG đụng dòng ngày khác (01-02 có INITIAL cashflow phải còn).
 INSERT INTO T_SI_UNIT_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
  VALUES ('SUB00001001','KH00001001','SDI01','2026-01-06',0,0,1000);
 EXEC SP_EOD_COMPUTE '2026-01-06';
 IF NOT EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-06')
-    PRINT '  OK MERGE DELETE: dòng unit_ledger cf=0 bị gỡ khi tính lại @06';
-ELSE PRINT '  !!! MERGE KHÔNG gỡ dòng cf=0 @06';
+    PRINT '  OK DELETE+INSERT: dòng unit_ledger cf=0 bị gỡ khi tính lại @06';
+ELSE PRINT '  !!! KHÔNG gỡ dòng cf=0 @06';
 IF EXISTS (SELECT 1 FROM T_SI_UNIT_LEDGER WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-02')
-    PRINT '  OK MERGE DELETE scoped: ngày khác (01-02 INITIAL) KHÔNG bị xoá';
-ELSE PRINT '  !!! MERGE DELETE xoá NHẦM ngày khác (01-02)';
+    PRINT '  OK DELETE scoped: ngày khác (01-02 INITIAL) KHÔNG bị xoá';
+ELSE PRINT '  !!! DELETE xoá NHẦM ngày khác (01-02)';
