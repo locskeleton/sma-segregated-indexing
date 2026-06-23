@@ -572,8 +572,12 @@ BEGIN
         FROM T_MASTER_PORTFOLIO_TICKER mw INNER JOIN LD ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
     ),
     FACT AS (
+        -- FACTOR = BÌNH QUÂN GIA QUYỀN price-relative = Σ(w × close/ref) / Σ(w). CHIA Σw để BẤT BIẾN với thang
+        --   trọng số: dù FO gửi w dạng phân số (Σ=1) hay phần trăm (Σ=100) đều ra ~1.0x/ngày (KHÔNG còn ×100 nổ
+        --   cấp số nhân). close/ref = giá đóng / giá tham chiếu đầu phiên (self-contained, cùng dòng @p_d).
         SELECT W.C_MASTER_CODE,
-               SUM( W.C_TARGET_WEIGHT * p.C_CLOSE_PRICE / p.C_REF_PRICE ) AS FACTOR   -- daily-return self-contained: close / giá tham chiếu đầu phiên (cùng dòng @p_d)
+               SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) * p.C_CLOSE_PRICE / p.C_REF_PRICE )
+                 / NULLIF(SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR   -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
         FROM W
         INNER JOIN T_PRICE_DAILY p ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@p_d
         GROUP BY W.C_MASTER_CODE
@@ -1048,6 +1052,44 @@ BEGIN
             FROM T_SI_NAV_CURRENT s
             INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_to_date;
 
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
+    END CATCH
+END
+GO
+
+/*===========================================================================
+  SP_EOD_RECOMPUTE_INDEX_RANGE — tính LẠI master index (danh mục mẫu) cho [from..to].
+    Dùng khi: sửa công thức/giá/weight → chuỗi index cũ SAI (vd nổ cấp số nhân do weight %). Loop ngày GD
+    THEO THỨ TỰ (mỗi ngày prev = ngày vừa tính lại → chuỗi đúng). SP_EOD_SI_INDEX idempotent (DELETE+INSERT @d).
+    ⚠️ Để sửa chuỗi hỏng phải chạy TỪ INCEPTION (prev ngày đầu = base 1000); chạy từ giữa → prev vẫn số cũ.
+    Index là MASTER-level (giá×weight), KHÔNG theo KH → luôn tính mọi master có weight+giá @d.
+    err: 0 OK · 20 range không hợp lệ · -1 runtime.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_RECOMPUTE_INDEX_RANGE
+    @p_from_date DATE,
+    @p_to_date   DATE          = NULL,
+    @p_user      VARCHAR(64)   = NULL,
+    @p_err_code  INT           OUTPUT,
+    @p_err_msg   NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code=0; SET @p_err_msg=NULL;
+    IF @p_to_date IS NULL SET @p_to_date = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
+    IF @p_from_date IS NULL OR @p_to_date IS NULL OR @p_from_date > @p_to_date
+        BEGIN SET @p_err_code=20; SET @p_err_msg=N'Khoảng ngày không hợp lệ.'; RETURN; END
+    BEGIN TRY
+        BEGIN TRAN;
+        DECLARE @d DATE = @p_from_date;
+        WHILE @d <= @p_to_date
+        BEGIN
+            IF dbo.UDF_IS_TRADING_DATE(@d) = 1 EXEC SP_EOD_SI_INDEX @d;   -- idempotent, prev=ngày GD trước (đã tính lại)
+            SET @d = DATEADD(DAY, 1, @d);
+        END
         COMMIT;
     END TRY
     BEGIN CATCH

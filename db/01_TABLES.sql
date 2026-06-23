@@ -366,7 +366,7 @@ CREATE TABLE T_MASTER_INDEX_DAILY (
     PK_MASTER_INDEX_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_INDEX_DAILY_PKID DEFAULT NEWID(),
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_INDEX_VALUE    DECIMAL(18,6)   NOT NULL,   -- Index danh mục mẫu (PR, daily-rebalanced): Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref. Gốc 1000.
+    C_INDEX_VALUE    DECIMAL(18,2)   NOT NULL,   -- Index danh mục mẫu (PR, daily-rebalanced): Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref. Gốc 1000. 2 chữ số thập phân (index quote chuẩn).
     C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- lợi suất index NGÀY-TRÊN-NGÀY = FACTOR − 1 = Index_t/Index_(t-1) − 1
                                                   --   (so với hôm trước qua P_ref = close hôm trước / giá sau chia ngày ex-rights).
                                                   --   DÙNG Ở: J12B SP_EOD_TE_ACCUM — active return = C_DAILY_RETURN(KH) − C_DAILY_RETURN(index này)
