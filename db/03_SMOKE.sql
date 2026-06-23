@@ -347,3 +347,30 @@ ELSE PRINT CONCAT('  !!! gate KHÔNG chặn khi thiếu giá: err=',@ecP2,' ',@e
 DELETE FROM T_PRICE_DAILY  WHERE C_BUSINESS_DATE='2026-03-02';
 DELETE FROM T_EOD_RUN      WHERE C_BUSINESS_DATE='2026-03-09';
 DELETE FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-03-09';
+
+PRINT '';
+PRINT '======== RERUN QUÁ KHỨ: SP_EOD_RECOMPUTE_RANGE (reconstruct AS-OF từ history) ========';
+-- ⚠️ Block idempotent ở trên đã chạy FORWARD SP_EOD_COMPUTE @06 (đọc holdings HIỆN TẠI = post-rebalance BBB90000)
+--   → NAV@06 BỊ SAI (=11.28tr thay vì 10.76tr). ĐÂY chính là lý do cần luồng rerun riêng. Recompute đọc holdings
+--   AS-OF @06 (BBB80000 từ holding_hist) → KHÔI PHỤC đúng. Khẳng định recompute = SỬA được số ngày quá khứ.
+DECLARE @ecR INT, @emR NVARCHAR(400);
+EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-02', @p_to_date=NULL, @p_cust_code='KH00001001', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+DECLARE @n02 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-02');
+DECLARE @n05 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-05');
+DECLARE @n06 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-06');
+DECLARE @n07 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-07');
+DECLARE @mR DECIMAL(20,0)=(SELECT C_NAV FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-07');
+DECLARE @cntR INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001');
+IF @ecR=0 AND @n02=10000000 AND @n05=10440000 AND @n06=10760000 AND @n07=11280000 AND @mR=11280000 AND @cntR=4
+   PRINT CONCAT('  OK recompute KH ĐÚNG as-of (02=',@n02,' 05=',@n05,' 06=',@n06,' 07=',@n07,'; master@07=',@mR,'; #rows=',@cntR,') — @06 đã KHÔI PHỤC đúng');
+ELSE PRINT CONCAT('  !!! recompute SAI: err=',@ecR,' 02=',@n02,' 05=',@n05,' 06=',@n06,' 07=',@n07,' master@07=',@mR,' #rows=',@cntR,' ',@emR);
+-- per-SI scope (05→07) đúng
+EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-05', @p_to_date='2026-01-07', @p_si_account='SUB00001001', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+IF @ecR=0 AND (SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-06')=10760000
+   PRINT '  OK recompute per-SI (05→07) đúng'; ELSE PRINT CONCAT('  !!! recompute per-SI sai: err=',@ecR);
+-- scope rỗng → err=1
+EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-02', @p_cust_code='KHKHONGCO', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+IF @ecR=1 PRINT '  OK scope rỗng → err=1'; ELSE PRINT CONCAT('  !!! scope rỗng sai: err=',@ecR);
+-- range from>to → err=20
+EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-07', @p_to_date='2026-01-02', @p_si_account='SUB00001001', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+IF @ecR=20 PRINT '  OK range from>to → err=20'; ELSE PRINT CONCAT('  !!! range guard sai: err=',@ecR);

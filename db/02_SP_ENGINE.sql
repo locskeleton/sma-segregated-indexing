@@ -509,7 +509,11 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
-    DELETE FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_d;
+    -- DELETE SCOPED theo master có trong T_EOD_WORK @p_d (forward: all masters = xoá hết @p_d; rerun: chỉ master
+    --   bị ảnh hưởng → KHÔNG đụng master khác). Behavior forward giữ nguyên.
+    DELETE m FROM T_MASTER_NAV_BALANCE m
+        WHERE m.C_BUSINESS_DATE=@p_d
+          AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_MASTER_CODE=m.C_MASTER_CODE AND w.C_BUSINESS_DATE=@p_d);
 
     ;WITH agg AS (
         SELECT C_MASTER_CODE,
@@ -532,7 +536,9 @@ BEGIN
     FROM agg a
     LEFT JOIN T_MASTER_NAV_BALANCE prev ON prev.C_MASTER_CODE=a.C_MASTER_CODE AND prev.C_BUSINESS_DATE=@prev;
 
-    -- current cấp master (overwrite) — đọc nhanh AUM/cash-drag/#KH hiện tại
+    -- current cấp master (overwrite) — CHỈ khi @p_d là ngày MỚI NHẤT (forward). Rerun ngày QUÁ KHỨ → KHÔNG đụng
+    --   current (current phải = hôm nay). Forward luôn tính ngày mới nhất ⇒ chạy như cũ.
+    IF @p_d = (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE)
     MERGE T_MASTER_NAV_CURRENT AS t
     USING (SELECT C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_STOCK_VALUE,C_TOTAL_ASSET,C_NAV,C_UNIT,C_UNIT_PRICE,C_TOTAL_ACCOUNT,C_BUSINESS_DATE
            FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_d) s
@@ -945,6 +951,108 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
+    END CATCH
+END
+GO
+
+/*===========================================================================
+  SP_EOD_RECOMPUTE_RANGE — LUỒNG RERUN QUÁ KHỨ (tách riêng, KHÔNG đụng forward).
+    Nghiệp vụ: KH báo sai NAV ngày quá khứ → sửa dữ liệu nguồn đã lưu (giá/holdings/cashflow…) rồi
+    TÍNH LẠI chuỗi [from..to] mà KHÔNG cần re-feed BO/FO. Reconstruct AS-OF từ dữ liệu DATED đã lưu:
+      holdings ← T_SI_HOLDING_HIST@d × giá T_PRICE_DAILY@d ; cash/pending/div ← T_SI_CASH_HIST@d (interval) ;
+      anchor + payable base ← T_SI_NAV_BALANCE@prev ; cắt phí ← T_SI_INCOME_FEE(charge_date=@d) ; cashflow dated.
+    Phạm vi (chọn 1): cả 2 NULL = TOÀN BỘ; @p_cust_code = theo KH; @p_si_account = 1 tiểu khoản.
+      ⟹ recompute ở mức MASTER (mọi SI của các master bị ảnh hưởng) để master-agg đúng (master = Σ mọi SI).
+    Mỗi ngày GD: seed as-of (all SI affected masters, active-as-of @d theo registry) → SP_EOD_COMPUTE_CORE
+      (per-SI nav_balance/unit_ledger, SCOPED) → SP_EOD_SI_AGG (master nav_balance, SCOPED; current chỉ đổi nếu @d
+      là ngày mới nhất) → SP_EOD_TE_ACCUM (TE). Roll-forward NAV_CURRENT (SI) chỉ khi @p_to_date = ngày mới nhất.
+    Atomic: cả range trong 1 transaction (XACT_ABORT) → lỗi giữa chừng rollback sạch (chuỗi không nửa vời).
+    ⚠️ KHÔNG recompute T_MASTER_HOLDING_BALANCE (composition PM) — dùng holdings current, cần as-of riêng (follow-up).
+    ⚠️ Recompute đúng cho ngày TỪ lúc có history pending/div trở đi (ngày cũ hơn thiếu receivables history).
+    err: 0 OK · 1 scope rỗng · 20 range không hợp lệ · -1 runtime.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_RECOMPUTE_RANGE
+    @p_from_date  DATE,
+    @p_to_date    DATE          = NULL,            -- NULL = ngày GD mới nhất
+    @p_cust_code  VARCHAR(10)   = NULL,            -- scope theo KH
+    @p_si_account VARCHAR(20)   = NULL,            -- scope theo 1 tiểu khoản
+    @p_user       VARCHAR(64)   = NULL,
+    @p_err_code   INT           OUTPUT,
+    @p_err_msg    NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+
+    DECLARE @latest DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
+    IF @p_to_date IS NULL SET @p_to_date = @latest;
+    IF @p_from_date IS NULL OR @p_to_date IS NULL OR @p_from_date > @p_to_date
+        BEGIN SET @p_err_code=20; SET @p_err_msg=N'Khoảng ngày không hợp lệ (from/to NULL hoặc from>to).'; RETURN; END
+
+    -- Master bị ảnh hưởng từ scope (registry). NULL cả 2 = mọi master.
+    DECLARE @masters TABLE (C_MASTER_CODE VARCHAR(20) PRIMARY KEY);
+    INSERT @masters
+    SELECT DISTINCT C_MASTER_CODE FROM T_SI_PORTFOLIO
+    WHERE (@p_si_account IS NULL OR C_SI_ACCOUNT=@p_si_account)
+      AND (@p_cust_code  IS NULL OR C_CUST_CODE =@p_cust_code);
+    IF NOT EXISTS (SELECT 1 FROM @masters)
+        BEGIN SET @p_err_code=1; SET @p_err_msg=N'Scope rỗng (không có KH/SI/master).'; RETURN; END
+
+    BEGIN TRY
+        BEGIN TRAN;
+        DECLARE @d DATE = @p_from_date;
+        WHILE @d <= @p_to_date
+        BEGIN
+            IF dbo.UDF_IS_TRADING_DATE(@d) = 1   -- chỉ ngày GD (có giá)
+            BEGIN
+                DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@d);
+                DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
+
+                -- SEED AS-OF: mọi SI của affected masters, active-as-of @d (registry join/close)
+                INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
+                    C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_PREV_DATE,C_FEE_CUT,
+                    C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV,C_STOCK_VALUE)
+                SELECT @d, p.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
+                    ISNULL(ch.C_CASH,0), ISNULL(ch.C_PENDING_CASH,0), ISNULL(ch.C_DIV_CASH,0),
+                    ISNULL(pb.C_PAYABLE_FEE,0), @prev, ISNULL(fc.CUT,0),
+                    ISNULL(pb.C_NAV,0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT,0), ISNULL(sv.SV,0)
+                FROM T_SI_PORTFOLIO p
+                INNER JOIN @masters mm ON mm.C_MASTER_CODE=p.C_MASTER_CODE
+                LEFT JOIN T_SI_CASH_HIST ch ON ch.C_SI_ACCOUNT=p.C_SI_ACCOUNT
+                       AND ch.C_VALID_FROM<=@d AND (ch.C_VALID_TO>@d OR ch.C_VALID_TO IS NULL)
+                LEFT JOIN T_SI_NAV_BALANCE pb ON pb.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND pb.C_BUSINESS_DATE=@prev
+                -- C_FEE_CUT chỉ tính cắt của LOẠI PHÍ ACCRUE (T_FEE_CONFIG rate>0) → net-off payable. CUSTODY_FEE
+                --   (FO point-event trừ thẳng cash, KHÔNG accrue) KHÔNG vào payable → KHÔNG trừ ở đây.
+                OUTER APPLY (SELECT SUM(f.C_AMOUNT) AS CUT FROM T_SI_INCOME_FEE f
+                             WHERE f.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND f.C_FEE_GROUP='PAYABLE' AND f.C_BUSINESS_DATE=@d
+                               AND f.C_FEE_TYPE IN (SELECT C_FEE_TYPE FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0)) fc
+                OUTER APPLY (SELECT SUM(h.C_QUANTITY*px.C_CLOSE_PRICE) AS SV
+                             FROM T_SI_HOLDING_HIST h
+                             INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=h.C_TICKER AND px.C_BUSINESS_DATE=@d
+                             WHERE h.C_SI_ACCOUNT=p.C_SI_ACCOUNT
+                               AND h.C_VALID_FROM<=@d AND (h.C_VALID_TO>@d OR h.C_VALID_TO IS NULL)) sv
+                WHERE p.C_JOIN_DATE<=@d AND (p.C_CLOSE_DATE IS NULL OR @d < p.C_CLOSE_DATE);
+
+                EXEC SP_EOD_COMPUTE_CORE @d;   -- per-SI: J06..J10 + nav_balance/unit_ledger (SCOPED to work)
+                EXEC SP_EOD_SI_AGG       @d;   -- master nav_balance (SCOPED; current chỉ đổi nếu @d mới nhất)
+                EXEC SP_EOD_TE_ACCUM     @d;   -- TE accum prefix-sum
+            END
+            SET @d = DATEADD(DAY, 1, @d);
+        END
+
+        -- Roll-forward NAV_CURRENT (SI) CHỈ khi range chạm ngày mới nhất (current = hôm nay).
+        --   work còn lại = ngày cuối @p_to_date. Roll cho mọi SI trong work (affected masters).
+        IF @p_to_date >= @latest
+            UPDATE s SET s.C_UNIT=w.C_UNIT, s.C_PAYABLE_FEE=w.C_PAYABLE_FEE, s.C_LAST_NAV=w.C_NAV,
+                s.C_LAST_UNIT_PRICE=w.C_UNIT_PRICE, s.C_LAST_BUSINESS_DATE=@p_to_date
+            FROM T_SI_NAV_CURRENT s
+            INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_to_date;
+
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
     END CATCH
 END
 GO
