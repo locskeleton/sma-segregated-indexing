@@ -571,22 +571,30 @@ BEGIN
         SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT
         FROM T_MASTER_PORTFOLIO_TICKER mw INNER JOIN LD ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
     ),
+    REQ AS (   -- số mã RỔ cần (mọi mã trong rổ hiệu lực @p_d) — để so với số mã CÓ giá
+        SELECT C_MASTER_CODE, COUNT(*) AS NEED FROM W GROUP BY C_MASTER_CODE
+    ),
     FACT AS (
         -- FACTOR = BÌNH QUÂN GIA QUYỀN price-relative = Σ(w × close/ref) / Σ(w). CHIA Σw để BẤT BIẾN với thang
         --   trọng số: dù FO gửi w dạng phân số (Σ=1) hay phần trăm (Σ=100) đều ra ~1.0x/ngày (KHÔNG còn ×100 nổ
         --   cấp số nhân). close/ref = giá đóng / giá tham chiếu đầu phiên (self-contained, cùng dòng @p_d).
         SELECT W.C_MASTER_CODE,
                SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) * p.C_CLOSE_PRICE / p.C_REF_PRICE )
-                 / NULLIF(SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR   -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
+                 / NULLIF(SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR,  -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
+               COUNT(*) AS HAVE                                                          -- số mã CÓ giá @p_d (do INNER JOIN)
         FROM W
         INNER JOIN T_PRICE_DAILY p ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@p_d
         GROUP BY W.C_MASTER_CODE
     )
+    -- COMPLETENESS in-proc: CHỈ tính master khi ĐỦ giá MỌI mã rổ (NEED=HAVE). Thiếu DÙ 1 mã → SKIP master đó
+    --   (KHÔNG ghi index) thay vì INNER JOIN drop mã ngầm → index sai. An toàn MỌI đường gọi (forward/direct/recompute),
+    --   không phụ thuộc completeness gate ở SP_EOD_RUN_INDEX. (Forward vẫn có gate err=11 báo rõ mã thiếu trước khi tới đây.)
     INSERT INTO T_MASTER_INDEX_DAILY (C_BUSINESS_DATE,C_MASTER_CODE,C_INDEX_VALUE,C_DAILY_RETURN)
     SELECT @p_d, f.C_MASTER_CODE,
            COALESCE(pi.C_INDEX_VALUE, 1000) * f.FACTOR,
            f.FACTOR - 1
     FROM FACT f
+    INNER JOIN REQ r ON r.C_MASTER_CODE=f.C_MASTER_CODE AND r.NEED = f.HAVE   -- đủ giá mọi mã rổ mới tính
     LEFT JOIN T_MASTER_INDEX_DAILY pi ON pi.C_MASTER_CODE=f.C_MASTER_CODE AND pi.C_BUSINESS_DATE=@prev;
 END
 GO
