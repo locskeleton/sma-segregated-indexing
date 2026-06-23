@@ -625,7 +625,10 @@ BEGIN
     FROM T_SI_NAV_BALANCE b
     INNER JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=@p_d
     LEFT JOIN T_SI_NAV_BALANCE p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_BUSINESS_DATE=@prev
-    WHERE b.C_BUSINESS_DATE=@p_d;
+    WHERE b.C_BUSINESS_DATE=@p_d
+      -- SCOPE theo T_EOD_WORK @p_d: forward (work=mọi SI active) → cập nhật hết như cũ; rerun per-KH (work=SI master
+      --   bị ảnh hưởng) → CHỈ cập nhật SI đó (tối ưu, không quét toàn bộ SI mỗi ngày). Mọi flow đều populate work @p_d trước TE.
+      AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d);
 END
 GO
 
@@ -1027,24 +1030,38 @@ BEGIN
                     C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV,C_STOCK_VALUE)
                 SELECT @d, p.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
                     ISNULL(ch.C_CASH,0), ISNULL(ch.C_PENDING_CASH,0), ISNULL(ch.C_DIV_CASH,0),
-                    ISNULL(pb.C_PAYABLE_FEE,0), @prev, ISNULL(fc.CUT,0),
-                    ISNULL(pb.C_NAV,0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT,0), ISNULL(sv.SV,0)
+                    ISNULL(pb.C_PAYABLE_FEE,0), @prev, 0,           -- C_FEE_CUT seed 0 → set-based UPDATE bên dưới
+                    ISNULL(pb.C_NAV,0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT,0), 0  -- C_STOCK_VALUE seed 0 → set-based UPDATE bên dưới
                 FROM T_SI_PORTFOLIO p
                 INNER JOIN @masters mm ON mm.C_MASTER_CODE=p.C_MASTER_CODE
                 LEFT JOIN T_SI_CASH_HIST ch ON ch.C_SI_ACCOUNT=p.C_SI_ACCOUNT
                        AND ch.C_VALID_FROM<=@d AND (ch.C_VALID_TO>@d OR ch.C_VALID_TO IS NULL)
                 LEFT JOIN T_SI_NAV_BALANCE pb ON pb.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND pb.C_BUSINESS_DATE=@prev
-                -- C_FEE_CUT chỉ tính cắt của LOẠI PHÍ ACCRUE (T_FEE_CONFIG rate>0) → net-off payable. CUSTODY_FEE
-                --   (FO point-event trừ thẳng cash, KHÔNG accrue) KHÔNG vào payable → KHÔNG trừ ở đây.
-                OUTER APPLY (SELECT SUM(f.C_AMOUNT) AS CUT FROM T_SI_INCOME_FEE f
-                             WHERE f.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND f.C_FEE_GROUP='PAYABLE' AND f.C_BUSINESS_DATE=@d
-                               AND f.C_FEE_TYPE IN (SELECT C_FEE_TYPE FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0)) fc
-                OUTER APPLY (SELECT SUM(h.C_QUANTITY*px.C_CLOSE_PRICE) AS SV
-                             FROM T_SI_HOLDING_HIST h
-                             INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=h.C_TICKER AND px.C_BUSINESS_DATE=@d
-                             WHERE h.C_SI_ACCOUNT=p.C_SI_ACCOUNT
-                               AND h.C_VALID_FROM<=@d AND (h.C_VALID_TO>@d OR h.C_VALID_TO IS NULL)) sv
                 WHERE p.C_JOIN_DATE<=@d AND (p.C_CLOSE_DATE IS NULL OR @d < p.C_CLOSE_DATE);
+
+                -- STOCK MTM as-of (SET-BASED, scoped work @d): thay OUTER APPLY per-SI (RBAR) → 1 join group-by.
+                UPDATE w SET w.C_STOCK_VALUE = sv.SV
+                FROM T_EOD_WORK w
+                INNER JOIN (SELECT h.C_SI_ACCOUNT, SUM(h.C_QUANTITY*px.C_CLOSE_PRICE) AS SV
+                            FROM T_EOD_WORK w2
+                            INNER JOIN T_SI_HOLDING_HIST h ON h.C_SI_ACCOUNT=w2.C_SI_ACCOUNT
+                                 AND h.C_VALID_FROM<=@d AND (h.C_VALID_TO>@d OR h.C_VALID_TO IS NULL)
+                            INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=h.C_TICKER AND px.C_BUSINESS_DATE=@d
+                            WHERE w2.C_BUSINESS_DATE=@d
+                            GROUP BY h.C_SI_ACCOUNT) sv ON sv.C_SI_ACCOUNT=w.C_SI_ACCOUNT
+                WHERE w.C_BUSINESS_DATE=@d;
+
+                -- FEE_CUT as-of (SET-BASED, scoped work @d): chỉ cắt LOẠI PHÍ ACCRUE (T_FEE_CONFIG rate>0) → net-off
+                --   payable. CUSTODY_FEE (FO point-event trừ thẳng cash, KHÔNG accrue) KHÔNG vào payable → KHÔNG trừ.
+                UPDATE w SET w.C_FEE_CUT = c.CUT
+                FROM T_EOD_WORK w
+                INNER JOIN (SELECT f.C_SI_ACCOUNT, SUM(f.C_AMOUNT) AS CUT
+                            FROM T_EOD_WORK w2
+                            INNER JOIN T_SI_INCOME_FEE f ON f.C_SI_ACCOUNT=w2.C_SI_ACCOUNT AND f.C_BUSINESS_DATE=@d
+                            WHERE w2.C_BUSINESS_DATE=@d AND f.C_FEE_GROUP='PAYABLE'
+                              AND f.C_FEE_TYPE IN (SELECT C_FEE_TYPE FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0)
+                            GROUP BY f.C_SI_ACCOUNT) c ON c.C_SI_ACCOUNT=w.C_SI_ACCOUNT
+                WHERE w.C_BUSINESS_DATE=@d;
 
                 EXEC SP_EOD_COMPUTE_CORE @d;   -- per-SI: J06..J10 + nav_balance/unit_ledger (SCOPED to work)
                 EXEC SP_EOD_SI_AGG       @d;   -- master nav_balance (SCOPED; current chỉ đổi nếu @d mới nhất)
