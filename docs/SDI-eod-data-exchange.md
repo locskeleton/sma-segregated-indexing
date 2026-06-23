@@ -188,5 +188,6 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 - **Scope:** cả 2 NULL = **TẤT CẢ**; `@p_cust_code` = theo 1 KH; `@p_si_account` = 1 tiểu khoản → **tính lại ở mức MASTER** (mọi tiểu khoản của các master bị ảnh hưởng, để tổng hợp master vẫn đúng).
 - **Reconstruct AS-OF từ bảng DATED** (mỗi phiên GD trong `[from,to]`): holdings = `T_SI_HOLDING_HIST`@d × giá `T_PRICE_DAILY`@d; cash/pending/div = `T_SI_CASH_HIST`@d (interval); anchor + payable base = `T_SI_NAV_BALANCE`@prev; fee cut = `T_SI_INCOME_FEE` (loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG (master) → SP_EOD_TE_ACCUM`.
 - **Atomic toàn range** (XACT_ABORT). Roll-forward `NAV_CURRENT` **chỉ khi** `@p_to_date` chạm phiên mới nhất. err: `1` = scope rỗng, `20` = range không hợp lệ.
-- **Giới hạn:** chính xác **chỉ cho các ngày từ khi bắt đầu capture history pending/div** (`T_SI_CASH_HIST` đủ 3 khoản); **CHƯA** tính lại composition `T_MASTER_HOLDING_BALANCE` (follow-up).
+- **Tái dựng đủ:** nav_balance (SI+master) + TE + **composition `T_MASTER_HOLDING_BALANCE` as-of** (từ `T_SI_HOLDING_HIST@d`×giá). **Index master sửa riêng:** `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception).
+- **Giới hạn:** chính xác **chỉ cho các ngày từ khi bắt đầu capture history pending/div** (`T_SI_CASH_HIST` đủ 3 khoản).
 - Forward + rerun **dùng CHUNG** lõi công thức `SP_EOD_COMPUTE_CORE` (DRY) — xem `db/README.md` / [SDI-spec.md §9](./SDI-spec.md).

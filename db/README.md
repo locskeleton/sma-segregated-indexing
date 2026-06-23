@@ -84,7 +84,8 @@ EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-06', @p_user='ops',
 ```
 - **Reconstruct AS-OF** mỗi phiên trong `[from,to]` từ bảng DATED: holdings=`T_SI_HOLDING_HIST`@d×giá@d; cash/pending/div=`T_SI_CASH_HIST`@d (interval); anchor+payable base=`T_SI_NAV_BALANCE`@prev; fee cut=`T_SI_INCOME_FEE`(loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG → SP_EOD_TE_ACCUM`.
 - **Atomic toàn range** (XACT_ABORT); roll-forward `NAV_CURRENT` chỉ khi `@p_to_date` chạm phiên mới nhất.
-- **Giới hạn:** chính xác chỉ cho ngày từ khi bắt đầu capture history pending/div (`T_SI_CASH_HIST` đủ 3 khoản); CHƯA tính lại `T_MASTER_HOLDING_BALANCE` (follow-up).
+- **Tái dựng đủ:** nav_balance (SI+master) + TE + composition `T_MASTER_HOLDING_BALANCE` as-of. Index master sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception).
+- **Giới hạn:** chính xác chỉ cho ngày từ khi bắt đầu capture history pending/div (`T_SI_CASH_HIST` đủ 3 khoản).
 
 > **`SP_EOD_COMPUTE_CORE @p_d`** = lõi công thức per-ngày (CF → J06 accrue → J08 NAV → J09 PnL → J10 Unit → ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE` SCOPE theo các tiểu khoản trong `T_EOD_WORK`), chạy trên `T_EOD_WORK` ĐÃ seed. **Forward (`SP_EOD_COMPUTE`) + rerun DÙNG CHUNG** lõi này (DRY, 1 công thức). Forward = seed từ current + J07 MTM (holdings hiện tại) + EXEC core + roll-forward `NAV_CURRENT` (hành vi KHÔNG đổi). `T_EOD_WORK` thêm 2 cột staged: `C_PREV_DATE` (gap accrue + guard), `C_FEE_CUT` (phí cắt trừ khỏi accrue; forward=0).
 **Trạng thái `T_EOD_PIPELINE`**: MKT_DATA (PENDING|READY — pull API BO, không đếm) + FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
