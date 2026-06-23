@@ -272,7 +272,9 @@ CREATE TABLE T_EOD_WORK (
     C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN MẶT @d (FO sync)
     C_PENDING_CASH    DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN bán chờ về @d
     C_DIV_CASH        DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN cổ tức chờ về @d
-    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- PHÍ QL phải trả lũy kế sau accrue J06 (payable_prev + accrue ngày)
+    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- vào: BASE payable_prev; ra J06: base + accrue − cut = payable @d
+    C_PREV_DATE       DATE           NULL,                 -- ngày GD trước (mốc accrue gap + guard); seed forward=NAV_CURRENT.C_LAST_BUSINESS_DATE, rerun=ngày GD trước @d
+    C_FEE_CUT         DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- phí BO cắt TRỪ trong J06 (forward=0 vì đã net-off NAV_CURRENT; rerun=Σ cắt charge_date=@d)
     C_LAST_NAV        DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- NAV cuối ngày TRƯỚC (để tính PnL J09)
     C_LAST_UNIT_PRICE DECIMAL(18,6) NULL,                  -- Unit Price cuối ngày trước (mẫu số ΔUnit J10)
     C_UNIT_PREV       DECIMAL(18,6) NOT NULL DEFAULT 0,    -- Unit đầu ngày (trước biến động dòng tiền)

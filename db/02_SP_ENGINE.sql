@@ -237,6 +237,85 @@ GO
     • TWR (Time-Weighted Return) = lợi suất theo Unit Price (UP_t/UP_(t-1) − 1) — không bị méo bởi cashflow.
     • roll-forward state = ghi đè trạng thái current (T_SI_NAV_CURRENT) sang cuối phiên @p_d làm mốc phiên sau.
 ===========================================================================*/
+/*========================================================================================
+  SP_EOD_COMPUTE_CORE @p_d — LÕI tính 1 phiên trên T_EOD_WORK ĐÃ SEED (dùng chung forward + rerun quá khứ).
+  Giả định caller đã seed T_EOD_WORK @p_d: cash/pending/div, C_STOCK_VALUE (MTM), anchor (C_LAST_NAV/
+    C_LAST_UNIT_PRICE/C_UNIT_PREV), C_PAYABLE_FEE = BASE (payable kỳ trước), C_PREV_DATE (mốc accrue+guard),
+    C_FEE_CUT (phí BO cắt trừ trong kỳ; forward=0).
+  Core: CF (dated) → J06 accrue (staged) → J08 NAV → J09 PnL → J10 Unit → ghi unit_ledger + nav_balance
+    (SCOPED theo SI có trong T_EOD_WORK → rerun per-KH KHÔNG đụng SI khác). KHÔNG roll-forward NAV_CURRENT
+    (caller quyết: forward roll hết; rerun roll ngày cuối + đúng scope).
+========================================================================================*/
+CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE_CORE @p_d DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- CF ngày @p_d (dated — forward+rerun như nhau). CF_OUT = chỉ WITHDRAW; CF_IN = mọi loại KHÁC (catch-all).
+    UPDATE w SET w.C_CF_IN = cf.CF_IN, w.C_CF_OUT = cf.CF_OUT
+    FROM T_EOD_WORK w
+    INNER JOIN (
+        SELECT C_SI_ACCOUNT,
+               SUM(CASE WHEN C_EVENT_TYPE =  'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_OUT,
+               SUM(CASE WHEN C_EVENT_TYPE <> 'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_IN   -- ⚠️ thêm loại OUTFLOW mới phải sửa ĐÂY
+        FROM T_SI_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@p_d GROUP BY C_SI_ACCOUNT
+    ) cf ON cf.C_SI_ACCOUNT=w.C_SI_ACCOUNT
+    WHERE w.C_BUSINESS_DATE=@p_d;
+
+    -- J06 ACCRUE payable (STAGED, config-driven GLOBAL): payable = BASE + accrue − cắt.
+    --   accrue = AUM_gross × (NGÀY DƯƠNG LỊCH từ C_PREV_DATE; NULL→1) × Σ(C_RATE/C_DAY_COUNT), chỉ khi C_PREV_DATE<@p_d
+    --   (guard idempotent: re-run cùng ngày C_PREV_DATE=@p_d → KHÔNG accrue). AUM_gross = stock+cash+pending+div.
+    --   forward C_FEE_CUT=0 (cắt đã net-off NAV_CURRENT giữa EOD); rerun C_FEE_CUT=Σ cắt charge_date=@p_d.
+    DECLARE @rate_per_day DECIMAL(18,12) = (SELECT SUM(C_RATE / C_DAY_COUNT)
+                                            FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
+    UPDATE T_EOD_WORK SET C_PAYABLE_FEE = C_PAYABLE_FEE
+        + (CASE WHEN @rate_per_day > 0 AND (C_PREV_DATE IS NULL OR C_PREV_DATE < @p_d)
+                THEN (C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH)
+                     * (CASE WHEN C_PREV_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, C_PREV_DATE, @p_d) END)
+                     * @rate_per_day
+                ELSE 0 END)
+        - C_FEE_CUT
+    WHERE C_BUSINESS_DATE=@p_d;
+
+    -- J08 NAV = stock + cash + pending + div − payable
+    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH - C_PAYABLE_FEE
+    WHERE C_BUSINESS_DATE=@p_d;
+    -- J09 PnL = NAV − NAV_prev + ra − vào
+    UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@p_d;
+    -- J10 Unit/UnitPrice (ΔUnit=CF/UP_prev; init khi unit_prev=0 → unit=NAV/10000)
+    UPDATE T_EOD_WORK SET
+        C_DELTA_UNIT = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
+                            THEN (C_NAV/10000.0) - C_UNIT_PREV
+                            ELSE (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END,
+        C_UNIT       = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
+                            THEN C_NAV/10000.0
+                            ELSE C_UNIT_PREV + (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END
+    WHERE C_BUSINESS_DATE=@p_d;
+    UPDATE T_EOD_WORK SET C_UNIT_PRICE = CASE WHEN C_UNIT>0 THEN C_NAV/C_UNIT ELSE 10000 END
+    WHERE C_BUSINESS_DATE=@p_d;
+
+    -- unit ledger (SCOPED theo SI trong T_EOD_WORK) — DELETE+INSERT idempotent. forward (all SI) = xoá hết @p_d;
+    --   rerun per-KH = chỉ SI của KH đó (KHÔNG đụng SI khác). Chỉ ngày có cashflow.
+    DELETE ul FROM T_SI_UNIT_LEDGER ul
+        INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=ul.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d
+        WHERE ul.C_BUSINESS_DATE=@p_d;
+    INSERT INTO T_SI_UNIT_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
+    SELECT w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,@p_d,(w.C_CF_IN-w.C_CF_OUT),w.C_DELTA_UNIT,w.C_UNIT
+    FROM T_EOD_WORK w
+    WHERE w.C_BUSINESS_DATE=@p_d AND (w.C_CF_IN-w.C_CF_OUT)<>0;
+
+    -- nav_balance (SCOPED) — DELETE+INSERT. accum TE reset 0 CÓ CHỦ ĐÍCH (J12B/SP_EOD_TE_ACCUM set lại sau).
+    DELETE nb FROM T_SI_NAV_BALANCE nb
+        INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=nb.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d
+        WHERE nb.C_BUSINESS_DATE=@p_d;
+    INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_PAYABLE_FEE,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
+    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, w.C_NAV, w.C_PAYABLE_FEE, w.C_UNIT, w.C_UNIT_PRICE, w.C_DAILY_PNL,
+           CASE WHEN w.C_LAST_UNIT_PRICE>0 THEN w.C_UNIT_PRICE/w.C_LAST_UNIT_PRICE - 1 END
+    FROM T_EOD_WORK w
+    WHERE w.C_BUSINESS_DATE=@p_d;
+END
+GO
+
 CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE @p_d DATE
 AS
 BEGIN
@@ -244,36 +323,19 @@ BEGIN
 
     DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d;
 
-    -- seed:
-    --   • TÀI SẢN @D (cash/pending/div + payable) ← STATE HIỆN TẠI T_SI_NAV_CURRENT (FO sync + BO net-off): đúng cho @D.
-    --   • ANCHOR PnL/Unit (C_LAST_NAV/C_LAST_UNIT_PRICE/C_UNIT_PREV) ← CUỐI ngày GD TRƯỚC, đọc từ T_SI_NAV_BALANCE @prev.
-    --     LÝ DO: roll-forward (cuối proc) ghi đè NAV_CURRENT.C_LAST_* = giá trị ngày @D. Nếu seed anchor từ NAV_CURRENT,
-    --     TÍNH LẠI @D (RESET re-run / chạy đi chạy lại) sẽ lấy nhầm mốc "hôm qua"=@D → PnL=0, Unit cộng đôi cashflow.
-    --     Đọc NAV_BALANCE @prev (bất biến qua các lần chạy @D) ⇒ IDEMPOTENT: chạy bao nhiêu lần cũng RA SỐ Y HỆT.
-    --     SI mới (chưa có dòng @prev) → pb NULL → C_UNIT_PREV=0/C_LAST_UNIT_PRICE=NULL → nhánh init (unit=NAV/10000).
+    -- SEED FORWARD: tài sản @D từ STATE HIỆN TẠI (NAV_CURRENT: FO sync + BO net-off); ANCHOR PnL/Unit từ
+    --   NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll → re-run idempotent). C_PREV_DATE = NAV_CURRENT.C_LAST_BUSINESS_DATE
+    --   (mốc accrue + guard), C_FEE_CUT = 0 (cắt đã net-off NAV_CURRENT.payable). SI mới (pb NULL) → init unit.
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
-    INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
+    INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_PREV_DATE,C_FEE_CUT,C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
     SELECT @p_d, s.C_SI_ACCOUNT, s.C_CUST_CODE, s.C_MASTER_CODE,
-           s.C_CASH, s.C_PENDING_CASH, s.C_DIV_CASH, s.C_PAYABLE_FEE,
-           ISNULL(pb.C_NAV, 0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT, 0)   -- anchor từ NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll)
+           s.C_CASH, s.C_PENDING_CASH, s.C_DIV_CASH, s.C_PAYABLE_FEE, s.C_LAST_BUSINESS_DATE, 0,
+           ISNULL(pb.C_NAV, 0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT, 0)
     FROM T_SI_NAV_CURRENT s
     LEFT JOIN T_SI_NAV_BALANCE pb ON pb.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND pb.C_BUSINESS_DATE=@prev
     WHERE s.C_STATUS='ACTIVE';
 
-    -- CF của ngày (cho PnL & unit) — group theo sub-account
-    UPDATE w SET w.C_CF_IN = cf.CF_IN, w.C_CF_OUT = cf.CF_OUT
-    FROM T_EOD_WORK w
-    INNER JOIN (
-        SELECT C_SI_ACCOUNT,
-               -- 2 dòng ĐẢO nhau (dễ đọc nhầm là giống): CF_OUT = chỉ WITHDRAW; CF_IN = mọi loại KHÁC withdraw.
-               SUM(CASE WHEN C_EVENT_TYPE =  'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_OUT,  -- TIỀN RA (rút)
-               SUM(CASE WHEN C_EVENT_TYPE <> 'WITHDRAW' THEN C_AMOUNT ELSE 0 END) AS CF_IN    -- TIỀN VÀO (INITIAL/TOPUP/SIP/INTEREST_IN). ⚠️ thêm loại OUTFLOW mới phải sửa ĐÂY (else=IN là catch-all)
-        FROM T_SI_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@p_d GROUP BY C_SI_ACCOUNT
-    ) cf ON cf.C_SI_ACCOUNT=w.C_SI_ACCOUNT
-    WHERE w.C_BUSINESS_DATE=@p_d;
-
-    -- J07 MTM = ĐỊNH GIÁ THỊ TRƯỜNG cổ phiếu: stock value = Σ(số lượng × giá đóng cửa @p_d), group theo
-    --   sub-account. (Câu nặng nhất — set-based; prod chạy batch-mode trên columnstore.)
+    -- J07 MTM = Σ(qty × close_price @p_d) từ holdings HIỆN TẠI (forward: current = holdings @D). Job nặng nhất.
     UPDATE w SET w.C_STOCK_VALUE = m.SV
     FROM T_EOD_WORK w
     INNER JOIN (
@@ -284,47 +346,9 @@ BEGIN
     ) m ON m.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- J06 ACCRUE phí phải trả (accrue = TRÍCH TRƯỚC). Config-driven GLOBAL (T_FEE_CONFIG, loại group PAYABLE có rate):
-    --   payable += AUM_gross × (NGÀY DƯƠNG LỊCH kể từ EOD trước) × Σ(C_RATE/C_DAY_COUNT) [rate GLOBAL, áp mọi master].
-    --   AUM_gross = stock + cash + tiền bán chờ về + cổ tức tiền. C_PAYABLE_FEE = TỔNG accrued mọi loại (chưa cắt).
-    --   THÊM loại phí accrue mới (TAX, PERF_FEE) = INSERT 1 dòng T_FEE_CONFIG (group PAYABLE + rate) → tự vào payable.
-    --   Breakdown per-type cho sao kê (Option B, 2026-06-21): 1 loại accrue ⇒ pending = chính C_PAYABLE_FEE (FR-06 RS5);
-    --     >1 loại → cần nâng cấp cột JSON per-type ghi tại đây (J06). KHÔNG log dày, KHÔNG reconstruct/xẻ tổng.
-    --   IDEMPOTENT: chỉ accrue khi CHƯA compute @p_d (C_LAST_BUSINESS_DATE < @p_d) → re-run không cộng đôi.
-    DECLARE @rate_per_day DECIMAL(18,12) = (SELECT SUM(C_RATE / C_DAY_COUNT)
-                                            FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
-    IF @rate_per_day > 0
-        UPDATE w SET w.C_PAYABLE_FEE = w.C_PAYABLE_FEE
-            + (w.C_STOCK_VALUE + w.C_CASH + w.C_PENDING_CASH + w.C_DIV_CASH)
-              * (CASE WHEN s.C_LAST_BUSINESS_DATE IS NULL THEN 1 ELSE DATEDIFF(DAY, s.C_LAST_BUSINESS_DATE, @p_d) END)
-              * @rate_per_day
-        FROM T_EOD_WORK w
-        INNER JOIN T_SI_NAV_CURRENT s ON s.C_SI_ACCOUNT = w.C_SI_ACCOUNT
-        WHERE w.C_BUSINESS_DATE=@p_d
-          AND (s.C_LAST_BUSINESS_DATE IS NULL OR s.C_LAST_BUSINESS_DATE < @p_d);
+    EXEC SP_EOD_COMPUTE_CORE @p_d;   -- CF → J06 → J08 → J09 → J10 + ghi unit_ledger/nav_balance
 
-    -- J08 NAV = Tổng tài sản − payable. Tổng tài sản = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables).
-    UPDATE T_EOD_WORK SET C_NAV = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH - C_PAYABLE_FEE
-    WHERE C_BUSINESS_DATE=@p_d;
-
-    -- J09 PnL = NAV − NAV_prev + ra − vào
-    UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@p_d;
-
-    -- J10 Unit: ΔUnit = CF/UnitPrice_(t-1) (giả định cashflow đầu ngày + tham gia đầu tư → giá quy đổi = NAV/unit đầu ngày = UP cuối ngày trước; TWR sạch, không bias)
-    --           init khi unit_prev=0 → unit=NAV/10000, UP=10000
-    UPDATE T_EOD_WORK SET
-        C_DELTA_UNIT = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
-                            THEN (C_NAV/10000.0) - C_UNIT_PREV
-                            ELSE (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END,
-        C_UNIT       = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
-                            THEN C_NAV/10000.0
-                            ELSE C_UNIT_PREV + (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END
-    WHERE C_BUSINESS_DATE=@p_d;
-
-    UPDATE T_EOD_WORK SET C_UNIT_PRICE = CASE WHEN C_UNIT>0 THEN C_NAV/C_UNIT ELSE 10000 END
-    WHERE C_BUSINESS_DATE=@p_d;
-
-    -- roll-forward state (cập nhật unit + last_nav + last_up + payable tích luỹ sau accrue/settle)
+    -- roll-forward state (forward: tất cả SI active trong work)
     UPDATE s SET
         s.C_UNIT              = w.C_UNIT,
         s.C_PAYABLE_FEE       = w.C_PAYABLE_FEE,
@@ -333,28 +357,6 @@ BEGIN
         s.C_LAST_BUSINESS_DATE= @p_d
     FROM T_SI_NAV_CURRENT s
     INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d;
-
-    -- unit ledger (chỉ ngày có cashflow) — DELETE @p_d + INSERT lại (sạch, idempotent, SỬA-SỐ-AN-TOÀN).
-    --   Tính lại @p_d: xoá sạch dòng @p_d rồi insert theo state mới → cashflow đổi (kể cả về 0 ⇒ không insert)
-    --   tự đúng, KHÔNG dup. DELETE giới hạn C_BUSINESS_DATE=@p_d → KHÔNG đụng ngày khác. Cả COMPUTE trong 1
-    --   transaction (SP_EOD_STEP) nên DELETE+INSERT là atomic — crash thì rollback sạch, không mất dòng.
-    DELETE FROM T_SI_UNIT_LEDGER WHERE C_BUSINESS_DATE=@p_d;
-    INSERT INTO T_SI_UNIT_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
-    SELECT w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,@p_d,(w.C_CF_IN-w.C_CF_OUT),w.C_DELTA_UNIT,w.C_UNIT
-    FROM T_EOD_WORK w
-    WHERE w.C_BUSINESS_DATE=@p_d AND (w.C_CF_IN-w.C_CF_OUT)<>0;
-
-    -- LỊCH SỬ per sub-account (chart FR-03) — DELETE @p_d + INSERT lại (sạch, idempotent, SỬA-SỐ-AN-TOÀN).
-    --   ⚠️ accum TE (C_ACCUM_ACTIVE_RET*) bị reset DEFAULT 0 ở đây CÓ CHỦ ĐÍCH: J12B/SP_EOD_TE_ACCUM chạy SAU
-    --   trong pipeline set lại ĐÚNG (accum@d = accum@prev + đóng góp@d, overwrite/idempotent — xem comment J12B,
-    --   dòng "J07 INSERT lại NAV_BALANCE @d ⇒ reset DEFAULT 0 ⇒ J12B set lại đúng"). DELETE chỉ @p_d (không đụng ngày khác).
-    DELETE FROM T_SI_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_d;
-    INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_PAYABLE_FEE,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
-    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, w.C_NAV, w.C_PAYABLE_FEE, w.C_UNIT, w.C_UNIT_PRICE, w.C_DAILY_PNL,
-           CASE WHEN w.C_LAST_UNIT_PRICE>0 THEN w.C_UNIT_PRICE/w.C_LAST_UNIT_PRICE - 1 END
-    FROM T_EOD_WORK w
-    WHERE w.C_BUSINESS_DATE=@p_d;
-
 END
 GO
 
