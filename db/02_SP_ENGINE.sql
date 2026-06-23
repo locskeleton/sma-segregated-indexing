@@ -971,7 +971,8 @@ GO
       (per-SI nav_balance/unit_ledger, SCOPED) → SP_EOD_SI_AGG (master nav_balance, SCOPED; current chỉ đổi nếu @d
       là ngày mới nhất) → SP_EOD_TE_ACCUM (TE). Roll-forward NAV_CURRENT (SI) chỉ khi @p_to_date = ngày mới nhất.
     Atomic: cả range trong 1 transaction (XACT_ABORT) → lỗi giữa chừng rollback sạch (chuỗi không nửa vời).
-    ⚠️ KHÔNG recompute T_MASTER_HOLDING_BALANCE (composition PM) — dùng holdings current, cần as-of riêng (follow-up).
+    CÓ recompute T_MASTER_HOLDING_BALANCE (composition PM) AS-OF từ HOLDING_HIST@d × giá@d (KHÔNG dùng J14 vì
+      J14 đọc holdings hiện tại — sai cho ngày quá khứ). Scoped affected masters.
     ⚠️ Recompute đúng cho ngày TỪ lúc có history pending/div trở đi (ngày cũ hơn thiếu receivables history).
     err: 0 OK · 1 scope rỗng · 20 range không hợp lệ · -1 runtime.
 ===========================================================================*/
@@ -1040,6 +1041,26 @@ BEGIN
                 EXEC SP_EOD_COMPUTE_CORE @d;   -- per-SI: J06..J10 + nav_balance/unit_ledger (SCOPED to work)
                 EXEC SP_EOD_SI_AGG       @d;   -- master nav_balance (SCOPED; current chỉ đổi nếu @d mới nhất)
                 EXEC SP_EOD_TE_ACCUM     @d;   -- TE accum prefix-sum
+
+                -- COMPOSITION master AS-OF @d (T_MASTER_HOLDING_BALANCE) — KHÔNG dùng J14 (J14 đọc holdings HIỆN TẠI,
+                --   sai cho ngày quá khứ). Tái dựng từ HOLDING_HIST@d × giá@d, SCOPED affected masters (không đụng master khác).
+                DELETE hb FROM T_MASTER_HOLDING_BALANCE hb
+                    INNER JOIN @masters mm ON mm.C_MASTER_CODE=hb.C_MASTER_CODE
+                    WHERE hb.C_BUSINESS_DATE=@d;
+                ;WITH sih AS (
+                    SELECT h.C_MASTER_CODE, h.C_TICKER, SUM(h.C_QUANTITY) AS QTY
+                    FROM T_SI_HOLDING_HIST h INNER JOIN @masters mm ON mm.C_MASTER_CODE=h.C_MASTER_CODE
+                    WHERE h.C_VALID_FROM<=@d AND (h.C_VALID_TO>@d OR h.C_VALID_TO IS NULL)
+                    GROUP BY h.C_MASTER_CODE, h.C_TICKER
+                ), val AS (
+                    SELECT sih.C_MASTER_CODE, sih.C_TICKER, sih.QTY, px.C_CLOSE_PRICE, sih.QTY*px.C_CLOSE_PRICE AS MV
+                    FROM sih INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=sih.C_TICKER AND px.C_BUSINESS_DATE=@d
+                )
+                INSERT INTO T_MASTER_HOLDING_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT)
+                SELECT @d, v.C_MASTER_CODE, v.C_TICKER, v.QTY, v.C_CLOSE_PRICE, v.MV,
+                       CASE WHEN SUM(v.MV) OVER (PARTITION BY v.C_MASTER_CODE) > 0
+                            THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_MASTER_CODE) END
+                FROM val v;
             END
             SET @d = DATEADD(DAY, 1, @d);
         END

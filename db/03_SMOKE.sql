@@ -354,6 +354,7 @@ PRINT '======== RERUN QUÁ KHỨ: SP_EOD_RECOMPUTE_RANGE (reconstruct AS-OF từ
 --   → NAV@06 BỊ SAI (=11.28tr thay vì 10.76tr). ĐÂY chính là lý do cần luồng rerun riêng. Recompute đọc holdings
 --   AS-OF @06 (BBB80000 từ holding_hist) → KHÔI PHỤC đúng. Khẳng định recompute = SỬA được số ngày quá khứ.
 DECLARE @ecR INT, @emR NVARCHAR(400);
+UPDATE T_MASTER_HOLDING_BALANCE SET C_QUANTITY=99999 WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-06' AND C_TICKER='BBB';  -- corrupt composition @06 để test recompute tái dựng
 EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-02', @p_to_date=NULL, @p_cust_code='KH00001001', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
 DECLARE @n02 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-02');
 DECLARE @n05 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-05');
@@ -364,6 +365,11 @@ DECLARE @cntR INT=(SELECT COUNT(*) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB
 IF @ecR=0 AND @n02=10000000 AND @n05=10440000 AND @n06=10760000 AND @n07=11280000 AND @mR=11280000 AND @cntR=4
    PRINT CONCAT('  OK recompute KH ĐÚNG as-of (02=',@n02,' 05=',@n05,' 06=',@n06,' 07=',@n07,'; master@07=',@mR,'; #rows=',@cntR,') — @06 đã KHÔI PHỤC đúng');
 ELSE PRINT CONCAT('  !!! recompute SAI: err=',@ecR,' 02=',@n02,' 05=',@n05,' 06=',@n06,' 07=',@n07,' master@07=',@mR,' #rows=',@cntR,' ',@emR);
+-- composition master AS-OF tái dựng đúng: BBB @06=80000 (trước rebalance), @07=90000 (sau) — đã sửa corrupt 99999
+DECLARE @b06 DECIMAL(20,0)=(SELECT C_QUANTITY FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-06' AND C_TICKER='BBB');
+DECLARE @b07 DECIMAL(20,0)=(SELECT C_QUANTITY FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-07' AND C_TICKER='BBB');
+IF @b06=80000 AND @b07=90000 PRINT CONCAT('  OK composition as-of tái dựng: BBB @06=',@b06,' @07=',@b07,' (sửa 99999→80000)');
+ELSE PRINT CONCAT('  !!! composition as-of SAI: BBB @06=',@b06,' @07=',@b07);
 -- per-SI scope (05→07) đúng
 EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-05', @p_to_date='2026-01-07', @p_si_account='SUB00001001', @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
 IF @ecR=0 AND (SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB00001001' AND C_BUSINESS_DATE='2026-01-06')=10760000
