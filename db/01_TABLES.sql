@@ -100,7 +100,10 @@ CREATE TABLE T_PRICE_DAILY (
     C_CLOSE_PRICE       DECIMAL(18,4) NOT NULL,  -- GIÁ đóng cửa — định giá MTM (J07: stock_value = Σ qty×close_price) + tử số index J12 (Pᵢ,t)
     C_IS_EX_RIGHTS      TINYINT      NOT NULL CONSTRAINT DF_PRICE_DAILY_EXR DEFAULT 0,  -- 1 = ngày có sự kiện quyền gây chia giá (ex-rights/ex-div) — metadata reporting/audit; 0 = phiên thường
     CONSTRAINT PK_PRICE_DAILY_NK PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_TICKER),  -- natural clustered (join MTM nóng)
-    CONSTRAINT UQ_PRICE_DAILY_PKID UNIQUE NONCLUSTERED (PK_PRICE_DAILY)
+    CONSTRAINT UQ_PRICE_DAILY_PKID UNIQUE NONCLUSTERED (PK_PRICE_DAILY),
+    -- GIÁ phải DƯƠNG: C_REF_PRICE là MẪU SỐ daily-return J12 → =0 sẽ chia-0 (Msg 8134) làm cả EOD fail;
+    --   close>0 (giá giao dịch thật). Chặn ngay tại tầng data thay vì để nổ ở J12/J07.
+    CONSTRAINT CK_PRICE_DAILY_POS CHECK (C_REF_PRICE > 0 AND C_CLOSE_PRICE > 0)
 );
 
 CREATE TABLE T_BENCHMARK_DAILY (
