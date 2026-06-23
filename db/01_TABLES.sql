@@ -178,13 +178,17 @@ CREATE TABLE T_SI_CASH_HIST (
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_VALID_FROM     DATE            NOT NULL,   -- khoảng hiệu lực interval [from, to)
     C_VALID_TO       DATE            NULL,
-    C_CASH           DECIMAL(20,0)   NOT NULL,   -- TIỀN MẶT (VND) snapshot trong khoảng (reconstruct tài sản FR-06; chỉ tiền mặt, KHÔNG gồm pending/div)
+    -- SNAPSHOT TIỀN (3 khoản) trong khoảng — interval đổi khi BẤT KỲ khoản nào đổi. Cho reconstruct tài sản as-of
+    --   (FR-06 + luồng rerun quá khứ SP_EOD_RECOMPUTE_RANGE). pending/div thêm 2026-06-23 để recompute ngày cũ đúng NAV.
+    C_CASH           DECIMAL(20,0)   NOT NULL,                                      -- tiền mặt (đã NET thuế/phí GD)
+    C_PENDING_CASH   DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_CASH_HIST_PEND DEFAULT 0,  -- tiền bán chờ về (T+)
+    C_DIV_CASH       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_CASH_HIST_DIV  DEFAULT 0,  -- cổ tức tiền chờ về
     CONSTRAINT PK_SI_CASH_HIST_ID PRIMARY KEY CLUSTERED (C_CASH_HIST_ID),
     CONSTRAINT UQ_SI_CASH_HIST_PKID UNIQUE NONCLUSTERED (PK_SI_CASH_HIST),
     CONSTRAINT UQ_SI_CASH_HIST_NK UNIQUE (C_SI_ACCOUNT, C_VALID_FROM)
 ) WITH (DATA_COMPRESSION = PAGE);
 CREATE INDEX IX_SI_CASH_HIST_OPEN ON T_SI_CASH_HIST (C_SI_ACCOUNT)
-    INCLUDE (C_CASH) WHERE C_VALID_TO IS NULL;
+    INCLUDE (C_CASH, C_PENDING_CASH, C_DIV_CASH) WHERE C_VALID_TO IS NULL;
 
 -- External cashflow (nạp/rút) — SDI-side, per sub-account
 CREATE TABLE T_SI_CASHFLOW_EVENT (
