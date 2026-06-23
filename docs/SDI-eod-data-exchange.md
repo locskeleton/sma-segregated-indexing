@@ -72,7 +72,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 |---|---|---|---|---|
 | 2 | **Model weight** | `T_MASTER_PORTFOLIO_TICKER` | C_MASTER_CODE, effective_date, ticker, target_weight (Σ=100%) | Version theo effective_date; **chỉ đẩy khi đổi** rổ. |
 | 3 | **Holdings** (trong event KH) | → `T_SI_PORTFOLIO_HOLDING` (current) + diff `T_SI_HOLDING_HIST` | C_SI_ACCOUNT, ticker, quantity, avg_cost | Mỗi event mang holdings từng sub-account của KH; ingest overwrite current + đóng/mở interval (no-dup). |
-| 4 | **Tiền (3 khoản)** (trong event KH) | → state `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff `T_SI_CASH_HIST` | C_SI_ACCOUNT, **tiền mặt, tiền bán chờ về, cổ tức tiền** | FO đồng bộ 3 khoản → `Tiền = Σ`. Tiền mặt đã NET thuế/phí. Tiền bán chờ về (T0+T1+T2, lưu **tổng**) + cổ tức tiền **vào tài sản** → `total_asset = stock + Tiền`, `NAV = total_asset − payable`. |
+| 4 | **Tiền (3 khoản)** (trong event KH) | → state `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff `T_SI_CASH_HIST` (**đủ 3 khoản**) | C_SI_ACCOUNT, **tiền mặt, tiền bán chờ về, cổ tức tiền** | FO đồng bộ 3 khoản → `Tiền = Σ`. Tiền mặt đã NET thuế/phí. Tiền bán chờ về (T0+T1+T2, lưu **tổng**) + cổ tức tiền **vào tài sản** → `total_asset = stock + Tiền`, `NAV = total_asset − payable`. **`T_SI_CASH_HIST` nay lưu interval ĐỦ 3 khoản** (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH` — trước chỉ cash) (SCD-2: mở dòng mới khi BẤT KỲ khoản nào đổi) → reconstruct receivables AS-OF ngày quá khứ cho rerun (xem §6.1). |
 | 5 | **Cổ tức + phí lưu ký** (FO→SDI) | `T_SI_INCOME_FEE` | business_date, C_SI_ACCOUNT, group[INCOME\|PAYABLE], type[DIVIDEND\|CUSTODY_FEE], ticker, amount, source_event_id | **SPARSE** — chỉ ngày có sự kiện. Cho FR-06. DIVIDEND→INCOME, CUSTODY_FEE→PAYABLE (source FO). (Phí ACCRUE BO cắt cũng đổ vào bảng này — xem 5b.) |
 | 5b | **Phí ACCRUE đã cắt** (BO→SDI) | `T_SI_INCOME_FEE` (type theo fee_type [default MGMT_FEE], group PAYABLE) → net-off `payable` | si_account, amount, charge_date, fee_type?, source_event_id | **Event Kafka từ BO** (`SP_INGEST_FEE_CHARGE`). BO cắt 1 cục/tháng (phí QL/thuế/perf…); charge_date→C_BUSINESS_DATE; SDI net-off payable (trừ tổng mọi loại; dedup source_event_id). |
 | 6 | **Cashflow** | `T_SI_CASHFLOW_EVENT` | C_SI_ACCOUNT, business_date, event_type[INITIAL\|TOPUP\|SIP\|INTEREST_IN\|WITHDRAW], amount | **SPARSE** — chỉ KH có nạp/rút/SIP. Dùng cho CF_t (PnL/unit), KHÔNG cộng lại cash. |
@@ -178,3 +178,15 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2–7) FO/Market
 - Kịch bản small/medium/large theo `bench.ps1`; **prod thực** ≈ 200K KH (~20M holdings) — large (6,25M) ≈ 31% prod.
 - Sparse feeds (cổ tức/phí, cashflow, CA, rebalance) biến động mạnh theo lịch sự kiện → cần đo riêng theo lịch SIP/chia cổ tức thực tế, không suy tuyến tính từ holdings.
 - Thời gian EOD large chưa đo — chạy `./bench.ps1 -Scale large` để lấy số thật trước khi cam kết SLA cửa sổ EOD.
+
+### 6.1 Rerun quá khứ — tính lại NAV ngày cũ KHÔNG re-feed (`SP_EOD_RECOMPUTE_RANGE`)
+
+> **Use case:** KH báo NAV một ngày quá khứ SAI → nghiệp vụ **sửa data nguồn đã lưu** (giá/holding/cash/phí @ngày đó) → tính lại chuỗi từ ngày đó tới nay **KHÔNG cần re-feed BO/FO** (không bắt FO bắn lại Kafka). Luồng **RIÊNG, KHÔNG đụng forward path** (EOD thường vẫn chạy như cũ).
+
+`SP_EOD_RECOMPUTE_RANGE @p_from_date, @p_to_date=NULL (default phiên GD mới nhất), @p_cust_code=NULL, @p_si_account=NULL, @p_user, @p_err_code OUT, @p_err_msg OUT`
+
+- **Scope:** cả 2 NULL = **TẤT CẢ**; `@p_cust_code` = theo 1 KH; `@p_si_account` = 1 tiểu khoản → **tính lại ở mức MASTER** (mọi tiểu khoản của các master bị ảnh hưởng, để tổng hợp master vẫn đúng).
+- **Reconstruct AS-OF từ bảng DATED** (mỗi phiên GD trong `[from,to]`): holdings = `T_SI_HOLDING_HIST`@d × giá `T_PRICE_DAILY`@d; cash/pending/div = `T_SI_CASH_HIST`@d (interval); anchor + payable base = `T_SI_NAV_BALANCE`@prev; fee cut = `T_SI_INCOME_FEE` (loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG (master) → SP_EOD_TE_ACCUM`.
+- **Atomic toàn range** (XACT_ABORT). Roll-forward `NAV_CURRENT` **chỉ khi** `@p_to_date` chạm phiên mới nhất. err: `1` = scope rỗng, `20` = range không hợp lệ.
+- **Giới hạn:** chính xác **chỉ cho các ngày từ khi bắt đầu capture history pending/div** (`T_SI_CASH_HIST` đủ 3 khoản); **CHƯA** tính lại composition `T_MASTER_HOLDING_BALANCE` (follow-up).
+- Forward + rerun **dùng CHUNG** lõi công thức `SP_EOD_COMPUTE_CORE` (DRY) — xem `db/README.md` / [SDI-spec.md §9](./SDI-spec.md).

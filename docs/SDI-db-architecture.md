@@ -44,7 +44,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `T_SI_NAV_CURRENT` | trạng thái hiện tại/tiểu khoản (gồm cash) | ~1M | **rowstore**, clustered PK (C_SI_ACCOUNT), PAGE compression; cân nhắc memory-optimized |
 | `T_SI_PORTFOLIO_HOLDING` | holdings hiện tại — **đích FO ingest thẳng** | ~20M | **rowstore** clustered (C_SI_ACCOUNT, C_TICKER) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
 | `T_SI_HOLDING_HIST` | **HISTORY holdings INTERVAL** (valid_from..valid_to), full + no-dup | ~20M + Δ/ingest | **CCI**, partition năm(valid_from) — DIFF current→close/open **tại INGEST (per-event Kafka)**; holding bất biến = 1 dòng; KHÔNG trong EOD core |
-| `T_SI_CASH_HIST` | **HISTORY cash INTERVAL**, full + no-dup | ~1M + Δ/ingest | rowstore/CCI, partition năm(valid_from) — DIFF state.cash→close/open **tại INGEST** (đối xứng holding_hist) |
+| `T_SI_CASH_HIST` | **HISTORY cash-state INTERVAL** (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH` — đủ 3 khoản, trước chỉ cash), full + no-dup | ~1M + Δ/ingest | rowstore/CCI, partition năm(valid_from) — DIFF state 3 khoản→close/open dòng mới khi BẤT KỲ khoản nào đổi **tại INGEST** + `SP_EOD_HISTORY` (đối xứng holding_hist). Cho reconstruct receivables AS-OF (rerun quá khứ §5) |
 | `T_SI_CASHFLOW_EVENT` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
 | `T_SI_NAV_BALANCE` | **lịch sử perf per-tiểu-khoản** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `T_SI_UNIT_LEDGER` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
@@ -152,6 +152,8 @@ J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_NAV_BALANCE; build T_MAST
 - **J07 delta incremental**: chỉ vị thế có event (nạp/rút/khớp/CA) → đổi unit; còn revaluation thì chạm toàn bộ.
 - **J07 full revaluation**: chạm 20M dòng nhưng là **1 câu hash-aggregate batch-mode** → giây→phút.
 - Không câu nào lặp từng vị thế.
+- **Core split (DRY):** phần per-ngày **J06 accrue → NAV → PnL → Unit** (ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE`, SCOPE theo tiểu khoản trong `T_EOD_WORK`) tách ra proc **`SP_EOD_COMPUTE_CORE @p_d`** chạy trên `T_EOD_WORK` ĐÃ seed. **Forward** (`SP_EOD_COMPUTE`: seed current + J07 MTM + core + roll-forward `NAV_CURRENT`) và **rerun quá khứ** (`SP_EOD_RECOMPUTE_RANGE`: seed AS-OF từ bảng dated) dùng CHUNG core (1 công thức). `T_EOD_WORK` +2 cột staged: `C_PREV_DATE` (gap accrue/guard), `C_FEE_CUT` (phí cắt; forward=0).
+- **Rerun quá khứ `SP_EOD_RECOMPUTE_RANGE`** (luồng RIÊNG, KHÔNG đụng forward): sửa data nguồn ngày cũ → tính lại `[from,to]` KHÔNG re-feed FO/BO. Reconstruct AS-OF từ `T_SI_HOLDING_HIST`/`T_SI_CASH_HIST`/`T_PRICE_DAILY`@d + anchor `T_SI_NAV_BALANCE`@prev → core → `SP_EOD_SI_AGG` → `SP_EOD_TE_ACCUM`. Atomic toàn range (XACT_ABORT); roll-forward `NAV_CURRENT` chỉ khi chạm phiên mới nhất. Scope all/cust/si (si→mức master). Chi tiết: [SDI-spec.md §9.4](./SDI-spec.md).
 
 ---
 

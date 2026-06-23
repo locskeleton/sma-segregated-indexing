@@ -270,6 +270,8 @@ Master Index_t   = Index_(t-1) × Σ w^(t)·P_t/P_ref
 
 Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạng thái vào `T_EOD_RUN`. "SB" = set-based (không RBAR). "‖" = song song theo master/hash(C_SI_ACCOUNT).
 
+> **Core split (DRY):** phần tính per-ngày **J06 accrue → J08 NAV → J09 PnL → J10 Unit** (ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE`, SCOPE theo tiểu khoản trong `T_EOD_WORK`) được tách ra proc **`SP_EOD_COMPUTE_CORE @p_d`**, chạy trên `T_EOD_WORK` ĐÃ seed. **Forward (`SP_EOD_COMPUTE`)** = seed từ current + J07 MTM (holdings hiện tại) + EXEC core + roll-forward `NAV_CURRENT`; **rerun quá khứ (`SP_EOD_RECOMPUTE_RANGE`)** seed AS-OF từ bảng dated rồi EXEC CÙNG core (1 công thức cho cả 2). `T_EOD_WORK` thêm 2 cột staged: `C_PREV_DATE` (gap accrue + guard), `C_FEE_CUT` (phí cắt trừ khỏi accrue; forward=0). Forward hành vi KHÔNG đổi. Xem §9.4.
+
 | # | Job | Phụ thuộc | Đọc | Ghi | SB | ‖ | Halt nếu lỗi |
 |---|---|---|---|---|---|---|---|
 | **INGEST** | `SP_INGEST_CUSTOMER` (Kafka per-KH, realtime, KHÔNG trong batch) | — | event 1 KH (JSON): cash + holdings + cổ tức/phí | cash→state + holdings→current + **interval CASH_HIST/HOLDING_HIST** + fee (dedup) + watermark `C_LAST_SYNC_DATE` | ✅ | ‖ per-cust | ✅ (forward-only: quá khứ→THROW) |
@@ -316,6 +318,17 @@ J0 GATE → J7 ─ J8 → J9
 - **Roll-forward**: holdings = FO snapshot full vào current; **state** (cash/NAV/unit) roll-forward tại chỗ; J7–J10 chạm toàn bộ ~1M (giá đổi) nhưng đều **set-based**. Không replay lịch sử.
 
 > Chi tiết kỹ thuật (columnstore, partition switch, runtime ~vài phút–15 phút, anti-patterns): [SDI-db-architecture.md](./SDI-db-architecture.md).
+
+### 9.4 Rerun quá khứ — `SP_EOD_RECOMPUTE_RANGE` (luồng RIÊNG, không đụng forward)
+
+**Use case:** KH báo NAV một ngày quá khứ SAI → nghiệp vụ **sửa data nguồn đã lưu** (giá/holding/cash/phí @ngày đó) → tính lại chuỗi từ ngày đó tới nay **KHÔNG cần re-feed BO/FO** (không bắt FO bắn lại Kafka). Tách hẳn forward path (`SP_EOD_RUN` không đổi).
+
+`SP_EOD_RECOMPUTE_RANGE @p_from_date, @p_to_date=NULL (default phiên GD mới nhất), @p_cust_code=NULL, @p_si_account=NULL, @p_user, @p_err_code OUT, @p_err_msg OUT`
+
+- **Scope:** cả 2 NULL = **TẤT CẢ**; `@p_cust_code` = theo 1 KH; `@p_si_account` = 1 tiểu khoản → **tính lại ở mức MASTER** (mọi tiểu khoản của các master bị ảnh hưởng → tổng hợp master vẫn đúng).
+- **Reconstruct AS-OF từ bảng DATED** (mỗi phiên GD trong `[from,to]`): holdings = `T_SI_HOLDING_HIST`@d × giá `T_PRICE_DAILY`@d; cash/pending/div = `T_SI_CASH_HIST`@d (interval, **đủ 3 khoản**); anchor + payable base = `T_SI_NAV_BALANCE`@prev; fee cut = `T_SI_INCOME_FEE` (loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG (master) → SP_EOD_TE_ACCUM`.
+- **Atomic toàn range** (XACT_ABORT). Roll-forward `T_SI_NAV_CURRENT` **chỉ khi** `@p_to_date` chạm phiên mới nhất. **err:** `1` = scope rỗng, `20` = range không hợp lệ.
+- **Giới hạn:** chính xác chỉ cho ngày **từ khi bắt đầu capture history pending/div** (`T_SI_CASH_HIST` đủ 3 khoản); **CHƯA** tính lại composition `T_MASTER_HOLDING_BALANCE` (follow-up).
 
 ---
 

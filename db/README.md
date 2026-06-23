@@ -71,6 +71,22 @@ EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_ms
 -- (BRD 2026-06-22: bỏ bước SP_EOD_SET_ASSET_SYNCED — SDI không push asset sang Asset; EOD_DONE = trạng thái cuối)
 -- sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (xóa job+break, recompute)
 ```
+
+### Rerun quá khứ — tính lại NAV ngày cũ KHÔNG re-feed (`SP_EOD_RECOMPUTE_RANGE`)
+KH báo NAV một ngày quá khứ SAI → **sửa data nguồn đã lưu** (giá/holding/cash/phí @ngày đó) → tính lại chuỗi từ ngày đó tới nay, **KHÔNG cần FO/BO bắn lại Kafka**. Luồng **RIÊNG, KHÔNG đụng forward path** (`SP_EOD_RUN` không đổi).
+```sql
+DECLARE @ec INT, @em NVARCHAR(400);
+-- toàn hệ từ 2026-01-06 → phiên mới nhất (default @p_to_date NULL):
+EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-06', @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- 1 KH: thêm @p_cust_code='CUST001'; 1 tiểu khoản: @p_si_account='CUST001-M1' (→ tính lại ở mức MASTER của các master bị ảnh hưởng)
+-- range cụ thể: thêm @p_to_date='2026-01-10'.  err: 1=scope rỗng, 20=range không hợp lệ
+```
+- **Reconstruct AS-OF** mỗi phiên trong `[from,to]` từ bảng DATED: holdings=`T_SI_HOLDING_HIST`@d×giá@d; cash/pending/div=`T_SI_CASH_HIST`@d (interval); anchor+payable base=`T_SI_NAV_BALANCE`@prev; fee cut=`T_SI_INCOME_FEE`(loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG → SP_EOD_TE_ACCUM`.
+- **Atomic toàn range** (XACT_ABORT); roll-forward `NAV_CURRENT` chỉ khi `@p_to_date` chạm phiên mới nhất.
+- **Giới hạn:** chính xác chỉ cho ngày từ khi bắt đầu capture history pending/div (`T_SI_CASH_HIST` đủ 3 khoản); CHƯA tính lại `T_MASTER_HOLDING_BALANCE` (follow-up).
+
+> **`SP_EOD_COMPUTE_CORE @p_d`** = lõi công thức per-ngày (CF → J06 accrue → J08 NAV → J09 PnL → J10 Unit → ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE` SCOPE theo các tiểu khoản trong `T_EOD_WORK`), chạy trên `T_EOD_WORK` ĐÃ seed. **Forward (`SP_EOD_COMPUTE`) + rerun DÙNG CHUNG** lõi này (DRY, 1 công thức). Forward = seed từ current + J07 MTM (holdings hiện tại) + EXEC core + roll-forward `NAV_CURRENT` (hành vi KHÔNG đổi). `T_EOD_WORK` thêm 2 cột staged: `C_PREV_DATE` (gap accrue + guard), `C_FEE_CUT` (phí cắt trừ khỏi accrue; forward=0).
 **Trạng thái `T_EOD_PIPELINE`**: MKT_DATA (PENDING|READY — pull API BO, không đếm) + FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
 EOD (PENDING|RUNNING|DONE|FAILED) → RECONCILE (PENDING|PASS|**BREAK**);
 overall WAITING_DATA→READY→EOD_RUNNING→(RECONCILE_BREAK | **EOD_DONE**). **EOD_DONE = trạng thái CUỐI khi reconcile PASS** (BRD 2026-06-22: bỏ ASSET_SYNC/COMPLETED — SDI không push asset sang Asset).
@@ -85,7 +101,7 @@ INDEX DONE) gọi tuần tự:
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
 FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):
-- **Cash** → cập nhật `T_SI_NAV_CURRENT.C_CASH` + diff interval `T_SI_CASH_HIST`.
+- **Cash** → cập nhật `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff interval `T_SI_CASH_HIST` (**đủ 3 khoản** `C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH` — trước chỉ cash; SCD-2: dòng mới khi BẤT KỲ khoản nào đổi → reconstruct receivables AS-OF cho rerun quá khứ). Maintain tại ingest + `SP_EOD_HISTORY`.
 - **Holdings** → overwrite `T_SI_PORTFOLIO_HOLDING` (current) + diff interval `T_SI_HOLDING_HIST`.
 - **Cổ tức/phí** → append `T_SI_INCOME_FEE` (DIVIDEND group INCOME, CUSTODY_FEE group PAYABLE; dedup theo `C_SOURCE_EVENT_ID`). (Phí ACCRUE đa-loại khai trong catalog `T_FEE_CONFIG` GLOBAL toàn hệ, dòng group=PAYABLE & rate>0; type+group khớp `T_SI_INCOME_FEE`; BO cắt phí qua `SP_INGEST_FEE_CHARGE` mang `fee_type`.)
 - Set watermark `C_LAST_SYNC_DATE=@d` (J0 GATE đếm received vs expected = tiểu khoản ACTIVE).
