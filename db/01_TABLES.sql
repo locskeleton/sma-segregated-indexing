@@ -438,8 +438,9 @@ CREATE TABLE T_EOD_RUN (
 );
 
 -- TRẠNG THÁI PIPELINE TỔNG /ngày — control toàn luồng: upstream (BO market data + FO ingest) →
---   EOD compute → đối soát (reconcile gate) → sync Asset. 1 dòng/ngày. SP_EOD_RUN chỉ chạy khi
---   MKT_DATA + FO_INGEST = READY; chỉ COMPLETED khi đối soát PASS + Asset sync DONE.
+--   EOD compute → đối soát (reconcile gate). 1 dòng/ngày. SP_EOD_RUN chỉ chạy khi MKT_DATA + FO_INGEST
+--   = READY; trạng thái CUỐI = EOD_DONE khi đối soát PASS. (BRD 2026-06-22: BỎ stage Asset-sync — SDI
+--   KHÔNG còn push asset/perf snapshot sang Asset; BO/FO đẩy thẳng Asset. Index là luồng riêng. SDI-asset-gap.md.)
 CREATE TABLE T_EOD_PIPELINE (
     C_BUSINESS_DATE      DATE         NOT NULL,
     -- MKT_DATA (dữ liệu thị trường): BO gửi event báo ready → SDI TỰ GỌI API BO pull 1 LẦN (giá/index/
@@ -459,10 +460,8 @@ CREATE TABLE T_EOD_PIPELINE (
     C_RECONCILE_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_REC  DEFAULT 'PENDING',  -- PENDING|PASS|BREAK
     C_RECONCILE_AT       DATETIME     NULL,
     C_BREAK_COUNT        INT          NOT NULL CONSTRAINT DF_EODP_BRK  DEFAULT 0,
-    C_ASSET_SYNC_STATUS  VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_AST  DEFAULT 'PENDING',  -- PENDING|DONE|FAILED
-    C_ASSET_SYNC_AT      DATETIME     NULL,
     C_OVERALL_STATUS     VARCHAR(20)  NOT NULL CONSTRAINT DF_EODP_OVR  DEFAULT 'WAITING_DATA',
-        -- WAITING_DATA|READY|EOD_RUNNING|RECONCILE_BREAK|EOD_DONE|COMPLETED|FAILED
+        -- WAITING_DATA|READY|EOD_RUNNING|RECONCILE_BREAK|EOD_DONE|FAILED  (EOD_DONE = trạng thái CUỐI; bỏ COMPLETED/Asset-sync)
     C_UPDATED_AT         DATETIME     NOT NULL CONSTRAINT DF_EODP_UPD  DEFAULT GETDATE(),
     C_UPDATED_BY         VARCHAR(64)  NULL,
     C_MESSAGE            NVARCHAR(2000) NULL,

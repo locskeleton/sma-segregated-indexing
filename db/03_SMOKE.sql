@@ -186,11 +186,10 @@ IF NOT EXISTS (SELECT 1 FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-07
     PRINT '  OK break clear sau khi data đúng: T_EOD_RECON_BREAK rỗng';
 ELSE PRINT '  !!! break vẫn còn sau khi data đúng';
 
--- (D) Asset synced → COMPLETED
-EXEC SP_EOD_SET_ASSET_SYNCED @p_business_date='2026-01-07', @p_status='DONE', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+-- (D) Trạng thái CUỐI = EOD_DONE sau reconcile PASS (BRD 2026-06-22: bỏ stage asset-sync/COMPLETED)
 SELECT @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
-IF @ecP=0 AND @ov='COMPLETED' PRINT '  OK asset synced: overall=COMPLETED';
-ELSE PRINT CONCAT('  !!! asset synced sai: err=',@ecP,' overall=',@ov);
+IF @ov='EOD_DONE' PRINT '  OK terminal: overall=EOD_DONE (không còn COMPLETED/asset-sync)';
+ELSE PRINT CONCAT('  !!! terminal sai: overall=',@ov);
 
 -- (E) Reset: xóa job + đưa pipeline 07 về PENDING/READY (giữ nguồn)
 EXEC SP_EOD_RESET @p_business_date='2026-01-07', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;

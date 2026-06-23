@@ -776,9 +776,9 @@ BEGIN
         UPDATE T_EOD_PIPELINE SET C_RECONCILE_STATUS='PASS', C_RECONCILE_AT=GETDATE(), C_BREAK_COUNT=0,
                C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
 
-        EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';
+        EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';   -- snapshot NỘI BỘ (T_MASTER_HOLDING_BALANCE) cho read API SDI
 
-        -- EOD xong (chưa publish — Asset sync do app làm rồi gọi SP_EOD_SET_ASSET_SYNCED).
+        -- EOD_DONE = trạng thái CUỐI (BRD 2026-06-22: SDI không push asset sang Asset → bỏ stage COMPLETED/asset-sync).
         UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='DONE', C_EOD_AT=GETDATE(), C_OVERALL_STATUS='EOD_DONE',
                C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
     END TRY
@@ -909,36 +909,11 @@ BEGIN
 END
 GO
 
--- App báo kết quả publish sang Asset cho ngày @p_business_date.
-CREATE OR ALTER PROCEDURE SP_EOD_SET_ASSET_SYNCED
-    @p_business_date DATE,
-    @p_status        VARCHAR(10),               -- 'DONE' | 'FAILED'
-    @p_user          VARCHAR(64)   = NULL,
-    @p_err_code      INT           OUTPUT,
-    @p_err_msg       NVARCHAR(400) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
-    BEGIN TRY
-    IF @p_status NOT IN ('DONE','FAILED')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_status phải DONE hoặc FAILED'; RAISERROR(@p_err_msg, 16, 1); END
-    IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date AND C_EOD_STATUS='DONE')
-        BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa EOD DONE — không thể đánh dấu Asset synced'; RAISERROR(@p_err_msg, 16, 1); END
-
-    UPDATE T_EOD_PIPELINE
-    SET C_ASSET_SYNC_STATUS=@p_status, C_ASSET_SYNC_AT=GETDATE(),
-        C_OVERALL_STATUS = CASE WHEN @p_status='DONE' THEN 'COMPLETED' ELSE C_OVERALL_STATUS END,
-        C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user
-    WHERE C_BUSINESS_DATE=@p_business_date;
-    END TRY
-    BEGIN CATCH
-        IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
-    END CATCH
-END
-GO
+-- (ĐÃ GỠ SP_EOD_SET_ASSET_SYNCED — BRD 2026-06-22: SDI không còn push asset/perf snapshot sang Asset
+--  nên không còn stage "asset synced". Trạng thái CUỐI pipeline = EOD_DONE (sau reconcile PASS). Xem SDI-asset-gap.md.)
 
 -- RESET re-run: sau khi sửa nguồn (FO/BO), xóa trạng thái job + break để EOD tính LẠI từ đầu.
---   GIỮ cờ nguồn (MKT_DATA/FO_INGEST) nếu nguồn vẫn ready; reset EOD/RECONCILE/ASSET về PENDING.
+--   GIỮ cờ nguồn (MKT_DATA/FO_INGEST) nếu nguồn vẫn ready; reset EOD/RECONCILE về PENDING.
 CREATE OR ALTER PROCEDURE SP_EOD_RESET
     @p_business_date DATE,
     @p_user          VARCHAR(64)   = NULL,
@@ -952,13 +927,12 @@ BEGIN
     -- IDEMPOTENT re-run: KHÔNG cần un-roll T_SI_NAV_CURRENT. SP_EOD_COMPUTE seed anchor PnL/Unit từ
     --   T_SI_NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll) → tính lại @d ra số Y HỆT dù NAV_CURRENT đã roll sang @d.
     --   ⚠️ Phạm vi: re-run NGÀY HIỆN TẠI (tài sản cash/pending/div trong NAV_CURRENT vẫn của @d). Recompute NGÀY
-    --     QUÁ KHỨ từ đầu KHÔNG hỗ trợ đầy đủ (pending_cash/div_cash chưa có lịch sử interval) — replay lịch sử
-    --     dùng SP_GET_ASSET_SNAPSHOT mode=HISTORY (reconstruct-only đọc NAV_BALANCE, không tính lại → không lệch).
+    --     QUÁ KHỨ từ đầu KHÔNG hỗ trợ đầy đủ (pending_cash/div_cash chưa có lịch sử interval) — lịch sử NAV/holdings
+    --     đọc qua read API FR-02/03/06 (reconstruct từ NAV_BALANCE/hist, không tính lại → không lệch).
     DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_business_date;
     UPDATE T_EOD_PIPELINE
     SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL,
         C_RECONCILE_STATUS='PENDING', C_RECONCILE_AT=NULL, C_BREAK_COUNT=0,
-        C_ASSET_SYNC_STATUS='PENDING', C_ASSET_SYNC_AT=NULL,
         C_OVERALL_STATUS = CASE WHEN C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY' THEN 'READY' ELSE 'WAITING_DATA' END,
         C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user, C_MESSAGE=N'RESET để chạy lại'
     WHERE C_BUSINESS_DATE=@p_business_date;

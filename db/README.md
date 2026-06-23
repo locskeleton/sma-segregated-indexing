@@ -2,7 +2,7 @@
 
 Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `EXEC` proc.
 
-> **⚠️ BRD 2026-06-22 — SDI→Asset gỡ 2 / giữ 1:** BO/FO/Market nay đẩy dữ liệu **THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR). SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset**. Đã gỡ khỏi `05_API.sql` **2 producer**: `SP_GET_ASSET_SNAPSHOT` (per-SI tài sản), `SP_GET_ASSET_MASTER_SNAPSHOT` (master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset theo luồng RIÊNG khi BO báo price-ready (path `SP_EOD_RUN_INDEX`); đây là luồng SDI→Asset DUY NHẤT còn lại. **BO còn đẩy phí QL accrued/ngày → Asset** (Asset tự tính NAV ròng). Read API (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) GIỮ NGUYÊN — phục vụ **giao diện riêng của SDI**. **`SP_GET_ASSET_REPORT` (FR-06) là read API báo cáo tài sản KH — GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` đã gỡ). Bước asset-sync customer trong pipeline (ASSET_SYNC tài sản KH / `SP_EOD_SET_ASSET_SYNCED` / "publish sang Asset" bên dưới) phản ánh mô hình CŨ — không còn push tài sản KH/master NAV; nhưng luồng index (`SP_EOD_RUN_INDEX` → Asset) VẪN chạy. Còn lại = reconcile R1 payable + R3 TWR. Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22 — SDI→Asset gỡ 2 / giữ 1:** BO/FO/Market nay đẩy dữ liệu **THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR). SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset**. Đã gỡ khỏi `05_API.sql` **2 producer**: `SP_GET_ASSET_SNAPSHOT` (per-SI tài sản), `SP_GET_ASSET_MASTER_SNAPSHOT` (master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset theo luồng RIÊNG khi BO báo price-ready (path `SP_EOD_RUN_INDEX`); đây là luồng SDI→Asset DUY NHẤT còn lại. **BO còn đẩy phí QL accrued/ngày → Asset** (Asset tự tính NAV ròng). Read API (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) GIỮ NGUYÊN — phục vụ **giao diện riêng của SDI**. **`SP_GET_ASSET_REPORT` (FR-06) là read API báo cáo tài sản KH — GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` đã gỡ). **Đã GỠ stage asset-sync trong pipeline** (`SP_EOD_SET_ASSET_SYNCED` + cột `C_ASSET_SYNC_*` + trạng thái `COMPLETED`) — trạng thái CUỐI pipeline nay = `EOD_DONE` (reconcile PASS); luồng index (`SP_EOD_RUN_INDEX` → Asset) VẪN chạy. Còn lại = reconcile R1 payable + R3 TWR. Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).
 
 ## Naming convention
 | Đối tượng | Quy ước |
@@ -68,13 +68,12 @@ EXEC SP_EOD_RUN_INDEX @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_
 EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='FO_INGEST', @p_total_record=50000, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 -- 4) EOD customer (CHẶN nếu chưa MKT/FO=READY + INDEX=DONE → @ec=10). @ec=-2 = reconcile BREAK.
 EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
--- 5) app publish Kafka sang Asset xong → báo lại
-EXEC SP_EOD_SET_ASSET_SYNCED @p_business_date='2026-01-06', @p_status='DONE', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+-- (BRD 2026-06-22: bỏ bước SP_EOD_SET_ASSET_SYNCED — SDI không push asset sang Asset; EOD_DONE = trạng thái cuối)
 -- sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (xóa job+break, recompute)
 ```
 **Trạng thái `T_EOD_PIPELINE`**: MKT_DATA (PENDING|READY — pull API BO, không đếm) + FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
-EOD (PENDING|RUNNING|DONE|FAILED) → RECONCILE (PENDING|PASS|**BREAK**) → ASSET_SYNC (PENDING|DONE|FAILED);
-overall WAITING_DATA→READY→EOD_RUNNING→(RECONCILE_BREAK | EOD_DONE)→COMPLETED. **Chỉ COMPLETED khi reconcile PASS + asset DONE.**
+EOD (PENDING|RUNNING|DONE|FAILED) → RECONCILE (PENDING|PASS|**BREAK**);
+overall WAITING_DATA→READY→EOD_RUNNING→(RECONCILE_BREAK | **EOD_DONE**). **EOD_DONE = trạng thái CUỐI khi reconcile PASS** (BRD 2026-06-22: bỏ ASSET_SYNC/COMPLETED — SDI không push asset sang Asset).
 
 **Master index TÁCH khỏi pipeline customer** (`SP_EOD_RUN_INDEX`, trigger khi BO ready): chỉ cần giá + target
 weight, KHÔNG cần FO → tính+lưu+sync Asset sớm, độc lập. Pipeline customer `SP_EOD_RUN` (cần MKT/FO READY +
