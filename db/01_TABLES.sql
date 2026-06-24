@@ -30,24 +30,8 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)
 );
 
--- CATALOG CHÍNH SÁCH PHÍ/THUẾ hệ thống — GLOBAL theo loại phí (1 dòng/loại, áp cho MỌI master).
---   (Cấu hình per-master sẽ xử lý sau khi cần — hiện global cho đơn giản.) Thêm loại mới = INSERT 1 dòng.
---   ⚠️ C_FEE_TYPE + C_FEE_GROUP DÙNG CHUNG VOCABULARY với T_SI_INCOME_FEE (mã phí + nhóm phải KHỚP giữa 2 bảng).
---   ACCRUE (J06): CHỈ loại C_FEE_GROUP='PAYABLE' AND C_RATE>0 → payable += AUM_gross × Σ(C_RATE/C_DAY_COUNT) × ngày.
---   Loại không rate (custody/thuế GD point-event, hoặc INCOME như cổ tức) → C_RATE NULL ⇒ KHÔNG accrue.
---   ⚠️ OPTION B (2026-06-21): payable lưu 1 TỔNG GỘP C_PAYABLE_FEE. Hợp lệ khi CHỈ 1 loại accrue (hiện MGMT_FEE);
---      breakdown sao kê = chính tổng đó. >1 loại → guard @nAccrue>1 (FR-06/snapshot) chặn; nâng cấp = cột JSON per-type.
-CREATE TABLE T_FEE_CONFIG (
-    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- MGMT_FEE|TAX|PERF_FEE|CUSTODY_FEE|DIVIDEND|... (KHỚP T_SI_INCOME_FEE)
-    PK_FEE_CONFIG UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_FEE_CONFIG_PKID DEFAULT NEWID(),
-    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE (KHỚP C_FEE_GROUP của T_SI_INCOME_FEE)
-    C_RATE           DECIMAL(10,6)   NULL,       -- %/NĂM (vd 0.01=1%/năm) cho loại ACCRUE; NULL ⇒ không accrue (point-event/income)
-    C_DAY_COUNT      SMALLINT        NOT NULL CONSTRAINT DF_FEE_CONFIG_DAYCOUNT DEFAULT 365,  -- mẫu số quy đổi ngày (accrue)
-    C_UPDATED_BY     VARCHAR(64)     NULL,
-    C_UPDATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_FEE_CONFIG_TIME DEFAULT GETDATE(),
-    CONSTRAINT PK_FEE_CONFIG PRIMARY KEY CLUSTERED (C_FEE_TYPE),
-    CONSTRAINT UQ_FEE_CONFIG_GUID UNIQUE (PK_FEE_CONFIG)
-);
+-- [BRD asset-sync] ĐÃ BỎ T_FEE_CONFIG: SDI KHÔNG còn accrue phí. Phí QL do Asset tính → gửi kèm sync
+--   (số tổng lũy kế per-SI). Xem docs/SDI-asset-handover.md.
 
 -- Danh mục mẫu (FO tính & feed). Σ C_TARGET_WEIGHT theo (C_MASTER_CODE, C_EFFECTIVE_DATE) = 1.0
 CREATE TABLE T_MASTER_PORTFOLIO_TICKER (
@@ -172,26 +156,33 @@ CREATE INDEX IX_SI_HOLDING_HIST_OPEN ON T_SI_HOLDING_HIST (C_SI_ACCOUNT, C_TICKE
     INCLUDE (C_QUANTITY, C_AVG_COST) WHERE C_VALID_TO IS NULL;
 -- (Cash vào qua SP_INGEST_CUSTOMER → state.C_CASH + diff T_SI_CASH_HIST; không có bảng feed batch.)
 
--- CASH HISTORY theo KHOẢNG (INTERVAL) per SUB-ACCOUNT — đối xứng holding_hist.
-CREATE TABLE T_SI_CASH_HIST (
-    C_CASH_HIST_ID   BIGINT IDENTITY(1,1) NOT NULL,
-    PK_SI_CASH_HIST UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_CASH_HIST_PKID DEFAULT NEWID(),
+-- [BRD asset-sync] ĐÃ BỎ T_SI_CASH_HIST: SDI không tự tính NAV nên không cần interval cash.
+--   Tiền (cash/pending/div) nhận từ Asset per ngày GD (T_SI_ASSET_DAILY).
+
+-- [BRD asset-sync] RAW FEED Asset → SDI: số TỔNG per-SI mỗi ngày GD (KHÔNG chi tiết mã). Nguồn duy nhất
+--   NAV/tiền/phí. Lưu raw để: derive unit/UP/PnL/return, đối soát (reconcile), re-ingest sửa quá khứ.
+--   Idempotent MERGE theo (date, si). NAV net = stock+cash+pending+div − fee_accum (SDI lắp, không tự định giá).
+CREATE TABLE T_SI_ASSET_DAILY (
+    C_ASSET_DAILY_ID BIGINT IDENTITY(1,1) NOT NULL,
+    PK_SI_ASSET_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_ASSET_DAILY_PKID DEFAULT NEWID(),
+    C_BUSINESS_DATE  DATE            NOT NULL,
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_VALID_FROM     DATE            NOT NULL,   -- khoảng hiệu lực interval [from, to)
-    C_VALID_TO       DATE            NULL,
-    -- SNAPSHOT TIỀN (3 khoản) trong khoảng — interval đổi khi BẤT KỲ khoản nào đổi. Cho reconstruct tài sản as-of
-    --   (FR-06 + luồng rerun quá khứ SP_EOD_RECOMPUTE_RANGE). pending/div thêm 2026-06-23 để recompute ngày cũ đúng NAV.
-    C_CASH           DECIMAL(20,0)   NOT NULL,                                      -- tiền mặt (đã NET thuế/phí GD)
-    C_PENDING_CASH   DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_CASH_HIST_PEND DEFAULT 0,  -- tiền bán chờ về (T+)
-    C_DIV_CASH       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_CASH_HIST_DIV  DEFAULT 0,  -- cổ tức tiền chờ về
-    CONSTRAINT PK_SI_CASH_HIST_ID PRIMARY KEY CLUSTERED (C_CASH_HIST_ID),
-    CONSTRAINT UQ_SI_CASH_HIST_PKID UNIQUE NONCLUSTERED (PK_SI_CASH_HIST),
-    CONSTRAINT UQ_SI_CASH_HIST_NK UNIQUE (C_SI_ACCOUNT, C_VALID_FROM)
+    C_STOCK_VALUE    DECIMAL(20,0)   NOT NULL,   -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; KHÔNG chi tiết mã)
+    C_CASH           DECIMAL(20,0)   NOT NULL,   -- số dư tiền
+    C_PENDING_CASH   DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_PEND DEFAULT 0,  -- tiền bán chờ về (T+)
+    C_DIV_CASH       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_DIV  DEFAULT 0,  -- cổ tức tiền chờ về
+    C_FEE_ACCUM      DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SAD_FEE  DEFAULT 0,  -- phí QL LŨY KẾ đến ngày (trừ khỏi NAV)
+    C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_CIN  DEFAULT 0,  -- nạp trong ngày (đối soát cashflow SDI)
+    C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_COUT DEFAULT 0,  -- rút trong ngày (đối soát)
+    C_INGESTED_AT    DATETIME        NOT NULL CONSTRAINT DF_SAD_AT DEFAULT GETDATE(),
+    CONSTRAINT PK_SI_ASSET_DAILY_ID PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_SI_ACCOUNT),  -- date-leading (ingest/seed theo ngày)
+    CONSTRAINT UQ_SI_ASSET_DAILY_PKID UNIQUE NONCLUSTERED (PK_SI_ASSET_DAILY)
 ) WITH (DATA_COMPRESSION = PAGE);
-CREATE INDEX IX_SI_CASH_HIST_OPEN ON T_SI_CASH_HIST (C_SI_ACCOUNT)
-    INCLUDE (C_CASH, C_PENDING_CASH, C_DIV_CASH) WHERE C_VALID_TO IS NULL;
+-- đọc per-SI theo ngày (derive prev + reconcile per-si)
+CREATE INDEX IX_SI_ASSET_DAILY_ACCT ON T_SI_ASSET_DAILY (C_SI_ACCOUNT, C_BUSINESS_DATE)
+    INCLUDE (C_STOCK_VALUE, C_CASH, C_PENDING_CASH, C_DIV_CASH, C_FEE_ACCUM, C_CASH_IN, C_CASH_OUT);
 
 -- External cashflow (nạp/rút) — SDI-side, per sub-account
 CREATE TABLE T_SI_CASHFLOW_EVENT (
@@ -325,44 +316,9 @@ CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_NAV_BALANCE (C_MASTER_CODE, C_BUSI
 CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_NAV_BALANCE (C_SI_ACCOUNT, C_BUSINESS_DATE)
     INCLUDE (C_NAV, C_PAYABLE_FEE, C_UNIT, C_UNIT_PRICE, C_DAILY_RETURN);
 
--- SỔ CÁI PHÍ/THU NHẬP per sub-account (SPARSE, idempotent). GỘP: cổ tức + phí lưu ký (FO đẩy qua
--- SP_INGEST_CUSTOMER) + phí QL BO cắt (BO đẩy qua SP_INGEST_FEE_CHARGE → net-off payable). Phân loại 2 cấp:
---   C_FEE_GROUP = nhóm hạch toán: 'INCOME' (cộng tài sản) | 'PAYABLE' (phí/phải trả). SUM theo group → tổng nhóm.
---   C_FEE_TYPE  = khoản cụ thể: DIVIDEND (INCOME); CUSTODY_FEE, MGMT_FEE (PAYABLE); mở rộng thêm KHÔNG cần đẻ bảng.
--- ⚠️ Accrual phí QL hằng ngày KHÔNG ở đây (vẫn T_SI_NAV_CURRENT.C_PAYABLE_FEE — J06); ledger chỉ event ĐÃ phát sinh.
-CREATE TABLE T_SI_INCOME_FEE (
-    C_INCOME_FEE_ID  BIGINT IDENTITY(1,1) NOT NULL,
-    PK_SI_INCOME_FEE UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_INCOME_FEE_PKID DEFAULT NEWID(),
-    C_BUSINESS_DATE  DATE            NOT NULL,   -- ngày phát sinh (cổ tức/phí lưu ký) HOẶC ngày BO cắt (phí QL)
-    C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
-    C_CUST_CODE      VARCHAR(10)     NULL,       -- denormalized (derive lúc ingest)
-    C_MASTER_CODE    VARCHAR(20)     NULL,
-    C_FEE_GROUP      VARCHAR(20)     NOT NULL,   -- INCOME | PAYABLE — nhóm hạch toán (SUM theo nhóm = tổng phải trả/thu nhập)
-    C_FEE_TYPE       VARCHAR(20)     NOT NULL,   -- DIVIDEND | CUSTODY_FEE | MGMT_FEE | (mở rộng)
-    C_AMOUNT         DECIMAL(20,0)   NOT NULL,   -- TIỀN (VND) > 0; ý nghĩa ±tài sản theo group (INCOME cộng, PAYABLE trừ)
-    C_TICKER         VARCHAR(20)     NULL,       -- cổ tức per-mã (DIVIDEND); NULL cho phí
-    C_SOURCE         VARCHAR(10)     NOT NULL CONSTRAINT DF_SI_INCOME_FEE_SRC DEFAULT 'FO',  -- FO | BO
-    C_SOURCE_EVENT_ID VARCHAR(64)    NULL,       -- khóa idempotency (chống Kafka redelivery nhân đôi)
-    C_CREATED_TIME   DATETIME        NOT NULL CONSTRAINT DF_SI_INCOME_FEE_CREATED DEFAULT GETDATE(),
-    CONSTRAINT PK_SI_INCOME_FEE_ID PRIMARY KEY CLUSTERED (C_INCOME_FEE_ID),
-    CONSTRAINT UQ_SI_INCOME_FEE_PKID UNIQUE NONCLUSTERED (PK_SI_INCOME_FEE)
-);
--- [FR-06] lũy kế/chi tiết theo SUB-ACCOUNT ≤ asOf — by si (INCLUDE group/type/ticker để filter+sum).
-CREATE INDEX IX_SI_INCOME_FEE_ACCT ON T_SI_INCOME_FEE (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT, C_TICKER, C_SOURCE);
--- EOD/agg theo ngày
-CREATE INDEX IX_SI_INCOME_FEE_DATE ON T_SI_INCOME_FEE (C_BUSINESS_DATE)
-    INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_FEE_GROUP, C_FEE_TYPE, C_AMOUNT);
--- idempotency: source_event_id duy nhất (filtered — FO có thể NULL, BO luôn có)
-CREATE UNIQUE INDEX UQ_SI_INCOME_FEE_SRCEVT ON T_SI_INCOME_FEE (C_SOURCE_EVENT_ID)
-    WHERE C_SOURCE_EVENT_ID IS NOT NULL;
-
--- (ĐÃ BỎ T_SI_FEE_ACCRUAL — bảng log accrue per-type/ngày bị DENSE như holdings.)
--- OPTION B (chốt 2026-06-21): payable giữ 1 TỔNG GỘP C_PAYABLE_FEE (NAV_CURRENT/BALANCE). Hiện CHỈ 1 loại phí
---  accrue (MGMT_FEE) ⇒ breakdown per-type cho sao kê = chính tổng đó: pending(loại) = C_PAYABLE_FEE đã chốt
---  @ngày, paid = Σ cắt(loại, T_SI_INCOME_FEE PAYABLE), accrued = pending+paid. KHÔNG reconstruct, KHÔNG xẻ-tổng
---  (Σ round(part) ≠ tổng → lệch đồng-lẻ). FR-06 RS5 + SP_GET_ASSET_SNAPSHOT có guard @nAccrue>1 chặn output sai.
---  ⚠️ NÂNG CẤP đa-loại: thêm cột JSON per-type trên T_SI_NAV_BALANCE, J06 ghi chính xác từng loại lúc accrue.
+-- [BRD asset-sync] ĐÃ BỎ T_SI_INCOME_FEE (chi tiết phí/thu nhập): SDI không quản chi tiết giao dịch phí nữa.
+--   Phí QL: số tổng lũy kế từ Asset (T_SI_ASSET_DAILY.C_FEE_ACCUM). Cổ tức/lưu ký: đã gộp trong tiền/NAV Asset gửi.
+--   C_PAYABLE_FEE (NAV_CURRENT/BALANCE/MASTER) GIỮ TÊN nhưng đổi NGHĨA = phí lũy kế Asset báo (AUM_gross = NAV + nó).
 
 /*------------------------------------------------ MASTER-LEVEL DAILY (output) -*/
 CREATE TABLE T_MASTER_INDEX_DAILY (
@@ -462,6 +418,10 @@ CREATE TABLE T_EOD_PIPELINE (
     C_FO_INGEST_TOTAL    INT          NULL,        -- total cust_code FO khai báo (break event)
     C_FO_INGEST_RECEIVED INT          NULL,        -- cust_code SDI đếm nhận được
     C_FO_INGEST_AT       DATETIME     NULL,
+    -- [BRD asset-sync] ASSET_NAV: Asset gửi số tổng per-SI (NAV/tiền/phí) → SDI ingest T_SI_ASSET_DAILY.
+    --   Gate: EOD chỉ chạy khi ASSET_NAV=READY (cần NAV để derive). App gọi SP_EOD_SET_SOURCE_READY @p_source='ASSET_NAV'.
+    C_ASSET_NAV_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_ANAV DEFAULT 'PENDING',  -- PENDING|READY (Asset)
+    C_ASSET_NAV_AT       DATETIME     NULL,
     C_INDEX_STATUS       VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_IDX  DEFAULT 'PENDING',  -- PENDING|DONE: master index TÍNH RIÊNG (BO ready), KHÔNG trong pipeline customer
     C_INDEX_AT           DATETIME     NULL,
     C_EOD_STATUS         VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_EOD  DEFAULT 'PENDING',  -- PENDING|RUNNING|DONE|FAILED (J07→J11→J12B→J13→J14, KHÔNG còn J12 index)
