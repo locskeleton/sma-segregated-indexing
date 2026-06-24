@@ -196,12 +196,22 @@ SELECT @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-0
 IF @ov='EOD_DONE' PRINT '  OK terminal: overall=EOD_DONE (không còn COMPLETED/asset-sync)';
 ELSE PRINT CONCAT('  !!! terminal sai: overall=',@ov);
 
--- (E) Reset: xóa job + đưa pipeline 07 về PENDING/READY (giữ nguồn)
+-- (E) Reset: KHÔNG xóa T_EOD_RUN (giữ log/audit) — chỉ set watermark C_EOD_RESET_AT → gate vô hiệu DONE cũ.
+DECLARE @j07Before DATETIME = (SELECT C_ENDED_AT FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07' AND C_JOB='J07_COMPUTE');
 EXEC SP_EOD_RESET @p_business_date='2026-01-07', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+DECLARE @wmReset DATETIME = (SELECT C_EOD_RESET_AT FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07');
+DECLARE @logKept INT = (SELECT COUNT(*) FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07');   -- >0 = log GIỮ NGUYÊN
 SELECT @eod=C_EOD_STATUS, @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
-IF @eod='PENDING' AND @ov='READY' AND NOT EXISTS (SELECT 1 FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07')
-    PRINT '  OK reset: EOD_STATUS=PENDING overall=READY, T_EOD_RUN @07 đã xóa (sẵn sàng chạy lại)';
-ELSE PRINT CONCAT('  !!! reset sai: eod=',@eod,' overall=',@ov);
+IF @eod='PENDING' AND @ov='READY' AND @wmReset IS NOT NULL AND @logKept>0
+    PRINT CONCAT('  OK reset: EOD=PENDING overall=READY, watermark set, T_EOD_RUN @07 GIỮ NGUYÊN (',@logKept,' dòng log không bị xóa)');
+ELSE PRINT CONCAT('  !!! reset sai: eod=',@eod,' overall=',@ov,' wm=',ISNULL(CONVERT(VARCHAR(30),@wmReset,121),'NULL'),' logRows=',@logKept);
+-- re-run sau reset: gate phải cho job chạy LẠI (DONE cũ <= watermark) → J07 C_ENDED_AT tiến, pipeline EOD_DONE
+EXEC SP_EOD_RUN '2026-01-07', @p_err_code=@ecP OUTPUT, @p_err_msg=@emP OUTPUT;
+DECLARE @j07After DATETIME = (SELECT C_ENDED_AT FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-07' AND C_JOB='J07_COMPUTE');
+SELECT @ov=C_OVERALL_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-07';
+IF @ov='EOD_DONE' AND @j07After > @j07Before
+    PRINT '  OK re-run sau reset: job chạy LẠI (J07 C_ENDED_AT tiến), pipeline EOD_DONE — log update-in-place';
+ELSE PRINT CONCAT('  !!! re-run sau reset sai: overall=',@ov,' before=',CONVERT(VARCHAR(30),@j07Before,121),' after=',CONVERT(VARCHAR(30),@j07After,121));
 
 PRINT '';
 PRINT '======== PHÍ PHẢI TRẢ — breakdown Option B + guard @nAccrue (FR-06 RS5) ========';

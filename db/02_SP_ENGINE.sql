@@ -778,7 +778,11 @@ CREATE OR ALTER PROCEDURE SP_EOD_STEP @p_d DATE, @p_job VARCHAR(40), @p_proc SYS
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF EXISTS (SELECT 1 FROM T_EOD_RUN WHERE C_BUSINESS_DATE=@p_d AND C_JOB=@p_job AND C_STATUS='DONE')
+    -- GATE RESUME (driven by T_EOD_PIPELINE.C_EOD_RESET_AT): skip job ĐÃ DONE *sau* lần reset gần nhất.
+    --   reset chỉ SET watermark (KHÔNG xoá T_EOD_RUN) → DONE cũ (C_ENDED_AT <= watermark) KHÔNG còn tính → chạy lại.
+    DECLARE @resetAt DATETIME = (SELECT C_EOD_RESET_AT FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_d);
+    IF EXISTS (SELECT 1 FROM T_EOD_RUN WHERE C_BUSINESS_DATE=@p_d AND C_JOB=@p_job AND C_STATUS='DONE'
+                 AND C_ENDED_AT > ISNULL(@resetAt, '1900-01-01'))
         RETURN;
     EXEC SP_EOD_LOG @p_d,@p_job,'RUNNING';
     BEGIN TRY
@@ -995,7 +999,8 @@ GO
 -- (ĐÃ GỠ SP_EOD_SET_ASSET_SYNCED — BRD 2026-06-22: SDI không còn push asset/perf snapshot sang Asset
 --  nên không còn stage "asset synced". Trạng thái CUỐI pipeline = EOD_DONE (sau reconcile PASS). Xem SDI-asset-gap.md.)
 
--- RESET re-run: sau khi sửa nguồn (FO/BO), xóa trạng thái job + break để EOD tính LẠI từ đầu.
+-- RESET re-run: sau khi sửa nguồn (FO/BO), cho EOD tính LẠI từ đầu. GIỮ NGUYÊN T_EOD_RUN (log/audit) — chỉ
+--   đặt watermark C_EOD_RESET_AT=GETDATE() để gate (SP_EOD_STEP) vô hiệu các DONE cũ → mọi job chạy lại.
 --   GIỮ cờ nguồn (MKT_DATA/FO_INGEST) nếu nguồn vẫn ready; reset EOD/RECONCILE về PENDING.
 CREATE OR ALTER PROCEDURE SP_EOD_RESET
     @p_business_date DATE,
@@ -1006,7 +1011,8 @@ AS
 BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
-    DELETE FROM T_EOD_RUN         WHERE C_BUSINESS_DATE=@p_business_date;   -- mọi job chạy lại (compute DELETE+INSERT theo @d: idempotent + sửa-số)
+    -- KHÔNG xoá T_EOD_RUN (giữ log/audit). Watermark vô hiệu DONE cũ → mọi job chạy lại (compute DELETE+INSERT
+    --   theo @d: idempotent + sửa-số). Re-run sẽ UPDATE-in-place dòng log (timing/rows của lượt mới nhất).
     -- IDEMPOTENT re-run: KHÔNG cần un-roll T_SI_NAV_CURRENT. SP_EOD_COMPUTE seed anchor PnL/Unit từ
     --   T_SI_NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll) → tính lại @d ra số Y HỆT dù NAV_CURRENT đã roll sang @d.
     --   ⚠️ Phạm vi: re-run NGÀY HIỆN TẠI (tài sản cash/pending/div trong NAV_CURRENT vẫn của @d). Recompute NGÀY
@@ -1014,7 +1020,7 @@ BEGIN
     --     đọc qua read API FR-02/03/06 (reconstruct từ NAV_BALANCE/hist, không tính lại → không lệch).
     DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_business_date;
     UPDATE T_EOD_PIPELINE
-    SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL,
+    SET C_EOD_STATUS='PENDING', C_EOD_AT=NULL, C_EOD_RESET_AT=GETDATE(),   -- watermark: vô hiệu DONE cũ trong T_EOD_RUN
         C_RECONCILE_STATUS='PENDING', C_RECONCILE_AT=NULL, C_BREAK_COUNT=0,
         C_OVERALL_STATUS = CASE WHEN C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY' THEN 'READY' ELSE 'WAITING_DATA' END,
         C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user, C_MESSAGE=N'RESET để chạy lại'
