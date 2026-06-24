@@ -101,10 +101,13 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 
 ## 6. Cơ chế giảm vênh: NAV-bridge reconcile (SDI làm validator)
 
-2 check, ghi break vào `T_EOD_RECON_BREAK` (mở rộng), lệch quá ngưỡng → chặn publish:
+**MỤC ĐÍCH KÉP (chốt):** reconcile vừa **chặn publish** khi lệch lớn, vừa **GHI LẠI độ lệch (giá trị diff per-SI/ngày) KỂ CẢ khi trong ngưỡng** → dùng để **đo mức vênh SDI-derive vs Asset theo thời gian**, đánh giá thực tế thiết kế 2-nguồn lệch tới đâu (đúng quan ngại §0). Lưu diff (không chỉ pass/fail) để báo cáo/giám sát.
+
+3 check, ghi vào `T_EOD_RECON_BREAK` (mở rộng + cột lưu diff):
 1. **NAV-bridge per-SI:** `NAV_t ≈ NAV_{t-1} + (cash_in − cash_out) + Δ_định_giá` — bắt Asset gửi thiếu/sai SI.
-2. **Cashflow 2 nguồn (QĐ5):** `cash_in/out (SDI nhập)` vs `cash_in/out (Asset gửi)` phải khớp. Lệch → unit/UP (SDI) và NAV (Asset) không cùng dòng tiền → **bắt buộc PASS** trước khi serve.
-(Không còn check `Σ(SI)=master` vì master do SDI tự SUM — QĐ2.)
+2. **Cashflow 2 nguồn (QĐ5):** `cash_in/out (SDI nhập)` vs `cash_in/out (Asset gửi)`. Lệch → unit/UP (SDI) và NAV (Asset) không cùng dòng tiền.
+3. **Holdings (QĐ FO-giữ):** `Σ(FO holdings × giá BO)` vs Asset `stock_value`.
+(Không check `Σ(SI)=master` vì master do SDI tự SUM — QĐ2.)
 
 ## 7. Điểm vênh còn lại + xử lý
 
