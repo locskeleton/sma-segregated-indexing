@@ -660,15 +660,45 @@ BEGIN
     FROM T_EOD_WORK
     WHERE C_BUSINESS_DATE=@p_d AND (C_NAV < 0 OR (C_UNIT<=0 AND C_NAV>0));
 
-    -- Check 2: NAV master != Σ NAV khách (chênh > 1 VND) → ghi từng master lệch
+    -- Check 2: NAV master != Σ NAV khách (chênh > 1 VND) → sanity agg (master = Σ SI, cùng nguồn ingest)
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
     SELECT @p_d, 'SI_NAV_MISMATCH', p.C_MASTER_CODE, p.C_NAV, a.NAV, p.C_NAV - a.NAV,
-           N'NAV master != Σ NAV khách (derive cùng nguồn → phải khớp)'
+           N'NAV master != Σ NAV khách (agg sai?)'
     FROM T_MASTER_NAV_BALANCE p
     INNER JOIN (SELECT C_MASTER_CODE, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
       ON a.C_MASTER_CODE=p.C_MASTER_CODE
     WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_NAV - a.NAV) > 1;
-    -- #dòng break ghi (2 check gộp); 0 = sạch. Tổng hợp cuối để khỏi phụ thuộc @@ROWCOUNT của riêng check cuối.
+
+    -- [BRD] Check 3 CASHFLOW_MISMATCH (đo vênh 2 nguồn — QĐ5): cashflow SDI tự nhập (authoritative cho unit/UP)
+    --   vs cash_in/out Asset gửi. Lệch (số nguyên VND, exact) → unit/UP (SDI) & NAV (Asset) KHÔNG cùng dòng tiền.
+    ;WITH sdicf AS (
+        SELECT C_SI_ACCOUNT,
+               SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END) AS NET
+        FROM T_SI_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@p_d GROUP BY C_SI_ACCOUNT)
+    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
+    SELECT @p_d, 'CASHFLOW_MISMATCH', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
+           ISNULL(s.NET,0), (a.C_CASH_IN - a.C_CASH_OUT), ISNULL(s.NET,0) - (a.C_CASH_IN - a.C_CASH_OUT),
+           N'Cashflow SDI != Asset cash_in/out'
+    FROM T_SI_ASSET_DAILY a
+    LEFT JOIN sdicf s ON s.C_SI_ACCOUNT=a.C_SI_ACCOUNT
+    WHERE a.C_BUSINESS_DATE=@p_d AND ISNULL(s.NET,0) <> (a.C_CASH_IN - a.C_CASH_OUT);
+
+    -- [BRD] Check 4 HOLDINGS_MISMATCH (đo vênh 2 nguồn): Σ(FO holdings × giá BO) vs Asset stock_value (cùng giá BO,
+    --   QĐ3) → lệch = FO holdings vs định giá Asset khác nhau (chênh > 1 VND, tránh nhiễu làm tròn).
+    ;WITH fohold AS (
+        SELECT h.C_SI_ACCOUNT, SUM(h.C_QUANTITY*px.C_CLOSE_PRICE) AS SV
+        FROM T_SI_PORTFOLIO_HOLDING h
+        INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=h.C_TICKER AND px.C_BUSINESS_DATE=@p_d
+        GROUP BY h.C_SI_ACCOUNT)
+    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
+    SELECT @p_d, 'HOLDINGS_MISMATCH', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
+           ISNULL(f.SV,0), a.C_STOCK_VALUE, ISNULL(f.SV,0) - a.C_STOCK_VALUE,
+           N'Σ(FO holdings×giá BO) != Asset stock_value'
+    FROM T_SI_ASSET_DAILY a
+    LEFT JOIN fohold f ON f.C_SI_ACCOUNT=a.C_SI_ACCOUNT
+    WHERE a.C_BUSINESS_DATE=@p_d AND ABS(ISNULL(f.SV,0) - a.C_STOCK_VALUE) > 1;
+
+    -- #dòng break (4 check gộp); 0 = sạch. Tổng cuối (khỏi phụ thuộc @@ROWCOUNT riêng check cuối).
     SET @p_rows = (SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d);
 END
 GO
@@ -775,17 +805,17 @@ BEGIN
     --   nhầm "không phải ngày GD". Data-driven: precondition MKT_DATA=READY bên dưới mới là cổng đúng — giá
     --   chưa về ⇒ MKT chưa READY; ngày nghỉ/tương lai ⇒ pipeline không tồn tại/không READY ⇒ cùng err=10.)
 
-    -- PRECONDITION: BO market data READY + FO ingest READY + master INDEX đã tính (J12 chạy ở
-    --   luồng RIÊNG SP_EOD_RUN_INDEX, KHÔNG còn trong pipeline này). J12B TE cần index daily_return.
-    DECLARE @mkt VARCHAR(10), @fo VARCHAR(10), @idx VARCHAR(10);
-    SELECT @mkt=C_MKT_DATA_STATUS, @fo=C_FO_INGEST_STATUS, @idx=C_INDEX_STATUS
+    -- PRECONDITION: BO market data READY + FO ingest(holdings) READY + [BRD] ASSET_NAV READY (cần NAV để derive)
+    --   + master INDEX đã tính (J12 riêng SP_EOD_RUN_INDEX). J12B TE cần index daily_return.
+    DECLARE @mkt VARCHAR(10), @fo VARCHAR(10), @idx VARCHAR(10), @anav VARCHAR(10);
+    SELECT @mkt=C_MKT_DATA_STATUS, @fo=C_FO_INGEST_STATUS, @idx=C_INDEX_STATUS, @anav=C_ASSET_NAV_STATUS
     FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d;
-    IF @mkt IS NULL OR @mkt<>'READY' OR @fo<>'READY' OR @idx<>'DONE'
+    IF @mkt IS NULL OR @mkt<>'READY' OR @fo<>'READY' OR @anav<>'READY' OR @idx<>'DONE'
     BEGIN
         SET @p_err_code = 10;
         SET @p_err_msg = CONCAT(N'Precondition chưa đủ: MKT_DATA=', ISNULL(@mkt,'(null)'),
-                                N', FO_INGEST=', ISNULL(@fo,'(null)'), N', INDEX=', ISNULL(@idx,'(null)'),
-                                N' (cần MKT/FO=READY + INDEX=DONE; index tính qua SP_EOD_RUN_INDEX).');
+                                N', FO_INGEST=', ISNULL(@fo,'(null)'), N', ASSET_NAV=', ISNULL(@anav,'(null)'),
+                                N', INDEX=', ISNULL(@idx,'(null)'), N' (cần MKT/FO/ASSET_NAV=READY + INDEX=DONE).');
         RETURN;   -- KHÔNG chạy EOD
     END
 
@@ -908,8 +938,8 @@ AS
 BEGIN
     SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
-    IF @p_source NOT IN ('MKT_DATA','FO_INGEST')
-        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA hoặc FO_INGEST'; RAISERROR(@p_err_msg, 16, 1); END
+    IF @p_source NOT IN ('MKT_DATA','FO_INGEST','ASSET_NAV')
+        BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA | FO_INGEST | ASSET_NAV'; RAISERROR(@p_err_msg, 16, 1); END
 
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
         INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
@@ -918,6 +948,12 @@ BEGIN
     BEGIN
         -- BO event ready → SDI đã pull market data 1 lần (giá/index/benchmark). Cờ READY, không đếm.
         UPDATE T_EOD_PIPELINE SET C_MKT_DATA_STATUS='READY', C_MKT_DATA_AT=GETDATE(),
+               C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
+    END
+    ELSE IF @p_source='ASSET_NAV'
+    BEGIN
+        -- [BRD] Asset đã gửi số tổng per-SI (SP_INGEST_ASSET_NAV vào T_SI_ASSET_DAILY). Cờ READY → đủ NAV để derive.
+        UPDATE T_EOD_PIPELINE SET C_ASSET_NAV_STATUS='READY', C_ASSET_NAV_AT=GETDATE(),
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
     END
     ELSE  -- FO_INGEST: completeness theo total cust_code
@@ -938,10 +974,10 @@ BEGIN
         END
     END
 
-    -- cả 2 READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)
+    -- cả 3 nguồn READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)
     UPDATE T_EOD_PIPELINE SET C_OVERALL_STATUS='READY'
     WHERE C_BUSINESS_DATE=@p_business_date AND C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY'
-      AND C_OVERALL_STATUS='WAITING_DATA';
+      AND C_ASSET_NAV_STATUS='READY' AND C_OVERALL_STATUS='WAITING_DATA';
     END TRY
     BEGIN CATCH
         IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
