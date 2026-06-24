@@ -1,7 +1,30 @@
 # Kế hoạch implement BRD Asset-NAV-sync (nhánh `feat/brd-asset-nav-sync`)
 
-> **CHƯA CODE** — bản kế hoạch để duyệt. Quyết định nghiệp vụ: xem [SDI-asset-handover.md](SDI-asset-handover.md).
+> **ĐÃ IMPLEMENT (2026-06-24)** — P0→P5 xong, build + all tests GREEN trên nhánh. Quyết định nghiệp vụ: [SDI-asset-handover.md](SDI-asset-handover.md).
 > Nhánh độc lập, KHÔNG merge `main`. Build/test: fresh DB mỗi lần (DDL edit an toàn).
+
+## TRẠNG THÁI IMPLEMENT (2026-06-24)
+
+| Phase | Kết quả |
+|---|---|
+| P0 schema | ✅ drop T_FEE_CONFIG/T_SI_INCOME_FEE/T_SI_CASH_HIST; thêm T_SI_ASSET_DAILY + C_ASSET_NAV_STATUS |
+| P1 ingest+derive | ✅ SP_INGEST_ASSET_NAV; SP_EOD_COMPUTE seed từ Asset (bỏ MTM/accrue); bỏ fee-charge + recompute-range |
+| P2 pipeline | ✅ gate ASSET_NAV + SET_SOURCE_READY 'ASSET_NAV' |
+| P3 reconcile | ✅ CASHFLOW_MISMATCH + HOLDINGS_MISMATCH + lưu diff |
+| P4 ripple+test | ✅ 05_API FR-06 rewrite; 03_SMOKE (15 assert GREEN); 04/08 bench; 07 PM smoke GREEN |
+| P5 self-review | ✅ thêm guard ASSET_NAV completeness per-SI (err=12); docs |
+
+**Quyết định/giả định khi code (xác nhận lại nếu cần):**
+- **Giữ TÊN cột `C_PAYABLE_FEE`** (NAV_BALANCE/CURRENT/MASTER) nhưng đổi NGHĨA = phí lũy kế Asset → giảm ripple PM/AUM (AUM_gross = NAV + C_PAYABLE_FEE vẫn đúng). Đổi tên sang C_FEE_ACCUM là cosmetic, để sau nếu muốn.
+- **NAV = stock+cash+pending+div − fee_accum** (J08). Tức Asset gửi NAV **gross-components + fee riêng**, SDI trừ fee. Nếu Asset gửi NAV đã-net thì sửa 1 dòng J08 (bỏ −payable).
+- **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
+- **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
+- FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient; cột fee cũ unused).
+
+**Tests:** `03_SMOKE` (customer ingest/derive incl cashflow-day, reconcile vênh, reset, date-guard, index guards, asset-completeness) · `07_PM_SMOKE` (PM serve, seed NAV trực tiếp) · `04_BENCH`/`08_PM_BENCH` (seed asset_daily). Build 01/02/05/06 clean.
+
+---
+
 
 ## Nguyên tắc
 - Asset = nguồn NAV/tiền/phí (số tổng per-SI, không per-mã). SDI: ingest → derive unit/UP/PnL/return → SUM master → index (của SDI) → PM serve → reconcile (đo vênh).

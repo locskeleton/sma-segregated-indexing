@@ -1,6 +1,6 @@
 # SDI ⇄ Asset — bàn giao tính NAV/phí (BRD 2026-06-24)
 
-> Trạng thái: **DESIGN — đang chốt**. Một số quyết định CÒN MỞ (đánh dấu 🔶). Chưa implement.
+> Trạng thái: **ĐÃ IMPLEMENT 2026-06-24** (P0→P5, build + all tests GREEN). Chi tiết: [SDI-asset-impl-plan.md](SDI-asset-impl-plan.md).
 > **Nhánh `feat/brd-asset-nav-sync` — ĐỘC LẬP, KHÔNG merge vào `main`.** Main giữ luồng hiện tại (SDI tự tính NAV/phí).
 > Liên quan: [SDI-asset-gap.md](SDI-asset-gap.md).
 
