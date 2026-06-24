@@ -69,7 +69,8 @@ EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-01-06', @p_source='FO_INGEST
 -- 4) EOD customer (CHẶN nếu chưa MKT/FO=READY + INDEX=DONE → @ec=10). @ec=-2 = reconcile BREAK.
 EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 -- (BRD 2026-06-22: bỏ bước SP_EOD_SET_ASSET_SYNCED — SDI không push asset sang Asset; EOD_DONE = trạng thái cuối)
--- sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (xóa job+break, recompute)
+-- sửa nguồn rồi chạy lại: EXEC SP_EOD_RESET @p_business_date='2026-01-06', ... (đặt watermark C_EOD_RESET_AT
+--   để gate cho job chạy LẠI — GIỮ NGUYÊN T_EOD_RUN làm log/audit, KHÔNG xóa; clear break; recompute)
 ```
 
 ### Rerun quá khứ — tính lại NAV ngày cũ KHÔNG re-feed (`SP_EOD_RECOMPUTE_RANGE`)
