@@ -819,6 +819,18 @@ BEGIN
         RETURN;   -- KHÔNG chạy EOD
     END
 
+    -- [BRD] COMPLETENESS ASSET_NAV per-SI: MỌI tiểu khoản ACTIVE phải có dòng T_SI_ASSET_DAILY @d (Asset gửi đủ).
+    --   Thiếu → SI đó sẽ bị bỏ ngầm (không NAV/derive → PM gap, reconcile KHÔNG bắt vì nó duyệt asset_daily). Chặn.
+    DECLARE @missSI INT = (SELECT COUNT(*) FROM T_SI_PORTFOLIO p WHERE p.C_STATUS='ACTIVE'
+        AND NOT EXISTS (SELECT 1 FROM T_SI_ASSET_DAILY a WHERE a.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND a.C_BUSINESS_DATE=@d));
+    IF @missSI > 0
+    BEGIN
+        SET @p_err_code = 12;
+        SET @p_err_msg = CONCAT(N'Thiếu Asset NAV cho ', @missSI, N' tiểu khoản ACTIVE @',
+                                CONVERT(VARCHAR(10),@d,23), N' — Asset chưa gửi đủ per-SI, chặn EOD.');
+        RETURN;
+    END
+
     UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='RUNNING', C_OVERALL_STATUS='EOD_RUNNING',
            C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
 
