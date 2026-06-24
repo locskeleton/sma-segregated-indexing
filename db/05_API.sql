@@ -270,10 +270,9 @@ BEGIN
             ip.C_SIP_AMOUNT,
             ip.C_SIP_SCHEDULE,
             ip.C_MIN_INVEST,
-            fc.C_RATE AS C_MGMT_FEE_RATE_EFFECTIVE   -- rate phí QL hiệu lực từ T_FEE_CONFIG (global, type MGMT_FEE)
+            CAST(NULL AS DECIMAL(10,6)) AS C_MGMT_FEE_RATE_EFFECTIVE   -- [BRD] rate phí do Asset quản; SDI không giữ T_FEE_CONFIG
     FROM       T_SI_PORTFOLIO ip
     INNER JOIN       T_MASTER_PORTFOLIO   mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    LEFT  JOIN       T_FEE_CONFIG fc ON fc.C_FEE_TYPE = 'MGMT_FEE'   -- config GLOBAL theo loại phí
     WHERE ip.C_SI_ACCOUNT = @p_si_account;
     END TRY
     BEGIN CATCH
@@ -369,34 +368,27 @@ BEGIN
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
-    -- GUARD Option B: breakdown phí phải trả (RS5) chỉ đúng khi CHỈ 1 loại phí accrue. >1 → cần nâng cấp JSON per-type.
-    DECLARE @nAccrue INT = (SELECT COUNT(*) FROM T_FEE_CONFIG WHERE C_FEE_GROUP='PAYABLE' AND C_RATE > 0);
-    IF @nAccrue > 1 BEGIN SET @p_err_code = 4;
-        SET @p_err_msg = CONCAT(N'Option B chỉ hỗ trợ 1 loại phí accrue; phát hiện ', @nAccrue,
-            N' loại — cần nâng cấp JSON per-type (xem memory mgmt-fee-accrual).'); RAISERROR(@p_err_msg, 16, 1); END
+    -- [BRD asset-sync] BỎ guard @nAccrue (T_FEE_CONFIG đã drop). Phí = số tổng lũy kế từ Asset (C_FEE_ACCUM).
 
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
 
-    -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_NAV_BALANCE) cho ĐÚNG sub-account này. 1 check chặn cả:
-    --   ngày nghỉ/gap, ngày tương lai, ngày TRƯỚC khi mở TK, ngày SAU khi đóng TK → tránh trả NAV=NULL mà
-    --   total_asset>0 (holding định giá theo giá ≤ asof) — bất nhất, KH thấy được. Default @p_asof=MAX nên luôn qua.
+    -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_NAV_BALANCE) cho ĐÚNG sub-account này (chặn ngày
+    --   nghỉ/tương lai/trước-mở/sau-đóng). NAV_BALANCE @asof tồn tại ⇒ T_SI_ASSET_DAILY @asof cũng có (compute cần).
     IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
     BEGIN SET @p_err_code = 5;
         SET @p_err_msg = CONCAT(N'Không có dữ liệu EOD cho sub-account ', @p_si_account, N' @ ',
             CONVERT(VARCHAR(10),@p_asof,23), N' (ngày nghỉ/tương lai/trước khi mở/sau khi đóng TK).');
         RAISERROR(@p_err_msg, 16, 1); END
 
-    DECLARE @cash DECIMAL(20,0) = (
-        SELECT C_CASH FROM T_SI_CASH_HIST
-        WHERE C_SI_ACCOUNT=@p_si_account
-          AND C_VALID_FROM <= @p_asof AND (C_VALID_TO > @p_asof OR C_VALID_TO IS NULL));
+    -- [BRD] Thành phần tài sản số TỔNG từ Asset (T_SI_ASSET_DAILY @asof) — SDI KHÔNG tự định giá.
+    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0), @pending DECIMAL(20,0), @div DECIMAL(20,0), @fee DECIMAL(20,6);
+    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH, @pending=C_PENDING_CASH, @div=C_DIV_CASH, @fee=C_FEE_ACCUM
+    FROM T_SI_ASSET_DAILY WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
 
-    -- Holdings reconstruct @asof + giá ≤ asOf — MATERIALIZE 1 LẦN, dùng chung @stock (RS1) + RS2.
-    -- OUTER APPLY top-1/mã KH giữ: tối ưu cho per-customer ít mã (KHÔNG window-CTE vì sẽ quét latest-price
-    -- toàn universe). Trước đây reconstruct chạy 2 lần (@stock + RS2) → gộp còn 1.
-    SELECT h.C_TICKER, h.C_QUANTITY, h.C_AVG_COST,
-           px.C_CLOSE_PRICE AS C_MARKET_PRICE,
+    -- Holdings chi tiết per-mã (FO holdings reconstruct @asof × giá ≤ asof) cho RS2. ⚠️ Σ(FO×giá) CÓ THỂ lệch
+    --   Asset stock_value (đo ở reconcile HOLDINGS_MISMATCH); RS1 total dùng số Asset (authoritative).
+    SELECT h.C_TICKER, h.C_QUANTITY, h.C_AVG_COST, px.C_CLOSE_PRICE AS C_MARKET_PRICE,
            h.C_QUANTITY * px.C_CLOSE_PRICE AS C_MARKET_VALUE
     INTO #hold
     FROM T_SI_HOLDING_HIST h
@@ -405,74 +397,30 @@ BEGIN
                  ORDER BY C_BUSINESS_DATE DESC) px
     WHERE h.C_SI_ACCOUNT=@p_si_account
       AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL);
-    DECLARE @stock DECIMAL(20,0) = (SELECT SUM(C_MARKET_VALUE) FROM #hold);
 
-    -- RS1: summary
-    --   Rollup theo NHÓM (fee_group): C_ACCUM_INCOME = Σ thu nhập (INCOME); C_ACCUM_FEE_PAYABLE = Σ phí ĐÃ phát sinh (PAYABLE, ledger).
-    --   Chi tiết ĐÃ CẮT theo type: dividend/custody/mgmt_paid. C_FEE_ACCRUED_TOTAL = TỔNG phí phải trả ACCRUED chưa cắt (mọi loại, từ payable).
-    SELECT  @p_asof                  AS C_ASOF,
+    -- RS1: summary (NAV/unit/UP derive @asof + thành phần Asset + phí lũy kế Asset)
+    SELECT  @p_asof                AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
-            nd.C_NAV,
-            nd.C_UNIT,
-            nd.C_UNIT_PRICE,
-            ISNULL(@cash, 0)       AS C_CASH,
-            ISNULL(@stock, 0)      AS C_STOCK_VALUE,
-            ISNULL(@cash,0) + ISNULL(@stock,0) AS C_TOTAL_ASSET,
-            ISNULL(fi.C_ACCUM_INCOME, 0)       AS C_ACCUM_INCOME,        -- Σ theo group INCOME (tổng thu nhập)
-            ISNULL(fi.C_ACCUM_FEE_PAYABLE, 0)  AS C_ACCUM_FEE_PAYABLE,   -- Σ theo group PAYABLE (tổng phí phải trả)
-            fi.C_ACCUM_DIVIDEND,
-            fi.C_ACCUM_CUSTODY_FEE,
-            ISNULL(fi.C_MGMT_FEE_PAID, 0)  AS C_ACCUM_MGMT_FEE_PAID,
-            ISNULL(nd.C_PAYABLE_FEE, 0)    AS C_FEE_ACCRUED_TOTAL   -- TỔNG phí phải trả accrued chưa cắt @asOf (mọi loại: mgmt+tax+...)
+            nd.C_NAV, nd.C_UNIT, nd.C_UNIT_PRICE,
+            ISNULL(@cash,0)        AS C_CASH,
+            ISNULL(@stock,0)       AS C_STOCK_VALUE,
+            ISNULL(@pending,0)     AS C_PENDING_CASH,
+            ISNULL(@div,0)         AS C_DIV_CASH,
+            ISNULL(@stock,0)+ISNULL(@cash,0)+ISNULL(@pending,0)+ISNULL(@div,0) AS C_TOTAL_ASSET,  -- AUM gross
+            ISNULL(@fee,0)         AS C_FEE_ACCRUED_TOTAL    -- phí QL lũy kế (Asset) — đã trừ khỏi NAV
     FROM (SELECT 1 x) z
-    LEFT JOIN   T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
-    OUTER APPLY (
-        SELECT  SUM(CASE WHEN C_FEE_GROUP = 'INCOME'  THEN C_AMOUNT END) AS C_ACCUM_INCOME,       -- rollup nhóm
-                SUM(CASE WHEN C_FEE_GROUP = 'PAYABLE' THEN C_AMOUNT END) AS C_ACCUM_FEE_PAYABLE,  -- rollup nhóm
-                SUM(CASE WHEN C_FEE_TYPE  = 'DIVIDEND'    THEN C_AMOUNT END) AS C_ACCUM_DIVIDEND,
-                SUM(CASE WHEN C_FEE_TYPE  = 'CUSTODY_FEE' THEN C_AMOUNT END) AS C_ACCUM_CUSTODY_FEE,
-                SUM(CASE WHEN C_FEE_TYPE  = 'MGMT_FEE'    THEN C_AMOUNT END) AS C_MGMT_FEE_PAID  -- phí QL BO đã cắt thực
-        FROM T_SI_INCOME_FEE
-        WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof
-    ) fi;
+    LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof;
 
-    -- RS2: holdings reconstruct @p_asof — đọc lại #hold (KHÔNG reconstruct lần 2)
+    -- RS2: holdings chi tiết per-mã (FO)
     SELECT  C_TICKER, C_QUANTITY, C_MARKET_PRICE, C_MARKET_VALUE,
-            CAST(C_MARKET_VALUE / NULLIF(@stock,0) AS DECIMAL(12,8)) AS C_WEIGHT,
+            CAST(C_MARKET_VALUE / NULLIF((SELECT SUM(C_MARKET_VALUE) FROM #hold),0) AS DECIMAL(12,8)) AS C_WEIGHT,
             C_AVG_COST
     FROM #hold
     ORDER BY C_MARKET_VALUE DESC;
 
-    -- RS3: chi tiết THU NHẬP ≤ asOf — group INCOME (DIVIDEND + loại thu nhập thêm sau). GROUP-based → KHÔNG sót loại mới.
-    SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_TICKER, C_AMOUNT, C_SOURCE
-    FROM T_SI_INCOME_FEE
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='INCOME'
-    ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
-
-    -- RS4: chi tiết PHÍ PHẢI TRẢ ≤ asOf — group PAYABLE (CUSTODY_FEE + MGMT_FEE + loại phí thêm sau). GROUP-based.
-    SELECT C_BUSINESS_DATE, C_FEE_TYPE, C_AMOUNT, C_SOURCE, C_SOURCE_EVENT_ID
-    FROM T_SI_INCOME_FEE
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_FEE_GROUP='PAYABLE'
-    ORDER BY C_BUSINESS_DATE DESC, C_FEE_TYPE;
-
-    -- RS5: KÊ TỪNG KHOẢN PHẢI TRẢ accrued chưa cắt @asOf.
-    --   OPTION B (chốt 2026-06-21): hiện CHỈ 1 loại phí accrue (MGMT_FEE) → pending = ĐÚNG C_PAYABLE_FEE đã
-    --   chốt @asOf (T_SI_NAV_BALANCE) — khớp TUYỆT ĐỐI NAV, KHÔNG reconstruct/không lệch làm tròn. paid = Σ cắt
-    --   loại đó (T_SI_INCOME_FEE group PAYABLE); accrued = pending + paid (khôi phục gross). Σ pending = C_FEE_ACCRUED_TOTAL.
-    --   ⚠️ NÂNG CẤP khi >1 loại accrue: lưu JSON per-type trên T_SI_NAV_BALANCE (ghi lúc J06 accrue) — KHÔNG xẻ từ
-    --      tổng gộp (Σ round(part) ≠ tổng). Guard @nAccrue (đầu proc) chặn output sai-âm-thầm cho tới khi nâng cấp.
-    SELECT cfg.C_FEE_TYPE,
-           CAST(ISNULL(nd.C_PAYABLE_FEE,0) + ISNULL(c.C_PAID,0) AS DECIMAL(20,4)) AS C_FEE_ACCRUED,   -- gross = pending + paid
-           CAST(ISNULL(c.C_PAID,0)                              AS DECIMAL(20,4)) AS C_FEE_PAID,
-           CAST(ISNULL(nd.C_PAYABLE_FEE,0)                      AS DECIMAL(20,4)) AS C_FEE_PENDING     -- = payable đã chốt (exact)
-    FROM T_FEE_CONFIG cfg
-    LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof
-    LEFT JOIN (SELECT C_FEE_TYPE, CAST(SUM(C_AMOUNT) AS DECIMAL(20,6)) AS C_PAID  -- CAST tránh bẫy DECIMAL-38
-               FROM T_SI_INCOME_FEE WHERE C_SI_ACCOUNT=@p_si_account AND C_FEE_GROUP='PAYABLE' AND C_BUSINESS_DATE <= @p_asof
-               GROUP BY C_FEE_TYPE) c ON c.C_FEE_TYPE = cfg.C_FEE_TYPE
-    WHERE cfg.C_FEE_GROUP='PAYABLE' AND cfg.C_RATE > 0
-    ORDER BY cfg.C_FEE_TYPE;
+    -- [BRD asset-sync] BỎ RS3/RS4/RS5 (chi tiết income/fee): SDI không quản chi tiết giao dịch phí nữa.
+    --   Phí QL = số tổng lũy kế (C_FEE_ACCRUED_TOTAL ở RS1, từ Asset). Cổ tức đã gộp trong tiền/NAV Asset gửi.
 
     DROP TABLE #hold;
     END TRY
