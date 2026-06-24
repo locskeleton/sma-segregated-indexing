@@ -18,9 +18,11 @@ Có quan ngại kiến trúc: **SDI là nơi phát sinh nghiệp vụ chính** �
 | 4 | Ngày gửi NAV | **Chỉ ngày GD**; T7/CN/lễ SDI **carry-forward**. |
 | 5 | Originator cashflow | **SDI VẪN nhập cashflow** (giữ `T_SI_CASHFLOW_EVENT`) + Asset cũng gửi `cash_in/out` → **đối soát 2 nguồn**. Unit/UP tính theo cashflow SDI (authoritative); **reconcile phải PASS** để NAV(Asset) & unit(SDI) nhất quán (cùng dòng tiền). |
 
-**Bổ sung (lưu ý giá cuối ngày):** Asset gửi **`stock_value` (tổng tiền CP nắm giữ)** + **`pending` (tiền chờ về T+)** đã định giá sẵn → **SDI KHÔNG MTM** (bỏ J07 hoàn toàn). SDI chỉ **lắp** NAV từ thành phần Asset gửi.
+**Bổ sung — giá cuối ngày + thành phần tài sản (chốt):** Asset gửi **ĐỦ thành phần tài sản dạng SỐ TỔNG cấp SI** (`stock_value + pending + cash + div_cash`), **KHÔNG chi tiết từng mã** → SDI **không tự định giá EOD** (bỏ MTM cho EOD NAV), chỉ **lắp** NAV. **Mọi hệ (BO/Asset/SDI) tham chiếu CÙNG 1 bộ giá đóng cửa.**
 
-🔶 **Còn 1 điểm cần làm rõ:** `cash` (số dư tiền) và `div_cash` (cổ tức tiền) — Asset gửi luôn, hay SDI tự giữ từ cashflow? (xem §3).
+**FO holdings (per-mã): TẠM GIỮ ingest.** Không phục vụ EOD NAV (lấy từ Asset), mà cho: composition `T_MASTER_HOLDING_BALANCE`, US3-click RS2 (delta holdings thực per-mã), alert drift/ngành, và **tính tài sản CẬN REAL-TIME (future)**. Thêm đối soát `Σ(FO holdings × giá BO) ≈ Asset stock_value`.
+
+> Lưu ý scope PM BRD: core **US1–US5 KHÔNG cần per-mã** (chạy trên NAV/unit cấp SI/master). Per-mã chỉ nuôi US3-click RS2 + alert (alert: nguồn ngành `T_TICKER_INDUSTRY` thật chưa nạp).
 
 ## 1. Thay đổi BRD
 
@@ -48,10 +50,10 @@ Vì units/UP/PnL/TWR đều derive từ **NAV+flow của Asset** (chỉ dùng UP
 
 Mỗi `(business_date, si_account)` — **chỉ ngày GD** (QĐ4), **per-SI** (QĐ2):
 ```
-stock_value    -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; SDI KHÔNG MTM)
+stock_value    -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; SDI KHÔNG MTM) -- SỐ TỔNG cấp SI, KHÔNG chi tiết từng mã
 pending        -- tiền bán chờ về (T+) / receivables
-cash           -- 🔶 số dư tiền — Asset gửi? hay SDI giữ từ cashflow? (cần làm rõ)
-div_cash       -- 🔶 cổ tức tiền chờ/đã về — Asset gửi? (cần làm rõ)
+cash           -- số dư tiền (Asset gửi — đã chốt)
+div_cash       -- cổ tức tiền chờ/đã về (Asset gửi — đã chốt)
 fee            -- phí LŨY KẾ đến ngày (QĐ1)
 cash_in        -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhập — QĐ5)
 cash_out       -- rút trong ngày (ĐỐI SOÁT)
@@ -82,16 +84,16 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 - Index danh mục mẫu (J12 `SP_EOD_SI_INDEX`) — chỉ cần giá BO + target weight, độc lập NAV.
 - PM serve layer (06_PM_API) — đọc NAV/UP/return/TE đã ingest+derive.
 - TE accum (J12B) — đọc `daily_return` derive, `index daily_return` từ J12.
-- Composition `T_MASTER_HOLDING_BALANCE` (alert drift/ngành) — cần FO holdings.
+- **FO holdings ingest (per-mã) — TẠM GIỮ**: composition `T_MASTER_HOLDING_BALANCE`, US3-click RS2, alert drift/ngành, **near-realtime asset (future)**. KHÔNG dùng cho EOD NAV.
 - **`T_SI_CASHFLOW_EVENT` (QĐ5): SDI VẪN là originator** nạp/rút → giữ; dùng tính unit/UP + đối soát với Asset.
 - **SI_AGG (J11): SUM per-SI → master** (giờ SUM số ingest, không phải số tự tính).
 - **Tính unit/unit_price/PnL/return per-SI** từ NAV(ingest) + cashflow(SDI) + UP history (§4).
 - **Validator** đối soát NAV-bridge + cashflow 2 nguồn (§6).
 
 **BỎ:**
-- `SP_EOD_COMPUTE` J06 accrue, **J07 MTM** (Asset gửi `stock_value`), J08 NAV-from-holdings (chỉ lắp NAV), J09/J10 giữ phần derive unit/PnL nhưng nguồn = NAV ingest.
+- `SP_EOD_COMPUTE` J06 accrue, **J07 MTM cho EOD NAV** (EOD lấy `stock_value` từ Asset — nhưng GIỮ năng lực MTM holdings cho near-realtime future), J08 NAV-from-holdings (EOD chỉ lắp NAV từ Asset), J09/J10 derive unit/PnL nhưng nguồn = NAV ingest.
 - `SP_INGEST_FEE_CHARGE`, `T_SI_INCOME_FEE` (chi tiết phí), `T_FEE_CONFIG`, `C_PAYABLE_FEE`.
-- `T_SI_HOLDING_HIST`/`T_SI_CASH_HIST` cho mục tính NAV (holdings vẫn cần cho composition; cash-hist bỏ).
+- `T_SI_CASH_HIST` (interval cash cho tính NAV). **Holdings GIỮ** (FO ingest — xem GIỮ).
 - `SP_EOD_RECOMPUTE_RANGE` (recompute NAV từ history) → thay bằng **re-ingest** (§7.D).
 
 **ĐỔI THÀNH INGEST:**
@@ -115,11 +117,12 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 
 ## 8. Trạng thái quyết định
 
-1–5 **ĐÃ CHỐT** (xem §0b). Còn lại:
+**ĐÃ CHỐT:** QĐ1–5 (§0b) · cash/div = Asset gửi đủ thành phần số tổng SI · Asset không per-mã · **FO holdings TẠM GIỮ** (composition + US3-RS2 + alert + near-realtime future).
 
-🔶 **(a) `cash` & `div_cash`**: Asset gửi luôn, hay SDI tự giữ từ cashflow (QĐ5 SDI là originator nên có dữ liệu tiền)? — quyết nốt để chốt contract §3.
-
-🔶 **(b) Thiết kế reconcile cashflow 2 nguồn (QĐ5)**: ngưỡng lệch, xử lý khi lệch (chặn publish? cảnh báo?), thời điểm đối soát. SDI-cashflow là authoritative cho unit/UP; Asset-cash_in/out để bắt lệch.
+**CÒN LẠI (chi tiết implement, quyết khi code):**
+🔶 **(b) Thiết kế reconcile cashflow 2 nguồn (QĐ5)**: ngưỡng lệch, xử lý khi lệch (chặn publish? cảnh báo?), thời điểm đối soát. SDI-cashflow authoritative cho unit/UP; Asset-cash_in/out để bắt lệch.
+🔶 **(c) Reconcile holdings**: `Σ(FO×giá BO)` vs Asset `stock_value` — ngưỡng + xử lý.
+🔶 **(d) Near-realtime asset valuation (future)**: giữ năng lực MTM holdings cho intraday — phạm vi/định nghĩa để sau.
 
 ## 9. Tác động migration (high-level, sau khi chốt §8)
 
