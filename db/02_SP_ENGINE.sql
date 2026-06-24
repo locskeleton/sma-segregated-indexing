@@ -589,6 +589,29 @@ BEGIN
         THROW 51011, @emsg, 1;
     END
 
+    -- VALIDATE WEIGHT (TRƯỚC mọi DML): master ACTIVE có Σtarget_weight = 0 (cấu hình rổ sai) ⇒ FACTOR =
+    --   numerator/NULLIF(0,0) = NULL ⇒ nếu để chạy tới INSERT sẽ vỡ ràng buộc NOT NULL của C_INDEX_VALUE.
+    --   Raise NGAY tại đây (báo rõ master), KHÔNG để lỗi NOT NULL khó hiểu ở tầng insert.
+    DECLARE @badw NVARCHAR(MAX) = (
+        SELECT STRING_AGG(CONVERT(NVARCHAR(20), z.C_MASTER_CODE), N', ') WITHIN GROUP (ORDER BY z.C_MASTER_CODE)
+        FROM (
+            SELECT mw.C_MASTER_CODE
+            FROM T_MASTER_PORTFOLIO_TICKER mw
+            INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+            INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
+                        FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE) LD
+              ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
+            GROUP BY mw.C_MASTER_CODE
+            HAVING SUM(CAST(mw.C_TARGET_WEIGHT AS FLOAT)) = 0
+        ) z);
+    IF @badw IS NOT NULL
+    BEGIN
+        DECLARE @wmsg NVARCHAR(2000) = CONCAT(N'INDEX weight INVALID @', CONVERT(VARCHAR(10),@p_d,23),
+            N': Σtarget_weight = 0 (cấu hình rổ sai) — master ', LEFT(@badw,1800),
+            N' — KHÔNG tính index (FACTOR không xác định).');
+        THROW 51012, @wmsg, 1;
+    END
+
     -- DELETE scoped theo master ACTIVE (đúng tập sẽ INSERT lại). KHÔNG xoá index của master ĐÃ CLOSED
     --   → lịch sử index master đã đóng được GIỮ NGUYÊN (đóng băng) khi re-run/recompute ngày quá khứ.
     DELETE idx FROM T_MASTER_INDEX_DAILY idx
@@ -1140,7 +1163,7 @@ GO
     THEO THỨ TỰ (mỗi ngày prev = ngày vừa tính lại → chuỗi đúng). SP_EOD_SI_INDEX idempotent (DELETE+INSERT @d).
     ⚠️ Để sửa chuỗi hỏng phải chạy TỪ INCEPTION (prev ngày đầu = base 1000); chạy từ giữa → prev vẫn số cũ.
     Index là MASTER-level (giá×weight), KHÔNG theo KH → luôn tính mọi master có weight+giá @d.
-    err: 0 OK · 11 thiếu giá mã rổ (completeness hard-fail, xem msg) · 20 range không hợp lệ · -1 runtime.
+    err: 0 OK · 11 thiếu giá mã rổ (completeness) · 12 Σweight=0 (cấu hình rổ sai) · 20 range không hợp lệ · -1 runtime.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RECOMPUTE_INDEX_RANGE
     @p_from_date DATE,
@@ -1167,8 +1190,8 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT>0 ROLLBACK;
-        -- 51011 = INDEX completeness hard-fail từ SP_EOD_SI_INDEX → map err=11 (báo rõ); còn lại runtime -1.
-        SET @p_err_code = CASE WHEN ERROR_NUMBER()=51011 THEN 11 ELSE -1 END;
+        -- map lỗi hard-fail từ SP_EOD_SI_INDEX: 51011 completeness→11, 51012 weight Σ=0→12; còn lại runtime -1.
+        SET @p_err_code = CASE ERROR_NUMBER() WHEN 51011 THEN 11 WHEN 51012 THEN 12 ELSE -1 END;
         SET @p_err_msg = ERROR_MESSAGE();
     END CATCH
 END
