@@ -317,7 +317,7 @@ BEGIN
 END
 GO
 
-CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -358,6 +358,7 @@ BEGIN
         s.C_LAST_BUSINESS_DATE= @p_d
     FROM T_SI_NAV_CURRENT s
     INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d;
+    SET @p_rows = @@ROWCOUNT;   -- #tiểu khoản roll-forward (= #SI active xử lý phiên này)
 END
 GO
 
@@ -505,7 +506,7 @@ GO
   J11 — SI AGGREGATE → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất + cổ tức/phí)
          + upsert T_MASTER_NAV_CURRENT (snapshot current cấp SI cho serving)
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -536,6 +537,7 @@ BEGIN
            a.CFIN, a.CFOUT, a.ACCT
     FROM agg a
     LEFT JOIN T_MASTER_NAV_BALANCE prev ON prev.C_MASTER_CODE=a.C_MASTER_CODE AND prev.C_BUSINESS_DATE=@prev;
+    SET @p_rows = @@ROWCOUNT;   -- #master aggregate (bắt NGAY sau INSERT, trước MERGE current bên dưới)
 
     -- current cấp master (overwrite) — CHỈ khi @p_d là ngày MỚI NHẤT (forward). Rerun ngày QUÁ KHỨ → KHÔNG đụng
     --   current (current phải = hôm nay). Forward luôn tính ngày mới nhất ⇒ chạy như cũ.
@@ -557,7 +559,7 @@ GO
   J12 — SI INDEX (danh mục mẫu, 100% cổ phiếu) → T_MASTER_INDEX_DAILY
         Index_t = Index_(t-1) × Σ w^(t) × P_t / P_ref ;  w^(t)=eff_date≤@d mới nhất
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_SI_INDEX @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_SI_INDEX @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -647,6 +649,7 @@ BEGIN
            f.FACTOR - 1
     FROM FACT f
     LEFT JOIN T_MASTER_INDEX_DAILY pi ON pi.C_MASTER_CODE=f.C_MASTER_CODE AND pi.C_BUSINESS_DATE=@prev;
+    SET @p_rows = @@ROWCOUNT;   -- #master index ghi @p_d
 END
 GO
 
@@ -658,7 +661,7 @@ GO
       (J07 INSERT lại NAV_BALANCE @d ⇒ 3 cột reset DEFAULT 0 ⇒ J12B set lại đúng).
     Đọc 2 lát ngày (@d, @prev) join theo si (hash) → KHÔNG cần index leading si.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_TE_ACCUM @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_TE_ACCUM @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -680,6 +683,7 @@ BEGIN
       -- SCOPE theo T_EOD_WORK @p_d: forward (work=mọi SI active) → cập nhật hết như cũ; rerun per-KH (work=SI master
       --   bị ảnh hưởng) → CHỈ cập nhật SI đó (tối ưu, không quét toàn bộ SI mỗi ngày). Mọi flow đều populate work @p_d trước TE.
       AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d);
+    SET @p_rows = @@ROWCOUNT;   -- #tiểu khoản cập nhật TE accum (scope theo work @p_d)
 END
 GO
 
@@ -690,7 +694,7 @@ GO
         rollback theo transaction của SP_EOD_STEP. Đọc data ĐÃ committed của J07/J11 (T_EOD_WORK,
         T_MASTER_NAV_BALANCE) — đó là lý do mỗi step commit riêng.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_RECONCILE @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_RECONCILE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -711,6 +715,8 @@ BEGIN
     INNER JOIN (SELECT C_MASTER_CODE, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
       ON a.C_MASTER_CODE=p.C_MASTER_CODE
     WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_NAV - a.NAV) > 1;
+    -- #dòng break ghi (2 check gộp); 0 = sạch. Tổng hợp cuối để khỏi phụ thuộc @@ROWCOUNT của riêng check cuối.
+    SET @p_rows = (SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d);
 END
 GO
 
@@ -718,7 +724,7 @@ GO
   J14 — SNAPSHOT: T_MASTER_HOLDING_BALANCE (SI aggregate holdings + tỷ trọng)
          (composition tài sản + NAV đã gộp về T_MASTER_NAV_BALANCE ở J11)
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -738,6 +744,7 @@ BEGIN
            CASE WHEN SUM(v.MV) OVER (PARTITION BY v.C_MASTER_CODE) > 0
                 THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_MASTER_CODE) END
     FROM val v;
+    SET @p_rows = @@ROWCOUNT;   -- #dòng holdings-balance (mã × master) snapshot @p_d
     -- (composition tài sản + NAV cấp SI: đã ghi T_MASTER_NAV_BALANCE ở J11_SI_AGG)
 END
 GO
@@ -747,7 +754,7 @@ GO
        vs expected (tiểu khoản ACTIVE). Lệch ⇒ THROW (thiếu/dư data) → chặn EOD + alert.
        (đếm theo state nên DISTINCT sẵn — Kafka redelivery không làm phồng số.)
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_EOD_GATE @p_d DATE
+CREATE OR ALTER PROCEDURE SP_EOD_GATE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -760,6 +767,7 @@ BEGIN
             '/',@expected,' tiểu khoản — chưa nhận đủ FO ingest, CHẶN EOD.');
         THROW 50010, @msg, 1;
     END
+    SET @p_rows = @received;   -- #tiểu khoản đã nhận đủ FO ingest (= expected khi qua cổng)
 END
 GO
 
@@ -775,11 +783,14 @@ BEGIN
     EXEC SP_EOD_LOG @p_d,@p_job,'RUNNING';
     BEGIN TRY
         BEGIN TRAN;
-        -- dynamic SQL: '@p_d' = tên param target proc (đã đổi); '@d' = biến trong batch động (khai báo N'@d DATE')
-        DECLARE @sql NVARCHAR(300) = N'EXEC ' + QUOTENAME(@p_proc) + N' @p_d=@d';
-        EXEC sp_executesql @sql, N'@d DATE', @d=@p_d;
+        -- dynamic SQL: '@p_d' = tên param target proc (đã đổi); '@d' = biến trong batch động (khai báo N'@d DATE').
+        -- @p_rows OUTPUT: MỌI job proc dispatch qua đây PHẢI có param @p_rows BIGINT=NULL OUTPUT (trả #dòng
+        --   xử lý chính) → ghi vào T_EOD_RUN.C_ROWS. (Direct caller khác KHÔNG truyền → default NULL, không ảnh hưởng.)
+        DECLARE @rows BIGINT;
+        DECLARE @sql NVARCHAR(300) = N'EXEC ' + QUOTENAME(@p_proc) + N' @p_d=@d, @p_rows=@r OUTPUT';
+        EXEC sp_executesql @sql, N'@d DATE, @r BIGINT OUTPUT', @d=@p_d, @r=@rows OUTPUT;
         COMMIT;
-        EXEC SP_EOD_LOG @p_d,@p_job,'DONE';
+        EXEC SP_EOD_LOG @p_d,@p_job,'DONE', @rows;
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT>0 ROLLBACK;

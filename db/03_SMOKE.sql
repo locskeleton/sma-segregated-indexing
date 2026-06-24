@@ -110,6 +110,11 @@ WHERE C_CUST_CODE='KH00001001' ORDER BY C_FEE_TYPE;   -- KỲ VỌNG: 2 dòng (D
 
 PRINT '--- T_EOD_RUN (job log) ---';
 SELECT C_STATUS, COUNT(*) AS N FROM T_EOD_RUN GROUP BY C_STATUS;   -- KỲ VỌNG: 28 DONE (7 job × 4 phiên)
+-- C_ROWS phải được populate (KHÔNG NULL) cho mọi job DONE — dispatcher thread @p_rows OUTPUT vào C_ROWS.
+DECLARE @nullRows INT = (SELECT COUNT(*) FROM T_EOD_RUN WHERE C_STATUS='DONE' AND C_ROWS IS NULL);
+DECLARE @snapRows BIGINT = (SELECT C_ROWS FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-06' AND C_JOB='J14_SNAPSHOT');
+IF @nullRows=0 AND @snapRows=2 PRINT CONCAT('  OK C_ROWS populate đủ (0 job DONE bị NULL; J14 snapshot @06 = ',@snapRows,' dòng AAA/BBB)');
+ELSE PRINT CONCAT('  !!! C_ROWS thiếu: ',@nullRows,' job DONE NULL; J14@06=',ISNULL(CAST(@snapRows AS VARCHAR),'(null)'));
 
 PRINT '--- GUARD 1: event QUÁ KHỨ (business_date 06 < watermark 07) phải bị CHẶN ---';
 BEGIN TRY
