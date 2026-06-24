@@ -24,10 +24,11 @@ BEGIN
 END
 GO
 
-/*---------------------------------------------------- UDF: ngày có phải ngày GIAO DỊCH không
-  (helper chuẩn hoá cho date-guard toàn hệ): 1 nếu BO đã publish giá @d (T_PRICE_DAILY có dòng) → ngày GD;
-  0 nếu ngày nghỉ/cuối tuần/tương lai/chưa có data. Dùng ở SP_EOD_RUN + read API để chặn ngày-bừa-bãi. */
-CREATE OR ALTER FUNCTION UDF_IS_TRADING_DATE (@d DATE)
+/*---------------------------------------------------- UDF: ngày ĐÃ CÓ GIÁ chưa (data-driven)
+  1 nếu BO đã publish giá @d (T_PRICE_DAILY có dòng); 0 nếu chưa. ĐÂY KHÔNG PHẢI "ngày giao dịch theo lịch":
+  ngày GD hiện tại mà giá EOD CHƯA về cũng trả 0. Vì vậy CHỈ dùng để chọn ngày QUÁ KHỨ có data (recompute loop).
+  Việc "ngày hiện tại có sẵn sàng chạy EOD" do precondition MKT_DATA=READY ở SP_EOD_RUN quyết (không dùng UDF này). */
+CREATE OR ALTER FUNCTION UDF_HAS_PRICE_DATA (@d DATE)
 RETURNS BIT
 AS
 BEGIN
@@ -802,15 +803,9 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
-    -- DATE GUARD: chặn chạy EOD cho ngày KHÔNG phải ngày giao dịch (nghỉ/cuối tuần/tương lai/chưa có giá).
-    --   Báo sớm + rõ nghĩa thay vì rơi vào precondition chung. (BO publish giá ⇒ T_PRICE_DAILY có dòng.)
-    IF dbo.UDF_IS_TRADING_DATE(@d) = 0
-    BEGIN
-        SET @p_err_code = 10;
-        SET @p_err_msg = CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@d,23),
-            N' KHÔNG phải ngày giao dịch (chưa có giá T_PRICE_DAILY) — không chạy EOD.');
-        RETURN;
-    END
+    -- (KHÔNG còn guard "ngày giao dịch" bằng price-existence: ngày GD hiện tại mà giá EOD chưa về sẽ bị báo
+    --   nhầm "không phải ngày GD". Data-driven: precondition MKT_DATA=READY bên dưới mới là cổng đúng — giá
+    --   chưa về ⇒ MKT chưa READY; ngày nghỉ/tương lai ⇒ pipeline không tồn tại/không READY ⇒ cùng err=10.)
 
     -- PRECONDITION: BO market data READY + FO ingest READY + master INDEX đã tính (J12 chạy ở
     --   luồng RIÊNG SP_EOD_RUN_INDEX, KHÔNG còn trong pipeline này). J12B TE cần index daily_return.
@@ -1069,7 +1064,7 @@ BEGIN
         DECLARE @d DATE = @p_from_date;
         WHILE @d <= @p_to_date
         BEGIN
-            IF dbo.UDF_IS_TRADING_DATE(@d) = 1   -- chỉ ngày GD (có giá)
+            IF dbo.UDF_HAS_PRICE_DATA(@d) = 1   -- chỉ ngày QUÁ KHỨ đã có giá
             BEGIN
                 DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@d);
                 DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@d;
@@ -1183,7 +1178,7 @@ BEGIN
         DECLARE @d DATE = @p_from_date;
         WHILE @d <= @p_to_date
         BEGIN
-            IF dbo.UDF_IS_TRADING_DATE(@d) = 1 EXEC SP_EOD_SI_INDEX @d;   -- idempotent, prev=ngày GD trước (đã tính lại)
+            IF dbo.UDF_HAS_PRICE_DATA(@d) = 1 EXEC SP_EOD_SI_INDEX @d;   -- idempotent, prev=ngày có giá trước (đã tính lại)
             SET @d = DATEADD(DAY, 1, @d);
         END
         COMMIT;

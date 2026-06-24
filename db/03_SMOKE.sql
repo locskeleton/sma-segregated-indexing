@@ -304,9 +304,10 @@ IF @ecD=3 PRINT '  OK index snapshot ngày tương lai → err=3'; ELSE PRINT CO
 -- rebalance detail: trước inception → err=5
 EXEC SP_GET_MASTER_REBALANCE_DETAIL 'SDI01','2026-01-01',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
 IF @ecD=5 PRINT '  OK rebalance_detail ngày trước inception → err=5'; ELSE PRINT CONCAT('  !!! rebalance KHÔNG chặn: err=',@ecD);
--- SP_EOD_RUN: ngày KHÔNG phải ngày GD (2099, không có giá) → err=10 + thông điệp trading-day
+-- SP_EOD_RUN: ngày chưa sẵn sàng (2099, không pipeline/giá) → err=10 từ precondition MKT_DATA (data-driven,
+--   KHÔNG còn guard price-existence: ngày GD hiện tại giá chưa về cũng phải để precondition xử, không báo nhầm).
 EXEC SP_EOD_RUN '2099-06-15',@p_err_code=@ecD OUTPUT,@p_err_msg=@emD OUTPUT;
-IF @ecD=10 PRINT CONCAT('  OK SP_EOD_RUN ngày không-GD → err=10 (',@emD,')'); ELSE PRINT CONCAT('  !!! SP_EOD_RUN không chặn ngày không-GD: err=',@ecD);
+IF @ecD=10 PRINT CONCAT('  OK SP_EOD_RUN ngày chưa sẵn sàng → err=10 precondition (',@emD,')'); ELSE PRINT CONCAT('  !!! SP_EOD_RUN không chặn: err=',@ecD);
 
 PRINT '';
 PRINT '======== INGEST GIÁ EOD: SP_INGEST_PRICE_DAILY (atomic+validate) + completeness gate index ========';
