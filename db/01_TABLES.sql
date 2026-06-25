@@ -357,10 +357,10 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_CASH             DECIMAL(20,0) NOT NULL,                                   -- Σ TIỀN MẶT các tiểu khoản
     C_PENDING_CASH     DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_PEND DEFAULT 0,  -- Σ TIỀN bán chờ về
     C_DIV_CASH         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_DIV  DEFAULT 0,  -- Σ TIỀN cổ tức chờ về
-    C_STOCK_VALUE      DECIMAL(20,0) NOT NULL,                                   -- Σ giá trị cổ phiếu (MTM)
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ phí QL phải trả (Σ payable tiểu khoản). Cổ tức/phí lưu ký theo ngày: tra T_SI_INCOME_FEE on-demand (không lưu rollup master).
-    C_TOTAL_ASSET      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
-    C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_TOTAL_ASSET − C_PAYABLE_FEE (NAV net phí)
+    -- [BRD] BỎ C_STOCK_VALUE cấp master (PM tool KHÔNG đọc; AUM gross đã gồm stock). Stock per-mã ở T_MASTER_HOLDING_BALANCE.
+    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ lũy kế PHẢI TRẢ (Asset). AUM_gross = C_NAV + C_PAYABLE_FEE.
+    C_AUM      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
+    C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_AUM − C_PAYABLE_FEE (NAV net phí)
     C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master
     C_UNIT_PRICE       DECIMAL(18,6) NULL,      -- = C_NAV / C_UNIT (pooled master unit price)
     C_DAILY_PNL        DECIMAL(20,0)  NOT NULL, -- Σ lãi/lỗ TIỀN ngày
@@ -379,9 +379,9 @@ CREATE TABLE T_MASTER_NAV_CURRENT (
     C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_CASH DEFAULT 0,
     C_PENDING_CASH     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_PEND DEFAULT 0,
     C_DIV_CASH         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_DIV  DEFAULT 0,
-    C_STOCK_VALUE      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_STOCK DEFAULT 0,
-    C_TOTAL_ASSET      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- TỔNG TÀI SẢN (AUM) hiện tại = stock+cash+pending+div. Nguồn nhanh cho US1/US2 AUM + cash drag.
-    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_NAV DEFAULT 0,    -- NAV net phí = C_TOTAL_ASSET − Σpayable
+    -- [BRD] BỎ C_STOCK_VALUE cấp master (PM không đọc).
+    C_AUM      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- TỔNG TÀI SẢN (AUM) hiện tại = stock+cash+pending+div (gross). Nguồn nhanh US1/US2 AUM + cash drag.
+    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_NAV DEFAULT 0,    -- NAV net phí = C_AUM − Σpayable
     C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_SNC_UNIT DEFAULT 0,
     C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                          -- pooled master unit price = NAV/Unit
     C_TOTAL_ACCOUNT    INT           NOT NULL CONSTRAINT DF_SNC_TACC DEFAULT 0,  -- [PM] #tiểu khoản ACTIVE

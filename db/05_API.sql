@@ -180,9 +180,9 @@ BEGIN
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
                  ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
 
-    -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu)
+    -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu). [BRD] bỏ C_STOCK_VALUE master (đã drop).
     SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
-                 C_TOTAL_ASSET, C_CASH, C_STOCK_VALUE
+                 C_AUM, C_CASH
     FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
     END TRY
     BEGIN CATCH
@@ -407,7 +407,7 @@ BEGIN
             ISNULL(@stock,0)       AS C_STOCK_VALUE,
             ISNULL(@pending,0)     AS C_PENDING_CASH,
             ISNULL(@div,0)         AS C_DIV_CASH,
-            ISNULL(@stock,0)+ISNULL(@cash,0)+ISNULL(@pending,0)+ISNULL(@div,0) AS C_TOTAL_ASSET,  -- AUM gross
+            ISNULL(@stock,0)+ISNULL(@cash,0)+ISNULL(@pending,0)+ISNULL(@div,0) AS C_AUM,  -- AUM gross
             ISNULL(@fee,0)         AS C_FEE_ACCRUED_TOTAL    -- phí QL lũy kế (Asset) — đã trừ khỏi NAV
     FROM (SELECT 1 x) z
     LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof;

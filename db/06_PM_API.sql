@@ -140,7 +140,7 @@ BEGIN
 
     -- AUM hiện tại + tiền (tầng master — KHÔNG SUM SI)
     DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT;
-    SELECT @aumNow = C_TOTAL_ASSET, @nKH = C_TOTAL_ACCOUNT,
+    SELECT @aumNow = C_AUM, @nKH = C_TOTAL_ACCOUNT,
            @tienNow = C_CASH + C_PENDING_CASH + C_DIV_CASH
     FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@p_master_code;
 
@@ -148,7 +148,7 @@ BEGIN
     DECLARE @cashIn DECIMAL(20,0), @cashOut DECIMAL(20,0), @aumBase DECIMAL(20,0);
     SELECT @cashIn  = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_IN  END),0),
            @cashOut = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_OUT END),0),
-           @aumBase = MAX(CASE WHEN C_BUSINESS_DATE = @base THEN C_TOTAL_ASSET END)
+           @aumBase = MAX(CASE WHEN C_BUSINESS_DATE = @base THEN C_AUM END)
     FROM T_MASTER_NAV_BALANCE
     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE >= @base AND C_BUSINESS_DATE <= @end;
 
@@ -605,7 +605,7 @@ BEGIN
 
     -- per-master rollup
     DECLARE @cdThrDefault DECIMAL(9,6) = 0.05;
-    -- #mr KHÔNG giữ master AUM (lấy mc.C_TOTAL_ASSET tầng master ở RS2/RS3, không SUM SI).
+    -- #mr KHÔNG giữ master AUM (lấy mc.C_AUM tầng master ở RS2/RS3, không SUM SI).
     CREATE TABLE #mr (m VARCHAR(20), wret FLOAT, rmaster FLOAT,
                       wte FLOAT, cashdrag FLOAT, cdThr DECIMAL(9,6));
     INSERT #mr (m, wret, wte)
@@ -615,8 +615,8 @@ BEGIN
     FROM #kh k GROUP BY k.m;
     UPDATE r SET rmaster = CASE WHEN d.idxBase IS NULL OR d.idxBase=0 THEN NULL ELSE d.idxEnd/d.idxBase-1 END,
                  cdThr = ISNULL(cfg.C_CASH_DRAG_THRESHOLD, @cdThrDefault),
-                 cashdrag = CASE WHEN mc.C_TOTAL_ASSET=0 THEN NULL
-                                 ELSE (mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/mc.C_TOTAL_ASSET END
+                 cashdrag = CASE WHEN mc.C_AUM=0 THEN NULL
+                                 ELSE (mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/mc.C_AUM END
     FROM #mr r
     INNER JOIN #md d ON d.m=r.m
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
@@ -629,14 +629,14 @@ BEGIN
     FROM #md;
 
     -- RS2 tổng toàn hệ
-    SELECT  CAST(SUM(mc.C_TOTAL_ASSET) AS DECIMAL(38,0)) AS C_TOTAL_AUM,
+    SELECT  CAST(SUM(mc.C_AUM) AS DECIMAL(38,0)) AS C_TOTAL_AUM,
             CAST(SUM(x.aumBase) AS DECIMAL(38,0))        AS C_TOTAL_AUM_BASE,
             CASE WHEN SUM(x.aumBase)=0 THEN NULL
-                 ELSE CAST(SUM(mc.C_TOTAL_ASSET)*1.0/NULLIF(SUM(x.aumBase),0) - 1 AS DECIMAL(18,6)) END AS C_AUM_GROWTH_PCT,
+                 ELSE CAST(SUM(mc.C_AUM)*1.0/NULLIF(SUM(x.aumBase),0) - 1 AS DECIMAL(18,6)) END AS C_AUM_GROWTH_PCT,
             CAST(SUM(x.cin) AS DECIMAL(38,0))  AS C_NET_IN,
             CAST(SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_OUT,
             CAST(SUM(x.cin)-SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_FLOW,
-            CAST(SUM(mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/NULLIF(SUM(mc.C_TOTAL_ASSET),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
+            CAST(SUM(mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/NULLIF(SUM(mc.C_AUM),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
             SUM(CASE WHEN r.cashdrag > r.cdThr THEN 1 ELSE 0 END) AS C_CNT_MASTER_CASH_OVER
     FROM #md d
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m
@@ -645,7 +645,7 @@ BEGIN
     OUTER APPLY (SELECT MAX(CASE WHEN isBase=1 THEN ta END) aumBase,
                         ISNULL(SUM(CASE WHEN aft=1 THEN cin END),0) cin,
                         ISNULL(SUM(CASE WHEN aft=1 THEN cout END),0) cout
-                 FROM (SELECT C_TOTAL_ASSET AS ta, C_CASH_IN AS cin, C_CASH_OUT AS cout,
+                 FROM (SELECT C_AUM AS ta, C_CASH_IN AS cin, C_CASH_OUT AS cout,
                               CASE WHEN C_BUSINESS_DATE=d.dbase THEN 1 ELSE 0 END AS isBase,
                               CASE WHEN C_BUSINESS_DATE>d.dbase THEN 1 ELSE 0 END AS aft
                        FROM T_MASTER_NAV_BALANCE
@@ -653,7 +653,7 @@ BEGIN
 
     -- RS3 list master
     SELECT  mp.C_MASTER_CODE, mp.C_MASTER_NAME, mc.C_TOTAL_ACCOUNT AS C_TOTAL_ACCOUNT,
-            mc.C_TOTAL_ASSET AS C_AUM,
+            mc.C_AUM AS C_AUM,
             CAST(r.rmaster AS DECIMAL(18,6)) AS C_MASTER_RETURN,
             CAST(r.wret AS DECIMAL(18,6))    AS C_KH_RETURN_AUMW,
             CAST((r.wret - r.rmaster)*10000 AS DECIMAL(12,2)) AS C_DEVIATION_BPS,
@@ -662,12 +662,12 @@ BEGIN
     FROM #mr r
     INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=r.m
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
-    ORDER BY CASE @p_sort WHEN 'AUM'  THEN mc.C_TOTAL_ASSET END DESC,
+    ORDER BY CASE @p_sort WHEN 'AUM'  THEN mc.C_AUM END DESC,
              CASE @p_sort WHEN 'RET'  THEN r.wret END DESC,
              CASE @p_sort WHEN 'DEV'  THEN (r.wret-r.rmaster) END DESC,
              CASE @p_sort WHEN 'TE'   THEN r.wte END DESC,
              CASE @p_sort WHEN 'CASH' THEN r.cashdrag END DESC,
-             mc.C_TOTAL_ASSET DESC;
+             mc.C_AUM DESC;
 
     DROP TABLE #kh; DROP TABLE #mr; DROP TABLE #md;
     END TRY

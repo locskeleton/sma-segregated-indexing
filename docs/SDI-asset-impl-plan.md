@@ -21,6 +21,7 @@
 - **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
 - **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
 - FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient; cột fee cũ unused).
+- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_NAV_BALANCE/CURRENT) — PM không đọc; AUM gross vẫn = stock+cash+pending+div (tính từ work). Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + T_EOD_WORK + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
 
 **Tests:** `03_SMOKE` (customer ingest/derive incl cashflow-day, reconcile vênh, reset, date-guard, index guards, asset-completeness) · `07_PM_SMOKE` (PM serve, seed NAV trực tiếp) · `04_BENCH`/`08_PM_BENCH` (seed asset_daily). Build 01/02/05/06 clean.
 
