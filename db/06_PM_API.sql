@@ -877,3 +877,72 @@ BEGIN
     END CATCH
 END
 GO
+
+/*===========================================================================
+  [BRD đối chiếu] AUM-weighted return KH của 1 master — 2 API, 2 CÔNG THỨC tính Rᵢ (hiệu suất kỳ KH i).
+    Cả 2: wᵢ = AUMᵢ/ΣAUM (AUMᵢ = C_LAST_NAV + C_PAYABLE_FEE, current ACTIVE); return = Σ wᵢ·Rᵢ. Khung base/end giống US2.
+    RS: C_MASTER_CODE, C_BASE_DATE, C_END_DATE, C_METHOD, C_KH_RETURN_AUMW.
+    (1) RET_INDEX : Rᵢ = UP_end/UP_base − 1  (ret_index = C_UNIT_PRICE, đọc 2-lát) — NHANH.
+    (2) COMPOUND  : Rᵢ = ∏(1+C_DAILY_RETURN) qua (base,end] = EXP(Σ ln(1+r))−1 (QUÉT ngày) — đúng công thức literal.
+    Cùng data nhất quán (UPₜ=UPₜ₋₁·(1+rₜ)) ⇒ 2 kết quả KHỚP. Dùng đối chiếu + đo perf.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_MASTER_RETURN_RETINDEX
+    @p_master_code VARCHAR(20), @p_range VARCHAR(20)='INCEPTION',
+    @p_user VARCHAR(64)=NULL, @p_err_code INT OUTPUT, @p_err_msg NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
+        BEGIN SET @p_err_code=1; SET @p_err_msg=N'Master not found'; RAISERROR(@p_err_msg,16,1); END
+    DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
+    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff=dbo.UDF_RANGE_CUTOFF(@end,@p_range);
+    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
+    IF @base IS NULL SET @base=@first;
+
+    ;WITH kh AS (
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum, nc.C_LAST_UNIT_PRICE AS up_end
+        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
+    ), b AS (   -- up_base lát @base; KH join sau base → 10000 (mốc inception)
+        SELECT k.si, k.aum, k.up_end, COALESCE(nb.C_UNIT_PRICE,10000) AS up_base
+        FROM kh k LEFT JOIN T_SI_NAV_BALANCE nb ON nb.C_MASTER_CODE=@p_master_code AND nb.C_BUSINESS_DATE=@base AND nb.C_SI_ACCOUNT=k.si
+    )
+    SELECT @p_master_code AS C_MASTER_CODE, @base AS C_BASE_DATE, @end AS C_END_DATE, 'RET_INDEX' AS C_METHOD,
+           CAST(SUM((up_end/NULLIF(up_base,0) - 1)*aum)/NULLIF(SUM(aum),0) AS DECIMAL(18,6)) AS C_KH_RETURN_AUMW
+    FROM b WHERE up_base>0;
+    END TRY BEGIN CATCH IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END END CATCH
+END
+GO
+
+CREATE OR ALTER PROCEDURE SP_GET_MASTER_RETURN_COMPOUND
+    @p_master_code VARCHAR(20), @p_range VARCHAR(20)='INCEPTION',
+    @p_user VARCHAR(64)=NULL, @p_err_code INT OUTPUT, @p_err_msg NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
+        BEGIN SET @p_err_code=1; SET @p_err_msg=N'Master not found'; RAISERROR(@p_err_msg,16,1); END
+    DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
+    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SET @cutoff=dbo.UDF_RANGE_CUTOFF(@end,@p_range);
+    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
+    IF @base IS NULL SET @base=@first;
+
+    ;WITH kh AS (
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum
+        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
+    ), comp AS (   -- ∏(1+r) qua (base,end] = EXP(Σ ln(1+r))−1 ; QUÉT ngày; bỏ ngày return NULL (vd ngày đầu)
+        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        FROM T_SI_NAV_BALANCE b
+        WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
+          AND b.C_DAILY_RETURN IS NOT NULL
+        GROUP BY b.C_SI_ACCOUNT
+    )
+    SELECT @p_master_code AS C_MASTER_CODE, @base AS C_BASE_DATE, @end AS C_END_DATE, 'COMPOUND' AS C_METHOD,
+           CAST(SUM(kh.aum * ISNULL(comp.R,0))/NULLIF(SUM(kh.aum),0) AS DECIMAL(18,6)) AS C_KH_RETURN_AUMW
+    FROM kh LEFT JOIN comp ON comp.si=kh.si;
+    END TRY BEGIN CATCH IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END END CATCH
+END
+GO
