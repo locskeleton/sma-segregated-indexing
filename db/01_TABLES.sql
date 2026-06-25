@@ -161,7 +161,8 @@ CREATE INDEX IX_SI_HOLDING_HIST_OPEN ON T_SI_HOLDING_HIST (C_SI_ACCOUNT, C_TICKE
 
 -- [BRD asset-sync] RAW FEED Asset → SDI: số TỔNG per-SI mỗi ngày GD (KHÔNG chi tiết mã). Nguồn duy nhất
 --   NAV/tiền/phí. Lưu raw để: derive unit/UP/PnL/return, đối soát (reconcile), re-ingest sửa quá khứ.
---   Idempotent MERGE theo (date, si). NAV net = stock+cash+pending+div − fee_accum (SDI lắp, không tự định giá).
+--   Idempotent theo (date, si). NAV RÒNG do Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Components (stock/cash/
+--   pending/div) + fee_accum gửi kèm để hiển thị/đối soát (reconcile NAV-consistency: nav vs comp−fee).
 CREATE TABLE T_SI_ASSET_DAILY (
     C_ASSET_DAILY_ID BIGINT IDENTITY(1,1) NOT NULL,
     PK_SI_ASSET_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_ASSET_DAILY_PKID DEFAULT NEWID(),
@@ -169,11 +170,12 @@ CREATE TABLE T_SI_ASSET_DAILY (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
+    C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ)
     C_STOCK_VALUE    DECIMAL(20,0)   NOT NULL,   -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; KHÔNG chi tiết mã)
     C_CASH           DECIMAL(20,0)   NOT NULL,   -- số dư tiền
     C_PENDING_CASH   DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_PEND DEFAULT 0,  -- tiền bán chờ về (T+)
     C_DIV_CASH       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_DIV  DEFAULT 0,  -- cổ tức tiền chờ về
-    C_FEE_ACCUM      DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SAD_FEE  DEFAULT 0,  -- phí QL LŨY KẾ đến ngày (trừ khỏi NAV)
+    C_FEE_ACCUM      DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SAD_FEE  DEFAULT 0,  -- phí QL LŨY KẾ PHẢI TRẢ đến ngày (AUM_gross=NAV+nó)
     C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_CIN  DEFAULT 0,  -- nạp trong ngày (đối soát cashflow SDI)
     C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_COUT DEFAULT 0,  -- rút trong ngày (đối soát)
     C_INGESTED_AT    DATETIME        NOT NULL CONSTRAINT DF_SAD_AT DEFAULT GETDATE(),

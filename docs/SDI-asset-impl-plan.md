@@ -14,9 +14,10 @@
 | P4 ripple+test | ✅ 05_API FR-06 rewrite; 03_SMOKE (15 assert GREEN); 04/08 bench; 07 PM smoke GREEN |
 | P5 self-review | ✅ thêm guard ASSET_NAV completeness per-SI (err=12); docs |
 
-**Quyết định/giả định khi code (xác nhận lại nếu cần):**
-- **Giữ TÊN cột `C_PAYABLE_FEE`** (NAV_BALANCE/CURRENT/MASTER) nhưng đổi NGHĨA = phí lũy kế Asset → giảm ripple PM/AUM (AUM_gross = NAV + C_PAYABLE_FEE vẫn đúng). Đổi tên sang C_FEE_ACCUM là cosmetic, để sau nếu muốn.
-- **NAV = stock+cash+pending+div − fee_accum** (J08). Tức Asset gửi NAV **gross-components + fee riêng**, SDI trừ fee. Nếu Asset gửi NAV đã-net thì sửa 1 dòng J08 (bỏ −payable).
+**Quyết định khi code (ĐÃ CHỐT với user 2026-06-25):**
+- **Giữ TÊN cột `C_PAYABLE_FEE`**, đổi NGHĨA = **lũy kế phải trả** (Asset gửi). AUM_gross = NAV + C_PAYABLE_FEE. Đổi tên C_FEE_ACCUM là cosmetic, để sau.
+- **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_NAV` ingest trực tiếp; SP_EOD_COMPUTE seed C_NAV; CORE **bỏ J08** (không lắp NAV). Components (stock/cash/pending/div) + fee gửi kèm để display (FR-06) + AUM + reconcile.
+- **Reconcile NAV_CONSISTENCY** (mới, vì NAV độc lập components): `nav` Asset vs `(stock+cash+pending+div − fee)` → bắt Asset tự mâu thuẫn. (5 check: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_CONSISTENCY.)
 - **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
 - **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
 - FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient; cột fee cũ unused).

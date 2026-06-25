@@ -28,7 +28,7 @@ PRINT '======== CUSTOMER EOD: ingest Asset NAV → derive ========';
 -- DAY 02: nạp 10tr; holdings AAA60000/BBB80000 (stock 10tr); cash 0; fee 0 → NAV=10tr, UP=10000, units=1000
 INSERT T_SI_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT) VALUES ('SUB001','KH001','SDI01','2026-01-02','INITIAL',10000000);
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-02","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","stock_value":10000000,"cash":0,"fee_accum":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":10000000,"stock_value":10000000,"cash":0,"fee_accum":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -38,7 +38,7 @@ IF @ec<>0 PRINT CONCAT('  !!! EOD 02 ec=',@ec,' ',@em);
 
 -- DAY 05: market move (AAA110/BBB48) → stock 10.44tr; no flow → UP=10440, return=0.044
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-05","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","stock_value":10440000,"cash":0,"fee_accum":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":10440000,"stock_value":10440000,"cash":0,"fee_accum":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -50,7 +50,7 @@ IF @ec<>0 PRINT CONCAT('  !!! EOD 05 ec=',@ec,' ',@em);
 --   10.44tr, cash +1.044tr) → NAV=11.484tr. Units phát hành @UP_prev=10440 → ΔUnit=100 → units=1100 → UP=10440, return=0.
 INSERT T_SI_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT) VALUES ('SUB001','KH001','SDI01','2026-01-06','TOPUP',1044000);
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-06","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","stock_value":10440000,"cash":1044000,"fee_accum":0,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11484000,"stock_value":10440000,"cash":1044000,"fee_accum":0,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -81,14 +81,14 @@ PRINT '';
 PRINT '======== RECONCILE: đo vênh 2 nguồn ========';
 DECLARE @brk6 INT=(SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06');
 IF @brk6=0 PRINT '  OK reconcile @06 sạch (2 nguồn khớp)'; ELSE PRINT CONCAT('  !!! reconcile @06 break: ',@brk6);
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","stock_value":9999999,"cash":1044000,"fee_accum":0,"cash_in":2000000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11043999,"stock_value":9999999,"cash":1044000,"fee_accum":0,"cash_in":2000000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RECONCILE '2026-01-06',@p_rows=@ec OUTPUT;
 DECLARE @cfd DECIMAL(20,6)=(SELECT C_DIFF FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06' AND C_CHECK_NAME='CASHFLOW_MISMATCH');
 DECLARE @hdf DECIMAL(20,6)=(SELECT C_DIFF FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06' AND C_CHECK_NAME='HOLDINGS_MISMATCH');
 -- cashflow: SDI 1.044tr − Asset 2tr = −956000 ; holdings: Σ(FO×giá 10.44tr) − Asset stock 9999999 = 440001
 IF @cfd=-956000 AND @hdf=440001 PRINT CONCAT('  OK reconcile đo vênh: cashflow diff=',@cfd,' holdings diff=',@hdf);
 ELSE PRINT CONCAT('  !!! reconcile diff sai: cashflow=',ISNULL(CAST(@cfd AS VARCHAR(30)),'(null)'),' holdings=',ISNULL(CAST(@hdf AS VARCHAR(30)),'(null)'));
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","stock_value":10440000,"cash":1044000,"fee_accum":0,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11484000,"stock_value":10440000,"cash":1044000,"fee_accum":0,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RECONCILE '2026-01-06',@p_rows=@ec OUTPUT;
 
 PRINT '';

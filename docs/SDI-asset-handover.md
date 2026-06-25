@@ -50,15 +50,16 @@ Vì units/UP/PnL/TWR đều derive từ **NAV+flow của Asset** (chỉ dùng UP
 
 Mỗi `(business_date, si_account)` — **chỉ ngày GD** (QĐ4), **per-SI** (QĐ2):
 ```
-stock_value    -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; SDI KHÔNG MTM) -- SỐ TỔNG cấp SI, KHÔNG chi tiết từng mã
+nav            -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Chốt 2026-06-25.
+stock_value    -- tổng tiền CP nắm giữ (Asset ĐÃ định giá) -- SỐ TỔNG cấp SI, KHÔNG chi tiết từng mã
 pending        -- tiền bán chờ về (T+) / receivables
-cash           -- số dư tiền (Asset gửi — đã chốt)
-div_cash       -- cổ tức tiền chờ/đã về (Asset gửi — đã chốt)
-fee            -- phí LŨY KẾ đến ngày (QĐ1)
+cash           -- số dư tiền
+div_cash       -- cổ tức tiền chờ/đã về
+fee            -- LŨY KẾ PHẢI TRẢ đến ngày (QĐ1) — AUM_gross = nav + fee
 cash_in        -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhập — QĐ5)
 cash_out       -- rút trong ngày (ĐỐI SOÁT)
 ```
-- **NAV = stock_value + cash + pending + div_cash − fee** — SDI **lắp**, không tự định giá.
+- **NAV = Asset gửi trực tiếp** (`nav`). SDI KHÔNG lắp/trừ. Components + fee gửi kèm để hiển thị (FR-06) + AUM + reconcile NAV_CONSISTENCY (`nav` vs `stock+cash+pending+div−fee` → bắt Asset tự lệch).
 - **GIÁ EOD THỐNG NHẤT (QĐ3 mở rộng):** Asset định giá `stock_value` bằng **đúng giá BO close** mà SDI dùng cho index → index ↔ NAV apples-to-apples.
 - **Per-SI** (QĐ2): PM tool toàn bộ per-KH; SDI tự SUM lên master.
 - **QĐ5:** SDI dùng `cash_in/cash_out` **của chính nó** (originator) để tính unit/UP; `cash_in/out` Asset gửi chỉ để **đối soát**. Reconcile lệch → ghi break, chặn publish (vì NAV Asset & unit SDI phải cùng dòng tiền).
