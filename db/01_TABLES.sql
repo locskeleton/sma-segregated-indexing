@@ -172,9 +172,7 @@ CREATE TABLE T_SI_ASSET_DAILY (
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ)
     C_STOCK_VALUE    DECIMAL(20,0)   NOT NULL,   -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; KHÔNG chi tiết mã)
-    C_CASH           DECIMAL(20,0)   NOT NULL,   -- số dư tiền
-    C_PENDING_CASH   DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_PEND DEFAULT 0,  -- tiền bán chờ về (T+)
-    C_DIV_CASH       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_DIV  DEFAULT 0,  -- cổ tức tiền chờ về
+    C_CASH           DECIMAL(20,0)   NOT NULL,   -- [BRD] TỔNG tiền dư (1 số: gộp tiền mặt + bán chờ về + cổ tức tiền), Asset gửi
     C_FEE_ACCUM      DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SAD_FEE  DEFAULT 0,  -- phí QL LŨY KẾ PHẢI TRẢ đến ngày (AUM_gross=NAV+nó)
     C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_CIN  DEFAULT 0,  -- nạp trong ngày (đối soát cashflow SDI)
     C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_COUT DEFAULT 0,  -- rút trong ngày (đối soát)
@@ -184,7 +182,7 @@ CREATE TABLE T_SI_ASSET_DAILY (
 ) WITH (DATA_COMPRESSION = PAGE);
 -- đọc per-SI theo ngày (derive prev + reconcile per-si)
 CREATE INDEX IX_SI_ASSET_DAILY_ACCT ON T_SI_ASSET_DAILY (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_STOCK_VALUE, C_CASH, C_PENDING_CASH, C_DIV_CASH, C_FEE_ACCUM, C_CASH_IN, C_CASH_OUT);
+    INCLUDE (C_NAV, C_STOCK_VALUE, C_CASH, C_FEE_ACCUM, C_CASH_IN, C_CASH_OUT);
 
 -- External cashflow (nạp/rút) — SDI-side, per sub-account
 CREATE TABLE T_SI_CASHFLOW_EVENT (
@@ -231,7 +229,7 @@ CREATE TABLE T_SI_NAV_CURRENT (
     C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- TIỀN MẶT khả dụng (FO sync). Đã NET phí GD + thuế.
     C_PENDING_CASH     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_PEND DEFAULT 0,     -- TIỀN bán chờ về (FO, tổng T0+T1+T2) — receivable, vẫn tính vào tài sản
     C_DIV_CASH         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_DIV DEFAULT 0,      -- TIỀN cổ tức chờ về (FO) — receivable
-    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,      -- PHÍ QL accrued chưa net-off (khoản PHẢI TRẢ). TIỀN = C_CASH+C_PENDING_CASH+C_DIV_CASH; NAV = (stock+TIỀN) − C_PAYABLE_FEE
+    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,      -- PHÍ QL accrued chưa net-off (khoản PHẢI TRẢ). TIỀN = C_CASH; NAV = (stock+TIỀN) − C_PAYABLE_FEE
     C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- NAV NET phí gần nhất = tổng tài sản (stock+TIỀN) − payable
     C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                           -- Unit Price gần nhất = NAV/Unit (T0=10.000). %hiệu suất TWR = UP_cuối/UP_mốc − 1
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
@@ -277,7 +275,7 @@ CREATE TABLE T_EOD_WORK (
     C_CF_IN           DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN vào ngày @d (Σ INITIAL/TOPUP/SIP/INTEREST_IN)
     C_CF_OUT          DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN ra ngày @d (Σ WITHDRAW)
     C_STOCK_VALUE     DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J07 MTM = Σ qty × close_price (định giá cổ phiếu)
-    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J08 = C_STOCK_VALUE + C_CASH + C_PENDING_CASH + C_DIV_CASH − C_PAYABLE_FEE
+    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J08 = C_STOCK_VALUE + C_CASH − C_PAYABLE_FEE
     C_DAILY_PNL       DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J09 = C_NAV − C_LAST_NAV + C_CF_OUT − C_CF_IN (loại ảnh hưởng dòng tiền)
     C_DELTA_UNIT      DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = (C_CF_IN − C_CF_OUT) / C_LAST_UNIT_PRICE (init: NAV/10000 khi UP_prev=0)
     C_UNIT            DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = C_UNIT_PREV + C_DELTA_UNIT

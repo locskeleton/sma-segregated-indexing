@@ -77,8 +77,8 @@ SELECT C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, @d, 'INITIAL', @nTick*@qty*@pri
 
 /*--- [BRD] seed T_SI_ASSET_DAILY (Asset gửi số tổng per-SI): stock = nTick×qty×price, cash 0, fee 0,
       cash_in = INITIAL (khớp cashflow SDI → reconcile sạch). SP_EOD_COMPUTE derive từ đây (KHÔNG MTM). ---*/
-INSERT INTO T_SI_ASSET_DAILY (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_STOCK_VALUE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_FEE_ACCUM,C_CASH_IN,C_CASH_OUT)
-SELECT @d, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, @nTick*@qty*@price, @nTick*@qty*@price, 0,0,0,0, @nTick*@qty*@price, 0 FROM T_SI_PORTFOLIO;  -- nav=stock (cash0,fee0)
+INSERT INTO T_SI_ASSET_DAILY (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_STOCK_VALUE,C_CASH,C_FEE_ACCUM,C_CASH_IN,C_CASH_OUT)
+SELECT @d, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, @nTick*@qty*@price, @nTick*@qty*@price, 0, 0, @nTick*@qty*@price, 0 FROM T_SI_PORTFOLIO;  -- nav=stock (cash 0, fee 0)
 
 DROP TABLE #cust, #tk;
 

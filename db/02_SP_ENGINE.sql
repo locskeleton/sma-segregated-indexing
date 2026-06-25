@@ -280,10 +280,10 @@ BEGIN
     --   định giá units nạp/rút; init UP=10.000). C_PAYABLE_FEE = lũy kế phải trả (cho AUM_gross=NAV+nó). C_PREV_DATE/C_FEE_CUT không dùng.
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
     INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-        C_NAV,C_STOCK_VALUE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_PAYABLE_FEE,C_PREV_DATE,C_FEE_CUT,
+        C_NAV,C_STOCK_VALUE,C_CASH,C_PAYABLE_FEE,C_PREV_DATE,C_FEE_CUT,
         C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
     SELECT @p_d, a.C_SI_ACCOUNT, a.C_CUST_CODE, a.C_MASTER_CODE,
-           a.C_NAV, a.C_STOCK_VALUE, a.C_CASH, a.C_PENDING_CASH, a.C_DIV_CASH, a.C_FEE_ACCUM, @prev, 0,
+           a.C_NAV, a.C_STOCK_VALUE, a.C_CASH, a.C_FEE_ACCUM, @prev, 0,   -- cash = TỔNG tiền (1 số); work pending/div mặc định 0
            ISNULL(pb.C_NAV, 0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT, 0)
     FROM T_SI_ASSET_DAILY a
     INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND p.C_STATUS='ACTIVE'
@@ -312,7 +312,7 @@ GO
   SDI KHÔNG tự định giá/trừ: NAV RÒNG + components (stock/cash/pending/div) + phí lũy kế phải trả + cash_in/out
   đều từ Asset. SDI chỉ derive unit/UP/PnL/return ở SP_EOD_COMPUTE (seed NAV + cashflow). Idempotent
   (DELETE+INSERT theo date,si → re-ingest sửa quá khứ). Validate: si registry + nav/stock/cash NOT NULL.
-  JSON: [{"si_account","nav","stock_value","cash","pending_cash","div_cash","fee_accum","cash_in","cash_out"}, ...]
+  JSON: [{"si_account","nav","stock_value","cash"(TỔNG tiền 1 số),"fee_accum","cash_in","cash_out"}, ...]
   err: 0 OK · 20 JSON sai · 21 validate FAIL · -1 runtime.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_ASSET_NAV
@@ -330,15 +330,13 @@ BEGIN
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
 
         DECLARE @src TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_NAV DECIMAL(20,0), C_STOCK_VALUE DECIMAL(20,0),
-                            C_CASH DECIMAL(20,0), C_PENDING_CASH DECIMAL(20,0), C_DIV_CASH DECIMAL(20,0),
-                            C_FEE_ACCUM DECIMAL(20,6), C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
+                            C_CASH DECIMAL(20,0), C_FEE_ACCUM DECIMAL(20,6), C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
         INSERT @src
-        SELECT j.si_account, j.nav, j.stock_value, j.cash, ISNULL(j.pending_cash,0), ISNULL(j.div_cash,0),
+        SELECT j.si_account, j.nav, j.stock_value, j.cash,
                ISNULL(j.fee_accum,0), ISNULL(j.cash_in,0), ISNULL(j.cash_out,0)
         FROM OPENJSON(@p_json) WITH (
             si_account VARCHAR(20) '$.si_account', nav DECIMAL(20,0) '$.nav', stock_value DECIMAL(20,0) '$.stock_value',
-            cash DECIMAL(20,0) '$.cash', pending_cash DECIMAL(20,0) '$.pending_cash',
-            div_cash DECIMAL(20,0) '$.div_cash', fee_accum DECIMAL(20,6) '$.fee_accum',
+            cash DECIMAL(20,0) '$.cash', fee_accum DECIMAL(20,6) '$.fee_accum',
             cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out') j;
 
         IF EXISTS (SELECT 1 FROM @src WHERE C_SI_ACCOUNT IS NULL OR C_NAV IS NULL OR C_STOCK_VALUE IS NULL OR C_CASH IS NULL)
@@ -350,9 +348,9 @@ BEGIN
         DELETE FROM T_SI_ASSET_DAILY WHERE C_BUSINESS_DATE=@p_business_date
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM @src);   -- idempotent re-ingest (sửa quá khứ = gửi lại)
         INSERT INTO T_SI_ASSET_DAILY (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-            C_NAV,C_STOCK_VALUE,C_CASH,C_PENDING_CASH,C_DIV_CASH,C_FEE_ACCUM,C_CASH_IN,C_CASH_OUT)
+            C_NAV,C_STOCK_VALUE,C_CASH,C_FEE_ACCUM,C_CASH_IN,C_CASH_OUT)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
-               s.C_NAV, s.C_STOCK_VALUE, s.C_CASH, s.C_PENDING_CASH, s.C_DIV_CASH, s.C_FEE_ACCUM, s.C_CASH_IN, s.C_CASH_OUT
+               s.C_NAV, s.C_STOCK_VALUE, s.C_CASH, s.C_FEE_ACCUM, s.C_CASH_IN, s.C_CASH_OUT
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;
         COMMIT;
     END TRY
@@ -698,12 +696,12 @@ BEGIN
     --   components (Asset gửi cả 2) → bắt Asset tự mâu thuẫn nội bộ. Chênh > 1 VND → break.
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
     SELECT @p_d, 'NAV_CONSISTENCY', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
-           a.C_NAV, (a.C_STOCK_VALUE + a.C_CASH + a.C_PENDING_CASH + a.C_DIV_CASH - a.C_FEE_ACCUM),
-           a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH + a.C_PENDING_CASH + a.C_DIV_CASH - a.C_FEE_ACCUM),
-           N'NAV Asset != stock+cash+pending+div − fee (Asset nội bộ lệch)'
+           a.C_NAV, (a.C_STOCK_VALUE + a.C_CASH - a.C_FEE_ACCUM),
+           a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH - a.C_FEE_ACCUM),
+           N'NAV Asset != stock + cash − fee (Asset nội bộ lệch)'
     FROM T_SI_ASSET_DAILY a
     WHERE a.C_BUSINESS_DATE=@p_d
-      AND ABS(a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH + a.C_PENDING_CASH + a.C_DIV_CASH - a.C_FEE_ACCUM)) > 1;
+      AND ABS(a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH - a.C_FEE_ACCUM)) > 1;
 
     -- #dòng break (5 check gộp); 0 = sạch. Tổng cuối (khỏi phụ thuộc @@ROWCOUNT riêng check cuối).
     SET @p_rows = (SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d);

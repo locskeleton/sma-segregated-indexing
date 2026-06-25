@@ -141,7 +141,7 @@ BEGIN
     -- AUM hiện tại + tiền (tầng master — KHÔNG SUM SI)
     DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT;
     SELECT @aumNow = C_AUM, @nKH = C_TOTAL_ACCOUNT,
-           @tienNow = C_CASH + C_PENDING_CASH + C_DIV_CASH
+           @tienNow = C_CASH
     FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@p_master_code;
 
     -- net in/out (base,end] + AUM @base: 1 read T_MASTER_NAV_BALANCE [base,end] (gộp 2 read cũ).
@@ -160,7 +160,7 @@ BEGIN
 
     INSERT #kh (si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
     SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE, nc.C_LAST_UNIT_PRICE,
-           nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
+           nc.C_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
 
@@ -580,7 +580,7 @@ BEGIN
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
     INSERT #kh (m, si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
     SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
-           nc.C_LAST_UNIT_PRICE, nc.C_CASH + nc.C_PENDING_CASH + nc.C_DIV_CASH, 0,0,0, 0,0,0
+           nc.C_LAST_UNIT_PRICE, nc.C_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     INNER JOIN #md d ON d.m=nc.C_MASTER_CODE
     WHERE nc.C_STATUS='ACTIVE';
@@ -616,7 +616,7 @@ BEGIN
     UPDATE r SET rmaster = CASE WHEN d.idxBase IS NULL OR d.idxBase=0 THEN NULL ELSE d.idxEnd/d.idxBase-1 END,
                  cdThr = ISNULL(cfg.C_CASH_DRAG_THRESHOLD, @cdThrDefault),
                  cashdrag = CASE WHEN mc.C_AUM=0 THEN NULL
-                                 ELSE (mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/mc.C_AUM END
+                                 ELSE (mc.C_CASH)*1.0/mc.C_AUM END
     FROM #mr r
     INNER JOIN #md d ON d.m=r.m
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
@@ -636,7 +636,7 @@ BEGIN
             CAST(SUM(x.cin) AS DECIMAL(38,0))  AS C_NET_IN,
             CAST(SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_OUT,
             CAST(SUM(x.cin)-SUM(x.cout) AS DECIMAL(38,0)) AS C_NET_FLOW,
-            CAST(SUM(mc.C_CASH+mc.C_PENDING_CASH+mc.C_DIV_CASH)*1.0/NULLIF(SUM(mc.C_AUM),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
+            CAST(SUM(mc.C_CASH)*1.0/NULLIF(SUM(mc.C_AUM),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
             SUM(CASE WHEN r.cashdrag > r.cdThr THEN 1 ELSE 0 END) AS C_CNT_MASTER_CASH_OVER
     FROM #md d
     INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m

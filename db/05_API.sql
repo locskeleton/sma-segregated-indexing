@@ -381,9 +381,9 @@ BEGIN
             CONVERT(VARCHAR(10),@p_asof,23), N' (ngày nghỉ/tương lai/trước khi mở/sau khi đóng TK).');
         RAISERROR(@p_err_msg, 16, 1); END
 
-    -- [BRD] Thành phần tài sản số TỔNG từ Asset (T_SI_ASSET_DAILY @asof) — SDI KHÔNG tự định giá.
-    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0), @pending DECIMAL(20,0), @div DECIMAL(20,0), @fee DECIMAL(20,6);
-    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH, @pending=C_PENDING_CASH, @div=C_DIV_CASH, @fee=C_FEE_ACCUM
+    -- [BRD] Thành phần tài sản số TỔNG từ Asset (T_SI_ASSET_DAILY @asof) — SDI KHÔNG tự định giá. cash = TỔNG tiền (1 số).
+    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0), @fee DECIMAL(20,6);
+    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH, @fee=C_FEE_ACCUM
     FROM T_SI_ASSET_DAILY WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
 
     -- Holdings chi tiết per-mã (FO holdings reconstruct @asof × giá ≤ asof) cho RS2. ⚠️ Σ(FO×giá) CÓ THỂ lệch
@@ -403,11 +403,9 @@ BEGIN
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
             nd.C_NAV, nd.C_UNIT, nd.C_UNIT_PRICE,
-            ISNULL(@cash,0)        AS C_CASH,
+            ISNULL(@cash,0)        AS C_CASH,        -- TỔNG tiền (1 số)
             ISNULL(@stock,0)       AS C_STOCK_VALUE,
-            ISNULL(@pending,0)     AS C_PENDING_CASH,
-            ISNULL(@div,0)         AS C_DIV_CASH,
-            ISNULL(@stock,0)+ISNULL(@cash,0)+ISNULL(@pending,0)+ISNULL(@div,0) AS C_AUM,  -- AUM gross
+            ISNULL(@stock,0)+ISNULL(@cash,0) AS C_AUM,  -- AUM gross = stock + tổng tiền
             ISNULL(@fee,0)         AS C_FEE_ACCRUED_TOTAL    -- phí QL lũy kế (Asset) — đã trừ khỏi NAV
     FROM (SELECT 1 x) z
     LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof;
