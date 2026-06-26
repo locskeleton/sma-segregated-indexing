@@ -4,6 +4,8 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 
 > Liên quan: [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md), [SDI-db-architecture.md](./SDI-db-architecture.md). Đo perf thực: `db/bench.ps1`.
 
+> **⚠️ THIN-LAYER (2026-06-26):** `T_SI_BALANCE` nay lưu **`aum` + `daily_return`** (Asset gửi), KHÔNG còn `unit/unit_price/PnL`. **Đã GỠ bảng:** `T_SI_UNIT_LEDGER`, `T_SI_CASH_HIST`, `T_SI_INCOME_FEE`, `T_FEE_CONFIG`. **Thêm:** `T_SI_ASSET_DAILY` (raw feed Asset). Dự phóng driver chính (`T_SI_BALANCE` dense/ngày) KHÔNG đổi — chỉ tên cột.
+
 > **Cập nhật quan trọng (spec interval):** Holdings & cash history nay **BẮT BUỘC lưu FULL history** (rule compliance) — nhưng lưu theo **KHOẢNG (interval / SCD-2)** trong `T_SI_HOLDING_HIST` & `T_SI_CASH_HIST`: `valid_from..valid_to`, holding bất biến N năm = **1 dòng**. Interval maintain bằng **DIFF** current vs dòng open **TẠI INGEST (per-event Kafka)** — KHÔNG còn job EOD. Vì danh mục index ít biến động → history **không phình theo ngày** mà chỉ **theo số lần thay đổi (churn Δ)**. Snapshot dated cũ (mỗi EOD +H₀ dòng) đã bị loại bỏ hoàn toàn.
 
 ---
@@ -12,10 +14,11 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 
 | Loại | Bảng | Cơ chế | Tăng theo |
 |---|---|---|---|
-| 🔴 **GROW không chặn (dense/ngày)** | `T_SI_BALANCE` | +1 dòng/tiểu khoản/EOD (history NAV/unit) | **ngày × KH** ← driver chính (cho FR-03) |
-| 🟠 **GROW theo CHURN (interval, full history)** | `T_SI_HOLDING_HIST`, `T_SI_CASH_HIST` | base H₀/S₀ + **1 dòng mỗi lần đổi** (DIFF tại ingest) | **số lần thay đổi** (rebalance/nạp-rút), KHÔNG theo ngày |
+| 🔴 **GROW không chặn (dense/ngày)** | `T_SI_BALANCE` | +1 dòng/tiểu khoản/EOD (**[thin-layer]** history `aum`/`daily_return`) | **ngày × KH** ← driver chính (cho FR-03) |
+| 🟠 **GROW theo CHURN (interval, full history)** | `T_SI_HOLDING_HIST` *([thin-layer] `T_SI_CASH_HIST` đã gỡ)* | base H₀ + **1 dòng mỗi lần đổi** (DIFF tại ingest) | **số lần thay đổi** (rebalance), KHÔNG theo ngày |
+| 🟠 **DENSE (raw feed Asset)** | `T_SI_ASSET_DAILY` **[thin-layer]** | +1 dòng/tiểu khoản/ngày GD (raw `aum`/`daily_return`) | ngày × KH (nguồn re-ingest) |
 | 🟠 (nhỏ, không chặn) | `T_MASTER_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_HOLDING_BALANCE` | +master(×mã)/EOD | ngày × master |
-| 🟠 (sparse) | `T_SI_CASHFLOW_EVENT`, `T_SI_INCOME_FEE`, `T_SI_UNIT_LEDGER` | theo sự kiện | tần suất nạp/rút/cổ tức |
+| 🟠 (sparse) | `T_SI_CASHFLOW_EVENT` *([thin-layer] `T_SI_INCOME_FEE`/`T_SI_UNIT_LEDGER` đã gỡ)* | theo sự kiện | tần suất nạp/rút |
 | 🟢 **FIXED (overwrite)** | `T_SI_PORTFOLIO_HOLDING` (current, đích FO ingest) | overwrite/ingest | chỉ theo KH |
 | 🟢 | `T_SI_CURRENT`, `T_MASTER_CURRENT` | overwrite/config | chỉ theo KH |
 | ⚪ transient | `T_EOD_WORK` | xoá/ghi mỗi run | 1 ngày |
@@ -44,7 +47,7 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 
 ## 3. Driver #1: `T_SI_BALANCE` — số bản ghi tích luỹ (triệu dòng)
 
-> rows/ngày = S₀ (tiểu khoản). Dense, không né được (FO snapshot ⇒ không event-source ⇒ phải materialize NAV/unit cho chart).
+> rows/ngày = S₀ (tiểu khoản). Dense, không né được (**[thin-layer]** Asset gửi `aum`/`daily_return` snapshot per-ngày ⇒ phải materialize cho chart FR-03).
 
 | Kịch bản | Kỳ | flat | đều (+50%/y) | nóng (×4/y) |
 |---|---|---:|---:|---:|
@@ -106,7 +109,7 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 ## 7. Kết luận & khuyến nghị
 1. **Interval thắng cả hai mục tiêu:** giữ **full history BẮT BUỘC** (compliance) NHƯNG loại bỏ trùng lặp — holding bất biến = 1 dòng. Tăng trưởng đổi từ "theo ngày" (snapshot) sang "theo churn", giảm ~98% khối holdings history.
 2. **Hai khối tăng trưởng dài hạn:** (a) `T_SI_BALANCE` (dense ngày×KH, ~2,5 tỷ/10y — lớn nhất); (b) `T_SI_HOLDING_HIST` (interval churn-driven, ~1 tỷ/10y churn-4). Cash hist nhỏ.
-3. **Bắt buộc với cả hai:** CCI + partition theo năm (`business_date` cho nav_balance; `valid_from` cho hist); cân nhắc **điểm thưa** nav_balance (unit_price tuần/tháng cho chart range dài).
+3. **Bắt buộc với cả hai:** CCI + partition theo năm (`business_date` cho nav_balance; `valid_from` cho hist); cân nhắc **điểm thưa** nav_balance (**[thin-layer]** `daily_return`+`aum` tuần/tháng cho chart range dài).
 4. **Churn là tham số nhạy nhất của hist:** index SMA tái cân bằng quý ⇒ churn ~4/y là thực tế; nếu sản phẩm cho phép giao dịch chủ động nhiều thì churn tăng tuyến tính số dòng. Theo dõi churn thật để hiệu chỉnh.
 5. **Interval DIFF đã CHUYỂN khỏi EOD → INGEST:** trước đây maintain interval là job EOD `J14b` (đo medium 1,25M SQL Express commit 216fea7: ~10–15s, từng là job nặng nhất EOD, hơn cả J07 MTM ~4–8s). Nay DIFF chạy **per-event tại ingest (Kafka)** → EOD core chỉ còn MTM/agg/index/reconcile/snapshot, nhẹ hẳn. Bản chất chi phí DIFF không đổi: quét **2×H₀ (current ⋈ open-rows) mỗi lần ingest** dù 0 thay đổi → chi phí theo **số event**, không theo ngày; storage vẫn **0 dòng ghi** khi không đổi. *Tối ưu tiềm năng (chưa làm):* checksum per (cust,si_account) / filter theo nhóm FO báo đổi để bỏ qua nhóm bất biến. Đo bằng `db/bench.ps1`.
 

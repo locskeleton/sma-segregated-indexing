@@ -23,21 +23,21 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 
 | Đại lượng | Công thức | Nguồn |
 |---|---|---|
-| **AUM** (1 master) | `Σ total_asset` các tiểu khoản ACTIVE = `Σ (stock + tiền mặt + tiền bán chờ về + cổ tức tiền)` | `T_MASTER_CURRENT.C_TOTAL_ASSET` (current) / `T_MASTER_BALANCE` (daily) |
+| **AUM** (1 master) | `Σ aum` các tiểu khoản ACTIVE (= Σ NAV ròng Asset gửi) | `T_MASTER_CURRENT.C_AUM` (current) / `T_MASTER_BALANCE` (daily) |
 | **Tăng trưởng AUM** | `AUM hiện tại − AUM đầu kỳ` ; `% = (AUM_now / AUM_đầu kỳ − 1)×100` | master daily theo range |
 | **Net in/out** | `NET_IN = Σ cash_in`, `NET_OUT = Σ cash_out`, `NET = IN − OUT` trong kỳ | `Σ T_MASTER_BALANCE.C_CASH_IN/C_CASH_OUT` |
-| **Cash drag** | `Σ Tiền / Σ AUM × 100%` (Tiền = cash + pending + div) | master current/daily |
+| **Cash drag** | `Σ Tiền / Σ AUM × 100%` (Tiền = `cash` tổng Asset gửi) | master current/daily |
 | **#KH (DM KH)** | `C_TOTAL_ACCOUNT` (tiểu khoản ACTIVE) | master current |
 | **Hiệu suất master (model)** | `Master Index` PR: `Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref` (CA: P_ref điều chỉnh) | `T_MASTER_INDEX_DAILY` |
-| **Hiệu suất DM tổng KH** | **AUM-weighted (end-weight)**: `Σ Wᵢ·PnLᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `PnLᵢ = UP_i(cuối)/UP_i(mốc) − 1` (TWR). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** — KH nạp định kỳ hằng tháng → tỷ số AUM bị nhiễm dòng tiền, sai hiệu suất. | per-KH `T_SI_BALANCE.C_UNIT_PRICE` 2 mốc + AUM cuối (current) |
+| **Hiệu suất DM tổng KH** | **[thin-layer] AUM-weighted (end-weight)**: `Σ Wᵢ·Rᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `Rᵢ = ∏(1+daily_returnₜ)−1 = EXP(Σ ln(1+r))−1` (compound `daily_return` Asset gửi). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** — KH nạp định kỳ → tỷ số AUM bị nhiễm dòng tiền. | per-KH `T_SI_BALANCE.C_DAILY_RETURN` (quét base..end) + `C_LAST_AUM` cuối (current) |
 | **Deviation (per dev)** | `(AUM-weighted Return KH − Return Master) × 10000` (BPS) | như trên + index |
-| **Tracking Error (TE)** | per-KH `TE_i = STDEV(dᵢ,t) × √X`, `dᵢ,t = R_KH,i,t − R_master,t` (active return ngày t); `X = số ngày GD kỳ (cap 252)`. Master: `Σ(TE_i × AUM_i)/Σ AUM_i` (AUM-weighted) | `T_SI_BALANCE.C_DAILY_RETURN` (KH) − `T_MASTER_INDEX_DAILY.C_DAILY_RETURN` (master), STDEV on-read |
-| **%PnL per-KH** | `UP_i(cuối kỳ)/UP_i(mốc) − 1` (TWR, miễn nhiễm dòng tiền) | `T_SI_BALANCE.C_UNIT_PRICE` |
+| **Tracking Error (TE)** | per-KH `TE_i = STDEV(dᵢ,t) × √X`, `dᵢ,t = R_KH,i,t − R_master,t` (active return ngày t); `X = số ngày GD kỳ (cap 252)`. Master: `Σ(TE_i × AUM_i)/Σ AUM_i` (AUM-weighted) | `T_SI_BALANCE.C_DAILY_RETURN` (KH, Asset gửi) − `T_MASTER_INDEX_DAILY.C_DAILY_RETURN` (master), STDEV on-read |
+| **%PnL per-KH** | **[thin-layer]** `∏(1+daily_returnₜ)−1 = EXP(Σ ln(1+r))−1` (compound `daily_return`, miễn nhiễm dòng tiền) | `T_SI_BALANCE.C_DAILY_RETURN` |
 | **VN-Index** | `(điểm cuối/điểm mốc − 1)×100` | `T_BENCHMARK_DAILY` |
 
 **Ngày mốc (đầu kỳ)** theo filter `1D/1W/MTD/1M/QTD/3T/6T/YTD/INCEP` — dùng `UDF_RANGE_CUTOFF` (đã có ở 05_API). KH/master tham gia sau mốc → mốc = ngày tham gia.
 
-⚠️ **TR vs PR**: R_KH là TWR (ăn cổ tức), Master Index là PR → active return có drift cổ tức; TE đo độ biến động (stdev) nên ít méo — chấp nhận theo BRD.
+⚠️ **TR vs PR**: R_KH là TWR (compound `daily_return` Asset gửi, ăn cổ tức), Master Index là PR → active return có drift cổ tức; TE đo độ biến động (stdev) nên ít méo — chấp nhận theo BRD.
 
 ---
 
@@ -105,7 +105,7 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
   - **`C_DRIFT_THRESHOLD` / `C_SYMBOL_WEIGHT_ALERT` / `C_INDUSTRY_WEIGHT_ALERT`** (ratio, vd 0.15=15%): NULL=chưa cấu hình ⇒ alert type TẮT (không default). **Consumer = `SP_GET_MASTER_ALERTS`** (đã build): drift/symbol so actual vs target weight; industry Σ theo `T_TICKER_INDUSTRY`.
 - **`T_TICKER_INDUSTRY`** (dimension mã→ngành: `C_TICKER` PK, `C_INDUSTRY_CODE`, `C_INDUSTRY_NAME`) — cho industryWeight alert. **Seed hiện ở smoke; nguồn nạp THẬT (FO/market data) = task data-ops chưa làm.**
 - **3 cột TE prefix-sum trên `T_SI_BALANCE`** (`accum_active_ret`, `accum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
-- **Cách serve-layer tiêu thụ** (đọc 2 lát base/end, không quét): TE range = HIỆU 2 mốc `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). Return/deviation = `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000). ⇒ US1 ~48s→~1s, **end-weight GIỮ NGUYÊN**.
+- **Cách serve-layer tiêu thụ:** **TE range** = đọc 2 lát base/end (HIỆU prefix-sum) `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). **[thin-layer] Return/deviation** = **compound** `daily_return` qua (base,end] (`EXP(Σ ln(1+r))−1`, quét lát NAV_BALANCE [base,end]) + `C_LAST_AUM` cuối (current) cho weight. *(Trước: 2-lát `UPᵢ,end/UPᵢ,base` — bỏ vì không còn unit price.)* end-weight GIỮ NGUYÊN.
 
 ---
 
@@ -124,7 +124,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 ---
 
 ## 7. Quyết định đã chốt (tham chiếu)
-- "DM tổng KH" = **AUM-weighted end-weight** (`ΣWᵢPnLᵢ`), per-KH `PnLᵢ = UP_cuối/UP_mốc − 1` (TWR qua unit price). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** (công thức return đơn giản kiểu "ending/beginning − 1"): KH nạp định kỳ hằng tháng nên tỷ số AUM bị nhiễm dòng tiền (nạp vào làm AUM tăng nhưng không phải lãi); unit price khử dòng tiền nên mới đo đúng hiệu suất đầu tư. Cũng KHÔNG dùng pooled `master unit_price` (begin-weight, khác). *Nếu BRD bản gốc viết literal `AUM_cuối/AUM_đầu − 1` thì đây là sai lệch CỐ Ý vì lý do trên — cần owner BRD ký.*
+- "DM tổng KH" = **AUM-weighted end-weight** (`ΣWᵢRᵢ`), **[thin-layer]** per-KH `Rᵢ = ∏(1+daily_returnₜ)−1 = EXP(Σ ln(1+r))−1` (compound `daily_return` Asset gửi = TWR). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** (kiểu "ending/beginning − 1"): KH nạp định kỳ hằng tháng nên tỷ số AUM bị nhiễm dòng tiền (nạp vào làm AUM tăng nhưng không phải lãi); `daily_return` Asset gửi đã khử dòng tiền nên compound mới đo đúng hiệu suất. *(Trước: `UP_cuối/UP_mốc − 1` qua unit price + pooled master unit_price — đã GỠ cùng unit.)*
 - TE = on-read (join 2 chuỗi return có sẵn, STDEV × √X); scale nhỏ → không materialize.
 - Snapshot realtime-on-query, hiệu suất T-1.
 - Ngưỡng per-master (`T_MASTER_PM_CONFIG`).
@@ -133,7 +133,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 ## 8. Quyết định (đã chốt khi duyệt — trước open)
 - **TE alert threshold RIÊNG** (`C_TE_ALERT_THRESHOLD`, không = badge_high). ✅
 - **Default ngưỡng hệ thống**: TE badge low=0.02/high=0.05; TE alert=0.05; cash drag Y=0.05 (UDF_PM_CONFIG, fallback khi cột NULL). **Deviation A=+100 / B=−100 BPS = default tại tham số SP** (US2/DEVIATION_DIST), KHÔNG qua config — caller truyền override. ✅
-- **"DM tổng KH" = end-weight cố định** (`Wᵢ=AUMᵢ,end/ΣAUM`); chuỗi US3: `value_t = Σ Wᵢ·(UPᵢ,t/UPᵢ,base) / Σ Wᵢ(present)` (equi-join sample-date set-based — KHÔNG OUTER APPLY per-KH; renormalize Σweight present → KH join/đóng giữa kỳ không méo), base=1.0. ✅
+- **"DM tổng KH" = end-weight cố định** (`Wᵢ=AUMᵢ,end/ΣAUM`). **[thin-layer] chuỗi US3 composite** = **compound master AUM-weighted daily return**: `kc(d) = ∏(1+master_daily_returnₜ)` qua (base,d], base=1.0 (`master_daily_return` engine đã ghi = `Σ(AUMᵢ·rᵢ)/ΣAUMᵢ`). 1 read `T_MASTER_BALANCE [base,end]` → running-compound set-based, App rebase 0%. *(Trước: per-KW `Σ Wᵢ·UPᵢ,t/UPᵢ,base` — bỏ vì không còn unit price; master daily return đã AUM-weighted nên không cần per-KW.)* ✅
 - **Resolution US3**: NULL=auto (kỳ >90 ngày→tháng, >21→tuần, còn lại→ngày); chọn phiên cuối mỗi bucket + luôn gồm base/end. ✅
 
 ## 9. P5 — đo perf scale thật (50k KH, 10 master, 250 phiên = 12.5M dòng NAV_BALANCE; warm, SQLEXPRESS)
@@ -157,7 +157,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 | US4 PNL_DIST | ~2.4 s | 48 ms | |
 | US5 TOP_KH | ~2.3 s | 16 ms | |
 
-**Cách fix** (end-weight nguyên vẹn): (1) **Return** — bỏ subquery GROUP-BY quét lịch sử, đọc thẳng lát `@base` + current (return chỉ cần `UPᵢ,base`/`UPᵢ,end`, KHÔNG cần precompute). (2) **TE** — prefix-sum 3 cột lũy kế trên `T_SI_BALANCE` (EOD J12B), query đọc HIỆU 2 mốc base/end. Cả 2 đọc 2 lát ngày (dùng `IX_SI_NAV_BALANCE_MASTER`) thay vì quét toàn bộ. Verify số khớp 100% bản STDEV trực tiếp (smoke). EOD J12B ~676ms/phiên @50k account (bench medium), J07 không regression.
+**Cách fix** (end-weight nguyên vẹn): (1) **Return** — đọc thẳng `C_LAST_AUM` cuối (current) cho weight; **[thin-layer]** return per-KH = compound `daily_return` qua (base,end] (`EXP(Σ ln(1+r))−1`, quét lát NAV_BALANCE [base,end] dùng `IX_SI_NAV_BALANCE_MASTER`). *(Số P5/P6 đo trên bản trước dùng `UPᵢ,base/UPᵢ,end` 2-lát — đã đổi sang compound; cùng độ phức tạp đọc.)* (2) **TE** — prefix-sum 3 cột lũy kế trên `T_SI_BALANCE` (EOD J12B), query đọc HIỆU 2 mốc base/end. Verify số khớp 100% bản STDEV trực tiếp (smoke). EOD J12B ~676ms/phiên @50k account (bench medium).
 - Lưu ý: TE annualize bằng `√(n per-KH)` (n = số ngày active trong range của từng KH) — KH join giữa kỳ scale theo cửa sổ thực của họ (chính xác hơn dùng X master đồng nhất).
 
 ## 11. Còn mở

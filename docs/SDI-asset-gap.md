@@ -6,6 +6,7 @@
 > Tài liệu này = **đối chiếu nhanh: ai cấp gì + điểm cần reconcile** giữa 2 hệ.
 >
 > **Cập nhật quan trọng (chốt 2026-06-26):**
+> - **[THIN-LAYER] Asset GỬI CẢ `daily_return` (TWR) về SDI** (cùng `aum`/`cash`/`cash_in/out`). SDI **KHÔNG tự tính** unit/UP/PnL/TWR — chỉ LƯU + SERVE (compound `daily_return`). ⇒ R3 (TWR methodology 2 hệ phải khớp) **GỠ**: không còn 2 hệ derive độc lập. Asset KHÔNG gửi `stock_value`.
 > - **BO KHÔNG tính/gửi phí QL lũy kế (accrued).** Asset chạy model **REALIZED**: phí QL chỉ giảm tài sản khi BO **cắt THẬT** (qua cash). ⇒ **AUM = NAV (gross = net, không tách payable)**; SDI cũng đã **GỠ accrual** (cột `C_PAYABLE_FEE` + `C_FEE_ACCUM` + J06 + `T_FEE_CONFIG` + `SP_INGEST_FEE_CHARGE`) để khớp Asset. Xem [[aum-weighted-return-twr-decision]].
 > - **Index snapshot: SDI VẪN đẩy riêng** (khi nhận tín hiệu price-ready từ BO) → Asset có master index. Producer
 >   `SP_GET_ASSET_INDEX_SNAPSHOT` (db/05_API.sql) **GIỮ**.
@@ -34,7 +35,7 @@
 | **NAV = Tài sản** (phí QL đã trừ khi BO cắt thật; KHÔNG có accrued payable) ⇒ AUM = NAV | FO + Market |
 | **Master Index (danh mục mẫu)** | **SDI đẩy riêng** (price-ready) |
 | Benchmark | Market |
-| **Unit/UnitPrice/TWR/return/PnL** | Asset TỰ TÍNH từ NAV series + cashflow (FO) |
+| **`daily_return` (TWR per-KH/ngày)** | **[thin-layer]** Asset TỰ TÍNH (khử dòng tiền) rồi **GỬI về SDI** — SDI LƯU, không derive |
 
 ---
 
@@ -46,7 +47,7 @@
 |---|---|---|---|
 | ~~R1~~ | ~~Payable (phí QL accrued)~~ — **ĐÃ GỠ** | Không còn: BO không accrue, SDI không accrue, Asset NAV = realized ⇒ KHÔNG có payable 2 bên để lệch. AUM = NAV. [[aum-weighted-return-twr-decision]] | — (gỡ) |
 | **R2** | **Master Index** | SDI đẩy → cùng nguồn, nhưng nếu Asset cache/replay sai mode | dùng đúng `SP_GET_ASSET_INDEX_SNAPSHOT` payload (index PR + benchmark) |
-| **R3** | **Unit/TWR/return** — Asset tự tính vs SDI | Methodology phải khớp: `T0=10.000`, `ΔUnit=CF_net/UP_prev`, `UP=NAV/Unit`, return=`UP_t/UP_{t-1}−1`, PnL=`NAV−NAV_prev+CF_out−CF_in`. [[master-index-methodology]] cho index | seed + công thức TWR phải khớp SDI; NAV ròng (R1) khớp trước |
+| ~~R3~~ | ~~**Unit/TWR/return** — Asset tự tính vs SDI~~ **[thin-layer] GỠ điểm lệch** | **Asset GỬI `daily_return` (TWR) thẳng cho SDI** ⇒ KHÔNG còn 2 hệ tự tính TWR độc lập (trước: cả Asset & SDI đều derive `UP=NAV/Unit; return=UP_t/UP_{t-1}−1` → phải khớp methodology). SDI chỉ compound `daily_return` Asset gửi. Còn lại = `CASHFLOW_MISMATCH` (cash_in/out SDI vs Asset). | cashflow 2 nguồn khớp ⇒ `daily_return` & flow cùng cơ sở |
 
 ---
 
@@ -58,8 +59,8 @@
 | ~~Payable (phí QL accrued)~~ | — | **ĐÃ GỠ** — BO không accrue; phí chỉ realized khi cắt thật |
 | NAV (= AUM) | ✅ | tài sản (stock + cash); phí QL đã trừ khi cắt thật, KHÔNG tách payable |
 | Master index | ✅ | **SDI đẩy riêng** (price-ready) |
-| Unit/TWR/return/PnL | ✅ data | Asset tự tính (reconcile R3 methodology) |
+| `daily_return` (TWR)/PnL | ✅ | **[thin-layer]** Asset tự tính + **GỬI về SDI** (SDI không derive) |
 
-**Kết luận:** BO/FO/Market cấp đủ data → **Asset tự tính** NAV (= AUM, model realized không accrue) + perf. SDI chỉ còn 1 luồng sang Asset = **index snapshot**. Khi reconcile, soi **R3 (TWR methodology)** — chỗ dễ lệch nhất (R1 payable đã gỡ vì 2 hệ đều không accrue).
+**Kết luận:** BO/FO/Market cấp đủ data → **Asset tự tính** NAV (= AUM, model realized không accrue) + `daily_return` (TWR) rồi **gửi cả về SDI** (thin-layer). SDI chỉ còn 1 luồng sang Asset = **index snapshot**. Khi reconcile, soi **CASHFLOW_MISMATCH** (cash_in/out 2 nguồn) — *(R3 TWR-methodology đã GỠ: Asset gửi `daily_return`, SDI không tự derive; R1 payable đã gỡ — 2 hệ không accrue).*
 
 Liên quan: [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md), [SDI-spec.md](./SDI-spec.md), memory [[aum-weighted-return-twr-decision]] · [[master-index-methodology]] · [[sdi-asset-sync-architecture]].

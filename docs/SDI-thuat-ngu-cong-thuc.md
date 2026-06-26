@@ -2,7 +2,7 @@
 
 Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) và công thức tính toán dùng trong module SDI (Asset & Performance Engine). Mục tiêu: một nơi tra cứu duy nhất, giải thích dễ hiểu kèm ví dụ.
 
-> **⚠️ THIN-LAYER (2026-06-26):** SDI KHÔNG tự tính hiệu suất — Asset gửi **AUM + daily_return (TWR)**. Đã GỠ unit/unit_price/PnL-tiền/TWR-do-SDI. %PnL kỳ = compound `∏(1+daily_return)−1`. Các mục §5–§7 nói về `unit`/`unit_price`/`NAV=NAV/Unit`/TWR-tính-từ-UP là **LỊCH SỬ** (đang cập nhật). Bảng đổi tên: `T_SI_BALANCE`/`T_SI_CURRENT`/`T_MASTER_BALANCE`/`T_MASTER_CURRENT`; `C_NAV`→`C_AUM`.
+> **⚠️ THIN-LAYER (2026-06-26):** SDI KHÔNG tự tính hiệu suất — Asset gửi per-KH/ngày **`aum` (= NAV ròng) + `daily_return` (TWR, Asset đã khử dòng tiền)** + `cash` + `cash_in/out`. SDI chỉ **LƯU + SERVE**. Đã GỠ: `unit`/`unit_price`(NAVPS)/PnL-tiền-ngày/`T_SI_UNIT_LEDGER`/MWR/master pooled unit price/`stock_value`. %PnL kỳ = compound `∏(1+daily_return)−1 = EXP(Σ ln(1+r))−1`. GIỮ NGUYÊN: Tracking Error, Deviation, Master Index, Benchmark, Cash drag, AUM growth. Các mục §3/§7 đánh dấu **"[thin-layer] ĐÃ GỠ"** = lịch sử (giữ để truy nguồn). Bảng đổi tên: `T_SI_BALANCE`/`T_SI_CURRENT`/`T_MASTER_BALANCE`/`T_MASTER_CURRENT`; `C_NAV`→`C_AUM`.
 
 > Bổ trợ: [SDI-spec.md](./SDI-spec.md) (đặc tả chi tiết + job EOD), [SDI-db-architecture.md](./SDI-db-architecture.md) (kiến trúc DB), [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md) (luồng dữ liệu), [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) (dashboard PM). Khi lệch, **doc đặc tả gốc là chuẩn**; tài liệu này chỉ tổng hợp.
 
@@ -33,10 +33,9 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Tiền bán chờ về | Pending settlement cash | `C_PENDING_CASH` | Tiền bán cổ phiếu chưa về tài khoản (chu kỳ T+2, tổng T0+T1+T2). Là **khoản phải thu (receivable)** — vẫn tính vào tài sản → NAV không hụt giả khi bán. | spec §3 |
 | Cổ tức tiền chờ về | Dividend receivable | `C_DIV_CASH` | Tiền cổ tức đã chia nhưng chưa về. Receivable. | spec §3 |
 | Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). | spec §3 |
-| Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. | spec §3 ; eod (J07) |
-| Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). | spec §3 ; pm §2 |
-| Phí phải trả (ĐÃ GỠ) | Payable (accrued) fee | ~~`C_PAYABLE_FEE`~~ | [BRD asset-sync] **ĐÃ GỠ** — SDI không accrue phí; Asset gửi NAV ròng (đã trừ phí QL sẵn). | — |
-| NAV ròng | Net Asset Value | `C_AUM` | NAV do **Asset gửi trực tiếp** (đã trừ phí QL). `= Tổng tài sản (stock + tiền)`. Giá trị thực thuộc nhà đầu tư. | spec §3 |
+| ~~Giá trị cổ phiếu~~ **[thin-layer] ĐÃ GỠ** | ~~Stock value (MTM)~~ | ~~`C_STOCK_VALUE`~~ | **ĐÃ GỠ khỏi feed Asset** — thin-layer Asset gửi `aum` (NAV ròng) + `cash` (tổng) + `daily_return`, KHÔNG gửi `stock_value`. Composition per-mã vẫn có từ FO holdings (`T_MASTER_HOLDING_BALANCE`), nhưng định giá tổng cổ phiếu không còn là trường feed riêng. | — |
+| AUM (= NAV ròng) | AUM / Net Asset Value | `C_AUM`, `C_LAST_AUM` | **[thin-layer] Asset gửi trực tiếp** (NAV ròng per-KH, đã trừ phí QL). SDI lưu, KHÔNG tự cộng từ stock+cash. Ở cấp master = Σ AUM tiểu khoản (Assets Under Management). | spec §3 ; eod (4) |
+| ~~Phí phải trả~~ **[thin-layer] ĐÃ GỠ** | ~~Payable (accrued) fee~~ | ~~`C_PAYABLE_FEE`~~ | **ĐÃ GỠ** — SDI không accrue phí; Asset gửi NAV ròng (đã trừ phí QL sẵn). | — |
 | AUM = NAV | — | — | Phí QL đã trừ trong NAV Asset gửi ⇒ **AUM (gross) = NAV (net)**, KHÔNG tách payable. | spec §3 |
 | Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. | spec §8 |
 | Giá vốn bình quân | Average cost | `C_AVG_COST` | Tham chiếu lãi/lỗ; **KHÔNG** vào NAV (NAV theo giá thị trường). | spec §8 |
@@ -48,16 +47,18 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 ## 3. Đơn vị quỹ & hiệu suất (Units & performance)
 
+> **[thin-layer] ĐỔI MÔ HÌNH (2026-06-26):** SDI **KHÔNG tự tính hiệu suất** nữa. Asset gửi per-KH/ngày **`aum` (= NAV ròng) + `daily_return` (TWR, Asset ĐÃ khử dòng tiền)**; SDI chỉ **LƯU + SERVE**. Vì thế **Unit / Unit Price (NAVPS) / PnL-tiền-ngày đã GỠ** (chúng là công cụ để SDI *derive* TWR từ NAV+flow — nay Asset cấp thẳng `daily_return` nên không cần). %PnL kỳ = **compound** `∏(1+daily_return)−1` (xem §7.4). Các dòng "ĐÃ GỠ" dưới giữ lại để truy nguồn lịch sử.
+
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
-| Đơn vị quỹ | Unit | `C_UNIT` | Số "phần" của tiểu khoản. Chỉ thay đổi do dòng tiền (nạp/rút), KHÔNG do biến động giá → tách bạch hiệu suất khỏi dòng tiền. | spec §5 |
-| Giá đơn vị quỹ | Unit Price (NAVPS) | `C_UNIT_PRICE`, `UP` | `= NAV ròng / Unit`. Gốc tại ngày tham gia (T0) = **10.000**. | spec §5 |
-| Lợi suất ngày | Daily return | `C_DAILY_RETURN`, `rₜ` | `= UPₜ / UP₍ₜ₋₁₎ − 1`. Độc lập dòng tiền. | spec §6 |
-| Lãi/lỗ (tiền) | PnL (money) | `C_DAILY_PNL` | Lãi/lỗ bằng tiền trong ngày/kỳ, đã khử dòng tiền. | spec §6 |
-| Hiệu suất theo thời gian | Time-Weighted Return (TWR) | — | Lợi suất "chiến lược", miễn nhiễm thời điểm/khối lượng nạp-rút. Tính qua Unit Price. | spec §6 |
-| Lợi suất theo dòng tiền | Money-Weighted Return (MWR) | — | Lợi suất "của bạn", chịu ảnh hưởng thời điểm nạp-rút. Dùng Modified Dietz / XIRR. | spec §6 |
-| %Lãi lỗ kỳ | %PnL (range return) | — | `= UP(cuối kỳ)/UP(mốc) − 1` (TWR). | spec §6 |
+| Lợi suất ngày | Daily return | `C_DAILY_RETURN`, `rₜ` | **[thin-layer] Asset GỬI** (TWR ngày, đã khử dòng tiền). SDI nhận + lưu, KHÔNG tự tính. (Trước: SDI derive `UPₜ/UP₍ₜ₋₁₎−1`.) | spec §6 ; eod (4) |
+| Hiệu suất theo thời gian | Time-Weighted Return (TWR) | — | Lợi suất "chiến lược", miễn nhiễm thời điểm/khối lượng nạp-rút. **[thin-layer] Asset tính** (khử dòng tiền); SDI chỉ **compound** chuỗi `daily_return` để ra %PnL kỳ. | spec §6 |
+| %Lãi lỗ kỳ | %PnL (range return) | `C_PNL_PCT` | **[thin-layer]** `= ∏(1+daily_return) − 1 = EXP(Σ ln(1+rₜ))−1` (compound các `daily_return` Asset gửi sau mốc). (Trước: `UP(cuối)/UP(mốc) − 1`.) | spec §6 |
 | Ngày mốc (đầu kỳ) | Base date | `@base` | Gốc 0% của kỳ xem (theo filter 1D/1M/YTD/INCEPTION…). KH tham gia sau mốc → mốc = ngày tham gia. | spec §6 ; pm §2 |
+| ~~Đơn vị quỹ~~ **[thin-layer] ĐÃ GỠ** | ~~Unit~~ | ~~`C_UNIT`~~ | **ĐÃ GỠ** (+ `T_SI_UNIT_LEDGER`). Unit là công cụ để derive TWR từ NAV+cashflow; nay Asset cấp thẳng `daily_return` nên SDI không còn cần phát hành/giữ unit. | — |
+| ~~Giá đơn vị quỹ~~ **[thin-layer] ĐÃ GỠ** | ~~Unit Price (NAVPS)~~ | ~~`C_UNIT_PRICE`, `UP`~~ | **ĐÃ GỠ.** Gốc 10.000 không còn. NAVPS = NAV/Unit chỉ cần khi SDI tự tính return từ unit — model thin-layer dùng `daily_return` Asset gửi nên bỏ. | — |
+| ~~Lãi/lỗ (tiền)~~ **[thin-layer] ĐÃ GỠ** | ~~PnL (money)~~ | ~~`C_DAILY_PNL`~~ | **ĐÃ GỠ.** SDI không tính PnL-tiền-ngày nữa (cần NAV đầu/cuối + flow để derive). AUM theo ngày vẫn lưu (`C_AUM`); chênh tiền tự suy nếu cần. | — |
+| ~~Lợi suất theo dòng tiền~~ **[thin-layer] ĐÃ GỠ** | ~~Money-Weighted Return (MWR)~~ | — | **ĐÃ GỠ** (xem §7.5). MWR/Modified-Dietz cần chuỗi unit + cashflow nội bộ để tính; thin-layer không giữ unit ⇒ bỏ. SDI chỉ phục vụ TWR (compound `daily_return`). | — |
 
 ---
 
@@ -67,7 +68,7 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 |---|---|---|---|---|
 | Chỉ số danh mục mẫu | Master Index | `C_INDEX_VALUE` (`T_MASTER_INDEX_DAILY`) | Chỉ số mô phỏng hiệu suất rổ mẫu (price-return), tái cân bằng hằng ngày về trọng số mục tiêu. Gốc 1000. | spec §7 |
 | Lợi nhuận giá | Price Return (PR) | — | Chỉ tính biến động giá, KHÔNG gồm cổ tức. (Master Index, VN-Index là PR.) | spec §7 |
-| Lợi nhuận tổng | Total Return (TR) | — | Gồm cả cổ tức. (Unit Price của KH/master là TR vì NAV ăn cổ tức.) | spec §7 |
+| Lợi nhuận tổng | Total Return (TR) | — | Gồm cả cổ tức. (Hiệu suất KH/master = TWR từ `daily_return` Asset gửi là TR vì NAV ăn cổ tức.) | spec §7 |
 | Benchmark | Benchmark | `C_BENCHMARK_CODE` | Chỉ số tham chiếu ngoài (VN-Index, VN30…). PR. | spec §7 |
 | Hiệu suất DM tổng KH | Aggregate customer return (AUM-weighted) | — | Lợi suất bình quân gia quyền theo AUM của toàn bộ KH trong master (end-weight). | pm §2 (US3) |
 | Độ lệch hiệu suất | Performance deviation | `C_DEVIATION_BPS` | Chênh giữa hiệu suất KH và chỉ số master, tính bằng **điểm cơ bản (BPS)**. | pm §2 (US2) |
@@ -111,50 +112,33 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 Quy ước: `t` = ngày; `(t-1)` = ngày giao dịch trước; `@base`/`@end` = mốc đầu/cuối kỳ.
 
-### 7.1 Tài sản & NAV
+### 7.1 Tài sản & AUM (= NAV ròng)
 ```
-Tiền          = C_CASH + C_PENDING_CASH + C_DIV_CASH
-Tổng tài sản  = Giá trị cổ phiếu + Tiền                       (= AUM ở cấp master)
-NAV           = Tổng tài sản = stock + Tiền        (Asset gửi NAV ròng; phí QL đã trừ ⇒ AUM = NAV)
+Tiền          = C_CASH                               (Asset gửi 1 SỐ tổng tiền dư)
+AUM = NAV     = Asset GỬI TRỰC TIẾP per-KH (NAV ròng, đã trừ phí QL)   [thin-layer]
 ```
-**Ví dụ:** stock 900tr, cash 60tr, pending 40tr, div 0 →
-Tiền = 100tr; Tổng tài sản = NAV = 1.000tr.
-*Bán cổ phiếu 40tr (chờ về T+2):* stock 860tr, pending 40tr → Tổng tài sản vẫn 1.000tr (NAV không hụt giả).
+**[thin-layer]** SDI KHÔNG tự cộng `stock + tiền` để ra NAV — Asset gửi thẳng `aum` (NAV ròng). `cash` gửi kèm để hiển thị (FR-06) + cash-drag. Phí QL đã trừ ⇒ AUM = NAV (không tách payable).
+**Ví dụ:** Asset gửi `aum = 1.000tr`, `cash = 100tr` → AUM = NAV = 1.000tr; cash drag = 100/1.000 = 10%.
 
-### 7.2 Unit & Unit Price (TWR sạch)
-```
-T0 (ngày tham gia):  UP₀ = 10.000 ;  Unit₀ = NAV₀ / 10.000
-CFₜ      = cash_in − cash_out                  (ròng, gom trong ngày)
-ΔUnitₜ   = CFₜ / UP₍ₜ₋₁₎                        (giá quy đổi = UP cuối ngày trước)
-Unitₜ    = Unit₍ₜ₋₁₎ + ΔUnitₜ
-UPₜ      = NAVₜ / Unitₜ
-```
-Vì sao chia `UP₍ₜ₋₁₎`: rút gọn ra `UPₜ = UP₍ₜ₋₁₎ × (1 + rₜ)` ⇒ daily return = lợi suất tài sản thật, **độc lập dòng tiền** (cashflow chỉ đổi số Unit, không đổi tỷ lệ giá Unit).
+### 7.2 ~~Unit & Unit Price (TWR sạch)~~ — **[thin-layer] ĐÃ GỠ (historical)**
+> **ĐÃ GỠ.** Unit/Unit Price là cơ chế để SDI tự *derive* TWR từ NAV+cashflow (khử dòng tiền qua số unit). Thin-layer: **Asset gửi thẳng `daily_return` (TWR đã khử dòng tiền)** nên SDI không còn phát hành unit / tính unit price. Bảng `T_SI_UNIT_LEDGER` đã bỏ.
+>
+> *(Công thức lịch sử, để truy nguồn: `UP₀=10.000; Unit₀=NAV₀/10.000; ΔUnitₜ=CFₜ/UP₍ₜ₋₁₎; Unitₜ=Unit₍ₜ₋₁₎+ΔUnitₜ; UPₜ=NAVₜ/Unitₜ`. Tính chất khử dòng tiền `UPₜ=UP₍ₜ₋₁₎×(1+rₜ)` nay do Asset đảm bảo khi cấp `daily_return`.)*
 
-**Ví dụ (ngày 3, từ worked example §8.6):** đầu ngày Unit=1000, UP₍₂₎=15.000; trong ngày nạp 2tr rút 0.1tr → CF=1.9tr; NAV cuối 18tr.
-`ΔUnit = 1.900.000 / 15.000 = 126,667` → Unit = 1.126,667 → `UP = 18.000.000 / 1.126,667 = 15.976`.
+### 7.3 ~~PnL tiền (cashflow-neutral)~~ — **[thin-layer] ĐÃ GỠ (historical)**
+> **ĐÃ GỠ** (`C_DAILY_PNL`). PnL-tiền-ngày `= NAV cuối − NAV đầu + tiền RA − tiền VÀO` cần NAV đầu/cuối + flow để SDI tự tính. Thin-layer SDI chỉ lưu `aum` + `daily_return` (Asset cấp), không derive PnL tiền. Chênh AUM 2 mốc tự suy nếu UI cần.
 
-### 7.3 PnL tiền (cashflow-neutral)
+### 7.4 TWR — %lãi lỗ kỳ (compound daily_return)
 ```
-PnL ngày  = NAV cuối − NAV đầu + tiền RA − tiền VÀO
-PnL kỳ    = Σ PnL các ngày trong kỳ
+%PnL(kỳ) = ∏(1 + daily_returnₜ) − 1 = EXP( Σ ln(1 + daily_returnₜ) ) − 1     (t sau mốc, daily_return Asset gửi)
 ```
+**[thin-layer]** SDI **compound on-read** chuỗi `daily_return` Asset gửi (KHÔNG còn `UP_cuối/UP_mốc − 1`). Bỏ ngày `daily_return` NULL; guard `daily_return ≤ −1` (mất hết vốn) → kẹp để LOG không vỡ.
+**Ví dụ:** 2 ngày `daily_return = 0,05` rồi `0,028571` ⇒ ∏ = `1,05 × 1,028571 = 1,08` → %PnL = **+8,0%**. Tương đương `EXP(ln 1,05 + ln 1,028571) − 1 = 0,08`.
 
-### 7.4 TWR — %lãi lỗ kỳ (time-weighted)
-```
-Daily return = UPₜ / UP₍ₜ₋₁₎ − 1
-%PnL(kỳ)     = UP[ngày cuối] / UP[ngày mốc] − 1     (= tích các daily return sau mốc)
-```
-**Ví dụ:** UP mốc 15.000 → UP cuối 19.082 ⇒ %PnL = 19.082/15.000 − 1 = **+27,21%** (bất kể nạp/rút giữa kỳ).
-
-### 7.5 MWR — lợi suất của bạn (money-weighted, Modified Dietz)
-```
-MWR = (NAV cuối − NAV đầu − CF_ròng) / (NAV đầu + Σᵢ wᵢ · CFᵢ)
-   wᵢ = (T − tᵢ) / T     (tᵢ = số phiên từ mốc tới flow i ; T = số phiên cả kỳ)
-   tử số = PnL tiền cả kỳ
-XIRR (tùy chọn, chính xác): giải r trong  NAV_đầu·(1+r)^T + Σ CFᵢ·(1+r)^(T−tᵢ) = NAV_cuối
-```
-Mẫu số ≈ 0 → trả null. Hiển thị period return (không quy năm trừ khi yêu cầu).
+### 7.5 ~~MWR — money-weighted (Modified Dietz / XIRR)~~ — **[thin-layer] ĐÃ GỠ (historical)**
+> **ĐÃ GỠ.** MWR (Modified Dietz, XIRR) cần chuỗi **unit + cashflow nội bộ** để giải lợi suất theo dòng tiền. Thin-layer không giữ unit (Asset cấp `daily_return` = TWR) ⇒ SDI chỉ phục vụ **TWR** (compound, §7.4), không tính MWR.
+>
+> *(Công thức lịch sử: `MWR = (NAV cuối − NAV đầu − CF_ròng)/(NAV đầu + Σᵢ wᵢ·CFᵢ)`, `wᵢ=(T−tᵢ)/T`; hoặc XIRR giải `NAV_đầu·(1+r)^T + Σ CFᵢ·(1+r)^(T−tᵢ) = NAV_cuối`.)*
 
 ### 7.6 Master Index — danh mục mẫu (price return, tái cân bằng ngày)
 ```
@@ -167,26 +151,26 @@ Daily return (index) = Σᵢ wᵢ⁽ᵗ⁾·Pᵢ,ₜ/P_refᵢ − 1   (= FACTOR 
 **Ví dụ (rebalance ngày 3 −C +D):** Index₂=1011, trọng số eff_date=3 A45 B35 D20:
 `Index₃ = 1011 × (0,45·103/101 + 0,35·52/50,5 + 0,20·62/60) = 1037`.
 
-### 7.7 Tổng hợp cấp master (pooled)
-```
-Master NAV          = Σ NAV các tiểu khoản
-Master Unit         = Σ Unit các tiểu khoản
-Master Unit Price   = Master NAV / Master Unit          (pooled; total-return)
-```
+### 7.7 ~~Tổng hợp cấp master (pooled unit price)~~ — **[thin-layer] ĐÃ GỠ (historical)**
+> **ĐÃ GỠ.** Pooled `Master Unit Price = Σ NAV / Σ Unit` cần unit per-KH. Thin-layer không giữ unit. Thay bằng:
+> - **Master daily return** = AUM-weighted `Σ(AUMᵢ·rᵢ) / Σ AUMᵢ` (engine ghi `T_MASTER_BALANCE.C_DAILY_RETURN` mỗi EOD, rᵢ = `daily_return` Asset gửi từng KH).
+> - **Master %PnL kỳ** = compound chuỗi master daily return: `∏(1 + master_daily_returnₜ) − 1` (US3 composite làm việc này).
+>
+> *(Historical: `Master NAV = Σ NAV; Master Unit = Σ Unit; Master Unit Price = Master NAV/Master Unit`.)*
 
 ### 7.8 Hiệu suất DM tổng KH — AUM-weighted (end-weight, dùng cho PM)
 ```
-Wᵢ   = AUMᵢ(cuối kỳ) / Σ AUM(cuối kỳ)          (trọng số = AUM cuối kỳ)
-PnLᵢ = UPᵢ(cuối) / UPᵢ(mốc) − 1                (TWR từng KH)
-Return_DM_tổng_KH = Σᵢ Wᵢ · PnLᵢ
+Wᵢ   = AUMᵢ(cuối kỳ) / Σ AUM(cuối kỳ)                  (trọng số = AUM cuối kỳ = C_LAST_AUM)
+Rᵢ   = ∏(1 + daily_returnₜ) − 1 = EXP(Σ ln(1+rₜ))−1    [thin-layer] compound daily_return KH i (TWR)
+Return_DM_tổng_KH = Σᵢ Wᵢ · Rᵢ
 ```
-**Ví dụ (3 KH):** PnL S1=8% S2=6% S3=12%; AUM 100tr/200tr/100tr (Σ=400tr) →
+**Ví dụ (3 KH):** Rᵢ S1=8% S2=6% S3=12% (mỗi Rᵢ = compound `daily_return` của KH đó); AUM 100tr/200tr/100tr (Σ=400tr) →
 `(0,08·100 + 0,06·200 + 0,12·100)/400 = 0,08 = +8,0%`.
-> Lưu ý: đây là **end-weight** (trọng số AUM cuối kỳ), KHÁC pooled Master Unit Price (§7.7, ~begin-weight). Hai số đo khác nhau có chủ đích.
+> Lưu ý: đây là **end-weight** (trọng số AUM cuối kỳ). Weight = AUM (`C_LAST_AUM`); AUM = NAV (phí QL đã trừ trong NAV Asset).
 >
-> **Vì sao `PnLᵢ` dùng Unit Price (TWR) chứ KHÔNG dùng `AUM_cuối/AUM_đầu − 1`:** KH nạp định kỳ hằng tháng (lãi tự chuyển vào) ⇒ AUM tăng do *nạp tiền*, không phải do lãi. Tỷ số `AUM_cuối/AUM_đầu − 1` (công thức return đơn giản kiểu "ending/beginning − 1") gộp luôn phần nạp vào → **thổi phồng hiệu suất**. Công thức đơn giản đó chỉ đúng khi danh mục KHÔNG có dòng tiền vào/ra giữa kỳ. Unit Price khử dòng tiền (`nạp tiền chỉ tăng số Unit, không đổi tỷ lệ giá Unit`) nên `UP_cuối/UP_mốc − 1` mới là hiệu suất đầu tư thật (TWR). Đây cũng là điều kiện để so KH vs Master Index và tính Tracking Error có nghĩa.
+> **Vì sao `Rᵢ` dùng TWR (compound `daily_return`) chứ KHÔNG dùng `AUM_cuối/AUM_đầu − 1`:** KH nạp định kỳ hằng tháng (lãi tự chuyển vào) ⇒ AUM tăng do *nạp tiền*, không phải do lãi. Tỷ số `AUM_cuối/AUM_đầu − 1` (kiểu "ending/beginning − 1") gộp luôn phần nạp vào → **thổi phồng hiệu suất**; chỉ đúng khi không có dòng tiền giữa kỳ. `daily_return` Asset gửi đã khử dòng tiền (TWR) nên compound chuỗi đó mới là hiệu suất đầu tư thật. Đây cũng là điều kiện để so KH vs Master Index và tính Tracking Error có nghĩa.
 >
-> **AUM = NAV (không tách payable):** [BRD asset-sync] Asset gửi NAV ròng (đã trừ phí QL); SDI không accrue ⇒ `AUMᵢ = NAVᵢ = C_LAST_AUM`. **2 cách hiện thực `Σ Wᵢ·Rᵢ`** (cùng kết quả — dùng đối chiếu, bắt lỗi data): `SP_GET_MASTER_RETURN_RETINDEX` (`Rᵢ = UP_cuối/UP_mốc − 1`, đọc 2 lát — NHANH) và `SP_GET_MASTER_RETURN_COMPOUND` (`Rᵢ = ∏(1+rₜ) − 1 = EXP(Σ ln(1+rₜ))−1`, quét daily return). Vì `UPₜ = UP₍ₜ₋₁₎·(1+rₜ)` nên `UP_cuối/UP_mốc ≡ ∏(1+rₜ)` ⇒ 2 cách đồng nhất. **BRD = RET_INDEX** (2 lát); COMPOUND chỉ là bản quét để verify, KHÔNG phải công thức khác.
+> **[thin-layer] 1 API** `SP_GET_MASTER_RETURN_COMPOUND` (`Rᵢ = ∏(1+rₜ) − 1 = EXP(Σ ln(1+rₜ))−1`, quét `daily_return` qua (base,end]). *(Bản 2-lát `SP_GET_MASTER_RETURN_RETINDEX` dựa trên `UP_cuối/UP_mốc` đã GỠ — không còn unit price.)*
 
 ### 7.9 Độ lệch hiệu suất (Deviation, BPS)
 ```
@@ -245,12 +229,12 @@ BO KHÔNG tính số phí lũy kế (accrued) gửi Asset; phí chỉ giảm tà
 |---|---|---|
 | Tiền, Số lượng | `(20,0)` | đồng (VND) / cổ phiếu, không lẻ |
 | Giá | `(18,4)` | giá đóng cửa, giá vốn |
-| % / return / fee_rate | `(10,6)` | tỷ lệ (0,01 = 1%) |
+| % / return / fee_rate / daily_return | `(10,6)` | tỷ lệ (0,01 = 1%); `daily_return` Asset gửi |
 | Giá trị đối chiếu/chênh lệch (reconcile) | `(20,6)` | giữ thập phân khi so 2 nguồn |
-| Unit & Unit Price | `(18,6)` | Unit Price gốc 10.000 |
+| ~~Unit & Unit Price~~ **[thin-layer] ĐÃ GỠ** | ~~`(18,6)`~~ | **ĐÃ GỠ** — không còn unit/unit_price (Asset cấp `daily_return`). |
 | Trọng số (weight) | `(12,8)` | Σ = 1.0 |
 | Index value | `(18,x)` | gốc 1000 |
 | Lũy kế TE (accum active) | `FLOAT` | double, tránh mất số khi cộng dồn |
 | Deviation | BPS (`DECIMAL(12,2)`) | 1% = 100 BPS |
 
-> **Đơn vị mặc định:** tiền = VND; lợi suất/return = tỷ lệ thập phân (0,08 = 8%); deviation = BPS; Unit Price gốc = 10.000; Index/benchmark gốc tương ứng 1000/điểm thị trường.
+> **Đơn vị mặc định:** tiền = VND; lợi suất/return = tỷ lệ thập phân (0,08 = 8%); `daily_return` Asset gửi cùng đơn vị; deviation = BPS; Index/benchmark gốc tương ứng 1000/điểm thị trường. *([thin-layer] Unit Price gốc 10.000 đã GỠ — không còn đơn vị quỹ.)*

@@ -1,5 +1,7 @@
 # Kế hoạch implement BRD Asset-NAV-sync (nhánh `feat/brd-asset-nav-sync`)
 
+> **⚠️ SUPERSEDED bởi THIN-LAYER (2026-06-26):** plan này (P0→P5, 2026-06-24) build engine **SDI derive unit/UP/PnL/TWR** từ NAV+flow. Refactor thin-layer sau đó: **Asset gửi CẢ `daily_return` (TWR)** → SDI **KHÔNG derive** (LƯU `aum`+`daily_return`, SERVE compound). Gỡ unit/unit_price/PnL-tiền/`T_SI_UNIT_LEDGER`/MWR/J09/J10. Các block "derive Δunits/UP_{t-1}" dưới = LỊCH SỬ — engine hiện hành ở [SDI-spec.md](SDI-spec.md) §9 (thin-layer).
+>
 > **ĐÃ IMPLEMENT (2026-06-24)** — P0→P5 xong, build + all tests GREEN trên nhánh. Quyết định nghiệp vụ: [SDI-asset-handover.md](SDI-asset-handover.md).
 > Nhánh độc lập, KHÔNG merge `main`. Build/test: fresh DB mỗi lần (DDL edit an toàn).
 
@@ -15,13 +17,13 @@
 | P5 self-review | ✅ thêm guard ASSET_NAV completeness per-SI (err=12); docs |
 
 **Quyết định khi code (ĐÃ CHỐT với user 2026-06-25):**
-- **[BRD asset-sync] GỠ phí hoàn toàn (chốt 2026-06-25):** không còn `C_PAYABLE_FEE`/`C_FEE_ACCUM`/`fee_accum`. Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); `AUM = stock + cash = NAV` (gross = net, không tách payable). *(Thiết kế trung gian "giữ tên C_PAYABLE_FEE đổi nghĩa lũy kế / AUM_gross = NAV + fee" đã bị thay.)*
+- **[BRD asset-sync] GỠ phí hoàn toàn (chốt 2026-06-25):** không còn `C_PAYABLE_FEE`/`C_FEE_ACCUM`/`fee_accum`. Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); **[thin-layer] `AUM = NAV`** (gross = net, không tách payable; bản 2026-06-25 viết `= stock + cash`, nay Asset không gửi `stock_value`). *(Thiết kế trung gian "giữ tên C_PAYABLE_FEE đổi nghĩa lũy kế / AUM_gross = NAV + fee" đã bị thay.)*
 - **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_AUM` ingest trực tiếp; CORE **bỏ J08** (không lắp NAV). Components (`stock`, `cash` tổng) gửi kèm để display (FR-06) + AUM + reconcile.
-- **Reconcile NAV_CONSISTENCY**: `nav` Asset vs `(stock + cash)` → bắt Asset tự mâu thuẫn. (5 check: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_CONSISTENCY.)
+- **Reconcile** (2026-06-24): NAV_CONSISTENCY + HOLDINGS_MISMATCH + NAV_NEGATIVE + SI_NAV_MISMATCH + CASHFLOW_MISMATCH (5 check). **[thin-layer 2026-06-26] còn 3:** NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH (gỡ NAV_CONSISTENCY + HOLDINGS_MISMATCH — Asset không gửi `stock_value`).
 - **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
 - **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
 - FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient).
-- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_BALANCE/CURRENT) — PM không đọc; `AUM = stock + cash = NAV`. Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
+- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench) + **[thin-layer] rename bảng** `T_SI_NAV_BALANCE`→`T_SI_BALANCE`, `T_MASTER_NAV_BALANCE`→`T_MASTER_BALANCE`, `T_SI_NAV_CURRENT`→`T_SI_CURRENT`, `T_MASTER_NAV_CURRENT`→`T_MASTER_CURRENT`; `C_LAST_NAV`→`C_LAST_AUM`. **Bỏ `C_STOCK_VALUE` cấp MASTER**; `AUM = NAV` (Asset gửi). **[thin-layer]** Asset KHÔNG gửi `stock_value` ⇒ stock không còn ở feed/reconcile. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
 
 **Tests:** `03_SMOKE` (customer ingest/derive incl cashflow-day, reconcile vênh, reset, date-guard, index guards, asset-completeness) · `07_PM_SMOKE` (PM serve, seed NAV trực tiếp) · `04_BENCH`/`08_PM_BENCH` (seed asset_daily). Build 01/02/05/06 clean.
 
@@ -29,7 +31,7 @@
 
 
 ## Nguyên tắc
-- Asset = nguồn NAV/tiền/phí (số tổng per-SI, không per-mã). SDI: ingest → derive unit/UP/PnL/return → SUM master → index (của SDI) → PM serve → reconcile (đo vênh).
+- Asset = nguồn NAV/tiền/phí + **[thin-layer] `daily_return` (TWR)** (số tổng per-SI, không per-mã). SDI: ingest → **LƯU `aum`+`daily_return`** (KHÔNG derive) → SUM master (AUM-weighted) → index (của SDI) → PM serve (compound) → reconcile.
 - FO holdings **giữ** (composition + near-realtime future). Cashflow nạp/rút **SDI vẫn nhập** (đối soát với Asset).
 
 ---
@@ -37,12 +39,12 @@
 ## P0 — Schema (`01_TABLES.sql`)
 
 **THÊM:**
-- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · **[BRD asset-sync]** `C_AUM, C_STOCK_VALUE, C_CASH, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`. **KHÔNG có `C_FEE_ACCUM`** (Asset gửi NAV ròng; `cash` = tổng tiền 1 số, không tách pending/div).
+- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · **[thin-layer 2026-06-26]** `C_AUM, C_DAILY_RETURN, C_CASH, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`. **KHÔNG có `C_STOCK_VALUE`/`C_FEE_ACCUM`** (Asset gửi NAV ròng + `daily_return`; `cash` = tổng tiền 1 số). *(Bản 2026-06-24 có `C_STOCK_VALUE`, không có `C_DAILY_RETURN`.)*
 - `T_EOD_PIPELINE.C_ASSET_NAV_STATUS` (PENDING|READY) + `C_ASSET_NAV_AT` — nguồn mới để gate.
 - `T_EOD_RECON_BREAK`: đã có `C_VALUE_SDI/C_VALUE_CHECK/C_DIFF` → tái dùng; thêm `C_CHECK_NAME` mới (CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_BRIDGE). Cân nhắc cột `C_WITHIN_THRESHOLD BIT` để log diff cả khi không break (đo vênh).
 
 **SỬA:**
-- `T_SI_BALANCE`: bỏ `C_PAYABLE_FEE`; **[BRD asset-sync] KHÔNG thêm `C_FEE_ACCUM`** (Asset gửi NAV ròng); thêm `C_CASH_IN`, `C_CASH_OUT`. Giữ NAV/UNIT/UNIT_PRICE/PNL/RETURN (derive từ ingest) + cột TE.
+- `T_SI_BALANCE`: bỏ `C_PAYABLE_FEE`; **KHÔNG thêm `C_FEE_ACCUM`** (Asset gửi NAV ròng); thêm `C_CASH_IN`, `C_CASH_OUT`. **[thin-layer 2026-06-26]** giữ `C_AUM` + `C_DAILY_RETURN` (Asset gửi) + cột TE; **gỡ `C_UNIT`/`C_UNIT_PRICE`/`C_DAILY_PNL`** (2026-06-24 còn giữ để derive — nay Asset cấp `daily_return`).
 - `T_SI_CURRENT`: bỏ `C_PAYABLE_FEE`; NAV + components (stock, cash tổng) từ Asset (đổi nguồn ghi).
 - `T_EOD_WORK`: bỏ cột phí (`C_PAYABLE_FEE`, `C_FEE_CUT`).
 
@@ -56,18 +58,18 @@
 ## P1 — Ingest + derive (`02_SP_ENGINE.sql`)
 
 **THÊM `SP_INGEST_ASSET_NAV @p_json`** (per-SI, 1 batch/ngày GD):
-- **[BRD asset-sync]** Parse JSON per-SI `{si_account, nav, stock_value, cash, cash_in, cash_out}` → ghi `T_SI_ASSET_DAILY` (idempotent MERGE theo date,si). KHÔNG còn `fee_accum`/`pending`/`div_cash`.
-- **Derive** per-SI (quy ước §4 handover, init UP=10.000, prior-day historic):
+- **[thin-layer]** Parse JSON per-SI `{si_account, aum, daily_return, cash, cash_in, cash_out}` → ghi `T_SI_ASSET_DAILY` (idempotent DELETE+INSERT theo date,si). KHÔNG còn `stock_value`/`fee_accum`/`pending`/`div_cash`.
+- **[thin-layer] LƯU THẲNG** per-SI (KHÔNG derive):
   ```
-  NAV   = nav   (Asset GỬI TRỰC TIẾP, đã trừ phí QL — model realized; SDI KHÔNG lắp/trừ).  AUM = stock + cash = NAV
-  UP_{t-1}, units_{t-1} ← T_SI_BALANCE @prev (UDF_PREV_BUSINESS_DATE); thiếu → UP=10.000
-  Δunits = (cash_in − cash_out)/UP_{t-1};  units_t = units_{t-1}+Δunits
-  UP_t   = NAV_t/units_t;  return_t = UP_t/UP_{t-1}−1;  PnL_t = NAV_t−NAV_{t-1}+cash_out−cash_in
+  AUM = NAV = aum         (Asset GỬI, đã trừ phí QL — model realized; SDI KHÔNG lắp/trừ/derive)
+  daily_return = daily_return  (Asset GỬI, TWR đã khử dòng tiền)
+  → ghi T_SI_BALANCE (aum + daily_return). KHÔNG tính units/UP/PnL.
   ```
-- Ghi `T_SI_BALANCE` (DELETE+INSERT @d) + roll `T_SI_CURRENT` (nếu @d mới nhất). Idempotent + scoped như engine cũ.
+  *(Bản 2026-06-24 derive `Δunits=(cash_in−cash_out)/UP_{t-1}; UP_t=NAV/units; return_t=UP_t/UP_{t-1}−1; PnL_t=...` từ NAV+flow — đã GỠ: Asset cấp luôn `daily_return`.)*
+- Ghi `T_SI_BALANCE` (DELETE+INSERT @d) + roll `T_SI_CURRENT` (nếu @d mới nhất). Idempotent + scoped.
 - err convention chuẩn (@p_err_code/@p_err_msg OUT).
 
-**BỎ:** `SP_EOD_COMPUTE`, `SP_EOD_COMPUTE_CORE` (J06 accrue/J07 MTM/J08 NAV/J09/J10) cho EOD; `SP_INGEST_FEE_CHARGE`; `SP_EOD_RECOMPUTE_RANGE` (NAV).
+**BỎ:** `SP_EOD_COMPUTE`, `SP_EOD_COMPUTE_CORE` (J06 accrue/J07 MTM/J08 NAV/**[thin-layer] J09 PnL/J10 unit**) cho EOD; `SP_INGEST_FEE_CHARGE`; `SP_EOD_RECOMPUTE_RANGE` (NAV); **[thin-layer] `T_SI_UNIT_LEDGER`**.
 **GIỮ năng lực MTM** (holdings×giá) tách riêng cho near-realtime future (chưa build — ghi TODO).
 
 **SỬA `SP_INGEST_CUSTOMER`** → **holdings-only** (bỏ phần cash-state + fees; giữ holdings + interval `T_SI_HOLDING_HIST`).
@@ -91,24 +93,23 @@ J14 SNAPSHOT : composition từ FO holdings × giá (giữ)
 
 ---
 
-## P3 — Reconcile 3 check (`02_SP_ENGINE.sql` — `SP_EOD_RECONCILE`)
+## P3 — Reconcile (`02_SP_ENGINE.sql` — `SP_EOD_RECONCILE`)
+
+> **[thin-layer 2026-06-26]** còn **3 check**: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH. NAV_BRIDGE/NAV_CONSISTENCY + HOLDINGS_MISMATCH GỠ (Asset không gửi `stock_value`). Block dưới = thiết kế 2026-06-24.
 
 Ghi `T_EOD_RECON_BREAK` (lưu `C_DIFF` **kể cả trong ngưỡng** để đo vênh):
-1. **NAV_BRIDGE** per-SI: `|NAV_t − (NAV_{t-1}+cash_in−cash_out+Δval)|` > ngưỡng.
+1. ~~**NAV_BRIDGE** per-SI: `|NAV_t − (NAV_{t-1}+cash_in−cash_out+Δval)|`~~ **[thin-layer] GỠ** (cần stock).
 2. **CASHFLOW_MISMATCH**: `cash_in/out` SDI (`T_SI_CASHFLOW_EVENT`) vs Asset (`T_SI_ASSET_DAILY`).
-3. **HOLDINGS_MISMATCH**: `Σ(FO holdings × giá BO)` vs Asset `stock_value` per-SI/master.
-- Cổng publish ở `SP_EOD_RUN` (như hiện tại): có break "cứng" → chặn J14/publish; break "đo lường" (trong ngưỡng) → chỉ log.
+3. ~~**HOLDINGS_MISMATCH**: `Σ(FO holdings × giá BO)` vs Asset `stock_value`~~ **[thin-layer] GỠ** (Asset không gửi `stock_value`).
+- Cổng publish ở `SP_EOD_RUN`: có break "cứng" → chặn J14/publish; break "đo lường" (trong ngưỡng) → chỉ log.
 
 ---
 
 ## P4 — Smoke (`03_SMOKE.sql`) + PM smoke (`07` giữ)
 
 - **BỎ** test EOD-compute (MTM/accrue/fee breakdown/idempotent NAV).
-- **THÊM**: ingest Asset NAV → assert derive đúng:
-  - ngày thường (no flow): `return = NAV_t/NAV_{t-1}−1`, units giữ nguyên.
-  - **ngày có nạp/rút**: units phát hành theo `UP_{t-1}`, UP_t đúng (case then chốt convention).
-  - ngày đầu: UP=10.000.
-- **THÊM** reconcile: bơm lệch cashflow → break CASHFLOW_MISMATCH + `C_DIFF` đúng; lệch holdings → HOLDINGS_MISMATCH; log diff trong-ngưỡng.
+- **[thin-layer] THÊM**: ingest Asset `aum`+`daily_return` → assert **LƯU đúng** (`C_AUM`=aum, `C_DAILY_RETURN`=daily_return) + serve %PnL = compound. *(Bản 2026-06-24 assert derive: ngày thường `return=NAV_t/NAV_{t-1}−1`; ngày nạp/rút `units` phát hành theo `UP_{t-1}`; ngày đầu UP=10.000 — đã GỠ vì SDI không derive.)*
+- **THÊM** reconcile: bơm lệch cashflow → break CASHFLOW_MISMATCH + `C_DIFF` đúng; log diff trong-ngưỡng. *([thin-layer] HOLDINGS_MISMATCH GỠ.)*
 - **GIỮ**: index (J12 + completeness hard-fail + weight guard), PM smoke (US1–US5), composition.
 - Bench (`04`): seed NAV ingest thay vì compute; đo SP_INGEST_ASSET_NAV scale 50k SI.
 

@@ -2,6 +2,8 @@
 
 Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống cần trao đổi: ai gửi gì cho ai, payload cụ thể, và **báo cáo định lượng** theo 3 kịch bản small / medium / large.
 
+> **⚠️ THIN-LAYER (2026-06-26):** Asset gửi per-SI/ngày GD **`aum` (NAV ròng) + `daily_return` (TWR, đã khử dòng tiền) + `cash` (tổng) + cash_in/out**; SDI **LƯU thẳng** (KHÔNG derive unit/UP/PnL/TWR). Asset KHÔNG gửi `stock_value`. Reconcile còn: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH (gỡ NAV_CONSISTENCY + holdings-vs-stock). Mô tả "derive unit/UP" bên dưới = LỊCH SỬ — đã cập nhật.
+
 > **⚠️ BRD 2026-06-22 + asset-sync:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (2 producer per-SI + master ĐÃ GỠ). BO/FO/Market đẩy dữ liệu **THẲNG sang Asset** (Asset tự tính NAV RÒNG). **[BRD asset-sync] Asset gửi NAV RÒNG trực tiếp về SDI** (đã trừ phí QL — model realized; **BO KHÔNG gửi số phí lũy kế accrued**) → SDI **KHÔNG accrue phí QL**, `AUM = NAV` (không tách payable). **SDI VẪN đẩy riêng Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, luồng price-ready BO) — luồng SDI→Asset DUY NHẤT còn lại. Tài liệu này tập trung **FO/Market/BO/Asset → SDI** (SDI phục vụ UI riêng qua read API). Đối chiếu 2 hệ + điểm reconcile: [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 > Liên quan: [SDI-spec.md](./SDI-spec.md) (công thức, job EOD J0–J14 + ingest), [SDI-db-architecture.md](./SDI-db-architecture.md) (kiến trúc DB, roll-forward, set-based).
@@ -15,11 +17,11 @@ Tài liệu tổng hợp **dữ liệu cuối ngày (EOD)** các hệ thống c�
 | **FO** (Front Office) | Tính tỷ trọng danh mục mẫu (model_weight); **đặt & khớp lệnh MP trực tiếp trên TK từng KH**; sở hữu tiền (trừ thuế GD vào cash). **[BRD asset-sync] Với SDI: nguồn sự thật = holdings** (composition); NAV/tiền nay từ Asset, cổ tức/phí không gửi SDI nữa. |
 | **BO** (Back Office) | **Cắt phí** của KH (phí QL/thuế/perf…, 1 cục/tháng) khi phát sinh thật (qua cash). **[BRD asset-sync] BO KHÔNG gửi số phí lũy kế (accrued)** — phí chỉ giảm tài sản khi cắt thật, đã phản ánh trong NAV ròng Asset gửi (model realized). SDI không nhận event cắt phí, không quản payable. |
 | **Market data** | Cấp giá EOD, corporate action, chỉ số benchmark (VN-Index…). (Nguồn riêng, không phải FO.) |
-| **SDI** | **[BRD asset-sync]** Nhận **NAV RÒNG từ Asset** (per-SI) + FO holdings (composition) → **ingest NAV thẳng** (`SP_INGEST_ASSET_NAV`), derive Unit/Unit Price, PnL, TWR, MWR; tính Master Index (giá BO × weight). **KHÔNG accrue phí QL, không quản payable** (`AUM = stock + cash = NAV`). Phục vụ **giao diện riêng của SDI** (NAV/index/perf) qua read API (FR-01..06, PM). |
-| **Asset** | **Nhận dữ liệu THẲNG từ BO/FO/Market → Asset tự tính NAV RÒNG** (đã trừ phí QL — model realized). **[BRD asset-sync] Asset GỬI NAV RÒNG + components (stock/cash) + cash_in/out per-SI về SDI** (nguồn NAV của SDI). SDI **KHÔNG còn đẩy** tài sản KH/NAV-perf master sang Asset, **CHỈ còn đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, price-ready BO). Reconcile còn lại: NAV_CONSISTENCY, cashflow 2 nguồn, holdings, TWR methodology. Xem [SDI-asset-gap.md](./SDI-asset-gap.md). |
+| **SDI** | **[thin-layer]** Nhận **`aum` (NAV ròng) + `daily_return` (TWR) từ Asset** (per-SI) + FO holdings (composition) → **LƯU thẳng** (`SP_INGEST_ASSET_NAV`), KHÔNG tự tính unit/UP/PnL/TWR. SERVE %PnL = compound `daily_return`; tính Master Index (giá BO × weight); TE/deviation. **KHÔNG accrue phí QL, không quản payable** (`AUM = NAV`). Phục vụ **giao diện riêng của SDI** (AUM/index/perf) qua read API (FR-01..06, PM). |
+| **Asset** | **Nhận dữ liệu THẲNG từ BO/FO/Market → Asset tự tính NAV RÒNG + `daily_return` (TWR, khử dòng tiền)** (phí QL đã trừ — model realized). **[thin-layer] Asset GỬI `aum` + `daily_return` + `cash` (tổng) + cash_in/out per-SI về SDI** (nguồn AUM/hiệu suất của SDI). SDI **KHÔNG còn đẩy** tài sản KH/NAV-perf master sang Asset, **CHỈ còn đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`, price-ready BO). Reconcile còn lại: NAV_NEGATIVE, SI_NAV_MISMATCH (Σ SI vs master), cashflow 2 nguồn. Xem [SDI-asset-gap.md](./SDI-asset-gap.md). |
 | **SMO** | Tầng hiển thị (đọc qua Asset). |
 
-**Nguyên tắc nền [BRD asset-sync]:** **Asset gửi NAV RÒNG trực tiếp** (`NAV = nav`, đã trừ phí QL — model realized) + components `stock_value` + `cash` (tổng). `AUM = stock + cash = NAV` (không tách payable). SDI **không tự định giá NAV, không accrue/quản phí**. FO holdings GIỮ cho composition (đối soát `Σ FO×giá ≈ Asset stock_value`).
+**Nguyên tắc nền [thin-layer]:** **Asset gửi `aum` (NAV ròng, `AUM = NAV`) + `daily_return` (TWR, khử dòng tiền) + `cash` (tổng)** per-SI/ngày GD. SDI **không tự định giá NAV, không tính hiệu suất, không accrue/quản phí** — chỉ LƯU + SERVE (compound `daily_return`). Asset KHÔNG gửi `stock_value`. FO holdings GIỮ cho composition.
 
 ---
 
@@ -33,13 +35,13 @@ SDI ──(1) rebalance_request (trigger REBALANCE/DEPLOY/REDEEM) ────�
         ┌──────────────────────── cuối ngày (EOD) ─────────────────────┐
 FO  ──(2) model_weight ─────────────────────────────────────────────▶ SDI
 FO  ──(3) holdings snapshot (KH×master×mã) — chỉ composition/near-realtime ▶ SDI
-Asset ─(4) [BRD asset-sync] NAV RÒNG + stock_value + cash(tổng) + cash_in/out per-SI ▶ SDI
+Asset ─(4) [thin-layer] aum (NAV ròng) + daily_return (TWR) + cash(tổng) + cash_in/out per-SI ▶ SDI
 SDI ──(6) cashflow nạp/rút/SIP (SDI là originator) ─────────────────── (đối soát Asset)
 Mkt ──(7) giá EOD + corporate action + benchmark ──────────────────▶ SDI
         │
-        │  INGEST-NAV (Asset, per-SI/ngày GD): SP_INGEST_ASSET_NAV → T_SI_ASSET_DAILY + derive
+        │  INGEST-NAV (Asset, per-SI/ngày GD): SP_INGEST_ASSET_NAV → T_SI_ASSET_DAILY + LƯU aum+daily_return
         │  FO holdings ingest (Kafka per-KH): SP_INGEST_CUSTOMER → holdings + interval hist (composition)
-        │  SDI EOD (SP_EOD_RUN): J0 GATE → INGEST-NAV derive (NAV→PnL→Unit)
+        │  SDI EOD (SP_EOD_RUN): J0 GATE → INGEST-NAV (LƯU aum+daily_return, KHÔNG derive)
         │       → J11 master agg → J12 Index → J12B TE accum → J13 RECONCILE (cổng publish nội bộ) → J14 build snapshot (nội bộ)
         ▼
 SDI ──▶ giao diện riêng SDI (read API FR-01..06, PM) — NAV/index/perf
@@ -50,7 +52,7 @@ SDI ──(8d) Master Index snapshot (SP_GET_ASSET_INDEX_SNAPSHOT, khi BO price-
         └────────────────────────────────────────────────────────────┘
 ```
 
-Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market đẩy EOD** + **[BRD asset-sync] (4) Asset gửi NAV RÒNG per-SI** (`SP_INGEST_ASSET_NAV`) → SDI ingest NAV thẳng + derive + **J13 reconcile là cổng publish nội bộ** (break > ngưỡng ⇒ chặn publish kết quả EOD). **(8a/8b/8c/9) SDI→Asset ĐÃ GỠ:** per-SI tài sản + master NAV/perf không còn push. **Vẫn GIỮ (8d): SDI đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`) khi BO price-ready — luồng SDI→Asset DUY NHẤT còn lại. **BO KHÔNG gửi số phí lũy kế** (phí QL đã trừ sẵn trong NAV ròng Asset). Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
+Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market đẩy EOD** + **[thin-layer] (4) Asset gửi `aum` + `daily_return` per-SI** (`SP_INGEST_ASSET_NAV`) → SDI LƯU thẳng (KHÔNG derive) + **J13 reconcile là cổng publish nội bộ** (break > ngưỡng ⇒ chặn publish kết quả EOD). **(8a/8b/8c/9) SDI→Asset ĐÃ GỠ:** per-SI tài sản + master NAV/perf không còn push. **Vẫn GIỮ (8d): SDI đẩy Master Index** (`SP_GET_ASSET_INDEX_SNAPSHOT`) khi BO price-ready — luồng SDI→Asset DUY NHẤT còn lại. **BO KHÔNG gửi số phí lũy kế** (phí QL đã trừ sẵn trong NAV ròng Asset). Xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -86,17 +88,17 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 ### E. Asset → SDI (feed EOD) — **[BRD asset-sync] MỚI**
 
-> **Cơ chế:** Asset gửi 1 batch JSON per-SI/ngày GD → `SP_INGEST_ASSET_NAV` (MERGE `T_SI_ASSET_DAILY` idempotent theo date,si) rồi SDI **derive** Unit/UP/PnL/return. Carry-forward T7/CN/lễ (Asset chỉ gửi ngày GD).
+> **Cơ chế:** Asset gửi 1 batch JSON per-SI/ngày GD → `SP_INGEST_ASSET_NAV` (idempotent DELETE+INSERT `T_SI_ASSET_DAILY` theo date,si) rồi SDI **LƯU thẳng** `aum`+`daily_return` (KHÔNG derive). Carry-forward T7/CN/lễ (Asset chỉ gửi ngày GD).
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 4 | **NAV ròng + components** Asset→SDI | `T_SI_ASSET_DAILY` → derive `T_SI_BALANCE`/`_CURRENT` | si_account, **nav** (RÒNG, đã trừ phí QL), stock_value, **cash** (TỔNG tiền 1 số), cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = stock + cash = NAV`. **KHÔNG `fee_accum`** (BO không gửi số phí lũy kế — model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). |
+| 4 | **AUM + daily_return** Asset→SDI | `T_SI_ASSET_DAILY` → LƯU `T_SI_BALANCE`/`_CURRENT` | si_account, **aum** (NAV RÒNG, đã trừ phí QL), **daily_return** (TWR, khử dòng tiền; NULL ngày đầu), **cash** (TỔNG tiền 1 số), cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = NAV`. **KHÔNG `stock_value`/`fee_accum`** (Asset gửi NAV ròng + return; phí QL model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). |
 
 ### D. SDI → Asset — chỉ còn Master Index (BRD 2026-06-22)
 
-> **GỠ 2 producer / GIỮ 1 (BRD 2026-06-22).** BO, FO, Market data nay **đẩy dữ liệu THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR/return). **Đã GỠ khỏi `db/05_API.sql` 2 producer:** `SP_GET_ASSET_SNAPSHOT` (8a — per-SI tài sản KH), `SP_GET_ASSET_MASTER_SNAPSHOT` (8b/8c — master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** (8d — Master Index): SDI **vẫn đẩy danh mục mẫu sang Asset** theo **luồng RIÊNG kích khi BO báo price-ready** (path `SP_EOD_RUN_INDEX`) — đây là luồng SDI→Asset DUY NHẤT còn lại.
+> **GỠ 2 producer / GIỮ 1 (BRD 2026-06-22).** BO, FO, Market data nay **đẩy dữ liệu THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + `daily_return`/TWR). **Đã GỠ khỏi `db/05_API.sql` 2 producer:** `SP_GET_ASSET_SNAPSHOT` (8a — per-SI tài sản KH), `SP_GET_ASSET_MASTER_SNAPSHOT` (8b/8c — master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** (8d — Master Index): SDI **vẫn đẩy danh mục mẫu sang Asset** theo **luồng RIÊNG kích khi BO báo price-ready** (path `SP_EOD_RUN_INDEX`) — đây là luồng SDI→Asset DUY NHẤT còn lại.
 >
-> **[BRD asset-sync] Asset ĐỦ data:** Asset tự tính **NAV RÒNG** (phí QL đã trừ — model realized; BO KHÔNG gửi số phí lũy kế) rồi GỬI về SDI (mục E); Master Index = SDI vẫn đẩy (8d). Còn lại chỉ là **điểm reconcile** (NAV_CONSISTENCY `nav` vs `stock+cash`; cashflow 2 nguồn SDI vs Asset; holdings `ΣFO×giá` vs Asset stock; TWR methodology khớp seed+công thức) — **không phải "thiếu dữ liệu"**. Xem **[SDI-asset-gap.md](./SDI-asset-gap.md)** (nguồn sự thật reconcile).
+> **[thin-layer] Asset ĐỦ data:** Asset tự tính **NAV RÒNG + `daily_return` (TWR)** (phí QL đã trừ — model realized; BO KHÔNG gửi số phí lũy kế) rồi GỬI về SDI (mục E); Master Index = SDI vẫn đẩy (8d). Còn lại chỉ là **điểm reconcile** (NAV_NEGATIVE; SI_NAV_MISMATCH Σ SI vs master; cashflow 2 nguồn SDI vs Asset) — **không phải "thiếu dữ liệu"**. *(NAV_CONSISTENCY + holdings-vs-stock đã GỠ — Asset không gửi `stock_value`.)* Xem **[SDI-asset-gap.md](./SDI-asset-gap.md)**.
 >
 > SDI **giữ engine + read API** (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) phục vụ **giao diện riêng của SDI** (NAV/index/perf) — không đổi.
 >
@@ -124,7 +126,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 | Feed | Grain | small | medium | large |
 |---|---|---:|---:|---:|
 | **(3) Holdings snapshot** FO→SDI | KH×master×mã | 60.000 | 1.250.000 | 6.250.000 |
-| **(4) NAV ròng + components** **[BRD asset-sync] Asset→SDI** | per-SI (KH×master) | 3.000 | 50.000 | 250.000 |
+| **(4) AUM + daily_return** **[thin-layer] Asset→SDI** | per-SI (KH×master) | 3.000 | 50.000 | 250.000 |
 | (2) Model weight FO→SDI | master×mã (khi đổi) | 60 | 125 | 125 |
 | ~~(5) Cổ tức/phí FO→SDI~~ **[BRD asset-sync] ĐÃ GỠ** | — | N/A | N/A | N/A |
 | (6) Cashflow (SDI originator) | sparse | *0 → ~tiểu khoản có SIP/nạp/rút* | | |
@@ -147,7 +149,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 | Feed | ~bytes/row | small | medium | large |
 |---|---:|---:|---:|---:|
 | (3) Holdings snapshot FO→SDI | ~60 | ~3,6 MB | ~75 MB | ~375 MB |
-| (4) NAV ròng + components **[BRD asset-sync] Asset→SDI** | ~40 | ~0,12 MB | ~2 MB | ~10 MB |
+| (4) AUM + daily_return **[thin-layer] Asset→SDI** | ~40 | ~0,12 MB | ~2 MB | ~10 MB |
 | ~~(8a) Current snapshot KH SDI→Asset~~ | — | N/A | N/A | N/A |
 | **Tổng feed→SDI/ngày** (3+4) | | **~3,7 MB** | **~77 MB** | **~385 MB** |
 | ~~**Tổng SDI→Asset/ngày** (8a+b+c)~~ | | N/A | N/A | N/A |
@@ -156,24 +158,26 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 ### 4.3 Thời gian xử lý EOD (đo thực, SQL Express 1 máy)
 
-| Kịch bản | Holdings | TOTAL EOD | J07 MTM (nặng nhất) | Ghi chú |
+> **[thin-layer] LƯU Ý:** số dưới là LỊCH SỬ (model SDI tự MTM/derive). Thin-layer EOD core **nhẹ hơn nhiều** — không MTM 20M dòng, không derive: chỉ LƯU `aum`+`daily_return` (set-based ~1M) + J11 agg + J12 index. J07 MTM **đã GỠ khỏi EOD NAV**. Cần đo lại bằng `bench.ps1` trên model mới.
+
+| Kịch bản | Holdings | TOTAL EOD *(model cũ)* | ~~J07 MTM~~ *(đã gỡ)* | Ghi chú |
 |---|---:|---:|---:|---|
 | small | 60.000 | ~0,9–1,2 s | ~0,5 s | — |
 | medium | 1.250.000 | ~16–19 s | ~8–9 s | đo A/B `db/bench.ps1` |
 | large | 6.250.000 | *chưa đo* | *~5× medium* | ~80–100 s ước lượng tuyến tính |
 
-> Đo bằng `db/bench.ps1` → ghi `db/perf-history.csv`. Điểm nóng cố định = **J07 MTM** (định giá lại toàn bộ holdings) — bám cột này khi theo dõi regression. Lưu ý: `C_CUST_CODE` VARCHAR(10) chậm hơn BIGINT ~13% total (xem perf note); chấp nhận vì là định danh KH xuyên hệ.
+> Đo bằng `db/bench.ps1` → ghi `db/perf-history.csv`. **[thin-layer]** EOD core không còn J07 MTM (NAV từ Asset) — điểm nóng mới = ingest+agg set-based. Lưu ý: `C_CUST_CODE` VARCHAR(10) chậm hơn BIGINT ~13% total; chấp nhận vì là định danh KH xuyên hệ.
 
 ---
 
 ## 5. Quy tắc hợp đồng (contract)
 
-1. **Snapshot overwrite, idempotent:** FO nạp toàn bộ holdings THẲNG vào current mỗi EOD; **[BRD asset-sync]** Asset NAV ingest idempotent (MERGE theo date,si); chạy lại 1 ngày cho cùng kết quả (overwrite, không cộng dồn).
+1. **Snapshot overwrite, idempotent:** FO nạp toàn bộ holdings THẲNG vào current mỗi EOD; **[thin-layer]** Asset ingest idempotent (DELETE+INSERT theo date,si); chạy lại 1 ngày cho cùng kết quả (overwrite, không cộng dồn).
 8. **Holdings history tách rời (interval):** DIFF **tại INGEST (per-event Kafka)** current → `T_SI_HOLDING_HIST` (SCD-2 valid_from/valid_to, **full history, no-dup**) — EOD core chỉ đọc current. *([BRD asset-sync] `T_SI_CASH_HIST` đã bỏ — tiền từ Asset.)*
-2. **[BRD asset-sync] NAV/tiền từ Asset** (NAV ròng, đã trừ phí QL — model realized). SDI **không tự định giá, không accrue/quản phí** (`AUM = stock + cash = NAV`). FO cash-state không còn gửi SDI.
+2. **[thin-layer] AUM + hiệu suất từ Asset** (`aum` NAV ròng + `daily_return` TWR, đã trừ phí QL — model realized). SDI **không tự định giá, không tính hiệu suất, không accrue/quản phí** (`AUM = NAV`). FO cash-state không còn gửi SDI; Asset không gửi `stock_value`.
 3. **Biến động holdings/ngày** SDI suy ra on-demand (qty(D)−qty(D-1)), KHÔNG cần FO gửi delta.
 4. **Cashflow là sự kiện sparse** — SDI là originator (nạp/rút/SIP), đối soát với `cash_in/out` Asset. *([BRD asset-sync] cổ tức/phí không còn là feed FO→SDI.)*
-5. **J13 RECONCILE là cổng publish nội bộ:** **[BRD asset-sync]** NAV_CONSISTENCY (`nav` vs `stock+cash`) + cashflow 2 nguồn + holdings (`ΣFO×giá` vs Asset stock) + Σ customer NAV vs master NAV — lệch > ngưỡng ⇒ **chặn publish kết quả EOD** (RECONCILE=BREAK). Reconcile vẫn là cổng nội bộ (không còn push SDI→Asset).
+5. **J13 RECONCILE là cổng publish nội bộ:** **[thin-layer]** NAV_NEGATIVE (`aum<0`) + SI_NAV_MISMATCH (Σ customer AUM vs master AUM) + CASHFLOW_MISMATCH (SDI vs Asset `cash_in/out`) — lệch > ngưỡng ⇒ **chặn publish kết quả EOD** (RECONCILE=BREAK). *(NAV_CONSISTENCY + holdings-vs-stock GỠ — Asset không gửi `stock_value`.)* Reconcile là cổng nội bộ (không còn push SDI→Asset).
 6. **SDI→Asset: chỉ còn Master Index (BRD 2026-06-22).** Đã GỠ 2 producer push tài sản KH + master NAV/perf (`SP_GET_ASSET_SNAPSHOT`, `SP_GET_ASSET_MASTER_SNAPSHOT`). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`**: SDI đẩy Master Index khi BO price-ready (`SP_EOD_RUN_INDEX`). **[BRD asset-sync] BO KHÔNG gửi số phí lũy kế** (phí QL đã trừ trong NAV ròng Asset). Lịch sử KH SDI giữ + serve qua **read API cho UI riêng của SDI**. Reconcile — xem [SDI-asset-gap.md](./SDI-asset-gap.md).
 7. **J0 GATE** chờ đủ nguồn (**[BRD asset-sync] Asset NAV per-SI**, FO holdings, model_weight, giá, benchmark, cashflow) sẵn sàng cho @d mới chạy.
 
@@ -189,5 +193,5 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 > **[BRD asset-sync]** Vì NAV là số **Asset gửi** (không phải SDI dựng từ holdings×giá−payable), `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV từ history) **đã GỠ**. Sửa quá khứ = **RE-INGEST**.
 
-- **Use case:** NAV một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent MERGE date,si) → SDI **derive lại** unit/UP/PnL/return + lũy kế TE **từ ngày sửa trở đi** (đã có NAV+flow history per (date,si) ở `T_SI_BALANCE`).
+- **Use case:** `aum`/`daily_return` một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent DELETE+INSERT date,si) → SDI **ghi lại** `aum`+`daily_return` + lũy kế TE **từ ngày sửa trở đi** (J12B accum forward).
 - **Index master** sửa riêng (độc lập NAV): `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` — chỉ cần giá BO + target weight.

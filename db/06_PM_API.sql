@@ -167,7 +167,7 @@ BEGIN
     -- Rᵢ = ∏(1+daily_return) qua (base,end] = EXP(Σ ln(1+r))−1 ; bỏ ngày return NULL ; KH không có ngày nào ⇒ r=0
     UPDATE k SET r = c.R
     FROM #kh k INNER JOIN (
-        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
           AND b.C_DAILY_RETURN IS NOT NULL
@@ -301,7 +301,7 @@ BEGIN
           AND C_DAILY_RETURN IS NOT NULL
     ), comp AS (
         SELECT s.d AS d,
-               CAST(EXP(ISNULL(SUM(LOG(1.0 + mret.r)),0)) AS DECIMAL(18,8)) AS kc
+               CAST(EXP(ISNULL(SUM(LOG(CASE WHEN 1.0 + mret.r <= 0 THEN 1.0 ELSE 1.0 + mret.r END)),0)) AS DECIMAL(18,8)) AS kc
         FROM @samp s
         LEFT JOIN mret ON mret.d > @base AND mret.d <= s.d
         GROUP BY s.d
@@ -432,7 +432,7 @@ BEGIN
     SELECT nc.C_SI_ACCOUNT, nc.C_LAST_AUM, ISNULL(c.R, 0)
     FROM T_SI_CURRENT nc
     LEFT JOIN (
-        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
           AND b.C_DAILY_RETURN IS NOT NULL
@@ -511,7 +511,7 @@ BEGIN
                CAST(ISNULL(c.R,0) AS DECIMAL(18,6)) AS C_PNL_PCT
         FROM T_SI_CURRENT nc
         LEFT JOIN (
-            SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+            SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
             FROM T_SI_BALANCE b
             WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
               AND b.C_DAILY_RETURN IS NOT NULL
@@ -601,7 +601,7 @@ BEGIN
     FROM #kh k
     INNER JOIN (
         SELECT b.C_MASTER_CODE AS m, b.C_SI_ACCOUNT AS si,
-               EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+               CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         INNER JOIN #md d ON d.m=b.C_MASTER_CODE
         WHERE b.C_BUSINESS_DATE > d.dbase AND b.C_BUSINESS_DATE <= d.dend
@@ -853,7 +853,7 @@ BEGIN
            (ISNULL(c.R,0) - @rMaster) * 10000
     FROM T_SI_CURRENT nc
     LEFT JOIN (
-        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
           AND b.C_DAILY_RETURN IS NOT NULL
@@ -933,7 +933,7 @@ BEGIN
         SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_AUM AS aum
         FROM T_SI_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), comp AS (   -- ∏(1+r) qua (base,end] = EXP(Σ ln(1+r))−1 ; QUÉT ngày; bỏ ngày return NULL (vd ngày đầu)
-        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
           AND b.C_DAILY_RETURN IS NOT NULL
