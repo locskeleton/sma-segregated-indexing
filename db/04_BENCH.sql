@@ -84,9 +84,10 @@ DROP TABLE #cust, #tk;
 
 /*--- CHẠY EOD (đây là phần được đo qua T_EOD_RUN) ---*/
 DECLARE @ec INT, @em NVARCHAR(400);
+DECLARE @totSI INT = @nCust*@nSi;   -- tổng SI (= cust × strategy) cho ASSET_NAV batch completeness
 EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='MKT_DATA',  @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX @d, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;   -- BO ready → master index (luồng riêng)
-EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='ASSET_NAV', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;   -- [BRD] Asset NAV ready
+EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='ASSET_NAV', @p_total_record=@totSI, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;   -- [thin-layer] batch completeness: total SI
 EXEC SP_EOD_SET_SOURCE_READY @p_business_date=@d, @p_source='FO_INGEST', @p_total_record=@nCust, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RUN @d, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('!!! EOD FAILED ec=',@ec,' ',@em);

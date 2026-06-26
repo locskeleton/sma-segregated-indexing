@@ -370,9 +370,12 @@ CREATE TABLE T_EOD_PIPELINE (
     C_FO_INGEST_TOTAL    INT          NULL,        -- total cust_code FO khai báo (break event)
     C_FO_INGEST_RECEIVED INT          NULL,        -- cust_code SDI đếm nhận được
     C_FO_INGEST_AT       DATETIME     NULL,
-    -- [BRD asset-sync] ASSET_NAV: Asset gửi số tổng per-SI (NAV/tiền/phí) → SDI ingest T_SI_ASSET_DAILY.
-    --   Gate: EOD chỉ chạy khi ASSET_NAV=READY (cần NAV để derive). App gọi SP_EOD_SET_SOURCE_READY @p_source='ASSET_NAV'.
-    C_ASSET_NAV_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_ANAV DEFAULT 'PENDING',  -- PENDING|READY (Asset)
+    -- [thin-layer] ASSET_NAV: Asset gửi per-SI (aum/daily_return/cash) qua Kafka BATCH (≤100 item/msg) → T_SI_ASSET_DAILY.
+    --   Completeness: Asset khai TOTAL = #SI; SDI đếm RECEIVED = #SI distinct @ngày (Σ batch); READY khi RECEIVED>=TOTAL.
+    --   Gate: EOD chỉ chạy khi ASSET_NAV=READY. Đơn vị = SI (như FO đếm cust_code).
+    C_ASSET_NAV_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_ANAV DEFAULT 'PENDING',  -- PENDING|READY (Asset, batch)
+    C_ASSET_NAV_TOTAL    INT          NULL,        -- total SI Asset khai báo (completeness batch)
+    C_ASSET_NAV_RECEIVED INT          NULL,        -- #SI distinct SDI nhận @ngày (Σ batch)
     C_ASSET_NAV_AT       DATETIME     NULL,
     C_INDEX_STATUS       VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_IDX  DEFAULT 'PENDING',  -- PENDING|DONE: master index TÍNH RIÊNG (BO ready), KHÔNG trong pipeline customer
     C_INDEX_AT           DATETIME     NULL,

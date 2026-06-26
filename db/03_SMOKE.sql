@@ -30,7 +30,7 @@ EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-02","sub
 EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10000000,"daily_return":null,"cash":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
-EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','ASSET_NAV',1,NULL,@ec OUTPUT,@em OUTPUT;   -- total=1 SI (SUB001); batch completeness
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 02 ec=',@ec,' ',@em);
@@ -40,7 +40,7 @@ EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-05","sub
 EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10440000,"daily_return":0.044,"cash":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
-EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','ASSET_NAV',1,NULL,@ec OUTPUT,@em OUTPUT;   -- total=1 SI (SUB001); batch completeness
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 05 ec=',@ec,' ',@em);
@@ -51,7 +51,7 @@ EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-06","sub
 EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":11484000,"daily_return":0,"cash":1044000,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
-EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',1,NULL,@ec OUTPUT,@em OUTPUT;   -- total=1 SI (SUB001); batch completeness
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN '2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 06 ec=',@ec,' ',@em);
@@ -137,5 +137,16 @@ INSERT T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STAT
 EXEC SP_EOD_RUN '2026-01-06',@p_err_code=@ecP OUTPUT,@p_err_msg=@emP OUTPUT;   -- SUB002 chưa có asset_daily @06
 IF @ecP=12 PRINT '  OK thiếu Asset NAV cho SUB002 → err=12 (chặn EOD, không bỏ ngầm)'; ELSE PRINT CONCAT('  !!! asset completeness: ec=',@ecP);
 DELETE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT='SUB002';
+
+PRINT '';
+PRINT '======== ASSET_NAV batch gate (received/total — Kafka batch ≤100/msg) ========';
+DECLARE @ag1 INT, @ag2 INT, @ast1 VARCHAR(10), @ast2 VARCHAR(10);
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',2,NULL,@ag1 OUTPUT,@em OUTPUT;  -- received=1 (SUB001) / total=2 → CHƯA đủ
+SELECT @ast1=C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-06';
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',1,NULL,@ag2 OUTPUT,@em OUTPUT;  -- received=1 / total=1 → đủ
+SELECT @ast2=C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-06';
+IF @ag1=4 AND @ast1='PENDING' AND @ag2=0 AND @ast2='READY'
+   PRINT '  OK batch gate: 1/2 → err=4 PENDING ; 1/1 → READY';
+ELSE PRINT CONCAT('  !!! batch gate: ag1=',@ag1,' st1=',@ast1,' ag2=',@ag2,' st2=',@ast2);
 
 PRINT '======== END SMOKE ========';

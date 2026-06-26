@@ -872,8 +872,8 @@ GO
 --     distinct (watermark); READY khi received >= total (else err=4).
 CREATE OR ALTER PROCEDURE SP_EOD_SET_SOURCE_READY
     @p_business_date DATE,
-    @p_source        VARCHAR(20),               -- 'MKT_DATA' (BO) | 'FO_INGEST' (FO)
-    @p_total_record  INT           = NULL,       -- BẮT BUỘC cho FO_INGEST (tổng cust_code); BỎ QUA cho MKT_DATA
+    @p_source        VARCHAR(20),               -- 'MKT_DATA' (BO) | 'FO_INGEST' (FO) | 'ASSET_NAV' (Asset)
+    @p_total_record  INT           = NULL,       -- BẮT BUỘC cho FO_INGEST (tổng cust_code) + ASSET_NAV (tổng SI); BỎ QUA cho MKT_DATA
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
     @p_err_msg       NVARCHAR(400) OUTPUT
@@ -895,9 +895,22 @@ BEGIN
     END
     ELSE IF @p_source='ASSET_NAV'
     BEGIN
-        -- [BRD] Asset đã gửi số tổng per-SI (SP_INGEST_ASSET_NAV vào T_SI_ASSET_DAILY). Cờ READY → đủ NAV để derive.
-        UPDATE T_EOD_PIPELINE SET C_ASSET_NAV_STATUS='READY', C_ASSET_NAV_AT=GETDATE(),
+        -- [thin-layer] Asset gửi per-SI qua Kafka BATCH (≤100 item/msg) → SP_INGEST_ASSET_NAV vào T_SI_ASSET_DAILY.
+        --   Completeness: @p_total_record = tổng SI Asset khai; RECEIVED = #SI distinct @ngày; READY khi đủ (else err=4).
+        IF @p_total_record IS NULL
+            BEGIN SET @p_err_code=2; SET @p_err_msg=N'ASSET_NAV cần @p_total_record (tổng SI Asset gửi)'; RAISERROR(@p_err_msg, 16, 1); END
+        DECLARE @anavRecv INT = (SELECT COUNT(DISTINCT C_SI_ACCOUNT) FROM T_SI_ASSET_DAILY
+                                 WHERE C_BUSINESS_DATE=@p_business_date);
+        DECLARE @anavOk BIT = CASE WHEN @anavRecv >= @p_total_record THEN 1 ELSE 0 END;
+        UPDATE T_EOD_PIPELINE SET C_ASSET_NAV_TOTAL=@p_total_record, C_ASSET_NAV_RECEIVED=@anavRecv,
+               C_ASSET_NAV_STATUS = CASE WHEN @anavOk=1 THEN 'READY' ELSE 'PENDING' END,
+               C_ASSET_NAV_AT     = CASE WHEN @anavOk=1 THEN GETDATE() ELSE C_ASSET_NAV_AT END,
                C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
+        IF @anavOk=0
+        BEGIN
+            SET @p_err_code=4;   -- chưa đủ batch → KHÔNG READY (không THROW; tình huống nghiệp vụ)
+            SET @p_err_msg=CONCAT(N'ASSET_NAV: received ', @anavRecv, '/', @p_total_record, N' SI — CHƯA đủ batch.');
+        END
     END
     ELSE  -- FO_INGEST: completeness theo total cust_code
     BEGIN
