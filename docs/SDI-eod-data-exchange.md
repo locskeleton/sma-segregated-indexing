@@ -90,7 +90,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 4 | **NAV ròng + components** Asset→SDI | `T_SI_ASSET_DAILY` → derive `T_SI_NAV_BALANCE`/`_CURRENT` | si_account, **nav** (RÒNG, đã trừ phí QL), stock_value, **cash** (TỔNG tiền 1 số), cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = stock + cash = NAV`. **KHÔNG `fee_accum`** (BO không gửi số phí lũy kế — model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). |
+| 4 | **NAV ròng + components** Asset→SDI | `T_SI_ASSET_DAILY` → derive `T_SI_BALANCE`/`_CURRENT` | si_account, **nav** (RÒNG, đã trừ phí QL), stock_value, **cash** (TỔNG tiền 1 số), cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = stock + cash = NAV`. **KHÔNG `fee_accum`** (BO không gửi số phí lũy kế — model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). |
 
 ### D. SDI → Asset — chỉ còn Master Index (BRD 2026-06-22)
 
@@ -100,9 +100,9 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 >
 > SDI **giữ engine + read API** (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) phục vụ **giao diện riêng của SDI** (NAV/index/perf) — không đổi.
 >
-> *(Bảng cũ liệt kê 8a current snapshot KH `T_SI_NAV_CURRENT` / 8b current snapshot master `T_MASTER_NAV_CURRENT` / 8c master series `T_MASTER_NAV_BALANCE` / 9 lịch sử KH API pull — KHÔNG còn áp dụng. Master Index series `T_MASTER_INDEX_DAILY` VẪN đẩy qua 8d.)*
+> *(Bảng cũ liệt kê 8a current snapshot KH `T_SI_CURRENT` / 8b current snapshot master `T_MASTER_CURRENT` / 8c master series `T_MASTER_BALANCE` / 9 lịch sử KH API pull — KHÔNG còn áp dụng. Master Index series `T_MASTER_INDEX_DAILY` VẪN đẩy qua 8d.)*
 
-> **Điểm mấu chốt (vẫn đúng):** FO→SDI nặng (per-mã, dense, nạp THẲNG current). Lịch sử dài hạn = `T_SI_NAV_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve **read API cho UI SDI** (FR-01..06). Holdings history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core. *([BRD asset-sync] `T_SI_CASH_HIST` đã bỏ — tiền/NAV nay từ Asset.)*
+> **Điểm mấu chốt (vẫn đúng):** FO→SDI nặng (per-mã, dense, nạp THẲNG current). Lịch sử dài hạn = `T_SI_BALANCE` (~2,5 tỷ dòng) SDI giữ + serve **read API cho UI SDI** (FR-01..06). Holdings history = **interval (SCD-2) full history, KHÔNG trùng lặp** (holding bất biến = 1 dòng) maintain bằng DIFF **tại INGEST (per-event)** — không trong EOD core. *([BRD asset-sync] `T_SI_CASH_HIST` đã bỏ — tiền/NAV nay từ Asset.)*
 
 > **Lưu ý FR-06:** `SP_GET_ASSET_REPORT` (FR-06, báo cáo tài sản KH) là **read API của KH — VẪN GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` producer đã gỡ).
 
@@ -189,5 +189,5 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 > **[BRD asset-sync]** Vì NAV là số **Asset gửi** (không phải SDI dựng từ holdings×giá−payable), `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV từ history) **đã GỠ**. Sửa quá khứ = **RE-INGEST**.
 
-- **Use case:** NAV một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent MERGE date,si) → SDI **derive lại** unit/UP/PnL/return + lũy kế TE **từ ngày sửa trở đi** (đã có NAV+flow history per (date,si) ở `T_SI_NAV_BALANCE`).
+- **Use case:** NAV một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent MERGE date,si) → SDI **derive lại** unit/UP/PnL/return + lũy kế TE **từ ngày sửa trở đi** (đã có NAV+flow history per (date,si) ở `T_SI_BALANCE`).
 - **Index master** sửa riêng (độc lập NAV): `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` — chỉ cần giá BO + target weight.

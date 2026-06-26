@@ -161,7 +161,7 @@ Modified Dietz (mặc định):
 XIRR (tùy chọn, chính xác):  giải r:  NAV_đầu·(1+r)^T + Σ CF_i·(1+r)^(T−t_i) = NAV_cuối
 ```
 - Hiển thị period return (không annualize trừ khi yêu cầu). Mẫu số ≈ 0 → trả null.
-- Tính on-read: NAV 2 đầu mút (từ `T_SI_NAV_BALANCE`) + cashflow events trong range.
+- Tính on-read: NAV 2 đầu mút (từ `T_SI_BALANCE`) + cashflow events trong range.
 
 ### Tổng hợp master (đường "Hiệu suất master" trên chart)
 ```
@@ -204,7 +204,7 @@ Index_t = Index_(t-1) × Σ_i ( w_i^(t) × P_i,t / P_ref_i )
 Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = `DECIMAL(20,0)` (không thập phân); giá = `DECIMAL(18,4)`; % / return / fee_rate = `DECIMAL(10,6)`; unit & unit_price = `DECIMAL(18,6)`; weight = `DECIMAL(12,8)`. **[BRD asset-sync]** Phí QL đã trừ sẵn trong NAV Asset gửi (model realized) ⇒ **không còn cột phí lũy kế (payable/accrued) ở SDI**. **Hai cấp:** master (`C_MASTER_CODE`, bảng `T_MASTER_*`) / sub-account = tiểu khoản (`C_SI_ACCOUNT`, bảng `T_SI_*`).
 
 ### Master / cấu hình
-- **`T_MASTER_PORTFOLIO`** (**`C_MASTER_CODE` PK** — mã danh mục MASTER, khóa chính + khóa public, KHÔNG surrogate; name, status[ACTIVE|CLOSED], inception_date, benchmark_code) — các bảng khác tham chiếu master theo `C_MASTER_CODE`; bảng tổng hợp master-level: `T_MASTER_NAV_BALANCE`/`T_MASTER_HOLDING_BALANCE`/`T_MASTER_INDEX_DAILY`/`T_MASTER_NAV_CURRENT`. **[BRD asset-sync] Không còn cột phí ở đây** (phí QL đã trừ sẵn trong NAV Asset gửi — SDI không cấu hình/accrue phí). **Sub-account** (`T_SI_PORTFOLIO`): `C_SI_ACCOUNT` (mã sub-account, UNIQUE) + `C_MASTER_CODE` + `C_CUST_CODE` + close_date; filtered-unique 1 ACTIVE/(cust,master). Customer-level tables khóa theo `C_SI_ACCOUNT`.
+- **`T_MASTER_PORTFOLIO`** (**`C_MASTER_CODE` PK** — mã danh mục MASTER, khóa chính + khóa public, KHÔNG surrogate; name, status[ACTIVE|CLOSED], inception_date, benchmark_code) — các bảng khác tham chiếu master theo `C_MASTER_CODE`; bảng tổng hợp master-level: `T_MASTER_BALANCE`/`T_MASTER_HOLDING_BALANCE`/`T_MASTER_INDEX_DAILY`/`T_MASTER_CURRENT`. **[BRD asset-sync] Không còn cột phí ở đây** (phí QL đã trừ sẵn trong NAV Asset gửi — SDI không cấu hình/accrue phí). **Sub-account** (`T_SI_PORTFOLIO`): `C_SI_ACCOUNT` (mã sub-account, UNIQUE) + `C_MASTER_CODE` + `C_CUST_CODE` + close_date; filtered-unique 1 ACTIVE/(cust,master). Customer-level tables khóa theo `C_SI_ACCOUNT`.
 - **`T_FEE_CONFIG`** — **[BRD asset-sync] ĐÃ GỠ.** SDI không còn accrue/cấu hình phí (phí QL đã trừ sẵn trong NAV Asset gửi — model realized). Catalog chính sách phí giờ thuộc Asset/BO, không phải SDI.
 - **`T_MASTER_PORTFOLIO_TICKER`** (`C_MASTER_CODE`, effective_date, ticker; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
 - **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04). **[BRD asset-sync] Phí không thuộc SDI** (đã trừ sẵn trong NAV Asset gửi).
@@ -218,19 +218,19 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_REBALANCE_REQUEST`** (request_id PK; `C_MASTER_CODE`, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).
 - **`T_SI_HOLDING_HIST`** (`C_SI_ACCOUNT`, ticker, valid_from; valid_to, quantity, avg_cost) — **HISTORY holdings theo KHOẢNG (INTERVAL / SCD-2)**: **FULL history BẮT BUỘC (compliance), KHÔNG trùng lặp** — holding bất biến N năm = **1 dòng** (`valid_to=NULL` = đang mở). Maintain bằng **DIFF** current vs dòng open **TẠI INGEST (per-event Kafka)** (đóng dòng đổi/biến mất → mở dòng mới). Reconstruct ngày D: `valid_from≤D AND (valid_to>D OR valid_to IS NULL)`. FO ingest holdings THẲNG `T_SI_PORTFOLIO_HOLDING` (current); **EOD core KHÔNG đọc hist**.
 - **`T_SI_CASH_HIST`** (`C_SI_ACCOUNT`, valid_from; valid_to, cash) — **HISTORY cash theo INTERVAL** (full, no-dup; đối xứng holding_hist). DIFF state.cash vs dòng open **tại INGEST**.
-- **State per-KH `T_SI_NAV_CURRENT`** (roll-forward) — **[BRD asset-sync]** giữ `C_NAV` + components (`stock_value`, `cash` tổng) Asset gửi; `AUM = stock + cash = NAV`. **Không còn cột `C_PAYABLE_FEE`** (phí QL đã trừ sẵn trong NAV ⇒ `NAV = AUM`, không trừ payable).
+- **State per-KH `T_SI_CURRENT`** (roll-forward) — **[BRD asset-sync]** giữ `C_AUM` + components (`stock_value`, `cash` tổng) Asset gửi; `AUM = stock + cash = NAV`. **Không còn cột `C_PAYABLE_FEE`** (phí QL đã trừ sẵn trong NAV ⇒ `NAV = AUM`, không trừ payable).
 - **`T_SI_CASHFLOW_EVENT`** (event_id PK; `C_SI_ACCOUNT`, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow; dùng cho **CF_t** (PnL/unit), KHÔNG cộng lại cash (cash từ FO sync).
 - **`T_SI_INCOME_FEE`** — **[BRD asset-sync] ĐÃ GỠ.** Sổ cái phí/thu nhập per-KH (cổ tức + phí lưu ký + phí ACCRUE cắt) không còn ở SDI: phí QL đã trừ sẵn trong NAV Asset gửi (model realized), cổ tức/income đã nằm trong NAV/`cash` Asset gửi. Cùng đó gỡ proc `SP_INGEST_FEE_CHARGE` (net-off payable).
 - **`T_SI_FEE_ACCRUAL` / payable / Option B breakdown per-type** — **[BRD asset-sync] ĐÃ GỠ TOÀN BỘ.** Không còn `C_PAYABLE_FEE`, không accrue, không breakdown per-type. Phí QL chỉ giảm tài sản khi BO cắt thật (qua cash, đã phản ánh trong NAV Asset gửi) — SDI không lưu/dựng lại số phí lũy kế.
 - **`T_SI_UNIT_LEDGER`** (`C_SI_ACCOUNT`, business_date; cf_net, delta_unit, unit) — ghi dòng khi unit thay đổi (cashflow). Unit full precision.
 
 ### Per-KH daily performance (LỊCH SỬ — materialize)
-- **`T_SI_NAV_BALANCE`** (business_date, `C_SI_ACCOUNT`; nav, unit, unit_price, daily_pnl, daily_return, **cash_in, cash_out**, **accum_active_ret, accum_active_ret_sq, ret_day_count**) — **BẮT BUỘC**: NAV/unit/unit_price per-ngày không derive được on-read → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). **[BRD asset-sync]** `nav` = NAV RÒNG Asset gửi (đã trừ phí QL); **không còn cột `payable_fee`/`nav_gross`** — `AUM = nav`.
+- **`T_SI_BALANCE`** (business_date, `C_SI_ACCOUNT`; nav, unit, unit_price, daily_pnl, daily_return, **cash_in, cash_out**, **accum_active_ret, accum_active_ret_sq, ret_day_count**) — **BẮT BUỘC**: NAV/unit/unit_price per-ngày không derive được on-read → phải lưu để vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). **[BRD asset-sync]** `nav` = NAV RÒNG Asset gửi (đã trừ phí QL); **không còn cột `payable_fee`/`nav_gross`** — `AUM = nav`.
   - **`accum_active_ret` / `accum_active_ret_sq` / `ret_day_count`** (FLOAT/INT) — **lũy kế TE prefix-sum** (active return = `daily_return` KH − `daily_return` master index), maintain bởi **J12B** (xem §9.2). Cho phép serve-layer PM tính Tracking Error qua range BẤT KỲ bằng HIỆU 2 mốc base/end (đọc 2 lát, không quét lịch sử): `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TE=√Var×√min(n,252)`. Tiêu thụ ở [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) (US1/US2). Index `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE,C_BUSINESS_DATE)` INCLUDE 3 cột này + unit_price/daily_return/nav để phủ đọc-2-lát.
 
 ### Chuỗi daily master-level (materialize, nhỏ)
-- **`T_MASTER_NAV_BALANCE`** (business_date, `C_MASTER_CODE`; cash, aum, nav, unit, unit_price, daily_pnl, daily_return, **cash_in**, **cash_out**, **total_account**) — **NGUỒN NAV master-level DUY NHẤT**. **[BRD asset-sync]** `aum = Σ (stock + cash)` per-SI `= Σ nav = nav` (không tách payable; không còn cột `payable_fee`). **[PM tool +]** `cash_in`/`cash_out` = Σ cashflow nạp/rút master/ngày; `total_account` = #tiểu khoản ACTIVE → phục vụ AUM-growth, net-flow, #KH ở dashboard PM (US1/US2).
-- **`T_MASTER_NAV_CURRENT`** (`C_MASTER_CODE`; cash, aum, last_nav, unit, last_unit_price, **total_account**, last_business_date) — NAV/state **current cấp master** (overwrite mỗi EOD bởi J11). **[BRD asset-sync]** `aum = stock + cash = last_nav` (không tách payable; cash = tổng tiền 1 số). Phục vụ đọc nhanh AUM/cash-drag/#KH **hiện tại** (US1/US2 snapshot, FR-01). Đối xứng `T_SI_NAV_CURRENT`.
+- **`T_MASTER_BALANCE`** (business_date, `C_MASTER_CODE`; cash, aum, nav, unit, unit_price, daily_pnl, daily_return, **cash_in**, **cash_out**, **total_account**) — **NGUỒN NAV master-level DUY NHẤT**. **[BRD asset-sync]** `aum = Σ (stock + cash)` per-SI `= Σ nav = nav` (không tách payable; không còn cột `payable_fee`). **[PM tool +]** `cash_in`/`cash_out` = Σ cashflow nạp/rút master/ngày; `total_account` = #tiểu khoản ACTIVE → phục vụ AUM-growth, net-flow, #KH ở dashboard PM (US1/US2).
+- **`T_MASTER_CURRENT`** (`C_MASTER_CODE`; cash, aum, last_nav, unit, last_unit_price, **total_account**, last_business_date) — NAV/state **current cấp master** (overwrite mỗi EOD bởi J11). **[BRD asset-sync]** `aum = stock + cash = last_nav` (không tách payable; cash = tổng tiền 1 số). Phục vụ đọc nhanh AUM/cash-drag/#KH **hiện tại** (US1/US2 snapshot, FR-01). Đối xứng `T_SI_CURRENT`.
 - **`T_MASTER_HOLDING_BALANCE`** (business_date, `C_MASTER_CODE`, ticker; quantity, market_price, market_value, weight) — top 20 + "mã khác"
 - **`T_MASTER_INDEX_DAILY`** (business_date, `C_MASTER_CODE`; index_value, daily_return)
 
@@ -241,7 +241,7 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - *(Đã BỎ `T_SDI_CONFIG`)* — **[BRD asset-sync]** SDI không còn accrue/cấu hình phí (phí QL đã trừ sẵn trong NAV Asset gửi); catalog phí `T_FEE_CONFIG` cũng đã gỡ.
 
 ### Customer-level: MATERIALIZE (do FO-sync)
-NAV/Unit Price/PnL theo ngày của KH được **lưu vào `T_SI_NAV_BALANCE`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.
+NAV/Unit Price/PnL theo ngày của KH được **lưu vào `T_SI_BALANCE`** mỗi EOD (J10). Vì FO sync **overwrite** holdings (không event-source) → KHÔNG derive được quá khứ → phải materialize. TWR/MWR theo range = đọc 2 đầu mút từ bảng này (TWR) hoặc dùng cashflow events (MWR). Giảm tải: điểm thưa / chỉ unit_price.
 
 ### Partition & retention
 
@@ -271,7 +271,7 @@ Master Index_t   = Index_(t-1) × Σ w^(t)·P_t/P_ref
 
 Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạng thái vào `T_EOD_RUN`. "SB" = set-based (không RBAR). "‖" = song song theo master/hash(C_SI_ACCOUNT).
 
-> **[BRD asset-sync] Core mới:** EOD **ingest NAV ròng từ Asset** (`SP_INGEST_ASSET_NAV` per-SI) rồi **derive** Unit/UnitPrice/PnL/return (ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE`), SUM lên master (J11). **Không còn J06 accrue / J07 MTM / J08 NAV-from-holdings** (NAV lấy thẳng từ Asset). **Sửa quá khứ = RE-INGEST** (Asset gửi lại ngày cũ → derive lại từ ngày đó) — `SP_EOD_RECOMPUTE_RANGE` đã bỏ.
+> **[BRD asset-sync] Core mới:** EOD **ingest NAV ròng từ Asset** (`SP_INGEST_ASSET_NAV` per-SI) rồi **derive** Unit/UnitPrice/PnL/return (ghi `T_SI_UNIT_LEDGER` + `T_SI_BALANCE`), SUM lên master (J11). **Không còn J06 accrue / J07 MTM / J08 NAV-from-holdings** (NAV lấy thẳng từ Asset). **Sửa quá khứ = RE-INGEST** (Asset gửi lại ngày cũ → derive lại từ ngày đó) — `SP_EOD_RECOMPUTE_RANGE` đã bỏ.
 
 | # | Job | Phụ thuộc | Đọc | Ghi | SB | ‖ | Halt nếu lỗi |
 |---|---|---|---|---|---|---|---|
@@ -283,16 +283,16 @@ Mỗi job **idempotent** (chạy lại 1 ngày → cùng kết quả), ghi trạ
 | ~~J6b~~ | ~~`LOG_ACCRUAL`~~ **(ĐÃ BỎ)** | — | không còn payable/breakdown per-type | — | – | – | – |
 | ~~INGEST-FEE~~ | ~~`SP_INGEST_FEE_CHARGE`~~ **[BRD asset-sync] ĐÃ GỠ** | — | BO không gửi số phí lũy kế; phí cắt phản ánh qua cash trong NAV Asset | — | – | – | – |
 | ~~J7~~ | ~~`MTM`~~ **[BRD asset-sync] ĐÃ GỠ khỏi EOD NAV** (NAV từ Asset; MTM giữ cho composition/near-realtime) | — | — | — | – | – | – |
-| **INGEST-NAV** | `SP_INGEST_ASSET_NAV` (Asset gửi per-SI/ngày GD) | — | JSON `{si_account, nav, stock_value, cash, cash_in, cash_out}` | `T_SI_ASSET_DAILY` + derive Unit/UP/PnL/return → `T_SI_NAV_BALANCE`; `AUM = stock + cash = NAV` | ✅ | ‖ | – |
+| **INGEST-NAV** | `SP_INGEST_ASSET_NAV` (Asset gửi per-SI/ngày GD) | — | JSON `{si_account, nav, stock_value, cash, cash_in, cash_out}` | `T_SI_ASSET_DAILY` + derive Unit/UP/PnL/return → `T_SI_BALANCE`; `AUM = stock + cash = NAV` | ✅ | ‖ | – |
 | **J9** | `CALC_PNL` *(trong INGEST-NAV)* | INGEST-NAV | NAV, NAV_prev, CF | daily_pnl per vị thế | ✅ | ‖ | – |
-| **J10** | `CALC_UNIT` *(trong INGEST-NAV)* | INGEST-NAV | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; T_SI_UNIT_LEDGER; **T_SI_NAV_BALANCE** (lịch sử per-KH) | ✅ | ‖ | – |
-| **J11** | `SI_AGG` tổng hợp master | INGEST-NAV, J10 | NAV/AUM/unit per tiểu khoản + T_SI_CASHFLOW_EVENT | **T_MASTER_NAV_BALANCE** (NAV + AUM(=stock+cash) + hiệu suất + **[PM] cash_in/cash_out Σ + total_account**) + **T_MASTER_NAV_CURRENT** (upsert) | ✅ | ‖ | – |
+| **J10** | `CALC_UNIT` *(trong INGEST-NAV)* | INGEST-NAV | CF_t (cashflow event), UnitPrice_prev | ΔUnit/Unit/UnitPrice; T_SI_UNIT_LEDGER; **T_SI_BALANCE** (lịch sử per-KH) | ✅ | ‖ | – |
+| **J11** | `SI_AGG` tổng hợp master | INGEST-NAV, J10 | NAV/AUM/unit per tiểu khoản + T_SI_CASHFLOW_EVENT | **T_MASTER_BALANCE** (NAV + AUM(=stock+cash) + hiệu suất + **[PM] cash_in/cash_out Σ + total_account**) + **T_MASTER_CURRENT** (upsert) | ✅ | ‖ | – |
 | **J12** | `SI_INDEX` master index — **LUỒNG RIÊNG `SP_EOD_RUN_INDEX`** (BO ready, KHÔNG trong pipeline customer) | giá+weight | model_weight, giá | T_MASTER_INDEX_DAILY | ✅ | ‖ | – |
-| **J12B** | `TE_ACCUM` lũy kế active return *(PM)* | J10, J12 | `daily_return` KH (J10) − `daily_return` index (J12); accum @prev | **T_SI_NAV_BALANCE** cập nhật `accum_active_ret/_sq + ret_day_count` (TE prefix-sum cho serve-layer PM). Idempotent: accum@d=accum@prev+a@d | ✅ | – | – |
+| **J12B** | `TE_ACCUM` lũy kế active return *(PM)* | J10, J12 | `daily_return` KH (J10) − `daily_return` index (J12); accum @prev | **T_SI_BALANCE** cập nhật `accum_active_ret/_sq + ret_day_count` (TE prefix-sum cho serve-layer PM). Idempotent: accum@d=accum@prev+a@d | ✅ | – | – |
 | **J13** | `RECONCILE` đối soát (RECORDER) | J11 | NAV âm/unit≤0; Σ customer NAV vs master NAV; **[BRD asset-sync]** NAV_CONSISTENCY (`nav` vs `stock+cash`); cashflow 2 nguồn; holdings (Σ FO×giá vs Asset stock) | **GHI `T_EOD_RECON_BREAK`** (KHÔNG throw) | ✅ | – | ✅ (có break → SP_EOD_RUN chặn publish, RECONCILE=BREAK) |
 | **J14** | `BUILD_SNAPSHOT` | INGEST-NAV | holdings | T_MASTER_HOLDING_BALANCE (top20+mã khác) | ✅ | ‖ | – |
 | ~~J14b~~ | ~~`HISTORY`~~ **(CHUYỂN sang INGEST realtime)** | — | interval CASH_HIST/HOLDING_HIST maintain TẠI ingest per-event; `SP_EOD_HISTORY` chỉ còn utility bulk-backfill | — | – | – | – |
-| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_NAV_CURRENT`; SWITCH/MERGE master-level (publish nội bộ cho read API). ~~push tài sản KH + master NAV/perf → Asset~~ **ĐÃ GỠ (BRD 2026-06-22)** — BO/FO/Market đẩy thẳng Asset. **Master Index VẪN đẩy Asset** qua luồng RIÊNG `SP_EOD_RUN_INDEX` (`SP_GET_ASSET_INDEX_SNAPSHOT`, BO price-ready), KHÔNG trong J15. Xem [SDI-asset-gap.md](./SDI-asset-gap.md) | ✅ | – | ✅ |
+| **J15** | `PUBLISH` | J13, J14 | staging/đích | commit `T_SI_CURRENT`; SWITCH/MERGE master-level (publish nội bộ cho read API). ~~push tài sản KH + master NAV/perf → Asset~~ **ĐÃ GỠ (BRD 2026-06-22)** — BO/FO/Market đẩy thẳng Asset. **Master Index VẪN đẩy Asset** qua luồng RIÊNG `SP_EOD_RUN_INDEX` (`SP_GET_ASSET_INDEX_SNAPSHOT`, BO price-ready), KHÔNG trong J15. Xem [SDI-asset-gap.md](./SDI-asset-gap.md) | ✅ | – | ✅ |
 | **J16** | `FINALIZE` | J15 | — | mark T_EOD_RUN done; (cuối tháng) build snapshot KH; update stats; alert success | – | – | – |
 
 ### 9.3 Thứ tự, song song & orchestration
@@ -324,7 +324,7 @@ J0 GATE → INGEST-NAV derive (NAV→PnL→Unit, J9/J10)
 
 > **[BRD asset-sync]** `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV từ history holdings×giá − payable) **đã GỠ**. Vì NAV là số **Asset gửi** (không phải SDI tự dựng từ holdings), sửa quá khứ = **RE-INGEST**.
 
-- **Use case:** NAV một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent MERGE theo date,si) → SDI **derive lại** unit/UP/PnL/return + lũy kế TE **từ ngày sửa trở đi** (đã có NAV+flow history per (date,si) ở `T_SI_NAV_BALANCE`).
+- **Use case:** NAV một ngày quá khứ SAI → **Asset gửi lại `T_SI_ASSET_DAILY` ngày đó** (`SP_INGEST_ASSET_NAV` idempotent MERGE theo date,si) → SDI **derive lại** unit/UP/PnL/return + lũy kế TE **từ ngày sửa trở đi** (đã có NAV+flow history per (date,si) ở `T_SI_BALANCE`).
 - **Index master** sửa riêng (độc lập NAV): `SP_EOD_RECOMPUTE_INDEX_RANGE` (chỉ cần giá BO + target weight).
 
 ---
@@ -337,12 +337,12 @@ J0 GATE → INGEST-NAV derive (NAV→PnL→Unit, J9/J10)
 
 | FR | API | Proc | Nguồn |
 |---|---|---|---|
-| FR-01 Tổng quan đa tiểu khoản | GET /customer/{id}/si-overview | `SP_GET_SI_OVERVIEW` | sum T_MASTER_NAV_BALANCE + derive customer NAV (current từ T_SI_NAV_CURRENT) |
-| FR-02 Chi tiết 1 tiểu khoản | GET /customer/{id}/si/{si} | `SP_GET_SI_DETAIL` | derive customer NAV/PnL + TWR + MWR + T_MASTER_NAV_BALANCE |
-| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | `SP_GET_SI_PERFORMANCE` | T_MASTER_NAV_BALANCE (TR) + T_MASTER_INDEX_DAILY (PR) + benchmark VN-Index (PR), chuỗi [mốc..cuối] |
+| FR-01 Tổng quan đa tiểu khoản | GET /customer/{id}/si-overview | `SP_GET_SI_OVERVIEW` | sum T_MASTER_BALANCE + derive customer NAV (current từ T_SI_CURRENT) |
+| FR-02 Chi tiết 1 tiểu khoản | GET /customer/{id}/si/{si} | `SP_GET_SI_DETAIL` | derive customer NAV/PnL + TWR + MWR + T_MASTER_BALANCE |
+| FR-03 Chart so sánh | GET /customer/{id}/si/{si}/performance?range= | `SP_GET_SI_PERFORMANCE` | T_MASTER_BALANCE (TR) + T_MASTER_INDEX_DAILY (PR) + benchmark VN-Index (PR), chuỗi [mốc..cuối] |
 | FR-04 Thông tin đầu tư | GET /customer/{id}/si/{si}/info | `SP_GET_SI_INFO` | T_SI_PORTFOLIO + master. **[BRD asset-sync]** phí QL không thuộc SDI (đã trừ trong NAV Asset) — không đọc rate phí từ SDI |
 | FR-05 Holdings | GET /customer/{id}/si/{si}/holdings | `SP_GET_SI_HOLDINGS` | **holdings CURRENT của KH** (T_SI_PORTFOLIO_HOLDING × giá mới nhất) top20 + "OTHER" — sản phẩm segregated nên đọc holdings KH (≠ master-aggregate T_MASTER_HOLDING_BALANCE) |
-| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | **[BRD asset-sync]** T_SI_NAV_BALANCE (NAV ròng + unit/UP derive @asOf) + components Asset (`stock_value`, `cash` tổng); `AUM = stock + cash = NAV` + holdings chi tiết per-mã (FO @asOf × giá). **Bỏ payable / `C_FEE_ACCRUED_TOTAL` / breakdown per-type** (SDI không quản chi tiết phí) |
+| FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | **[BRD asset-sync]** T_SI_BALANCE (NAV ròng + unit/UP derive @asOf) + components Asset (`stock_value`, `cash` tổng); `AUM = stock + cash = NAV` + holdings chi tiết per-mã (FO @asOf × giá). **Bỏ payable / `C_FEE_ACCRUED_TOTAL` / breakdown per-type** (SDI không quản chi tiết phí) |
 
 > **FR-06 result sets [BRD asset-sync]:** **RS1** summary (NAV ròng + unit/UP + `AUM = stock + cash = NAV`), **RS2** holdings chi tiết per-mã @asOf (FO×giá; ⚠️ Σ có thể lệch Asset `stock_value` — đo ở reconcile HOLDINGS_MISMATCH, RS1 dùng số Asset authoritative). **Đã BỎ RS3/RS4/RS5** (chi tiết income/phí + breakdown per-type) — phí QL đã trừ trong NAV Asset, SDI không quản sổ phí.
 
@@ -360,9 +360,9 @@ J0 GATE → INGEST-NAV derive (NAV→PnL→Unit, J9/J10)
 | Master Index / Performance / master snapshot (nội bộ) | ~250K dòng/loại |
 | Cashflow / execution / holding event | ~100M+ |
 | Unit ledger | ~120M |
-| Customer NAV/UP/% daily | **materialize** `T_SI_NAV_BALANCE` (~2,5 tỷ, CCI) — bắt buộc do FO-sync |
+| Customer NAV/UP/% daily | **materialize** `T_SI_BALANCE` (~2,5 tỷ, CCI) — bắt buộc do FO-sync |
 
-Customer NAV/UP/% daily: **BẮT BUỘC materialize** `T_SI_NAV_BALANCE` mỗi EOD — vì FO sync overwrite holdings (không event-source) → KHÔNG derive được lịch sử per-customer. Master-level agg tươi mỗi ngày + lưu `T_MASTER_NAV_BALANCE`.
+Customer NAV/UP/% daily: **BẮT BUỘC materialize** `T_SI_BALANCE` mỗi EOD — vì FO sync overwrite holdings (không event-source) → KHÔNG derive được lịch sử per-customer. Master-level agg tươi mỗi ngày + lưu `T_MASTER_BALANCE`.
 
 ---
 

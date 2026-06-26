@@ -6,9 +6,10 @@ GO
   Dashboard PM quản lý cấp MASTER (10 master, ~50k KH). Spec: docs/SDI-pm-tool-spec.md
   master-keyed: nhận @p_master_code (+ range); KHÔNG trả định danh KH ngoài top-N (US5).
   2 bản chất: Snapshot (current, T_MASTER/SI_NAV_CURRENT) | Hiệu suất (T-1, *_NAV_BALANCE).
-  Công thức (spec §2):
-    AUM = C_LAST_NAV (per KH) — [BRD] phí QL đã trừ trong NAV Asset gửi ⇒ AUM = NAV (gross = net)
-    DM tổng KH = AUM-weighted (end-weight): Σ Wᵢ·PnLᵢ, Wᵢ=AUMᵢ/ΣAUM, PnLᵢ=UPᵢ(end)/UPᵢ(base)−1 (TWR)
+  Công thức (spec §2) — [thin-layer] SDI KHÔNG tự tính hiệu suất: Asset gửi per-KH/ngày AUM + daily_return (TWR):
+    AUM = C_LAST_AUM (per KH) — [BRD] phí QL đã trừ trong NAV Asset gửi ⇒ AUM = NAV (gross = net)
+    Rᵢ (TWR kỳ KH i) = COMPOUND daily_return = EXP(SUM(LOG(1+C_DAILY_RETURN)))−1 qua (base,end] (T_SI_BALANCE)
+    DM tổng KH = AUM-weighted (end-weight): Σ Wᵢ·Rᵢ, Wᵢ=AUMᵢ/ΣAUM (TWR compound, KHÔNG còn unit_price)
     Deviation = (Return − Master Index Return) × 10000 (BPS)
     TE per-KH = STDEV(Rᵢ,t − R_master,t) × √X ; Master = Σ(TEᵢ·AUMᵢ)/ΣAUM (X = #ngày GD, cap 252)
 ==============================================================================*/
@@ -121,9 +122,9 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
@@ -142,38 +143,46 @@ BEGIN
     DECLARE @aumNow DECIMAL(20,0), @tienNow DECIMAL(20,0), @nKH INT;
     SELECT @aumNow = C_AUM, @nKH = C_TOTAL_ACCOUNT,
            @tienNow = C_CASH
-    FROM T_MASTER_NAV_CURRENT WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_CURRENT WHERE C_MASTER_CODE=@p_master_code;
 
-    -- net in/out (base,end] + AUM @base: 1 read T_MASTER_NAV_BALANCE [base,end] (gộp 2 read cũ).
+    -- net in/out (base,end] + AUM @base: 1 read T_MASTER_BALANCE [base,end] (gộp 2 read cũ).
     DECLARE @cashIn DECIMAL(20,0), @cashOut DECIMAL(20,0), @aumBase DECIMAL(20,0);
     SELECT @cashIn  = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_IN  END),0),
            @cashOut = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_OUT END),0),
            @aumBase = MAX(CASE WHEN C_BUSINESS_DATE = @base THEN C_AUM END)
-    FROM T_MASTER_NAV_BALANCE
+    FROM T_MASTER_BALANCE
     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE >= @base AND C_BUSINESS_DATE <= @end;
 
-    -- per-KH (end-weight): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end).
-    --   TE = STDEV(active) qua (base,end] = hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → up_base=10000, accum_base=0.
-    CREATE TABLE #kh (si VARCHAR(20), aum DECIMAL(20,6), up_base DECIMAL(18,6),
-                      up_end DECIMAL(18,6), tien DECIMAL(20,0),
+    -- per-KH (end-weight): AUM/tien từ CURRENT; return Rᵢ = COMPOUND daily_return qua (base,end] (QUÉT NAV_BALANCE);
+    --   TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end) — hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → accum_base=0.
+    CREATE TABLE #kh (si VARCHAR(20), aum DECIMAL(20,6), r DECIMAL(18,10), tien DECIMAL(20,0),
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
 
-    INSERT #kh (si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV, nc.C_LAST_UNIT_PRICE,
+    INSERT #kh (si, aum, r, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_AUM, 0,
            nc.C_CASH, 0,0,0, 0,0,0
-    FROM T_SI_NAV_CURRENT nc
+    FROM T_SI_CURRENT nc
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
+
+    -- Rᵢ = ∏(1+daily_return) qua (base,end] = EXP(Σ ln(1+r))−1 ; bỏ ngày return NULL ; KH không có ngày nào ⇒ r=0
+    UPDATE k SET r = c.R
+    FROM #kh k INNER JOIN (
+        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        FROM T_SI_BALANCE b
+        WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
+          AND b.C_DAILY_RETURN IS NOT NULL
+        GROUP BY b.C_SI_ACCOUNT
+    ) c ON c.si=k.si;
 
     -- lát @end: accum active đến cuối kỳ
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
-    FROM #kh k INNER JOIN T_SI_NAV_BALANCE e
+    FROM #kh k INNER JOIN T_SI_BALANCE e
       ON e.C_MASTER_CODE=@p_master_code AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
 
-    -- lát @base: up_base + accum active đến base (thiếu lát ⇒ KH join sau base ⇒ up_base=10000, accum_base=0)
-    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
-    FROM #kh k INNER JOIN T_SI_NAV_BALANCE b
+    -- lát @base: accum active đến base (thiếu lát ⇒ KH join sau base ⇒ accum_base=0)
+    UPDATE k SET car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    FROM #kh k INNER JOIN T_SI_BALANCE b
       ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
-    UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
     UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
@@ -182,18 +191,18 @@ BEGIN
         * SQRT(CASE WHEN (n_e-n_b) > 252 THEN 252 ELSE (n_e-n_b) END)
       END;
 
-    -- tổng hợp per-KH (AUM-weighted): KH return + TE. (master AUM = @aumNow tầng master, KHÔNG SUM SI.)
+    -- tổng hợp per-KH (AUM-weighted): KH return (compound) + TE. (master AUM = @aumNow tầng master, KHÔNG SUM SI.)
     DECLARE @wRet DECIMAL(18,10), @wTE FLOAT;
-    SELECT @wRet = SUM((up_end/NULLIF(up_base,0) - 1) * aum) / NULLIF(SUM(aum),0)
-    FROM #kh WHERE up_base IS NOT NULL AND up_base <> 0;
+    SELECT @wRet = SUM(r * aum) / NULLIF(SUM(aum),0)
+    FROM #kh;
     SELECT @wTE = SUM(CASE WHEN te IS NOT NULL THEN te * aum END) / NULLIF(SUM(CASE WHEN te IS NOT NULL THEN aum END),0)
     FROM #kh;
 
     DECLARE @nTEover INT, @nCashOver INT, @nDevHi INT, @nDevLo INT;
     SELECT @nTEover   = COUNT(CASE WHEN te > @teAlert THEN 1 END),
            @nCashOver = COUNT(CASE WHEN aum > 0 AND tien*1.0/aum > @cdThr THEN 1 END),
-           @nDevHi    = COUNT(CASE WHEN up_base>0 AND ((up_end/up_base-1) - @rMaster)*10000 > @devHi THEN 1 END),
-           @nDevLo    = COUNT(CASE WHEN up_base>0 AND ((up_end/up_base-1) - @rMaster)*10000 < @devLo THEN 1 END)
+           @nDevHi    = COUNT(CASE WHEN (r - @rMaster)*10000 > @devHi THEN 1 END),
+           @nDevLo    = COUNT(CASE WHEN (r - @rMaster)*10000 < @devLo THEN 1 END)
     FROM #kh;
 
     SELECT  mp.C_MASTER_CODE, mp.C_MASTER_NAME, mp.C_STATUS, mp.C_INCEPTION_DATE, mp.C_BENCHMARK_CODE,
@@ -226,7 +235,7 @@ GO
 /*===========================================================================
   US3 — SP_GET_MASTER_PERFORMANCE : chart 3 đường + mốc rebalance
     RS1 chuỗi theo @p_resolution (D/W/M, NULL=auto theo độ dài kỳ):
-        C_MASTER_INDEX (PR) | C_KH_COMPOSITE (AUM-weighted end-weight, base=1.0) | C_BENCHMARK (PR)
+        C_MASTER_INDEX (PR) | C_KH_COMPOSITE (COMPOUND master AUM-weighted daily return, base=1.0) | C_BENCHMARK (PR)
         → App rebase cả 3 về 0% tại điểm đầu.
     RS2: mốc rebalance (effective_date của T_MASTER_PORTFOLIO_TICKER trong kỳ).
 ===========================================================================*/
@@ -250,9 +259,9 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
@@ -261,22 +270,14 @@ BEGIN
         SET @p_resolution = CASE WHEN DATEDIFF(DAY,@base,@end) > 90 THEN 'M'
                                WHEN DATEDIFF(DAY,@base,@end) > 21 THEN 'W' ELSE 'D' END;
 
-    -- end-weight per KH: W_i = aum_i/Σaum ; up_base = lát @base (join sau base → 10000)
-    CREATE TABLE #kw (si VARCHAR(20), w DECIMAL(18,12), up_base DECIMAL(18,6));
-    ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum
-        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
-    ), tot AS (SELECT SUM(aum) s FROM kh)
-    INSERT #kw (si, w, up_base)
-    SELECT kh.si, CAST(kh.aum / NULLIF(tot.s,0) AS DECIMAL(18,12)), COALESCE(b.C_UNIT_PRICE,10000)
-    FROM kh CROSS JOIN tot
-    LEFT JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=kh.si;
+    -- [thin-layer] Composite KH = chuỗi COMPOUND master AUM-weighted daily return (T_MASTER_BALANCE.C_DAILY_RETURN).
+    --   C_KH_COMPOSITE @d = ∏(1+master_daily_return) qua (base,d] ; base=1.0 (App rebase về 0% tại điểm đầu).
+    --   (engine đã ghi C_DAILY_RETURN master = AUM-weighted Σ(AUMᵢ·rᵢ)/ΣAUMᵢ ⇒ KHÔNG cần per-KW unit_price nữa.)
 
     -- sample dates theo resolution (luôn gồm base & end)
     DECLARE @samp TABLE (d DATE PRIMARY KEY);
     ;WITH dd AS (
-        SELECT DISTINCT C_BUSINESS_DATE bd FROM T_MASTER_NAV_BALANCE
+        SELECT DISTINCT C_BUSINESS_DATE bd FROM T_MASTER_BALANCE
         WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE BETWEEN @base AND @end
     ), bucketed AS (
         SELECT bd,
@@ -290,19 +291,20 @@ BEGIN
     SELECT bd FROM bucketed WHERE @p_resolution='D' OR rn=1
     UNION SELECT @base UNION SELECT @end;
 
-    -- RS1 chuỗi. Composite KH set-based: sample-date là business-date thật ⇒ KH active có đúng 1
-    -- dòng NAV_BALANCE @ngày đó → equi-join (master,date∈sample) dùng IX_MASTER (KHÔNG OUTER APPLY
-    -- per-KH = tránh 60k scan). Renormalize Σweight present → KH join/đóng giữa kỳ không méo, base=1.0.
-    ;WITH comp AS (
-        SELECT b.C_BUSINESS_DATE AS d,
-               CAST( SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
-                              THEN kw.w * b.C_UNIT_PRICE / kw.up_base END)
-                   / NULLIF(SUM(CASE WHEN kw.up_base>0 AND b.C_UNIT_PRICE IS NOT NULL
-                                     THEN kw.w END),0) AS DECIMAL(18,8)) AS kc
-        FROM #kw kw
-        INNER JOIN T_SI_NAV_BALANCE b ON b.C_SI_ACCOUNT=kw.si AND b.C_MASTER_CODE=@p_master_code
-        INNER JOIN @samp s2 ON s2.d=b.C_BUSINESS_DATE
-        GROUP BY b.C_BUSINESS_DATE
+    -- RS1 chuỗi. Composite KH = COMPOUND master daily return từ base: tại mỗi sample-date d,
+    --   kc(d) = ∏(1+master_daily_return) qua (base,d] (base=1.0 vì khoảng rỗng). Bỏ ngày return NULL.
+    --   1 read T_MASTER_BALANCE [base,end] → mỗi sample-date d gộp các daily return ≤ d (running-compound set-based).
+    ;WITH mret AS (
+        SELECT C_BUSINESS_DATE AS d, C_DAILY_RETURN AS r
+        FROM T_MASTER_BALANCE
+        WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE>@base AND C_BUSINESS_DATE<=@end
+          AND C_DAILY_RETURN IS NOT NULL
+    ), comp AS (
+        SELECT s.d AS d,
+               CAST(EXP(ISNULL(SUM(LOG(1.0 + mret.r)),0)) AS DECIMAL(18,8)) AS kc
+        FROM @samp s
+        LEFT JOIN mret ON mret.d > @base AND mret.d <= s.d
+        GROUP BY s.d
     )
     SELECT  s.d AS C_BUSINESS_DATE,
             idx.C_INDEX_VALUE AS C_MASTER_INDEX,
@@ -319,8 +321,6 @@ BEGIN
     FROM T_MASTER_PORTFOLIO_TICKER
     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE BETWEEN @base AND @end
     ORDER BY C_EFFECTIVE_DATE;
-
-    DROP TABLE #kw;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
@@ -420,19 +420,24 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
+    -- per-KH %PnL = COMPOUND daily_return qua (base,end] = EXP(Σ ln(1+r))−1 ; KH không có ngày return ⇒ 0
     CREATE TABLE #p (si VARCHAR(20), aum DECIMAL(20,6), pnl DECIMAL(18,10));
     INSERT #p (si, aum, pnl)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
-           nc.C_LAST_UNIT_PRICE / NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1
-    FROM T_SI_NAV_CURRENT nc
-    LEFT JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_AUM, ISNULL(c.R, 0)
+    FROM T_SI_CURRENT nc
+    LEFT JOIN (
+        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        FROM T_SI_BALANCE b
+        WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
+          AND b.C_DAILY_RETURN IS NOT NULL
+        GROUP BY b.C_SI_ACCOUNT
+    ) c ON c.si=nc.C_SI_ACCOUNT
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
 
     -- RS1 summary
@@ -492,24 +497,29 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
+    -- per-KH %PnL = COMPOUND daily_return qua (base,end] = EXP(Σ ln(1+r))−1 ; KH không có ngày return ⇒ 0.
+    -- [thin-layer] BỎ cột C_UNIT_PRICE_BASE/END (không còn unit price). C_PNL_PCT = compound TWR.
     ;WITH k AS (
         SELECT nc.C_CUST_CODE, nc.C_SI_ACCOUNT,
-               nc.C_LAST_NAV AS C_AUM,
-               nc.C_LAST_UNIT_PRICE AS C_UNIT_PRICE_END,
-               COALESCE(b.C_UNIT_PRICE,10000) AS C_UNIT_PRICE_BASE,
-               CAST(nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1 AS DECIMAL(18,6)) AS C_PNL_PCT
-        FROM T_SI_NAV_CURRENT nc
-        LEFT JOIN T_SI_NAV_BALANCE b
-          ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+               nc.C_LAST_AUM AS C_AUM,
+               CAST(ISNULL(c.R,0) AS DECIMAL(18,6)) AS C_PNL_PCT
+        FROM T_SI_CURRENT nc
+        LEFT JOIN (
+            SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+            FROM T_SI_BALANCE b
+            WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
+              AND b.C_DAILY_RETURN IS NOT NULL
+            GROUP BY b.C_SI_ACCOUNT
+        ) c ON c.si=nc.C_SI_ACCOUNT
         WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     )
-    SELECT TOP (@p_topn) C_CUST_CODE, C_SI_ACCOUNT, C_AUM, C_UNIT_PRICE_BASE, C_UNIT_PRICE_END, C_PNL_PCT
+    SELECT TOP (@p_topn) C_CUST_CODE, C_SI_ACCOUNT, C_AUM, C_PNL_PCT
     FROM k
     ORDER BY CASE WHEN @p_dir='ASC' THEN C_PNL_PCT END ASC,
              CASE WHEN @p_dir<>'ASC' THEN C_PNL_PCT END DESC;
@@ -546,13 +556,13 @@ BEGIN
     INSERT #md (m, dend, dfirst)
     SELECT mp.C_MASTER_CODE, MAX(b.C_BUSINESS_DATE), MIN(b.C_BUSINESS_DATE)
     FROM T_MASTER_PORTFOLIO mp
-    INNER JOIN T_MASTER_NAV_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
+    INNER JOIN T_MASTER_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
     WHERE mp.C_STATUS='ACTIVE'
     GROUP BY mp.C_MASTER_CODE;
 
     UPDATE #md SET dcut = dbo.UDF_RANGE_CUTOFF(dend, @p_range);
     UPDATE m SET dbase = COALESCE(
-        (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+        (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
           WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE<=m.dcut),
         m.dfirst)
     FROM #md m;
@@ -573,28 +583,41 @@ BEGIN
               WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE>=m.dbase AND C_BUSINESS_DATE<=m.dend) z
     ) x;
 
-    -- per-KH metrics (toàn hệ): AUM/up_end/tien từ CURRENT; up_base + TE prefix-sum đọc 2 LÁT
-    --   (@base/@end theo master của KH) — KHÔNG quét toàn lịch sử.
+    -- per-KH metrics (toàn hệ): AUM/tien từ CURRENT; return Rᵢ = COMPOUND daily_return qua (dbase,dend] theo master của KH;
+    --   TE prefix-sum đọc 2 LÁT (@base/@end theo master) — KHÔNG quét toàn lịch sử (TE), nhưng return QUÉT (dbase,dend].
     CREATE TABLE #kh (m VARCHAR(20), si VARCHAR(20), aum DECIMAL(20,6),
-                      up_base DECIMAL(18,6), up_end DECIMAL(18,6), tien DECIMAL(20,0),
+                      r DECIMAL(18,10), tien DECIMAL(20,0),
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
-    INSERT #kh (m, si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
-    SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
-           nc.C_LAST_UNIT_PRICE, nc.C_CASH, 0,0,0, 0,0,0
-    FROM T_SI_NAV_CURRENT nc
+    INSERT #kh (m, si, aum, r, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
+    SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_AUM,
+           0, nc.C_CASH, 0,0,0, 0,0,0
+    FROM T_SI_CURRENT nc
     INNER JOIN #md d ON d.m=nc.C_MASTER_CODE
     WHERE nc.C_STATUS='ACTIVE';
+
+    -- return Rᵢ = ∏(1+daily_return) qua (dbase,dend] theo master của KH ; bỏ ngày NULL ; KH không có ngày ⇒ r=0
+    -- (set-based compound per master×si: quét lát (dbase,dend] mỗi master)
+    UPDATE k SET r = c.R
+    FROM #kh k
+    INNER JOIN (
+        SELECT b.C_MASTER_CODE AS m, b.C_SI_ACCOUNT AS si,
+               EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        FROM T_SI_BALANCE b
+        INNER JOIN #md d ON d.m=b.C_MASTER_CODE
+        WHERE b.C_BUSINESS_DATE > d.dbase AND b.C_BUSINESS_DATE <= d.dend
+          AND b.C_DAILY_RETURN IS NOT NULL
+        GROUP BY b.C_MASTER_CODE, b.C_SI_ACCOUNT
+    ) c ON c.m=k.m AND c.si=k.si;
 
     -- lát @end per master (accum active đến cuối kỳ)
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN #md d ON d.m=k.m
-    INNER JOIN T_SI_NAV_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
+    INNER JOIN T_SI_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
 
-    -- lát @base per master (up_base + accum active đến base; thiếu lát ⇒ up_base=10000, accum_base=0)
-    UPDATE k SET up_base=b.C_UNIT_PRICE, car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
+    -- lát @base per master (accum active đến base; thiếu lát ⇒ accum_base=0)
+    UPDATE k SET car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN #md d ON d.m=k.m
-    INNER JOIN T_SI_NAV_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
-    UPDATE #kh SET up_base=10000 WHERE up_base IS NULL;
+    INNER JOIN T_SI_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
     UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
@@ -610,7 +633,7 @@ BEGIN
                       wte FLOAT, cashdrag FLOAT, cdThr DECIMAL(9,6));
     INSERT #mr (m, wret, wte)
     SELECT k.m,
-           SUM(CASE WHEN k.up_base>0 THEN (k.up_end/k.up_base-1)*k.aum END)/NULLIF(SUM(CASE WHEN k.up_base>0 THEN k.aum END),0),
+           SUM(k.r*k.aum)/NULLIF(SUM(k.aum),0),
            SUM(CASE WHEN k.te IS NOT NULL THEN k.te*k.aum END)/NULLIF(SUM(CASE WHEN k.te IS NOT NULL THEN k.aum END),0)
     FROM #kh k GROUP BY k.m;
     UPDATE r SET rmaster = CASE WHEN d.idxBase IS NULL OR d.idxBase=0 THEN NULL ELSE d.idxEnd/d.idxBase-1 END,
@@ -619,12 +642,12 @@ BEGIN
                                  ELSE (mc.C_CASH)*1.0/mc.C_AUM END
     FROM #mr r
     INNER JOIN #md d ON d.m=r.m
-    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
+    INNER JOIN T_MASTER_CURRENT mc ON mc.C_MASTER_CODE=r.m
     OUTER APPLY dbo.UDF_PM_CONFIG(r.m) cfg;
 
     -- RS1 header
     SELECT COUNT(*) AS C_TOTAL_MASTER,
-           (SELECT ISNULL(SUM(C_TOTAL_ACCOUNT),0) FROM T_MASTER_NAV_CURRENT mc
+           (SELECT ISNULL(SUM(C_TOTAL_ACCOUNT),0) FROM T_MASTER_CURRENT mc
             INNER JOIN #md d ON d.m=mc.C_MASTER_CODE) AS C_TOTAL_KH
     FROM #md;
 
@@ -639,16 +662,16 @@ BEGIN
             CAST(SUM(mc.C_CASH)*1.0/NULLIF(SUM(mc.C_AUM),0) AS DECIMAL(9,6)) AS C_CASH_DRAG,
             SUM(CASE WHEN r.cashdrag > r.cdThr THEN 1 ELSE 0 END) AS C_CNT_MASTER_CASH_OVER
     FROM #md d
-    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=d.m
+    INNER JOIN T_MASTER_CURRENT mc ON mc.C_MASTER_CODE=d.m
     INNER JOIN #mr r ON r.m=d.m
-    -- aumBase(point) + net in/out(range) 1 read T_MASTER_NAV_BALANCE [dbase,dend] (gộp 2 OUTER APPLY cũ).
+    -- aumBase(point) + net in/out(range) 1 read T_MASTER_BALANCE [dbase,dend] (gộp 2 OUTER APPLY cũ).
     OUTER APPLY (SELECT MAX(CASE WHEN isBase=1 THEN ta END) aumBase,
                         ISNULL(SUM(CASE WHEN aft=1 THEN cin END),0) cin,
                         ISNULL(SUM(CASE WHEN aft=1 THEN cout END),0) cout
                  FROM (SELECT C_AUM AS ta, C_CASH_IN AS cin, C_CASH_OUT AS cout,
                               CASE WHEN C_BUSINESS_DATE=d.dbase THEN 1 ELSE 0 END AS isBase,
                               CASE WHEN C_BUSINESS_DATE>d.dbase THEN 1 ELSE 0 END AS aft
-                       FROM T_MASTER_NAV_BALANCE
+                       FROM T_MASTER_BALANCE
                        WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE>=d.dbase AND C_BUSINESS_DATE<=d.dend) z) x;
 
     -- RS3 list master
@@ -661,7 +684,7 @@ BEGIN
             CAST(r.cashdrag AS DECIMAL(9,6)) AS C_CASH_DRAG
     FROM #mr r
     INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=r.m
-    INNER JOIN T_MASTER_NAV_CURRENT mc ON mc.C_MASTER_CODE=r.m
+    INNER JOIN T_MASTER_CURRENT mc ON mc.C_MASTER_CODE=r.m
     ORDER BY CASE @p_sort WHEN 'AUM'  THEN mc.C_AUM END DESC,
              CASE @p_sort WHEN 'RET'  THEN r.wret END DESC,
              CASE @p_sort WHEN 'DEV'  THEN (r.wret-r.rmaster) END DESC,
@@ -809,9 +832,9 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
      WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
@@ -822,14 +845,20 @@ BEGIN
     FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE IN (@base,@end);
     SET @rMaster = CASE WHEN @idxBase IS NULL OR @idxBase=0 THEN NULL ELSE @idxEnd/@idxBase - 1 END;
 
-    -- per-KH deviation (BPS) = (TWR KH − return master) × 10000
+    -- per-KH deviation (BPS) = (TWR KH compound − return master index) × 10000
+    --   TWR KH = ∏(1+daily_return) qua (base,end] = EXP(Σ ln(1+r))−1 ; KH không có ngày return ⇒ 0
     CREATE TABLE #d (si VARCHAR(20), aum DECIMAL(20,6), dev_bps DECIMAL(18,6));
     INSERT #d (si, aum, dev_bps)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
-           ((nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1) - @rMaster) * 10000
-    FROM T_SI_NAV_CURRENT nc
-    LEFT JOIN T_SI_NAV_BALANCE b
-      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=nc.C_SI_ACCOUNT
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_AUM,
+           (ISNULL(c.R,0) - @rMaster) * 10000
+    FROM T_SI_CURRENT nc
+    LEFT JOIN (
+        SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
+        FROM T_SI_BALANCE b
+        WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
+          AND b.C_DAILY_RETURN IS NOT NULL
+        GROUP BY b.C_SI_ACCOUNT
+    ) c ON c.si=nc.C_SI_ACCOUNT
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
 
     -- RS1: summary
@@ -879,42 +908,12 @@ END
 GO
 
 /*===========================================================================
-  [BRD đối chiếu] AUM-weighted return KH của 1 master — 2 API, 2 CÔNG THỨC tính Rᵢ (hiệu suất kỳ KH i).
-    Cả 2: wᵢ = AUMᵢ/ΣAUM (AUMᵢ = C_LAST_NAV, current ACTIVE; AUM = NAV vì phí QL đã trừ); return = Σ wᵢ·Rᵢ. Khung base/end giống US2.
+  [BRD đối chiếu] AUM-weighted return KH của 1 master — COMPOUND daily_return (thin-layer).
+    wᵢ = AUMᵢ/ΣAUM (AUMᵢ = C_LAST_AUM, current ACTIVE; AUM = NAV vì phí QL đã trừ); return = Σ wᵢ·Rᵢ. Khung base/end giống US2.
     RS: C_MASTER_CODE, C_BASE_DATE, C_END_DATE, C_METHOD, C_KH_RETURN_AUMW.
-    (1) RET_INDEX : Rᵢ = UP_end/UP_base − 1  (ret_index = C_UNIT_PRICE, đọc 2-lát) — NHANH.
-    (2) COMPOUND  : Rᵢ = ∏(1+C_DAILY_RETURN) qua (base,end] = EXP(Σ ln(1+r))−1 (QUÉT ngày) — đúng công thức literal.
-    Cùng data nhất quán (UPₜ=UPₜ₋₁·(1+rₜ)) ⇒ 2 kết quả KHỚP. Dùng đối chiếu + đo perf.
+    Rᵢ = ∏(1+C_DAILY_RETURN) qua (base,end] = EXP(Σ ln(1+r))−1 (QUÉT ngày, Asset gửi daily_return TWR).
+    ([thin-layer] ĐÃ GỠ SP_GET_MASTER_RETURN_RETINDEX: không còn unit_price ⇒ chỉ còn 1 API COMPOUND.)
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_GET_MASTER_RETURN_RETINDEX
-    @p_master_code VARCHAR(20), @p_range VARCHAR(20)='INCEPTION',
-    @p_user VARCHAR(64)=NULL, @p_err_code INT OUTPUT, @p_err_msg NVARCHAR(400) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
-    BEGIN TRY
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
-        BEGIN SET @p_err_code=1; SET @p_err_msg=N'Master not found'; RAISERROR(@p_err_msg,16,1); END
-    DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
-    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
-    SET @cutoff=dbo.UDF_RANGE_CUTOFF(@end,@p_range);
-    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
-    IF @base IS NULL SET @base=@first;
-
-    ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum, nc.C_LAST_UNIT_PRICE AS up_end
-        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
-    ), b AS (   -- up_base lát @base; KH join sau base → 10000 (mốc inception)
-        SELECT k.si, k.aum, k.up_end, COALESCE(nb.C_UNIT_PRICE,10000) AS up_base
-        FROM kh k LEFT JOIN T_SI_NAV_BALANCE nb ON nb.C_MASTER_CODE=@p_master_code AND nb.C_BUSINESS_DATE=@base AND nb.C_SI_ACCOUNT=k.si
-    )
-    SELECT @p_master_code AS C_MASTER_CODE, @base AS C_BASE_DATE, @end AS C_END_DATE, 'RET_INDEX' AS C_METHOD,
-           CAST(SUM((up_end/NULLIF(up_base,0) - 1)*aum)/NULLIF(SUM(aum),0) AS DECIMAL(18,6)) AS C_KH_RETURN_AUMW
-    FROM b WHERE up_base>0;
-    END TRY BEGIN CATCH IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END END CATCH
-END
-GO
-
 CREATE OR ALTER PROCEDURE SP_GET_MASTER_RETURN_COMPOUND
     @p_master_code VARCHAR(20), @p_range VARCHAR(20)='INCEPTION',
     @p_user VARCHAR(64)=NULL, @p_err_code INT OUTPUT, @p_err_msg NVARCHAR(400) OUTPUT
@@ -925,17 +924,17 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
         BEGIN SET @p_err_code=1; SET @p_err_msg=N'Master not found'; RAISERROR(@p_err_msg,16,1); END
     DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
-    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
     SET @cutoff=dbo.UDF_RANGE_CUTOFF(@end,@p_range);
-    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
+    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
     IF @base IS NULL SET @base=@first;
 
     ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum
-        FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_AUM AS aum
+        FROM T_SI_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), comp AS (   -- ∏(1+r) qua (base,end] = EXP(Σ ln(1+r))−1 ; QUÉT ngày; bỏ ngày return NULL (vd ngày đầu)
         SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R
-        FROM T_SI_NAV_BALANCE b
+        FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
           AND b.C_DAILY_RETURN IS NOT NULL
         GROUP BY b.C_SI_ACCOUNT

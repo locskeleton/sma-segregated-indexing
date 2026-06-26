@@ -4,7 +4,7 @@ GO
 /*==============================================================================
   SDI MODULE — ENGINE CORE (SQL Server)  | ALL-IN-DB, set-based, no RBAR
   Naming: SP_ procs, UDF_ functions, T_/C_ tables/cols.
-  Mô hình roll-forward: T_SI_NAV_CURRENT (current) + áp delta ngày @d → tính lại.
+  Mô hình roll-forward: T_SI_CURRENT (current) + áp delta ngày @d → tính lại.
   INGEST: SP_INGEST_ASSET_NAV → Asset gửi NAV RÒNG + components (stock/cash) + cash_in/out per-SI/ngày;
     SP_INGEST_CUSTOMER → FO gửi holdings (per-mã, composition) + registry. SDI derive unit/UP/PnL/return.
   Thứ tự (master SP_EOD_RUN): J0_GATE → J07 → J11 → J12 → J13 → J14
@@ -94,7 +94,7 @@ BEGIN
             THROW 50022, 'INGEST: sub-account chưa đăng ký (thiếu T_SI_PORTFOLIO cho cust/si_account).', 1;
 
         -- FORWARD guard: sub-account đã sync ngày MỚI HƠN @d ⇒ event quá khứ
-        IF EXISTS (SELECT 1 FROM @sub n INNER JOIN T_SI_NAV_CURRENT s
+        IF EXISTS (SELECT 1 FROM @sub n INNER JOIN T_SI_CURRENT s
                    ON s.C_SI_ACCOUNT=n.C_SI_ACCOUNT WHERE s.C_LAST_SYNC_DATE > @d)
             THROW 50021, 'INGEST: event quá khứ (< watermark) — history CHƯA hỗ trợ (forward-only).', 1;
 
@@ -128,11 +128,11 @@ BEGIN
         /* [BRD asset-sync] FO chỉ còn gửi HOLDINGS (per-mã, cho composition/near-realtime). Tiền/phí/cổ tức KHÔNG
            qua đây nữa — Asset gửi số tổng (SP_INGEST_ASSET_NAV). Vẫn upsert registry NAV_CURRENT + watermark
            C_LAST_SYNC_DATE (cổng GATE FO holdings). cash/pending/div để 0 — compute fill từ Asset. */
-        MERGE T_SI_NAV_CURRENT s
+        MERGE T_SI_CURRENT s
         USING @sub n ON s.C_SI_ACCOUNT=n.C_SI_ACCOUNT
         WHEN MATCHED THEN UPDATE SET s.C_LAST_SYNC_DATE=@d
-        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_UNIT,C_CASH,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS,C_LAST_SYNC_DATE)
-            VALUES (n.C_SI_ACCOUNT,@cust,n.C_MASTER_CODE,0,0,0,NULL,'ACTIVE',@d);
+        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_LAST_AUM,C_STATUS,C_LAST_SYNC_DATE)
+            VALUES (n.C_SI_ACCOUNT,@cust,n.C_MASTER_CODE,0,0,'ACTIVE',@d);
 
         COMMIT;
     END TRY
@@ -185,28 +185,22 @@ END
 GO
 
 /*===========================================================================
-  SP_EOD_COMPUTE — LÕI tính cuối ngày 1 phiên @p_d cho TỪNG tiểu khoản (si_account):
-    seed NAV (Asset gửi) → J09 PnL → J10 Unit/UnitPrice → roll-forward + ghi lịch sử. SDI KHÔNG tự tính/trừ NAV.
+  SP_EOD_COMPUTE — [thin-layer] LƯU cuối ngày 1 phiên @p_d cho TỪNG tiểu khoản (si_account):
+    seed AUM + daily_return (Asset gửi) → ghi nav_balance → roll-forward current. SDI KHÔNG tính/derive gì.
 
-  THUẬT NGỮ (đọc trước khi sửa — viết tắt nhiều):
-    • MTM (Mark-to-Market) = ĐỊNH GIÁ THỊ TRƯỜNG: định giá danh mục cổ phiếu theo giá ĐÓNG CỬA
-        cuối phiên = Σ(số lượng × giá đóng cửa). Kết quả = "stock value" (C_STOCK_VALUE).
-    • AUM = stock value + tiền (Asset gửi 1 số tổng). [BRD] Phí QL đã trừ sẵn trong NAV ⇒ AUM = NAV.
-    • NAV (Net Asset Value) = giá trị tài sản RÒNG — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ phí).
-    • CF (cashflow) = dòng tiền KH nạp (CF_IN) / rút (CF_OUT) trong phiên.
-    • PnL (Profit & Loss) = lãi/lỗ TIỀN trong ngày, ĐÃ LOẠI ảnh hưởng nạp/rút (= NAV − NAV_prev + ra − vào).
-    • Unit / Unit Price = ĐƠN VỊ QUỸ / GIÁ MỖI ĐƠN VỊ (= NAV/Unit). Unit chỉ thay đổi do nạp/rút
-        (KHÔNG do biến động giá) ⇒ Unit Price phản ánh THUẦN lãi/lỗ đầu tư.
-    • TWR (Time-Weighted Return) = lợi suất theo Unit Price (UP_t/UP_(t-1) − 1) — không bị méo bởi cashflow.
-    • roll-forward state = ghi đè trạng thái current (T_SI_NAV_CURRENT) sang cuối phiên @p_d làm mốc phiên sau.
+  THUẬT NGỮ:
+    • AUM (Assets Under Management) = giá trị tài sản — Asset GỬI TRỰC TIẾP (= NAV ròng, đã trừ phí). SDI không tự tính.
+    • daily_return = lợi suất NGÀY (TWR, Asset ĐÃ khử dòng tiền) — SDI nhận, KHÔNG tự tính.
+    • CF (cashflow) = dòng tiền KH nạp (CF_IN) / rút (CF_OUT) — SDI tự nhập, dùng cho net flow + đối soát.
+    • %PnL kỳ = ∏(1+daily_return) − 1 (compound ON-READ khi serve PM/FR).
+    • TWR = Time-Weighted Return (khử dòng tiền) — do Asset tính, SDI chỉ compound lại.
+    • roll-forward state = ghi đè current (T_SI_CURRENT) cuối phiên @p_d làm mốc phiên sau.
 ===========================================================================*/
 /*========================================================================================
-  SP_EOD_COMPUTE_CORE @p_d — LÕI tính 1 phiên trên T_EOD_WORK ĐÃ SEED (dùng chung forward + rerun quá khứ).
-  Giả định caller đã seed T_EOD_WORK @p_d: C_NAV (Asset gửi), C_CASH, C_STOCK_VALUE, anchor (C_LAST_NAV/
-    C_LAST_UNIT_PRICE/C_UNIT_PREV). [BRD] SDI KHÔNG accrue phí (không payable/J06).
-  Core: CF (dated) → NAV=Asset (KHÔNG lắp) → J09 PnL → J10 Unit → ghi unit_ledger + nav_balance
-    (SCOPED theo SI có trong T_EOD_WORK → rerun per-KH KHÔNG đụng SI khác). KHÔNG roll-forward NAV_CURRENT
-    (caller quyết: forward roll hết; rerun roll ngày cuối + đúng scope).
+  SP_EOD_COMPUTE_CORE @p_d — [thin-layer] LƯU 1 phiên trên T_EOD_WORK ĐÃ SEED (dùng chung forward + rerun).
+  Giả định caller seed T_EOD_WORK @p_d: C_AUM (=AUM, Asset gửi), C_CASH, C_DAILY_RETURN (Asset gửi).
+  Core: CF (dated) → ghi nav_balance (AUM + daily_return) SCOPED theo SI trong T_EOD_WORK
+    (rerun per-KH KHÔNG đụng SI khác). KHÔNG derive, KHÔNG roll-forward NAV_CURRENT (caller quyết).
 ========================================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_COMPUTE_CORE @p_d DATE
 AS
@@ -224,39 +218,14 @@ BEGIN
     ) cf ON cf.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHERE w.C_BUSINESS_DATE=@p_d;
 
-    -- [BRD asset-sync] BỎ J06 accrue + J08 NAV-lắp: SDI KHÔNG tự tính NAV. C_NAV đã seed TRỰC TIẾP từ Asset
-    --   (T_SI_ASSET_DAILY.C_NAV, đã trừ phí QL). AUM = NAV (không tách payable).
-    -- J09 PnL = NAV − NAV_prev + ra − vào  (dùng NAV Asset)
-    UPDATE T_EOD_WORK SET C_DAILY_PNL = C_NAV - C_LAST_NAV + C_CF_OUT - C_CF_IN WHERE C_BUSINESS_DATE=@p_d;
-    -- J10 Unit/UnitPrice (ΔUnit=CF/UP_prev; init khi unit_prev=0 → unit=NAV/10000)
-    UPDATE T_EOD_WORK SET
-        C_DELTA_UNIT = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
-                            THEN (C_NAV/10000.0) - C_UNIT_PREV
-                            ELSE (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END,
-        C_UNIT       = CASE WHEN C_LAST_UNIT_PRICE IS NULL OR C_LAST_UNIT_PRICE=0 OR C_UNIT_PREV=0
-                            THEN C_NAV/10000.0
-                            ELSE C_UNIT_PREV + (C_CF_IN - C_CF_OUT) / C_LAST_UNIT_PRICE END
-    WHERE C_BUSINESS_DATE=@p_d;
-    UPDATE T_EOD_WORK SET C_UNIT_PRICE = CASE WHEN C_UNIT>0 THEN C_NAV/C_UNIT ELSE 10000 END
-    WHERE C_BUSINESS_DATE=@p_d;
-
-    -- unit ledger (SCOPED theo SI trong T_EOD_WORK) — DELETE+INSERT idempotent. forward (all SI) = xoá hết @p_d;
-    --   rerun per-KH = chỉ SI của KH đó (KHÔNG đụng SI khác). Chỉ ngày có cashflow.
-    DELETE ul FROM T_SI_UNIT_LEDGER ul
-        INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=ul.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d
-        WHERE ul.C_BUSINESS_DATE=@p_d;
-    INSERT INTO T_SI_UNIT_LEDGER (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_CF_NET,C_DELTA_UNIT,C_UNIT)
-    SELECT w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,@p_d,(w.C_CF_IN-w.C_CF_OUT),w.C_DELTA_UNIT,w.C_UNIT
-    FROM T_EOD_WORK w
-    WHERE w.C_BUSINESS_DATE=@p_d AND (w.C_CF_IN-w.C_CF_OUT)<>0;
-
-    -- nav_balance (SCOPED) — DELETE+INSERT. accum TE reset 0 CÓ CHỦ ĐÍCH (J12B/SP_EOD_TE_ACCUM set lại sau).
-    DELETE nb FROM T_SI_NAV_BALANCE nb
+    -- [thin-layer] SDI KHÔNG tính NAV/PnL/Unit: C_AUM(=AUM) + C_DAILY_RETURN đã seed TRỰC TIẾP từ Asset.
+    --   Core chỉ GHI vào nav_balance (SCOPED theo SI trong T_EOD_WORK; forward=all SI, rerun=SI ảnh hưởng).
+    -- nav_balance (SCOPED) — DELETE+INSERT. accum TE reset 0 CÓ CHỦ ĐÍCH (SP_EOD_TE_ACCUM set lại sau).
+    DELETE nb FROM T_SI_BALANCE nb
         INNER JOIN T_EOD_WORK w ON w.C_SI_ACCOUNT=nb.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d
         WHERE nb.C_BUSINESS_DATE=@p_d;
-    INSERT INTO T_SI_NAV_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_NAV,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN)
-    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, w.C_NAV, w.C_UNIT, w.C_UNIT_PRICE, w.C_DAILY_PNL,
-           CASE WHEN w.C_LAST_UNIT_PRICE>0 THEN w.C_UNIT_PRICE/w.C_LAST_UNIT_PRICE - 1 END
+    INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN)
+    SELECT @p_d, w.C_SI_ACCOUNT, w.C_CUST_CODE, w.C_MASTER_CODE, w.C_AUM, w.C_DAILY_RETURN
     FROM T_EOD_WORK w
     WHERE w.C_BUSINESS_DATE=@p_d;
 END
@@ -269,43 +238,35 @@ BEGIN
 
     DELETE FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d;
 
-    -- [BRD asset-sync] SEED từ T_SI_ASSET_DAILY @d: Asset gửi NAV RÒNG + components (đã trừ phí QL).
-    --   SDI KHÔNG tự tính/trừ NAV — dùng C_NAV Asset gửi TRỰC TIẾP. ANCHOR PnL/Unit từ NAV_BALANCE @prev (UP_prev
-    --   định giá units nạp/rút; init UP=10.000). AUM = NAV (không tách payable).
-    DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
+    -- [thin-layer] SEED từ T_SI_ASSET_DAILY @d: Asset gửi AUM + daily_return + cash. SDI KHÔNG derive gì.
     INSERT INTO T_EOD_WORK (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-        C_NAV,C_STOCK_VALUE,C_CASH,
-        C_LAST_NAV,C_LAST_UNIT_PRICE,C_UNIT_PREV)
+        C_AUM,C_DAILY_RETURN,C_CASH)
     SELECT @p_d, a.C_SI_ACCOUNT, a.C_CUST_CODE, a.C_MASTER_CODE,
-           a.C_NAV, a.C_STOCK_VALUE, a.C_CASH,   -- cash = TỔNG tiền (1 số); work pending/div mặc định 0
-           ISNULL(pb.C_NAV, 0), pb.C_UNIT_PRICE, ISNULL(pb.C_UNIT, 0)
+           a.C_AUM, a.C_DAILY_RETURN, a.C_CASH
     FROM T_SI_ASSET_DAILY a
     INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND p.C_STATUS='ACTIVE'
-    LEFT JOIN T_SI_NAV_BALANCE pb ON pb.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND pb.C_BUSINESS_DATE=@prev
     WHERE a.C_BUSINESS_DATE=@p_d;
 
-    EXEC SP_EOD_COMPUTE_CORE @p_d;   -- CF (cashflow SDI) → NAV=Asset (KHÔNG lắp) → PnL → Unit/UP → unit_ledger/nav_balance
+    EXEC SP_EOD_COMPUTE_CORE @p_d;   -- CF (cashflow SDI → work) → ghi AUM+daily_return vào nav_balance (KHÔNG derive)
 
-    -- roll-forward NAV_CURRENT: tiền (từ Asset) + unit/UP (derive). MERGE để tạo dòng nếu SI chưa có.
-    MERGE T_SI_NAV_CURRENT t
-    USING (SELECT C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_UNIT,C_NAV,C_UNIT_PRICE
+    -- roll-forward NAV_CURRENT: AUM + tiền (từ Asset). MERGE để tạo dòng nếu SI chưa có.
+    MERGE T_SI_CURRENT t
+    USING (SELECT C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_AUM
            FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d) w
     ON t.C_SI_ACCOUNT=w.C_SI_ACCOUNT
     WHEN MATCHED THEN UPDATE SET
-        t.C_CASH=w.C_CASH, t.C_UNIT=w.C_UNIT,
-        t.C_LAST_NAV=w.C_NAV, t.C_LAST_UNIT_PRICE=w.C_UNIT_PRICE, t.C_LAST_BUSINESS_DATE=@p_d
-    WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_UNIT,C_CASH,C_LAST_NAV,C_LAST_UNIT_PRICE,C_STATUS,C_LAST_BUSINESS_DATE)
-        VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_UNIT,w.C_CASH,w.C_NAV,w.C_UNIT_PRICE,'ACTIVE',@p_d);
+        t.C_CASH=w.C_CASH, t.C_LAST_AUM=w.C_AUM, t.C_LAST_BUSINESS_DATE=@p_d
+    WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_LAST_AUM,C_STATUS,C_LAST_BUSINESS_DATE)
+        VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_CASH,w.C_AUM,'ACTIVE',@p_d);
     SET @p_rows = @@ROWCOUNT;   -- #tiểu khoản xử lý phiên này
 END
 GO
 
 /*===========================================================================
   [BRD asset-sync] SP_INGEST_ASSET_NAV — Asset gửi số TỔNG per-SI mỗi ngày GD → T_SI_ASSET_DAILY (raw).
-  SDI KHÔNG tự định giá/trừ: NAV RÒNG (đã trừ phí QL) + components (stock/cash) + cash_in/out
-  đều từ Asset. SDI chỉ derive unit/UP/PnL/return ở SP_EOD_COMPUTE (seed NAV + cashflow). Idempotent
-  (DELETE+INSERT theo date,si → re-ingest sửa quá khứ). Validate: si registry + nav/stock/cash NOT NULL.
-  JSON: [{"si_account","nav","stock_value","cash"(TỔNG tiền 1 số),"cash_in","cash_out"}, ...]
+  [thin-layer] Asset gửi AUM + daily_return (TWR, đã khử dòng tiền) + cash + cash_in/out. SDI KHÔNG derive gì.
+  Idempotent (DELETE+INSERT theo date,si → re-ingest sửa quá khứ). Validate: si registry + aum/cash NOT NULL.
+  JSON: [{"si_account","aum","daily_return"(NULL ngày đầu),"cash"(TỔNG tiền 1 số),"cash_in","cash_out"}, ...]
   err: 0 OK · 20 JSON sai · 21 validate FAIL · -1 runtime.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_ASSET_NAV
@@ -322,18 +283,18 @@ BEGIN
         IF @p_business_date IS NULL BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
 
-        DECLARE @src TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_NAV DECIMAL(20,0), C_STOCK_VALUE DECIMAL(20,0),
+        DECLARE @src TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_AUM DECIMAL(20,0), C_DAILY_RETURN DECIMAL(10,6),
                             C_CASH DECIMAL(20,0), C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
         INSERT @src
-        SELECT j.si_account, j.nav, j.stock_value, j.cash,
+        SELECT j.si_account, j.aum, j.daily_return, j.cash,
                ISNULL(j.cash_in,0), ISNULL(j.cash_out,0)
         FROM OPENJSON(@p_json) WITH (
-            si_account VARCHAR(20) '$.si_account', nav DECIMAL(20,0) '$.nav', stock_value DECIMAL(20,0) '$.stock_value',
+            si_account VARCHAR(20) '$.si_account', aum DECIMAL(20,0) '$.aum', daily_return DECIMAL(10,6) '$.daily_return',
             cash DECIMAL(20,0) '$.cash',
             cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out') j;
 
-        IF EXISTS (SELECT 1 FROM @src WHERE C_SI_ACCOUNT IS NULL OR C_NAV IS NULL OR C_STOCK_VALUE IS NULL OR C_CASH IS NULL)
-            BEGIN SET @p_err_code=21; SET @p_err_msg=N'Thiếu si_account/nav/stock_value/cash'; RETURN; END
+        IF EXISTS (SELECT 1 FROM @src WHERE C_SI_ACCOUNT IS NULL OR C_AUM IS NULL OR C_CASH IS NULL)
+            BEGIN SET @p_err_code=21; SET @p_err_msg=N'Thiếu si_account/aum/cash'; RETURN; END
         IF EXISTS (SELECT 1 FROM @src s WHERE NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO p WHERE p.C_SI_ACCOUNT=s.C_SI_ACCOUNT))
             BEGIN SET @p_err_code=21; SET @p_err_msg=N'si_account chưa đăng ký registry (T_SI_PORTFOLIO)'; RETURN; END
 
@@ -341,9 +302,9 @@ BEGIN
         DELETE FROM T_SI_ASSET_DAILY WHERE C_BUSINESS_DATE=@p_business_date
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM @src);   -- idempotent re-ingest (sửa quá khứ = gửi lại)
         INSERT INTO T_SI_ASSET_DAILY (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-            C_NAV,C_STOCK_VALUE,C_CASH,C_CASH_IN,C_CASH_OUT)
+            C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_IN,C_CASH_OUT)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
-               s.C_NAV, s.C_STOCK_VALUE, s.C_CASH, s.C_CASH_IN, s.C_CASH_OUT
+               s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_IN, s.C_CASH_OUT
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;
         COMMIT;
     END TRY
@@ -443,8 +404,8 @@ END
 GO
 
 /*===========================================================================
-  J11 — SI AGGREGATE → T_MASTER_NAV_BALANCE (composition + NAV + hiệu suất + cổ tức/phí)
-         + upsert T_MASTER_NAV_CURRENT (snapshot current cấp SI cho serving)
+  J11 — SI AGGREGATE → T_MASTER_BALANCE (composition + NAV + hiệu suất + cổ tức/phí)
+         + upsert T_MASTER_CURRENT (snapshot current cấp SI cho serving)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_AGG @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -453,43 +414,40 @@ BEGIN
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
     -- DELETE SCOPED theo master có trong T_EOD_WORK @p_d (forward: all masters = xoá hết @p_d; rerun: chỉ master
     --   bị ảnh hưởng → KHÔNG đụng master khác). Behavior forward giữ nguyên.
-    DELETE m FROM T_MASTER_NAV_BALANCE m
+    DELETE m FROM T_MASTER_BALANCE m
         WHERE m.C_BUSINESS_DATE=@p_d
           AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_MASTER_CODE=m.C_MASTER_CODE AND w.C_BUSINESS_DATE=@p_d);
 
     ;WITH agg AS (
         SELECT C_MASTER_CODE,
                SUM(C_CASH) AS CASH,
-               SUM(C_STOCK_VALUE) AS STOCK,
-               SUM(C_NAV) AS NAV, SUM(C_UNIT) AS UNT, SUM(C_DAILY_PNL) AS PNL,
+               SUM(C_AUM) AS AUM,
+               SUM(CASE WHEN C_DAILY_RETURN IS NOT NULL THEN C_AUM * C_DAILY_RETURN END) AS WRNUM,  -- Σ AUMᵢ·rᵢ
+               SUM(CASE WHEN C_DAILY_RETURN IS NOT NULL THEN C_AUM END)                AS WRDEN,  -- Σ AUMᵢ (có rᵢ)
                SUM(C_CF_IN) AS CFIN, SUM(C_CF_OUT) AS CFOUT, COUNT(*) AS ACCT   -- [PM] flow + #tiểu khoản ACTIVE
         FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE
     )
-    INSERT INTO T_MASTER_NAV_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,
-                             C_AUM,C_UNIT,C_UNIT_PRICE,C_DAILY_PNL,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT)
+    INSERT INTO T_MASTER_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,
+                             C_AUM,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT)
     SELECT @p_d, a.C_MASTER_CODE, a.CASH,
-           a.NAV, a.UNT,   -- [BRD] C_AUM = Σ NAV tiểu khoản (= stock+cash; AUM=NAV, gộp 1 cột); C_UNIT. KHÔNG lưu stock riêng (PM không đọc)
-           CASE WHEN a.UNT>0 THEN a.NAV/a.UNT END,
-           a.PNL,
-           CASE WHEN a.UNT>0 AND prev.C_UNIT_PRICE>0 THEN (a.NAV/a.UNT)/prev.C_UNIT_PRICE - 1 END,
+           a.AUM,   -- [thin-layer] C_AUM = Σ AUM tiểu khoản
+           CAST(CASE WHEN a.WRDEN>0 THEN a.WRNUM/a.WRDEN END AS DECIMAL(10,6)),  -- master daily return = AUM-weighted Σ(AUMᵢ·rᵢ)/ΣAUMᵢ (DM tổng KH)
            a.CFIN, a.CFOUT, a.ACCT
-    FROM agg a
-    LEFT JOIN T_MASTER_NAV_BALANCE prev ON prev.C_MASTER_CODE=a.C_MASTER_CODE AND prev.C_BUSINESS_DATE=@prev;
+    FROM agg a;
     SET @p_rows = @@ROWCOUNT;   -- #master aggregate (bắt NGAY sau INSERT, trước MERGE current bên dưới)
 
     -- current cấp master (overwrite) — CHỈ khi @p_d là ngày MỚI NHẤT (forward). Rerun ngày QUÁ KHỨ → KHÔNG đụng
     --   current (current phải = hôm nay). Forward luôn tính ngày mới nhất ⇒ chạy như cũ.
-    IF @p_d = (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_NAV_BALANCE)
-    MERGE T_MASTER_NAV_CURRENT AS t
-    USING (SELECT C_MASTER_CODE,C_CASH,C_AUM,C_UNIT,C_UNIT_PRICE,C_TOTAL_ACCOUNT,C_BUSINESS_DATE
-           FROM T_MASTER_NAV_BALANCE WHERE C_BUSINESS_DATE=@p_d) s
+    IF @p_d = (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE)
+    MERGE T_MASTER_CURRENT AS t
+    USING (SELECT C_MASTER_CODE,C_CASH,C_AUM,C_TOTAL_ACCOUNT,C_BUSINESS_DATE
+           FROM T_MASTER_BALANCE WHERE C_BUSINESS_DATE=@p_d) s
     ON t.C_MASTER_CODE=s.C_MASTER_CODE
     WHEN MATCHED THEN UPDATE SET
-        t.C_CASH=s.C_CASH, t.C_AUM=s.C_AUM,
-        t.C_UNIT=s.C_UNIT, t.C_LAST_UNIT_PRICE=s.C_UNIT_PRICE, t.C_TOTAL_ACCOUNT=s.C_TOTAL_ACCOUNT,
+        t.C_CASH=s.C_CASH, t.C_AUM=s.C_AUM, t.C_TOTAL_ACCOUNT=s.C_TOTAL_ACCOUNT,
         t.C_LAST_BUSINESS_DATE=s.C_BUSINESS_DATE
-    WHEN NOT MATCHED THEN INSERT (C_MASTER_CODE,C_CASH,C_AUM,C_UNIT,C_LAST_UNIT_PRICE,C_TOTAL_ACCOUNT,C_LAST_BUSINESS_DATE)
-        VALUES (s.C_MASTER_CODE,s.C_CASH,s.C_AUM,s.C_UNIT,s.C_UNIT_PRICE,s.C_TOTAL_ACCOUNT,s.C_BUSINESS_DATE);
+    WHEN NOT MATCHED THEN INSERT (C_MASTER_CODE,C_CASH,C_AUM,C_TOTAL_ACCOUNT,C_LAST_BUSINESS_DATE)
+        VALUES (s.C_MASTER_CODE,s.C_CASH,s.C_AUM,s.C_TOTAL_ACCOUNT,s.C_BUSINESS_DATE);
 END
 GO
 
@@ -614,9 +572,9 @@ BEGIN
         b.C_ACCUM_ACTIVE_RET_SQ = ISNULL(p.C_ACCUM_ACTIVE_RET_SQ,0)
             + CASE WHEN b.C_DAILY_RETURN IS NULL OR idx.C_DAILY_RETURN IS NULL THEN 0
                    ELSE POWER(CAST(b.C_DAILY_RETURN - idx.C_DAILY_RETURN AS FLOAT),2) END
-    FROM T_SI_NAV_BALANCE b
+    FROM T_SI_BALANCE b
     INNER JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=@p_d
-    LEFT JOIN T_SI_NAV_BALANCE p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_BUSINESS_DATE=@prev
+    LEFT JOIN T_SI_BALANCE p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_BUSINESS_DATE=@prev
     WHERE b.C_BUSINESS_DATE=@p_d
       -- SCOPE theo T_EOD_WORK @p_d: forward (work=mọi SI active) → cập nhật hết như cũ; rerun per-KH (work=SI master
       --   bị ảnh hưởng) → CHỈ cập nhật SI đó (tối ưu, không quét toàn bộ SI mỗi ngày). Mọi flow đều populate work @p_d trước TE.
@@ -630,7 +588,7 @@ GO
         SP_EOD_RUN đọc bảng break SAU bước này để quyết: có break ⇒ RECONCILE_STATUS=BREAK +
         CHẶN publish (không chạy J14). KHÔNG throw ở đây để break được COMMIT (sống sót), không bị
         rollback theo transaction của SP_EOD_STEP. Đọc data ĐÃ committed của J07/J11 (T_EOD_WORK,
-        T_MASTER_NAV_BALANCE) — đó là lý do mỗi step commit riêng.
+        T_MASTER_BALANCE) — đó là lý do mỗi step commit riêng.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RECONCILE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -638,24 +596,24 @@ BEGIN
     SET NOCOUNT ON;
     DELETE FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d;   -- idempotent (re-run)
 
-    -- Check 1: NAV âm hoặc unit<=0 với NAV>0 (per-KH) → ghi từng dòng
+    -- Check 1: AUM âm (per-KH) → ghi từng dòng
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_MESSAGE)
-    SELECT @p_d, 'NAV_NEGATIVE', C_MASTER_CODE, C_SI_ACCOUNT, C_NAV,
-           CONCAT(N'NAV=', C_NAV, N' UNIT=', C_UNIT, N' bất thường')
+    SELECT @p_d, 'NAV_NEGATIVE', C_MASTER_CODE, C_SI_ACCOUNT, C_AUM,
+           CONCAT(N'AUM=', C_AUM, N' bất thường (<0)')
     FROM T_EOD_WORK
-    WHERE C_BUSINESS_DATE=@p_d AND (C_NAV < 0 OR (C_UNIT<=0 AND C_NAV>0));
+    WHERE C_BUSINESS_DATE=@p_d AND C_AUM < 0;
 
     -- Check 2: NAV master != Σ NAV khách (chênh > 1 VND) → sanity agg (master = Σ SI, cùng nguồn ingest)
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
     SELECT @p_d, 'SI_NAV_MISMATCH', p.C_MASTER_CODE, p.C_AUM, a.NAV, p.C_AUM - a.NAV,
            N'AUM master != Σ NAV khách (agg sai?)'
-    FROM T_MASTER_NAV_BALANCE p
-    INNER JOIN (SELECT C_MASTER_CODE, SUM(C_NAV) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
+    FROM T_MASTER_BALANCE p
+    INNER JOIN (SELECT C_MASTER_CODE, SUM(C_AUM) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
       ON a.C_MASTER_CODE=p.C_MASTER_CODE
     WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_AUM - a.NAV) > 1;
 
-    -- [BRD] Check 3 CASHFLOW_MISMATCH (đo vênh 2 nguồn — QĐ5): cashflow SDI tự nhập (authoritative cho unit/UP)
-    --   vs cash_in/out Asset gửi. Lệch (số nguyên VND, exact) → unit/UP (SDI) & NAV (Asset) KHÔNG cùng dòng tiền.
+    -- [BRD] Check 3 CASHFLOW_MISMATCH (đo vênh 2 nguồn): cashflow SDI tự nhập vs cash_in/out Asset gửi.
+    --   Lệch (số nguyên VND, exact) → 2 nguồn net flow KHÔNG khớp (cảnh báo đối soát).
     ;WITH sdicf AS (
         SELECT C_SI_ACCOUNT,
                SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END) AS NET
@@ -668,40 +626,17 @@ BEGIN
     LEFT JOIN sdicf s ON s.C_SI_ACCOUNT=a.C_SI_ACCOUNT
     WHERE a.C_BUSINESS_DATE=@p_d AND ISNULL(s.NET,0) <> (a.C_CASH_IN - a.C_CASH_OUT);
 
-    -- [BRD] Check 4 HOLDINGS_MISMATCH (đo vênh 2 nguồn): Σ(FO holdings × giá BO) vs Asset stock_value (cùng giá BO,
-    --   QĐ3) → lệch = FO holdings vs định giá Asset khác nhau (chênh > 1 VND, tránh nhiễu làm tròn).
-    ;WITH fohold AS (
-        SELECT h.C_SI_ACCOUNT, SUM(h.C_QUANTITY*px.C_CLOSE_PRICE) AS SV
-        FROM T_SI_PORTFOLIO_HOLDING h
-        INNER JOIN T_PRICE_DAILY px ON px.C_TICKER=h.C_TICKER AND px.C_BUSINESS_DATE=@p_d
-        GROUP BY h.C_SI_ACCOUNT)
-    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
-    SELECT @p_d, 'HOLDINGS_MISMATCH', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
-           ISNULL(f.SV,0), a.C_STOCK_VALUE, ISNULL(f.SV,0) - a.C_STOCK_VALUE,
-           N'Σ(FO holdings×giá BO) != Asset stock_value'
-    FROM T_SI_ASSET_DAILY a
-    LEFT JOIN fohold f ON f.C_SI_ACCOUNT=a.C_SI_ACCOUNT
-    WHERE a.C_BUSINESS_DATE=@p_d AND ABS(ISNULL(f.SV,0) - a.C_STOCK_VALUE) > 1;
+    -- [thin-layer] ĐÃ GỠ check 4 HOLDINGS_MISMATCH + check 5 NAV_CONSISTENCY: Asset KHÔNG gửi stock_value nữa
+    --   (chỉ AUM + daily_return + cash) ⇒ SDI không có components để đối soát holdings / nav-vs-components.
 
-    -- [BRD] Check 5 NAV_CONSISTENCY: NAV Asset gửi vs (stock+cash) — NAV ĐỘC LẬP với components (Asset gửi cả 2)
-    --   → bắt Asset tự mâu thuẫn nội bộ. Phí QL đã trừ sẵn trong NAV ⇒ NAV = stock+cash. Chênh > 1 VND → break.
-    INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
-    SELECT @p_d, 'NAV_CONSISTENCY', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
-           a.C_NAV, (a.C_STOCK_VALUE + a.C_CASH),
-           a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH),
-           N'NAV Asset != stock + cash (Asset nội bộ lệch)'
-    FROM T_SI_ASSET_DAILY a
-    WHERE a.C_BUSINESS_DATE=@p_d
-      AND ABS(a.C_NAV - (a.C_STOCK_VALUE + a.C_CASH)) > 1;
-
-    -- #dòng break (5 check gộp); 0 = sạch. Tổng cuối (khỏi phụ thuộc @@ROWCOUNT riêng check cuối).
+    -- #dòng break (3 check gộp); 0 = sạch. Tổng cuối (khỏi phụ thuộc @@ROWCOUNT riêng check cuối).
     SET @p_rows = (SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE=@p_d);
 END
 GO
 
 /*===========================================================================
   J14 — SNAPSHOT: T_MASTER_HOLDING_BALANCE (SI aggregate holdings + tỷ trọng)
-         (composition tài sản + NAV đã gộp về T_MASTER_NAV_BALANCE ở J11)
+         (composition tài sản + NAV đã gộp về T_MASTER_BALANCE ở J11)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SNAPSHOT @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -724,7 +659,7 @@ BEGIN
                 THEN v.MV / SUM(v.MV) OVER (PARTITION BY v.C_MASTER_CODE) END
     FROM val v;
     SET @p_rows = @@ROWCOUNT;   -- #dòng holdings-balance (mã × master) snapshot @p_d
-    -- (composition tài sản + NAV cấp SI: đã ghi T_MASTER_NAV_BALANCE ở J11_SI_AGG)
+    -- (composition tài sản + NAV cấp SI: đã ghi T_MASTER_BALANCE ở J11_SI_AGG)
 END
 GO
 
@@ -738,7 +673,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @expected INT = (SELECT COUNT(*) FROM T_SI_PORTFOLIO WHERE C_STATUS='ACTIVE');
-    DECLARE @received INT = (SELECT COUNT(*) FROM T_SI_NAV_CURRENT
+    DECLARE @received INT = (SELECT COUNT(*) FROM T_SI_CURRENT
                              WHERE C_STATUS='ACTIVE' AND C_LAST_SYNC_DATE=@p_d);
     IF @received <> @expected
     BEGIN
@@ -968,7 +903,7 @@ BEGIN
     BEGIN
         IF @p_total_record IS NULL
             BEGIN SET @p_err_code=2; SET @p_err_msg=N'FO_INGEST cần @p_total_record (tổng cust_code break event)'; RAISERROR(@p_err_msg, 16, 1); END
-        DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_NAV_CURRENT
+        DECLARE @received INT = (SELECT COUNT(DISTINCT C_CUST_CODE) FROM T_SI_CURRENT
                                  WHERE C_LAST_SYNC_DATE=@p_business_date);
         DECLARE @ok BIT = CASE WHEN @received >= @p_total_record THEN 1 ELSE 0 END;
         UPDATE T_EOD_PIPELINE SET C_FO_INGEST_TOTAL=@p_total_record, C_FO_INGEST_RECEIVED=@received,
@@ -1010,8 +945,8 @@ BEGIN
     BEGIN TRY
     -- KHÔNG xoá T_EOD_RUN (giữ log/audit). Watermark vô hiệu DONE cũ → mọi job chạy lại (compute DELETE+INSERT
     --   theo @d: idempotent + sửa-số). Re-run sẽ UPDATE-in-place dòng log (timing/rows của lượt mới nhất).
-    -- IDEMPOTENT re-run: KHÔNG cần un-roll T_SI_NAV_CURRENT. SP_EOD_COMPUTE seed anchor PnL/Unit từ
-    --   T_SI_NAV_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll) → tính lại @d ra số Y HỆT dù NAV_CURRENT đã roll sang @d.
+    -- IDEMPOTENT re-run: KHÔNG cần un-roll T_SI_CURRENT. SP_EOD_COMPUTE seed anchor PnL/Unit từ
+    --   T_SI_BALANCE @prev (KHÔNG từ NAV_CURRENT đã roll) → tính lại @d ra số Y HỆT dù NAV_CURRENT đã roll sang @d.
     --   ⚠️ Phạm vi: re-run NGÀY HIỆN TẠI (tài sản cash/pending/div trong NAV_CURRENT vẫn của @d). Recompute NGÀY
     --     QUÁ KHỨ từ đầu KHÔNG hỗ trợ đầy đủ (pending_cash/div_cash chưa có lịch sử interval) — lịch sử NAV/holdings
     --     đọc qua read API FR-02/03/06 (reconstruct từ NAV_BALANCE/hist, không tính lại → không lệch).

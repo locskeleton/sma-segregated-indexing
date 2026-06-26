@@ -16,12 +16,12 @@
 
 **Quyết định khi code (ĐÃ CHỐT với user 2026-06-25):**
 - **[BRD asset-sync] GỠ phí hoàn toàn (chốt 2026-06-25):** không còn `C_PAYABLE_FEE`/`C_FEE_ACCUM`/`fee_accum`. Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); `AUM = stock + cash = NAV` (gross = net, không tách payable). *(Thiết kế trung gian "giữ tên C_PAYABLE_FEE đổi nghĩa lũy kế / AUM_gross = NAV + fee" đã bị thay.)*
-- **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_NAV` ingest trực tiếp; CORE **bỏ J08** (không lắp NAV). Components (`stock`, `cash` tổng) gửi kèm để display (FR-06) + AUM + reconcile.
+- **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_AUM` ingest trực tiếp; CORE **bỏ J08** (không lắp NAV). Components (`stock`, `cash` tổng) gửi kèm để display (FR-06) + AUM + reconcile.
 - **Reconcile NAV_CONSISTENCY**: `nav` Asset vs `(stock + cash)` → bắt Asset tự mâu thuẫn. (5 check: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_CONSISTENCY.)
 - **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
 - **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
 - FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient).
-- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_NAV_BALANCE/CURRENT) — PM không đọc; `AUM = stock + cash = NAV`. Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
+- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_BALANCE/CURRENT) — PM không đọc; `AUM = stock + cash = NAV`. Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
 
 **Tests:** `03_SMOKE` (customer ingest/derive incl cashflow-day, reconcile vênh, reset, date-guard, index guards, asset-completeness) · `07_PM_SMOKE` (PM serve, seed NAV trực tiếp) · `04_BENCH`/`08_PM_BENCH` (seed asset_daily). Build 01/02/05/06 clean.
 
@@ -37,13 +37,13 @@
 ## P0 — Schema (`01_TABLES.sql`)
 
 **THÊM:**
-- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · **[BRD asset-sync]** `C_NAV, C_STOCK_VALUE, C_CASH, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`. **KHÔNG có `C_FEE_ACCUM`** (Asset gửi NAV ròng; `cash` = tổng tiền 1 số, không tách pending/div).
+- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · **[BRD asset-sync]** `C_AUM, C_STOCK_VALUE, C_CASH, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`. **KHÔNG có `C_FEE_ACCUM`** (Asset gửi NAV ròng; `cash` = tổng tiền 1 số, không tách pending/div).
 - `T_EOD_PIPELINE.C_ASSET_NAV_STATUS` (PENDING|READY) + `C_ASSET_NAV_AT` — nguồn mới để gate.
 - `T_EOD_RECON_BREAK`: đã có `C_VALUE_SDI/C_VALUE_CHECK/C_DIFF` → tái dùng; thêm `C_CHECK_NAME` mới (CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_BRIDGE). Cân nhắc cột `C_WITHIN_THRESHOLD BIT` để log diff cả khi không break (đo vênh).
 
 **SỬA:**
-- `T_SI_NAV_BALANCE`: bỏ `C_PAYABLE_FEE`; **[BRD asset-sync] KHÔNG thêm `C_FEE_ACCUM`** (Asset gửi NAV ròng); thêm `C_CASH_IN`, `C_CASH_OUT`. Giữ NAV/UNIT/UNIT_PRICE/PNL/RETURN (derive từ ingest) + cột TE.
-- `T_SI_NAV_CURRENT`: bỏ `C_PAYABLE_FEE`; NAV + components (stock, cash tổng) từ Asset (đổi nguồn ghi).
+- `T_SI_BALANCE`: bỏ `C_PAYABLE_FEE`; **[BRD asset-sync] KHÔNG thêm `C_FEE_ACCUM`** (Asset gửi NAV ròng); thêm `C_CASH_IN`, `C_CASH_OUT`. Giữ NAV/UNIT/UNIT_PRICE/PNL/RETURN (derive từ ingest) + cột TE.
+- `T_SI_CURRENT`: bỏ `C_PAYABLE_FEE`; NAV + components (stock, cash tổng) từ Asset (đổi nguồn ghi).
 - `T_EOD_WORK`: bỏ cột phí (`C_PAYABLE_FEE`, `C_FEE_CUT`).
 
 **BỎ:**
@@ -60,11 +60,11 @@
 - **Derive** per-SI (quy ước §4 handover, init UP=10.000, prior-day historic):
   ```
   NAV   = nav   (Asset GỬI TRỰC TIẾP, đã trừ phí QL — model realized; SDI KHÔNG lắp/trừ).  AUM = stock + cash = NAV
-  UP_{t-1}, units_{t-1} ← T_SI_NAV_BALANCE @prev (UDF_PREV_BUSINESS_DATE); thiếu → UP=10.000
+  UP_{t-1}, units_{t-1} ← T_SI_BALANCE @prev (UDF_PREV_BUSINESS_DATE); thiếu → UP=10.000
   Δunits = (cash_in − cash_out)/UP_{t-1};  units_t = units_{t-1}+Δunits
   UP_t   = NAV_t/units_t;  return_t = UP_t/UP_{t-1}−1;  PnL_t = NAV_t−NAV_{t-1}+cash_out−cash_in
   ```
-- Ghi `T_SI_NAV_BALANCE` (DELETE+INSERT @d) + roll `T_SI_NAV_CURRENT` (nếu @d mới nhất). Idempotent + scoped như engine cũ.
+- Ghi `T_SI_BALANCE` (DELETE+INSERT @d) + roll `T_SI_CURRENT` (nếu @d mới nhất). Idempotent + scoped như engine cũ.
 - err convention chuẩn (@p_err_code/@p_err_msg OUT).
 
 **BỎ:** `SP_EOD_COMPUTE`, `SP_EOD_COMPUTE_CORE` (J06 accrue/J07 MTM/J08 NAV/J09/J10) cho EOD; `SP_INGEST_FEE_CHARGE`; `SP_EOD_RECOMPUTE_RANGE` (NAV).

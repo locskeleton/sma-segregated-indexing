@@ -8,7 +8,7 @@ GO
     - KH:  C_CUST_CODE VARCHAR(10) — CHỈ FR-01 (list các sub-account của 1 KH).
     - SUB-ACCOUNT: C_SI_ACCOUNT VARCHAR(20) (mã sub-account, customer-level, = đơn vị API).
       UNIQUE toàn cục ⇒ các proc per-si (FR-02..06) CHỈ nhận @p_si_account (KHÔNG cần cust).
-      master suy từ DỮ LIỆU: FR-02/03/05/06 lấy từ T_SI_NAV_CURRENT (có sau FO ingest) — tiểu khoản
+      master suy từ DỮ LIỆU: FR-02/03/05/06 lấy từ T_SI_CURRENT (có sau FO ingest) — tiểu khoản
       chưa có data ⇒ not-found (không thuộc đường serve). FR-01 (list) + FR-04 (info) đọc T_SI_PORTFOLIO
       (endpoint registry: join_date/sub_account_no/initial_amount/sip...). Ownership/auth do tầng API gác.
   Read-only. T0 unit price = 10.000.
@@ -47,8 +47,11 @@ GO
 
 /*===========================================================================
   FR-01 — GET /customer/{id}/si-overview : tổng quan các sub-account của 1 KH
-    RS1: breakdown từng sub-account (current NAV/unit_price + %return inception)
+    RS1: breakdown từng sub-account (current NAV/AUM + cash + %return inception)
     RS2: tổng hợp toàn KH (Σ NAV, Σ cash, số sub-account)
+  [thin-layer] AUM = C_LAST_AUM (Asset gửi). %return inception = compound TOÀN BỘ
+    daily_return của si từ T_SI_BALANCE: EXP(Σ LN(1+r))−1 (TWR Asset-supplied).
+    Bỏ cột C_UNIT / C_LAST_UNIT_PRICE (Asset KHÔNG cấp unit/UP nữa).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_OVERVIEW
     @p_cust_code VARCHAR(10),
@@ -66,24 +69,33 @@ BEGIN
             mp.C_MASTER_NAME,
             ip.C_STATUS,
             ip.C_JOIN_DATE,
-            nc.C_UNIT,
             nc.C_CASH,
-            nc.C_LAST_NAV,
-            nc.C_LAST_UNIT_PRICE,
+            nc.C_LAST_AUM,                          -- AUM gần nhất (Asset gửi)
             nc.C_LAST_BUSINESS_DATE,
-            CAST(nc.C_LAST_UNIT_PRICE / 10000.0 - 1 AS DECIMAL(10,6)) AS C_RETURN_INCEPTION
+            -- [thin-layer] %return inception = compound TOÀN BỘ daily_return của si (TWR).
+            --   NULL nếu chưa có ngày nào có return (EXP/Σ trên tập rỗng → NULL).
+            ret.C_RETURN_INCEPTION
     FROM        T_SI_PORTFOLIO   ip
     INNER JOIN        T_MASTER_PORTFOLIO     mp ON mp.C_MASTER_CODE = ip.C_MASTER_CODE
-    LEFT JOIN   T_SI_NAV_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
+    LEFT JOIN   T_SI_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
+    OUTER APPLY (
+        -- compound = EXP(Σ LN(1+r))−1. GUARD wipeout: nếu CÓ ngày 1+r ≤ 0 (return ≤ −100%, mất sạch)
+        --   → LOG(≤0) lỗi "invalid floating point" ⇒ clamp arg LOG về 1 và ép kết quả = −1.0 (−100%, mất hết).
+        SELECT CASE WHEN MAX(CASE WHEN 1.0+b.C_DAILY_RETURN <= 0 THEN 1 ELSE 0 END) = 1 THEN CAST(-1 AS DECIMAL(10,6))
+                    ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+b.C_DAILY_RETURN > 0 THEN 1.0+b.C_DAILY_RETURN ELSE 1 END))) - 1 AS DECIMAL(10,6))
+               END AS C_RETURN_INCEPTION
+        FROM T_SI_BALANCE b
+        WHERE b.C_SI_ACCOUNT = ip.C_SI_ACCOUNT AND b.C_DAILY_RETURN IS NOT NULL
+    ) ret
     WHERE  ip.C_CUST_CODE = @p_cust_code
-    ORDER BY nc.C_LAST_NAV DESC;
+    ORDER BY nc.C_LAST_AUM DESC;
 
     SELECT  @p_cust_code          AS C_CUST_CODE,
             COUNT(*)              AS C_SI_COUNT,
-            SUM(nc.C_LAST_NAV)    AS C_TOTAL_NAV,
+            SUM(nc.C_LAST_AUM)    AS C_TOTAL_AUM,
             SUM(nc.C_CASH)        AS C_TOTAL_CASH
     FROM        T_SI_PORTFOLIO   ip
-    LEFT JOIN   T_SI_NAV_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
+    LEFT JOIN   T_SI_CURRENT nc ON nc.C_SI_ACCOUNT = ip.C_SI_ACCOUNT
     WHERE  ip.C_CUST_CODE = @p_cust_code;
     END TRY
     BEGIN CATCH
@@ -94,8 +106,11 @@ GO
 
 /*===========================================================================
   FR-02 — GET /customer/{id}/si/{si_account} : chi tiết 1 sub-account
-    Current NAV/unit + TWR (unit_price) + MWR (Modified Dietz) theo range.
+    Current NAV(AUM) + TWR (compound daily_return) + MWR (Modified Dietz) theo range.
     RS1: current + range metrics. RS2: dòng master-level mới nhất (tham chiếu).
+  [thin-layer] NAV = AUM (C_AUM/C_LAST_AUM, Asset gửi). Bỏ unit/UP.
+    TWR kỳ (@base,@end] = EXP(Σ LN(1+r))−1 từ daily_return (Asset ĐÃ khử dòng tiền).
+    MWR (Modified Dietz) GIỮ logic cashflow; base/end NAV → AUM.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_DETAIL
     @p_si_account VARCHAR(20),               -- si_account UNIQUE toàn cục → đủ định danh (master suy từ đây)
@@ -109,33 +124,44 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- master + trạng thái current: 1 seek clustered PK T_SI_NAV_CURRENT (có sau FO ingest, đọc luôn cho RS1).
+    -- master + trạng thái current: 1 seek clustered PK T_SI_CURRENT (có sau FO ingest, đọc luôn cho RS1).
     -- KHÔNG lấy master từ T_SI_PORTFOLIO — tiểu khoản chưa có dữ liệu (chưa ingest/EOD) không thuộc đường
     -- serve thật (SMO đọc Asset post-EOD) ⇒ không cần handle case đó, NULL → not-found.
     DECLARE @master VARCHAR(20),
-            @cur_nav DECIMAL(20,0), @cur_up DECIMAL(18,6), @cur_unit DECIMAL(18,6), @cur_date DATE;
-    SELECT @master   = C_MASTER_CODE, @cur_nav  = C_LAST_NAV, @cur_up = C_LAST_UNIT_PRICE,
-           @cur_unit = C_UNIT,        @cur_date = C_LAST_BUSINESS_DATE
-    FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account;
+            @cur_nav DECIMAL(20,0), @cur_date DATE;   -- [thin-layer] AUM hiện tại; bỏ unit/UP
+    SELECT @master   = C_MASTER_CODE, @cur_nav  = C_LAST_AUM,
+           @cur_date = C_LAST_BUSINESS_DATE
+    FROM T_SI_CURRENT WHERE C_SI_ACCOUNT=@p_si_account;
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @end DATE, @cutoff DATE, @base DATE;
-    DECLARE @base_nav DECIMAL(20,0), @base_up DECIMAL(18,6),
-            @end_nav  DECIMAL(20,0), @end_up  DECIMAL(18,6);
+    DECLARE @base_nav DECIMAL(20,0), @end_nav DECIMAL(20,0);   -- AUM mốc đầu/cuối kỳ (bỏ UP)
 
-    -- mốc CUỐI kỳ + giá trị: 1 read (TOP 1 đuôi index IX_SI_NAV_BALANCE_ACCT (si,date) DESC) gộp date+nav+up.
-    SELECT TOP 1 @end = C_BUSINESS_DATE, @end_nav = C_NAV, @end_up = C_UNIT_PRICE
-    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE DESC;
+    -- mốc CUỐI kỳ + AUM: 1 read (TOP 1 đuôi index IX_SI_NAV_BALANCE_ACCT (si,date) DESC).
+    SELECT TOP 1 @end = C_BUSINESS_DATE, @end_nav = C_AUM
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE DESC;
 
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
 
-    -- mốc ĐẦU kỳ + giá trị: 1 read (mốc ≤ cutoff gần nhất); fallback = mốc sớm nhất nếu range trùm cả lịch sử.
-    SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_NAV, @base_up = C_UNIT_PRICE
-    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff
+    -- mốc ĐẦU kỳ + AUM: 1 read (mốc ≤ cutoff gần nhất); fallback = mốc sớm nhất nếu range trùm cả lịch sử.
+    --   @base là mốc THAM CHIẾU (chưa tính return của chính ngày @base); TWR compound từ ngày > @base.
+    SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_AUM
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff
     ORDER BY C_BUSINESS_DATE DESC;
     IF @base IS NULL
-        SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_NAV, @base_up = C_UNIT_PRICE
-        FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE ASC;
+        SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_AUM
+        FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE ASC;
+
+    -- [thin-layer] TWR kỳ = compound daily_return của si trên (@base,@end]: EXP(Σ LN(1+r))−1.
+    --   Tập rỗng (không ngày nào có return) → NULL. Mỗi r ∈ T_SI_BALANCE (Asset gửi, đã khử CF).
+    --   GUARD wipeout: ngày 1+r ≤ 0 (return ≤ −100%) → LOG lỗi ⇒ clamp + ép TWR = −1.0.
+    DECLARE @twr DECIMAL(10,6);
+    SELECT @twr = CASE WHEN MAX(CASE WHEN 1.0+C_DAILY_RETURN <= 0 THEN 1 ELSE 0 END) = 1 THEN CAST(-1 AS DECIMAL(10,6))
+                       ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+C_DAILY_RETURN > 0 THEN 1.0+C_DAILY_RETURN ELSE 1 END))) - 1 AS DECIMAL(10,6))
+                  END
+    FROM T_SI_BALANCE
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
+      AND C_DAILY_RETURN IS NOT NULL;
 
     -- MWR Modified Dietz: cần lịch phiên cho trọng số w_i. Lấy từ T_MASTER_INDEX_DAILY (1 dòng/master/phiên)
     -- thay vì T_PRICE_DAILY (date×TẤT CẢ mã) — cùng tập ngày GD nhưng ~250 dòng thay vì hàng triệu.
@@ -165,25 +191,20 @@ BEGIN
             @p_range                 AS C_RANGE,
             @base                  AS C_BASE_DATE,
             @end                   AS C_END_DATE,
-            @base_nav              AS C_BASE_NAV,
-            @base_up               AS C_BASE_UNIT_PRICE,
-            @end_nav               AS C_END_NAV,
-            @end_up                AS C_END_UNIT_PRICE,
-            @cur_nav               AS C_CURRENT_NAV,
-            @cur_up                AS C_CURRENT_UNIT_PRICE,
-            @cur_unit              AS C_CURRENT_UNIT,
+            @base_nav              AS C_BASE_NAV,      -- AUM mốc đầu kỳ
+            @end_nav               AS C_END_NAV,       -- AUM mốc cuối kỳ
+            @cur_nav               AS C_CURRENT_NAV,   -- AUM hiện tại (T_SI_CURRENT)
             @cur_date              AS C_CURRENT_DATE,
-            CASE WHEN @base_up IS NULL OR @base_up = 0 THEN NULL
-                 ELSE CAST(@end_up / @base_up - 1 AS DECIMAL(10,6)) END AS C_TWR_PCT,
+            @twr                   AS C_TWR_PCT,       -- [thin-layer] compound daily_return
             (@end_nav - @base_nav - @cf_net) AS C_PNL_MONEY,
             @cf_net                AS C_CF_NET,
             CASE WHEN @T = 0 OR ABS(@denom) < 0.0001 THEN NULL
                  ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
 
-    -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu). [BRD] bỏ C_STOCK_VALUE master (đã drop).
-    SELECT TOP 1 C_BUSINESS_DATE, C_AUM, C_UNIT_PRICE, C_DAILY_RETURN,
-                 C_CASH
-    FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
+    -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu).
+    --   [thin-layer] bỏ C_UNIT_PRICE master (đã drop); C_DAILY_RETURN = master AUM-weighted daily return.
+    SELECT TOP 1 C_BUSINESS_DATE, C_AUM, C_DAILY_RETURN, C_CASH
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
@@ -193,8 +214,15 @@ GO
 
 /*===========================================================================
   FR-03 — GET /customer/{id}/si/{si_account}/performance?range= : chart so sánh
-    Chuỗi ngày [mốc..cuối]: unit_price sub-account (TWR) + master unit_price (TR)
-    + master index (PR) + benchmark (PR). App rebase về dòng đầu.
+    Chuỗi ngày [mốc..cuối], 4 đường:
+      (a) KH       = compound daily_return sub-account (TWR)         → C_CUST_RETURN
+      (b) master TR= compound master AUM-weighted daily_return       → C_MASTER_RETURN
+      (c) index PR = T_MASTER_INDEX_DAILY.C_INDEX_VALUE (danh mục mẫu) → C_MASTER_INDEX
+      (d) benchmark= T_BENCHMARK_DAILY.C_INDEX_VALUE (PR ngoài)        → C_BENCHMARK
+  [thin-layer] Bỏ unit_price (Asset không cấp). (a)(b) = lợi suất tích lũy CUMULATIVE
+    EXP(Σ LN(1+r) OVER ORDER BY date)−1 trên window [@base..@end] (mốc đầu ≈ 0% trừ ngày @base
+    có return). App rebase 2 đường index/benchmark (PR, giá trị tuyệt đối) về dòng đầu như cũ.
+    NHẤT QUÁN: (a)(b) trả CUMULATIVE RETURN (đã compound), (c)(d) trả MỨC index thô (app rebase).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SI_PERFORMANCE
     @p_si_account VARCHAR(20),
@@ -208,8 +236,8 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- master suy từ T_SI_NAV_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
+    -- master suy từ T_SI_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     DECLARE @bench VARCHAR(20) = (SELECT C_BENCHMARK_CODE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE = @master);
@@ -217,19 +245,34 @@ BEGIN
 
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
-    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE
+    SELECT @base = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE
      WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff;
     IF @base IS NULL SET @base = @first;
 
+    -- [thin-layer] CUMULATIVE compound return trong window:
+    --   running EXP(Σ LN(1+r) OVER (ORDER BY date))−1. ISNULL(r,0): ngày thiếu return KHÔNG ngắt chuỗi.
+    --   (a) KH: r = cd.C_DAILY_RETURN (T_SI_BALANCE per-si).
+    --   (b) master TR: r = sd.C_DAILY_RETURN (T_MASTER_BALANCE, = master AUM-weighted daily return).
+    --   Window dùng range của KH (cd) làm trục thời gian; master/index/benchmark LEFT JOIN theo ngày.
+    --   GUARD wipeout (1+r ≤ 0): clamp arg LOG về 1 để KHÔNG lỗi; từ ngày wipeout trở đi ép cumulative = −1.0
+    --   (running MAX của cờ wipeout). Pre-wipeout không bao giờ có 1+r ≤ 0 nên clamp vô hại.
     SELECT  cd.C_BUSINESS_DATE,
-            cd.C_UNIT_PRICE          AS C_CUST_UNIT_PRICE,   -- TWR sub-account
-            sd.C_UNIT_PRICE          AS C_MASTER_UNIT_PRICE, -- TR master
-            si.C_INDEX_VALUE         AS C_MASTER_INDEX,      -- PR danh mục mẫu
-            bm.C_INDEX_VALUE         AS C_BENCHMARK          -- PR benchmark ngoài
-    FROM        T_SI_NAV_BALANCE cd
-    LEFT JOIN   T_MASTER_NAV_BALANCE   sd ON sd.C_MASTER_CODE = @master AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+            CASE WHEN MAX(CASE WHEN 1.0+ISNULL(cd.C_DAILY_RETURN,0) <= 0 THEN 1 ELSE 0 END)
+                     OVER (ORDER BY cd.C_BUSINESS_DATE ROWS UNBOUNDED PRECEDING) = 1 THEN CAST(-1 AS DECIMAL(18,8))
+                 ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+ISNULL(cd.C_DAILY_RETURN,0) > 0 THEN 1.0+ISNULL(cd.C_DAILY_RETURN,0) ELSE 1 END))
+                          OVER (ORDER BY cd.C_BUSINESS_DATE ROWS UNBOUNDED PRECEDING)) - 1 AS DECIMAL(18,8))
+            END AS C_CUST_RETURN,    -- (a) lợi suất tích lũy KH
+            CASE WHEN MAX(CASE WHEN 1.0+ISNULL(sd.C_DAILY_RETURN,0) <= 0 THEN 1 ELSE 0 END)
+                     OVER (ORDER BY cd.C_BUSINESS_DATE ROWS UNBOUNDED PRECEDING) = 1 THEN CAST(-1 AS DECIMAL(18,8))
+                 ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+ISNULL(sd.C_DAILY_RETURN,0) > 0 THEN 1.0+ISNULL(sd.C_DAILY_RETURN,0) ELSE 1 END))
+                          OVER (ORDER BY cd.C_BUSINESS_DATE ROWS UNBOUNDED PRECEDING)) - 1 AS DECIMAL(18,8))
+            END AS C_MASTER_RETURN,  -- (b) lợi suất tích lũy master (AUM-weighted)
+            si.C_INDEX_VALUE         AS C_MASTER_INDEX,      -- (c) PR danh mục mẫu (mức thô, app rebase)
+            bm.C_INDEX_VALUE         AS C_BENCHMARK          -- (d) PR benchmark ngoài (mức thô, app rebase)
+    FROM        T_SI_BALANCE cd
+    LEFT JOIN   T_MASTER_BALANCE   sd ON sd.C_MASTER_CODE = @master AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     LEFT JOIN   T_MASTER_INDEX_DAILY   si ON si.C_MASTER_CODE = @master AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     LEFT JOIN   T_BENCHMARK_DAILY      bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     WHERE  cd.C_SI_ACCOUNT=@p_si_account AND cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
@@ -299,8 +342,8 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- tồn tại theo DỮ LIỆU (T_SI_NAV_CURRENT, có sau ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
-    IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account)
+    -- tồn tại theo DỮ LIỆU (T_SI_CURRENT, có sau ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    IF NOT EXISTS (SELECT 1 FROM T_SI_CURRENT WHERE C_SI_ACCOUNT=@p_si_account)
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- @pd = ngày giá mới nhất TOÀN THỊ TRƯỜNG (mốc định giá "hiện tại"). Lấy MAX trên clustered
@@ -364,30 +407,41 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- master suy từ T_SI_NAV_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
-    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
+    -- master suy từ T_SI_CURRENT (có sau FO ingest) — KHÔNG từ T_SI_PORTFOLIO; chưa có data → not-found.
+    DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
     -- [BRD asset-sync] Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng) ⇒ AUM = NAV.
 
     IF @p_asof IS NULL
-        SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+        SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
 
-    -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_NAV_BALANCE) cho ĐÚNG sub-account này (chặn ngày
+    -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_BALANCE) cho ĐÚNG sub-account này (chặn ngày
     --   nghỉ/tương lai/trước-mở/sau-đóng). NAV_BALANCE @asof tồn tại ⇒ T_SI_ASSET_DAILY @asof cũng có (compute cần).
-    IF NOT EXISTS (SELECT 1 FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
+    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
     BEGIN SET @p_err_code = 5;
         SET @p_err_msg = CONCAT(N'Không có dữ liệu EOD cho sub-account ', @p_si_account, N' @ ',
             CONVERT(VARCHAR(10),@p_asof,23), N' (ngày nghỉ/tương lai/trước khi mở/sau khi đóng TK).');
         RAISERROR(@p_err_msg, 16, 1); END
 
-    -- [BRD] Thành phần tài sản số TỔNG từ Asset (T_SI_ASSET_DAILY @asof) — SDI KHÔNG tự định giá. cash = TỔNG tiền (1 số).
-    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0);
-    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH
+    -- [thin-layer] Asset gửi số TỔNG: AUM (C_AUM) + cash (1 số). KHÔNG còn C_STOCK_VALUE (Asset không cấp).
+    --   Stock value = AUM − cash (suy ra, vì AUM = stock + tổng tiền). cash = TỔNG tiền (gộp tiền mặt + bán chờ + cổ tức tiền).
+    DECLARE @aum DECIMAL(20,0), @cash DECIMAL(20,0), @stock DECIMAL(20,0);
+    SELECT @aum=C_AUM, @cash=C_CASH
     FROM T_SI_ASSET_DAILY WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
+    SET @stock = ISNULL(@aum,0) - ISNULL(@cash,0);   -- stock suy ra (Asset không gửi tách riêng)
+
+    -- [thin-layer] return tích lũy INCEPTION→@asof = EXP(Σ LN(1+r))−1 (compound daily_return ≤ @asof).
+    --   GUARD wipeout (1+r ≤ 0): clamp + ép −1.0 (tránh LOG lỗi).
+    DECLARE @ret_incep DECIMAL(10,6);
+    SELECT @ret_incep = CASE WHEN MAX(CASE WHEN 1.0+C_DAILY_RETURN <= 0 THEN 1 ELSE 0 END) = 1 THEN CAST(-1 AS DECIMAL(10,6))
+                             ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+C_DAILY_RETURN > 0 THEN 1.0+C_DAILY_RETURN ELSE 1 END))) - 1 AS DECIMAL(10,6))
+                        END
+    FROM T_SI_BALANCE
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_DAILY_RETURN IS NOT NULL;
 
     -- Holdings chi tiết per-mã (FO holdings reconstruct @asof × giá ≤ asof) cho RS2. ⚠️ Σ(FO×giá) CÓ THỂ lệch
-    --   Asset stock_value (đo ở reconcile HOLDINGS_MISMATCH); RS1 total dùng số Asset (authoritative).
+    --   stock value Asset-derive (đo ở reconcile HOLDINGS_MISMATCH); RS1 total dùng số Asset (authoritative).
     SELECT h.C_TICKER, h.C_QUANTITY, h.C_AVG_COST, px.C_CLOSE_PRICE AS C_MARKET_PRICE,
            h.C_QUANTITY * px.C_CLOSE_PRICE AS C_MARKET_VALUE
     INTO #hold
@@ -398,16 +452,16 @@ BEGIN
     WHERE h.C_SI_ACCOUNT=@p_si_account
       AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL);
 
-    -- RS1: summary (NAV/unit/UP derive @asof + thành phần Asset). AUM = stock+cash = NAV (phí QL đã trừ trong NAV)
+    -- RS1: summary @asof. [thin-layer] AUM = C_AUM (Asset) = stock + tổng tiền. Bỏ unit/UP (Asset không cấp).
+    --   C_RETURN_INCEPTION = compound daily_return inception→@asof (TWR).
     SELECT  @p_asof                AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
-            nd.C_NAV, nd.C_UNIT, nd.C_UNIT_PRICE,
-            ISNULL(@cash,0)        AS C_CASH,        -- TỔNG tiền (1 số)
-            ISNULL(@stock,0)       AS C_STOCK_VALUE,
-            ISNULL(@stock,0)+ISNULL(@cash,0) AS C_AUM  -- AUM = stock + tổng tiền = NAV
-    FROM (SELECT 1 x) z
-    LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof;
+            ISNULL(@aum,0)         AS C_AUM,          -- AUM (= NAV ròng Asset gửi)
+            ISNULL(@aum,0)         AS C_AUM,          -- alias rõ nghĩa AUM = NAV
+            ISNULL(@cash,0)        AS C_CASH,         -- TỔNG tiền (1 số)
+            @stock                 AS C_STOCK_VALUE,  -- = AUM − cash (suy ra; Asset không gửi tách)
+            @ret_incep             AS C_RETURN_INCEPTION;
 
     -- RS2: holdings chi tiết per-mã (FO)
     SELECT  C_TICKER, C_QUANTITY, C_MARKET_PRICE, C_MARKET_VALUE,

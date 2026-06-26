@@ -1,17 +1,16 @@
 /*==============================================================================
-  SDI SMOKE — BRD ASSET-SYNC model (chạy sau 01+02+05+06).
-  Luồng mới: Asset gửi số tổng per-SI (NAV/tiền/phí) → SDI ingest (SP_INGEST_ASSET_NAV) → derive
-  unit/UP/PnL/return (init 10k, prior-day historic) → agg master → reconcile (đo vênh 2 nguồn).
-  FO chỉ gửi holdings (composition). Cashflow nạp/rút SDI vẫn nhập (đối soát với Asset).
+  SDI SMOKE — thin-layer (chạy sau 01+02+05+06).
+  Asset gửi per-SI per-ngày: AUM + daily_return (TWR) → SDI ingest (SP_INGEST_ASSET_NAV) → LƯU (KHÔNG derive)
+  → agg master (AUM + AUM-weighted return) → reconcile. FO chỉ gửi holdings. Cashflow SDI vẫn nhập (đối soát).
 ==============================================================================*/
 SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 DECLARE @ec INT, @em NVARCHAR(400);
 
 -- reset
-DELETE FROM T_EOD_WORK; DELETE FROM T_SI_UNIT_LEDGER; DELETE FROM T_SI_NAV_BALANCE;
-DELETE FROM T_MASTER_NAV_BALANCE; DELETE FROM T_MASTER_INDEX_DAILY; DELETE FROM T_MASTER_HOLDING_BALANCE;
-DELETE FROM T_EOD_RUN; DELETE FROM T_MASTER_NAV_CURRENT; DELETE FROM T_SI_ASSET_DAILY;
-DELETE FROM T_SI_PORTFOLIO_HOLDING; DELETE FROM T_SI_NAV_CURRENT; DELETE FROM T_SI_HOLDING_HIST;
+DELETE FROM T_EOD_WORK; DELETE FROM T_SI_BALANCE;
+DELETE FROM T_MASTER_BALANCE; DELETE FROM T_MASTER_INDEX_DAILY; DELETE FROM T_MASTER_HOLDING_BALANCE;
+DELETE FROM T_EOD_RUN; DELETE FROM T_MASTER_CURRENT; DELETE FROM T_SI_ASSET_DAILY;
+DELETE FROM T_SI_PORTFOLIO_HOLDING; DELETE FROM T_SI_CURRENT; DELETE FROM T_SI_HOLDING_HIST;
 DELETE FROM T_SI_CASHFLOW_EVENT; DELETE FROM T_EOD_RECON_BREAK; DELETE FROM T_EOD_PIPELINE;
 DELETE FROM T_PRICE_DAILY; DELETE FROM T_MASTER_PORTFOLIO_TICKER; DELETE FROM T_SI_PORTFOLIO; DELETE FROM T_MASTER_PORTFOLIO;
 
@@ -25,10 +24,10 @@ INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
 
 PRINT '======== CUSTOMER EOD: ingest Asset NAV → derive ========';
 
--- DAY 02: nạp 10tr; holdings AAA60000/BBB80000 (stock 10tr); cash 0; fee 0 → NAV=10tr, UP=10000, units=1000
+-- DAY 02: nạp 10tr; Asset gửi aum=10tr, daily_return=NULL (phiên đầu)
 INSERT T_SI_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT) VALUES ('SUB001','KH001','SDI01','2026-01-02','INITIAL',10000000);
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-02","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":10000000,"stock_value":10000000,"cash":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10000000,"daily_return":null,"cash":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -36,9 +35,9 @@ EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTP
 EXEC SP_EOD_RUN '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 02 ec=',@ec,' ',@em);
 
--- DAY 05: market move (AAA110/BBB48) → stock 10.44tr; no flow → UP=10440, return=0.044
+-- DAY 05: thị trường tăng → Asset gửi aum=10.44tr, daily_return=0.044 (no flow)
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-05","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":10440000,"stock_value":10440000,"cash":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10440000,"daily_return":0.044,"cash":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -46,11 +45,10 @@ EXEC SP_EOD_SET_SOURCE_READY '2026-01-05','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTP
 EXEC SP_EOD_RUN '2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 05 ec=',@ec,' ',@em);
 
--- DAY 06: CASHFLOW-VÀO-NGÀY-ĐÃ-TỒN-TẠI: nạp 1,044,000 (=UP_prev 10440 × 100), KHÔNG market move (stock giữ
---   10.44tr, cash +1.044tr) → NAV=11.484tr. Units phát hành @UP_prev=10440 → ΔUnit=100 → units=1100 → UP=10440, return=0.
+-- DAY 06: nạp 1.044tr, KHÔNG biến động giá → Asset gửi aum=11.484tr, daily_return=0 (chỉ nạp, không lãi)
 INSERT T_SI_CASHFLOW_EVENT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_BUSINESS_DATE,C_EVENT_TYPE,C_AMOUNT) VALUES ('SUB001','KH001','SDI01','2026-01-06','TOPUP',1044000);
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-06","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11484000,"stock_value":10440000,"cash":1044000,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":11484000,"daily_return":0,"cash":1044000,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','MKT_DATA',NULL,NULL,@ec OUTPUT,@em OUTPUT;
 EXEC SP_EOD_RUN_INDEX '2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',NULL,NULL,@ec OUTPUT,@em OUTPUT;
@@ -58,21 +56,18 @@ EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTP
 EXEC SP_EOD_RUN '2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 06 ec=',@ec,' ',@em);
 
-DECLARE @nav2 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-02');
-DECLARE @up2 DECIMAL(18,6)=(SELECT C_UNIT_PRICE FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-02');
-IF @nav2=10000000 AND @up2=10000 PRINT CONCAT('  OK day02: NAV=',@nav2,' UP=',@up2,' (init 10k)'); ELSE PRINT CONCAT('  !!! day02: NAV=',@nav2,' UP=',@up2);
-DECLARE @up5 DECIMAL(18,6)=(SELECT C_UNIT_PRICE FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-05');
-DECLARE @ret5 DECIMAL(10,6)=(SELECT C_DAILY_RETURN FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-05');
-IF @up5=10440 AND ABS(@ret5-0.044)<0.0001 PRINT CONCAT('  OK day05: UP=',@up5,' return=',@ret5,' (NAV từ Asset, units giữ)'); ELSE PRINT CONCAT('  !!! day05: UP=',@up5,' return=',@ret5);
-DECLARE @nav6 DECIMAL(20,0)=(SELECT C_NAV FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
-DECLARE @up6 DECIMAL(18,6)=(SELECT C_UNIT_PRICE FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
-DECLARE @un6 DECIMAL(18,6)=(SELECT C_UNIT FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
-DECLARE @ret6 DECIMAL(10,6)=(SELECT C_DAILY_RETURN FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
-IF @nav6=11484000 AND @un6=1100 AND @up6=10440 AND @ret6=0
-   PRINT CONCAT('  OK day06 CASHFLOW-day: NAV=',@nav6,' units=',@un6,' UP=',@up6,' return=',@ret6,' (units phát hành @UP_prev 10440)');
-ELSE PRINT CONCAT('  !!! day06: NAV=',@nav6,' units=',@un6,' UP=',@up6,' return=',@ret6);
+DECLARE @nav2 DECIMAL(20,0)=(SELECT C_AUM FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-02');
+DECLARE @ret2 DECIMAL(10,6)=(SELECT C_DAILY_RETURN FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-02');
+IF @nav2=10000000 AND @ret2 IS NULL PRINT CONCAT('  OK day02: AUM=',@nav2,' return=NULL (phiên đầu)'); ELSE PRINT CONCAT('  !!! day02: AUM=',@nav2,' return=',ISNULL(CAST(@ret2 AS VARCHAR(20)),'null'));
+DECLARE @ret5 DECIMAL(10,6)=(SELECT C_DAILY_RETURN FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-05');
+IF ABS(@ret5-0.044)<0.0001 PRINT CONCAT('  OK day05: return=',@ret5,' (Asset cấp daily_return)'); ELSE PRINT CONCAT('  !!! day05: return=',@ret5);
+DECLARE @nav6 DECIMAL(20,0)=(SELECT C_AUM FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
+DECLARE @ret6 DECIMAL(10,6)=(SELECT C_DAILY_RETURN FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-01-06');
+IF @nav6=11484000 AND @ret6=0
+   PRINT CONCAT('  OK day06: AUM=',@nav6,' return=',@ret6,' (nạp 1.044tr, không lãi)');
+ELSE PRINT CONCAT('  !!! day06: AUM=',@nav6,' return=',@ret6);
 
-DECLARE @mnav DECIMAL(20,0)=(SELECT C_AUM FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-06');
+DECLARE @mnav DECIMAL(20,0)=(SELECT C_AUM FROM T_MASTER_BALANCE WHERE C_MASTER_CODE='SDI01' AND C_BUSINESS_DATE='2026-01-06');
 IF @mnav=11484000 PRINT CONCAT('  OK master agg @06: AUM=',@mnav); ELSE PRINT CONCAT('  !!! master agg @06: ',@mnav);
 DECLARE @nullRows INT=(SELECT COUNT(*) FROM T_EOD_RUN WHERE C_STATUS='DONE' AND C_ROWS IS NULL);
 IF @nullRows=0 PRINT '  OK C_ROWS populate đủ (0 job DONE NULL)'; ELSE PRINT CONCAT('  !!! C_ROWS NULL: ',@nullRows);
@@ -81,14 +76,13 @@ PRINT '';
 PRINT '======== RECONCILE: đo vênh 2 nguồn ========';
 DECLARE @brk6 INT=(SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06');
 IF @brk6=0 PRINT '  OK reconcile @06 sạch (2 nguồn khớp)'; ELSE PRINT CONCAT('  !!! reconcile @06 break: ',@brk6);
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11043999,"stock_value":9999999,"cash":1044000,"cash_in":2000000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":11043999,"daily_return":0,"cash":1044000,"cash_in":2000000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RECONCILE '2026-01-06',@p_rows=@ec OUTPUT;
 DECLARE @cfd DECIMAL(20,6)=(SELECT C_DIFF FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06' AND C_CHECK_NAME='CASHFLOW_MISMATCH');
-DECLARE @hdf DECIMAL(20,6)=(SELECT C_DIFF FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06' AND C_CHECK_NAME='HOLDINGS_MISMATCH');
--- cashflow: SDI 1.044tr − Asset 2tr = −956000 ; holdings: Σ(FO×giá 10.44tr) − Asset stock 9999999 = 440001
-IF @cfd=-956000 AND @hdf=440001 PRINT CONCAT('  OK reconcile đo vênh: cashflow diff=',@cfd,' holdings diff=',@hdf);
-ELSE PRINT CONCAT('  !!! reconcile diff sai: cashflow=',ISNULL(CAST(@cfd AS VARCHAR(30)),'(null)'),' holdings=',ISNULL(CAST(@hdf AS VARCHAR(30)),'(null)'));
-EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","nav":11484000,"stock_value":10440000,"cash":1044000,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
+-- cashflow: SDI 1.044tr − Asset cash_in 2tr = −956000. (HOLDINGS_MISMATCH + NAV_CONSISTENCY đã gỡ thin-layer)
+IF @cfd=-956000 PRINT CONCAT('  OK reconcile đo vênh: cashflow diff=',@cfd);
+ELSE PRINT CONCAT('  !!! reconcile diff sai: cashflow=',ISNULL(CAST(@cfd AS VARCHAR(30)),'(null)'));
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":11484000,"daily_return":0,"cash":1044000,"cash_in":1044000,"cash_out":0}]','2026-01-06',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 EXEC SP_EOD_RECONCILE '2026-01-06',@p_rows=@ec OUTPUT;
 
 PRINT '';

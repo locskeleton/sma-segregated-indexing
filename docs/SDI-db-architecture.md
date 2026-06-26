@@ -2,7 +2,7 @@
 
 Bổ trợ cho [SDI-spec.md](./SDI-spec.md). Tập trung: chịu tải dữ liệu lớn + chạy batch chốt EOD trong cửa sổ đêm.
 
-> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (BO/FO/Market đẩy thẳng, Asset tự tính). Đã gỡ khỏi `db/05_API.sql` **2 producer** (`SP_GET_ASSET_SNAPSHOT` per-SI, `SP_GET_ASSET_MASTER_SNAPSHOT` master); **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset khi BO price-ready (luồng RIÊNG, SDI→Asset DUY NHẤT còn lại). **[BRD asset-sync] Asset gửi NAV RÒNG trực tiếp về SDI** (đã trừ phí QL — model realized; BO KHÔNG gửi số phí lũy kế) → SDI **KHÔNG accrue phí QL**, `AUM = NAV` (không tách payable). EOD engine vẫn build các bảng nội bộ (`T_SI_NAV_BALANCE`, `T_MASTER_*`) phục vụ read API cho UI riêng của SDI. Đối chiếu + reconcile: [SDI-asset-gap.md](./SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22:** SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset** (BO/FO/Market đẩy thẳng, Asset tự tính). Đã gỡ khỏi `db/05_API.sql` **2 producer** (`SP_GET_ASSET_SNAPSHOT` per-SI, `SP_GET_ASSET_MASTER_SNAPSHOT` master); **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset khi BO price-ready (luồng RIÊNG, SDI→Asset DUY NHẤT còn lại). **[BRD asset-sync] Asset gửi NAV RÒNG trực tiếp về SDI** (đã trừ phí QL — model realized; BO KHÔNG gửi số phí lũy kế) → SDI **KHÔNG accrue phí QL**, `AUM = NAV` (không tách payable). EOD engine vẫn build các bảng nội bộ (`T_SI_BALANCE`, `T_MASTER_*`) phục vụ read API cho UI riêng của SDI. Đối chiếu + reconcile: [SDI-asset-gap.md](./SDI-asset-gap.md).
 
 ---
 
@@ -28,7 +28,7 @@ Bổ trợ cho [SDI-spec.md](./SDI-spec.md). Tập trung: chịu tải dữ li�
 ### 2.1 ROLL-FORWARD STATE — không replay lịch sử mỗi ngày
 Giữ **trạng thái hiện tại** (current state), mỗi EOD chỉ **áp delta của ngày** rồi định giá lại. KHÔNG dựng lại NAV từ đầu lịch sử mỗi ngày.
 
-- `T_SI_NAV_CURRENT` — 1 dòng/vị thế (unit, cash, last_nav, last_unit_price) → ~1M dòng, **update tại chỗ**.
+- `T_SI_CURRENT` — 1 dòng/vị thế (unit, cash, last_nav, last_unit_price) → ~1M dòng, **update tại chỗ**.
 - `T_SI_PORTFOLIO_HOLDING` — 1 dòng/(vị thế × mã) (quantity, avg_cost) → ~20M dòng, update incremental.
 - Event ledger (cashflow, execution, CA) chỉ **append**; dùng để recompute khi cần.
 
@@ -41,15 +41,15 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 
 | Bảng | Vai trò | Quy mô | Lưu trữ |
 |---|---|---|---|
-| `T_SI_NAV_CURRENT` | trạng thái hiện tại/tiểu khoản (gồm cash) | ~1M | **rowstore**, clustered PK (C_SI_ACCOUNT), PAGE compression; cân nhắc memory-optimized |
+| `T_SI_CURRENT` | trạng thái hiện tại/tiểu khoản (gồm cash) | ~1M | **rowstore**, clustered PK (C_SI_ACCOUNT), PAGE compression; cân nhắc memory-optimized |
 | `T_SI_PORTFOLIO_HOLDING` | holdings hiện tại — **đích FO ingest thẳng** | ~20M | **rowstore** clustered (C_SI_ACCOUNT, C_TICKER) + **NCCI** (HTAP) cho MTM. Nguồn EOD core. |
 | `T_SI_HOLDING_HIST` | **HISTORY holdings INTERVAL** (valid_from..valid_to), full + no-dup | ~20M + Δ/ingest | **CCI**, partition năm(valid_from) — DIFF current→close/open **tại INGEST (per-event Kafka)**; holding bất biến = 1 dòng; KHÔNG trong EOD core |
 | ~~`T_SI_CASH_HIST`~~ **[BRD asset-sync] ĐÃ GỠ** | HISTORY cash-state INTERVAL — không còn (tiền/NAV nay từ Asset; sửa quá khứ = re-ingest, không reconstruct cash) | — | — |
 | `T_SI_CASHFLOW_EVENT` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
-| `T_SI_NAV_BALANCE` | **lịch sử perf per-tiểu-khoản** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
+| `T_SI_BALANCE` | **lịch sử perf per-tiểu-khoản** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | `T_SI_UNIT_LEDGER` | unit thay đổi (cashflow) | ~120M | **CCI**, partition theo năm |
-| `T_MASTER_NAV_BALANCE` | NAV master-level daily: NAV + AUM(=stock+cash=NAV) + hiệu suất | ~250K | rowstore, partition năm |
-| `T_MASTER_NAV_CURRENT` | NAV/state current cấp master (1 dòng/master, overwrite EOD) — serving overview/AUM | ~100 | rowstore (nhỏ, cache RAM) |
+| `T_MASTER_BALANCE` | NAV master-level daily: NAV + AUM(=stock+cash=NAV) + hiệu suất | ~250K | rowstore, partition năm |
+| `T_MASTER_CURRENT` | NAV/state current cấp master (1 dòng/master, overwrite EOD) — serving overview/AUM | ~100 | rowstore (nhỏ, cache RAM) |
 | `T_MASTER_INDEX_DAILY` / `T_BENCHMARK_DAILY` | index daily | ~250K | rowstore |
 | `T_PRICE_DAILY` | giá EOD | ~4M | rowstore, index (C_BUSINESS_DATE, C_TICKER) — nhỏ, cache RAM |
 | ~~`T_SI_INCOME_FEE`~~ **[BRD asset-sync] ĐÃ GỠ** | sổ cái phí/thu nhập per-tiểu-khoản — không còn ở SDI (phí QL đã trừ trong NAV Asset; cổ tức/income trong NAV/cash Asset). Gỡ cùng `SP_INGEST_FEE_CHARGE`. | — | — |
@@ -57,7 +57,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | ~~`T_FEE_CONFIG`~~ **[BRD asset-sync] ĐÃ GỠ** | catalog chính sách phí — SDI không còn accrue/cấu hình phí (thuộc Asset/BO) | — | — |
 | `T_SI_ASSET_DAILY` **[BRD asset-sync] MỚI** | raw feed Asset per-SI/ngày GD (`nav, stock_value, cash, cash_in, cash_out`) — nguồn ingest NAV ròng; audit + re-ingest history | ~triệu/năm | rowstore/CCI, partition năm |
 
-**Quyết định customer daily perf (đổi do FO-sync):** vì FO đồng bộ **snapshot overwrite** → holdings KHÔNG còn event-source → **KHÔNG derive được NAV/unit_price quá khứ** → **BẮT BUỘC materialize** `T_SI_NAV_BALANCE` (nav/unit/unit_price/day) để vẽ chart FR-03. Giảm tải: lấy **điểm thưa (tuần/tháng)** hoặc chỉ lưu `unit_price`. Lưu CCI + partition (§7.3).
+**Quyết định customer daily perf (đổi do FO-sync):** vì FO đồng bộ **snapshot overwrite** → holdings KHÔNG còn event-source → **KHÔNG derive được NAV/unit_price quá khứ** → **BẮT BUỘC materialize** `T_SI_BALANCE` (nav/unit/unit_price/day) để vẽ chart FR-03. Giảm tải: lấy **điểm thưa (tuần/tháng)** hoặc chỉ lưu `unit_price`. Lưu CCI + partition (§7.3).
 
 ---
 
@@ -72,7 +72,7 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | **Batch-mode on rowstore** (2019+, compat 150) | aggregate rowstore không cần columnstore | tăng tốc GROUP BY |
 | **RCSI / SNAPSHOT isolation** | batch không chặn app đọc | EOD chạy song song với SMO đọc |
 | **PAGE compression** | rowstore lớn | giảm I/O |
-| **Memory-Optimized table** (In-Memory OLTP) | `T_SI_NAV_CURRENT` nếu update nóng | bỏ latch/lock contention |
+| **Memory-Optimized table** (In-Memory OLTP) | `T_SI_CURRENT` nếu update nóng | bỏ latch/lock contention |
 | **Filegroups** nóng/lạnh | partition năm hiện tại (SSD) vs archive (HDD) | chi phí + tốc độ |
 | **Resource Governor + MAXDOP** | giới hạn/đảm bảo tài nguyên batch | ổn định cửa sổ EOD |
 
@@ -135,12 +135,12 @@ INGEST_NAV_DERIVE  [BRD asset-sync] NAV ingest thẳng từ Asset (KHÔNG MTM/ac
       AUM   = stock_value + cash = NAV   (không tách payable)
       PnL ngày = NAV_today − NAV_prev + ra − vào
       UNIT: ΔUnit = (cash_in−cash_out)/unit_price_prev ; unit_price = NAV/unit → INSERT T_SI_UNIT_LEDGER (ΔUnit≠0)
-        (init UP=10.000 ngày đầu; historic theo UP_{t-1}) → ghi T_SI_NAV_BALANCE.
-J11_SI_AGG    Σ per master → T_MASTER_NAV_BALANCE (NAV + AUM(=stock+cash) + hiệu suất + **[PM] cash_in/cash_out Σ
-              + total_account**); upsert T_MASTER_NAV_CURRENT
+        (init UP=10.000 ngày đầu; historic theo UP_{t-1}) → ghi T_SI_BALANCE.
+J11_SI_AGG    Σ per master → T_MASTER_BALANCE (NAV + AUM(=stock+cash) + hiệu suất + **[PM] cash_in/cash_out Σ
+              + total_account**); upsert T_MASTER_CURRENT
 J12_SI_INDEX  Index_t = Index_(t-1) × Σ w^(t)·P_t/P_ref  (100 master × ~25 mã — nhẹ) → T_MASTER_INDEX_DAILY
 J13_RECONCILE [BRD asset-sync] NAV_CONSISTENCY (nav vs stock+cash) + cashflow 2 nguồn + holdings (ΣFO×giá vs Asset stock) → bảng break; CHẶN publish nếu lệch quá ngưỡng (lưu diff cả khi trong ngưỡng)
-J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_NAV_BALANCE; build T_MASTER_HOLDING_BALANCE (top20). ~~push tài sản KH + master NAV/perf → Asset~~ ĐÃ GỠ (BRD 2026-06-22 — BO/FO/Market đẩy thẳng). Master Index VẪN đẩy Asset qua luồng RIÊNG SP_EOD_RUN_INDEX (SP_GET_ASSET_INDEX_SNAPSHOT), KHÔNG trong J14. Xem docs/SDI-asset-gap.md
+J14_SNAPSHOT  publish perf per-tiểu-khoản → T_SI_BALANCE; build T_MASTER_HOLDING_BALANCE (top20). ~~push tài sản KH + master NAV/perf → Asset~~ ĐÃ GỠ (BRD 2026-06-22 — BO/FO/Market đẩy thẳng). Master Index VẪN đẩy Asset qua luồng RIÊNG SP_EOD_RUN_INDEX (SP_GET_ASSET_INDEX_SNAPSHOT), KHÔNG trong J14. Xem docs/SDI-asset-gap.md
 ```
 
 - **[BRD asset-sync]** EOD core nhẹ: **không MTM 20M dòng, không accrue** — NAV ingest thẳng từ Asset (per-SI), chỉ derive unit/UP/PnL/return (set-based ~1M).
@@ -185,7 +185,7 @@ CREATE PARTITION SCHEME ps_year AS PARTITION pf_year
 - Nạp EOD: bulk vào **staging cùng filegroup + cùng index + CHECK constraint khớp biên** → `SWITCH` vào partition đích → tức thời, không khóa bảng lớn.
 
 ### 7.3 Customer daily perf — BẮT BUỘC materialize (do FO-sync)
-FO sync overwrite holdings → không event-source → derive-on-read lịch sử **không khả thi** → **phải materialize** `T_SI_NAV_BALANCE`:
+FO sync overwrite holdings → không event-source → derive-on-read lịch sử **không khả thi** → **phải materialize** `T_SI_BALANCE`:
 - Lưu CCI, **partition hash(C_SI_ACCOUNT) + năm** (hoặc **ordered CCI** theo (C_SI_ACCOUNT, C_BUSINESS_DATE)) để segment-elimination khi đọc 1 tiểu khoản. Tránh nonclustered rowstore index trên 2,5 tỷ (phình ~trăm GB).
 - EOD: bulk ~1M dòng/ngày vào CCI (rẻ). Đọc chart tiểu khoản: đọc thẳng (nhanh).
 - **Giảm tải**: lấy điểm **thưa (tuần/tháng)** thay vì daily, hoặc chỉ lưu cột `unit_price` (+nav) — narrow CCI nén rất tốt.
@@ -195,7 +195,7 @@ FO sync overwrite holdings → không event-source → derive-on-read lịch s�
 ## 8. Indexing & thiết kế khóa
 
 - **Khóa clustering**: dùng khóa **hẹp, tăng dần, không GUID** (GUID ngẫu nhiên → page split, fragmentation). Dùng `BIGINT IDENTITY` hoặc khóa tự nhiên hẹp.
-- `T_SI_NAV_CURRENT`: clustered PK `(C_SI_ACCOUNT)` — point update/lookup.
+- `T_SI_CURRENT`: clustered PK `(C_SI_ACCOUNT)` — point update/lookup.
 - `T_SI_PORTFOLIO_HOLDING`: clustered `(C_SI_ACCOUNT, C_TICKER)` + **NCCI** (cho J07 MTM).
 - Event ledger (CCI): partition `(C_BUSINESS_DATE)`; CCI tự lo, thêm **nonclustered rowstore** `(C_SI_ACCOUNT, C_BUSINESS_DATE)` nếu cần truy vết theo tiểu khoản.
 - Master-level daily: clustered `(C_MASTER_CODE, C_BUSINESS_DATE)`.
@@ -220,11 +220,11 @@ FO sync overwrite holdings → không event-source → derive-on-read lịch s�
 
 | Bảng | Dòng | Sau nén |
 |---|---|---|
-| T_SI_NAV_CURRENT (rowstore PAGE) | 1M | ~vài trăm MB |
+| T_SI_CURRENT (rowstore PAGE) | 1M | ~vài trăm MB |
 | T_SI_PORTFOLIO_HOLDING (rowstore + NCCI) | 20M | ~vài GB |
 | event ledger (T_SI_CASHFLOW_EVENT/T_SI_UNIT_LEDGER, CCI) | ~240M | ~chục GB |
 | master-level daily (rowstore) | ~1M | ~nhỏ |
-| **`T_SI_NAV_BALANCE` (CCI)** | **~2,5 tỷ** | **~100–300 GB** (bắt buộc — do FO-sync, xem §7.3) |
+| **`T_SI_BALANCE` (CCI)** | **~2,5 tỷ** | **~100–300 GB** (bắt buộc — do FO-sync, xem §7.3) |
 
 > Nén ~10× kéo bảng perf từ ~1–3 TB về ~100–300 GB. **Giảm**: lấy điểm thưa (tuần/tháng) hoặc chỉ lưu `unit_price` (+nav) → narrow CCI còn nhỏ hơn nhiều. Đặt partition cũ ở filegroup archive.
 > Lưu ý: trước đây có thể derive-on-read (event-source); sau khi đổi sang **FO sync snapshot** thì **bắt buộc** materialize bảng này.
@@ -254,13 +254,13 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 |---|---|---|---|
 | T_MASTER_PORTFOLIO | C_MASTER_CODE (natural) | — | — |
 | ~~T_FEE_CONFIG~~ **[BRD asset-sync] ĐÃ GỠ** | — | — | — |
-| **T_SI_NAV_BALANCE** ~2,5 tỷ | C_NAV_BALANCE_ID (BIGINT) | PK_… (nc) | (C_BUSINESS_DATE,C_SI_ACCOUNT) |
+| **T_SI_BALANCE** ~2,5 tỷ | C_NAV_BALANCE_ID (BIGINT) | PK_… (nc) | (C_BUSINESS_DATE,C_SI_ACCOUNT) |
 | **T_SI_HOLDING_HIST** ~20M | C_HOLDING_HIST_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_TICKER,C_VALID_FROM) +filtered open IX |
 | **T_SI_CASH_HIST** | C_CASH_HIST_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_VALID_FROM) +filtered open IX |
 | **T_SI_CASHFLOW_EVENT** ~120M | C_EVENT_ID (BIGINT) | PK_… (nc) | — |
 | **T_SI_UNIT_LEDGER** ~120M | C_SI_UNIT_LEDGER_ID (BIGINT) | PK_… (nc) | (C_SI_ACCOUNT,C_BUSINESS_DATE) |
 | **T_SI_PORTFOLIO_HOLDING** ~20M | (C_SI_ACCOUNT,C_TICKER) natural | PK_… (nc) | — (PK là natural) |
-| **T_SI_NAV_CURRENT** ~1M | (C_SI_ACCOUNT) natural | PK_… (nc) | — |
+| **T_SI_CURRENT** ~1M | (C_SI_ACCOUNT) natural | PK_… (nc) | — |
 | **T_PRICE_DAILY** (gộp CA: +C_REF_PRICE NOT NULL, +C_IS_EX_RIGHTS) | (C_BUSINESS_DATE,C_TICKER) natural | PK_… (nc) | — |
 | T_EOD_WORK (transient) | (C_BUSINESS_DATE,C_SI_ACCOUNT) natural | — | — |
 | T_SI_PORTFOLIO | PK_SI_PORTFOLIO (GUID) | (clustered) | (C_SI_ACCOUNT) + filtered-unique ACTIVE (C_CUST_CODE,C_MASTER_CODE) |
@@ -269,7 +269,7 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 | T_BENCHMARK_DAILY | PK_… (GUID) | (clustered) | (C_BENCHMARK_CODE,C_BUSINESS_DATE) |
 | ~~**T_SI_INCOME_FEE**~~ **[BRD asset-sync] ĐÃ GỠ** (sổ cái phí/thu nhập — không còn ở SDI) | — | — | — |
 | **T_SI_ASSET_DAILY** **[BRD asset-sync] MỚI** (raw feed Asset per-SI) | (C_BUSINESS_DATE,C_SI_ACCOUNT) natural | PK_… (nc) | (clustered PK) |
-| T_MASTER_NAV_BALANCE / _INDEX_DAILY / _HOLDING_BALANCE / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
+| T_MASTER_BALANCE / _INDEX_DAILY / _HOLDING_BALANCE / _NAV_CURRENT | PK_… (GUID) | (clustered) | natural per bảng |
 | T_EOD_RUN | PK_EOD_RUN (GUID) | (clustered) | (C_BUSINESS_DATE,C_JOB) |
 
 → **Đo thật (medium 1,25M, SQL Express — thời điểm interval-insert CÒN là job EOD `J14b`):** GUID-clustered MỌI bảng = **~40s**; mixed (perf-clustered cho 8 bảng nóng + GUID nonclustered) = **~32s**; baseline không GUID = **~20s**. Driver chi phí ~2× = **chỉ mục GUID nonclustered (NEWID random) phải maintain khi insert khối lớn** vào history. **Lưu ý:** interval-insert nay đã **chuyển sang INGEST (per-event Kafka)** → overhead GUID này áp ở **ingest-time, KHÔNG trong EOD core** (EOD nhẹ hơn nhiều). Tất cả vẫn << SLA 10 phút ⇒ chấp nhận để mọi row addressable qua API/UI.
@@ -307,10 +307,10 @@ Config nhỏ ĐỘC LẬP, không natural key    → (seq) GUID OK
 
 ## 12. Tóm tắt quyết định kiến trúc
 
-1. **Roll-forward state** (`T_SI_NAV_CURRENT` 1M + `T_SI_PORTFOLIO_HOLDING` 20M), KHÔNG replay mỗi ngày.
+1. **Roll-forward state** (`T_SI_CURRENT` 1M + `T_SI_PORTFOLIO_HOLDING` 20M), KHÔNG replay mỗi ngày.
 2. **EOD set-based**: ~10 câu lệnh; nặng nhất = MTM 20M dòng (1 câu, CCI batch-mode).
 3. **Columnstore** (CCI/NCCI) cho fact/history + **partition theo năm** + **partition switch** nạp/archive.
-4. **Customer daily perf: materialize** `T_SI_NAV_BALANCE` (CCI, partition) — bắt buộc do FO-sync overwrite (không event-source được); giảm tải bằng điểm thưa / chỉ unit_price.
+4. **Customer daily perf: materialize** `T_SI_BALANCE` (CCI, partition) — bắt buộc do FO-sync overwrite (không event-source được); giảm tải bằng điểm thưa / chỉ unit_price.
 5. **Song song theo master/hash(C_SI_ACCOUNT)**, MAXDOP, Resource Governor; **RCSI** để không chặn app.
 6. **Idempotent + resumable + reconcile** trước khi publish.
 7. EOD ước ~vài phút–15 phút (vs hàng giờ nếu RBAR).

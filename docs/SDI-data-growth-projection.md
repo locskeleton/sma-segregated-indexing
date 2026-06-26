@@ -12,15 +12,15 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 
 | Loại | Bảng | Cơ chế | Tăng theo |
 |---|---|---|---|
-| 🔴 **GROW không chặn (dense/ngày)** | `T_SI_NAV_BALANCE` | +1 dòng/tiểu khoản/EOD (history NAV/unit) | **ngày × KH** ← driver chính (cho FR-03) |
+| 🔴 **GROW không chặn (dense/ngày)** | `T_SI_BALANCE` | +1 dòng/tiểu khoản/EOD (history NAV/unit) | **ngày × KH** ← driver chính (cho FR-03) |
 | 🟠 **GROW theo CHURN (interval, full history)** | `T_SI_HOLDING_HIST`, `T_SI_CASH_HIST` | base H₀/S₀ + **1 dòng mỗi lần đổi** (DIFF tại ingest) | **số lần thay đổi** (rebalance/nạp-rút), KHÔNG theo ngày |
-| 🟠 (nhỏ, không chặn) | `T_MASTER_NAV_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_HOLDING_BALANCE` | +master(×mã)/EOD | ngày × master |
+| 🟠 (nhỏ, không chặn) | `T_MASTER_BALANCE`, `T_MASTER_INDEX_DAILY`, `T_MASTER_HOLDING_BALANCE` | +master(×mã)/EOD | ngày × master |
 | 🟠 (sparse) | `T_SI_CASHFLOW_EVENT`, `T_SI_INCOME_FEE`, `T_SI_UNIT_LEDGER` | theo sự kiện | tần suất nạp/rút/cổ tức |
 | 🟢 **FIXED (overwrite)** | `T_SI_PORTFOLIO_HOLDING` (current, đích FO ingest) | overwrite/ingest | chỉ theo KH |
-| 🟢 | `T_SI_NAV_CURRENT`, `T_MASTER_NAV_CURRENT` | overwrite/config | chỉ theo KH |
+| 🟢 | `T_SI_CURRENT`, `T_MASTER_CURRENT` | overwrite/config | chỉ theo KH |
 | ⚪ transient | `T_EOD_WORK` | xoá/ghi mỗi run | 1 ngày |
 
-→ **Hai driver dài hạn:** (1) `T_SI_NAV_BALANCE` dense theo ngày×KH (lớn nhất); (2) interval hist theo **churn** — full history nhưng tăng chậm vì danh mục index ít biến động. Bảng 🟢 chỉ to theo số KH.
+→ **Hai driver dài hạn:** (1) `T_SI_BALANCE` dense theo ngày×KH (lớn nhất); (2) interval hist theo **churn** — full history nhưng tăng chậm vì danh mục index ít biến động. Bảng 🟢 chỉ to theo số KH.
 
 ---
 
@@ -42,7 +42,7 @@ Dự phóng số bản ghi & dung lượng theo thời gian, cho 3 kịch bản 
 
 ---
 
-## 3. Driver #1: `T_SI_NAV_BALANCE` — số bản ghi tích luỹ (triệu dòng)
+## 3. Driver #1: `T_SI_BALANCE` — số bản ghi tích luỹ (triệu dòng)
 
 > rows/ngày = S₀ (tiểu khoản). Dense, không né được (FO snapshot ⇒ không event-source ⇒ phải materialize NAV/unit cho chart).
 
@@ -76,7 +76,7 @@ Cơ chế: ngày đầu mở H₀ dòng open; mỗi lần một vị thế đổ
 
 `T_SI_CASH_HIST` cùng cơ chế nhưng grain per-tiểu-khoản (S₀, không ×mã): base S₀ + S₀ × churn_cash × năm. medium 10Y churn-12 ≈ 50K + 50K×12×10 = ~6M dòng (nhỏ).
 
-Cash FO không còn bảng feed riêng: ingest Kafka cập nhật thẳng `T_SI_NAV_CURRENT.C_CASH` (overwrite) + diff interval vào `T_SI_CASH_HIST` → không có bảng transient tích luỹ.
+Cash FO không còn bảng feed riêng: ingest Kafka cập nhật thẳng `T_SI_CURRENT.C_CASH` (overwrite) + diff interval vào `T_SI_CASH_HIST` → không có bảng transient tích luỹ.
 
 ---
 
@@ -84,7 +84,7 @@ Cash FO không còn bảng feed riêng: ingest Kafka cập nhật thẳng `T_SI_
 | Bảng | medium base | medium ×4 KH | large base | large ×4 KH |
 |---|---:|---:|---:|---:|
 | `T_SI_PORTFOLIO_HOLDING` (current) | 1,25M | ~5M | 6,25M | ~25M |
-| `T_SI_NAV_CURRENT` | 50K | ~200K | 250K | ~1M |
+| `T_SI_CURRENT` | 50K | ~200K | 250K | ~1M |
 
 Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứng yên.
 
@@ -93,19 +93,19 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 ## 6. Tham chiếu prod thực (200K KH, S₀≈1M tiểu khoản, H₀≈25M holdings)
 | | flat | đều | nóng |
 |---|---:|---:|---:|
-| `T_SI_NAV_BALANCE` rows 1Y | ~252M | ~315M | ~516M |
+| `T_SI_BALANCE` rows 1Y | ~252M | ~315M | ~516M |
 | 10 năm | ~2,5 tỷ | ~3,1 tỷ | ~5,2 tỷ |
 | `T_SI_HOLDING_HIST` 10Y (churn 4/y) | ~1,0 tỷ | (theo KH cuối) | ~1,3 tỷ |
 | `T_SI_HOLDING_HIST` 10Y (churn 12/y) | ~3,0 tỷ | — | — |
-| Dung lượng `T_SI_NAV_BALANCE` 10y nén | ~30 GB | ~40 | ~65 |
+| Dung lượng `T_SI_BALANCE` 10y nén | ~30 GB | ~40 | ~65 |
 
-> `T_SI_NAV_BALANCE` 10 năm ~2,5 tỷ (khớp [SDI-spec §11]) — khối lớn nhất, cần partition/CCI/điểm thưa. `T_SI_HOLDING_HIST` full history nhưng nhờ interval chỉ ~1 tỷ (churn 4/y) thay vì ~63 tỷ nếu snapshot dated → tiết kiệm ~98%, vẫn đủ tái dựng mọi ngày.
+> `T_SI_BALANCE` 10 năm ~2,5 tỷ (khớp [SDI-spec §11]) — khối lớn nhất, cần partition/CCI/điểm thưa. `T_SI_HOLDING_HIST` full history nhưng nhờ interval chỉ ~1 tỷ (churn 4/y) thay vì ~63 tỷ nếu snapshot dated → tiết kiệm ~98%, vẫn đủ tái dựng mọi ngày.
 
 ---
 
 ## 7. Kết luận & khuyến nghị
 1. **Interval thắng cả hai mục tiêu:** giữ **full history BẮT BUỘC** (compliance) NHƯNG loại bỏ trùng lặp — holding bất biến = 1 dòng. Tăng trưởng đổi từ "theo ngày" (snapshot) sang "theo churn", giảm ~98% khối holdings history.
-2. **Hai khối tăng trưởng dài hạn:** (a) `T_SI_NAV_BALANCE` (dense ngày×KH, ~2,5 tỷ/10y — lớn nhất); (b) `T_SI_HOLDING_HIST` (interval churn-driven, ~1 tỷ/10y churn-4). Cash hist nhỏ.
+2. **Hai khối tăng trưởng dài hạn:** (a) `T_SI_BALANCE` (dense ngày×KH, ~2,5 tỷ/10y — lớn nhất); (b) `T_SI_HOLDING_HIST` (interval churn-driven, ~1 tỷ/10y churn-4). Cash hist nhỏ.
 3. **Bắt buộc với cả hai:** CCI + partition theo năm (`business_date` cho nav_balance; `valid_from` cho hist); cân nhắc **điểm thưa** nav_balance (unit_price tuần/tháng cho chart range dài).
 4. **Churn là tham số nhạy nhất của hist:** index SMA tái cân bằng quý ⇒ churn ~4/y là thực tế; nếu sản phẩm cho phép giao dịch chủ động nhiều thì churn tăng tuyến tính số dòng. Theo dõi churn thật để hiệu chỉnh.
 5. **Interval DIFF đã CHUYỂN khỏi EOD → INGEST:** trước đây maintain interval là job EOD `J14b` (đo medium 1,25M SQL Express commit 216fea7: ~10–15s, từng là job nặng nhất EOD, hơn cả J07 MTM ~4–8s). Nay DIFF chạy **per-event tại ingest (Kafka)** → EOD core chỉ còn MTM/agg/index/reconcile/snapshot, nhẹ hẳn. Bản chất chi phí DIFF không đổi: quét **2×H₀ (current ⋈ open-rows) mỗi lần ingest** dù 0 thay đổi → chi phí theo **số event**, không theo ngày; storage vẫn **0 dòng ghi** khi không đổi. *Tối ưu tiềm năng (chưa làm):* checksum per (cust,si_account) / filter theo nhóm FO báo đổi để bỏ qua nhóm bất biến. Đo bằng `db/bench.ps1`.
@@ -115,6 +115,6 @@ Không cộng dồn theo ngày — to lên một bậc khi KH tăng rồi đứn
 ## 8. Giả định & lưu ý
 - Bytes/row + tỷ lệ nén là ước lượng raw.
 - Churn 4/y (rebalance quý) là giả định trung tâm; nạp/rút/SIP/cổ tức-reinvest làm tăng churn — thay số thật vào `H₀ × churn × năm`.
-- Sparse (`T_SI_CASHFLOW_EVENT`, cổ tức/phí, `T_SI_UNIT_LEDGER`) chưa gộp — theo lịch sự kiện, thường << `T_SI_NAV_BALANCE`.
+- Sparse (`T_SI_CASHFLOW_EVENT`, cổ tức/phí, `T_SI_UNIT_LEDGER`) chưa gộp — theo lịch sự kiện, thường << `T_SI_BALANCE`.
 - "đều/nóng" minh hoạ tăng trưởng KH; thay tốc độ thật để ra số chính xác.
 - Interval lưu **full history vĩnh viễn** (compliance) — partition năm theo `valid_from` + filegroup nóng/lạnh (2 năm SSD + cũ HDD) thay cho purge.

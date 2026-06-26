@@ -2,6 +2,8 @@
 
 Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**. Bổ trợ [SDI-spec.md](./SDI-spec.md) (công thức NAV/index/EOD), [SDI-db-architecture.md](./SDI-db-architecture.md).
 
+> **⚠️ THIN-LAYER (2026-06-26):** Asset gửi per-KH **AUM + daily_return (TWR)**; SDI KHÔNG tự tính unit/UP. Per-KH return = **compound `∏(1+daily_return)−1`** (on-read), weight = AUM (`C_LAST_AUM`). TE giữ (prefix-sum active return). `SP_GET_MASTER_RETURN_RETINDEX` đã GỠ — chỉ còn `_COMPOUND`. US5 top-KH bỏ cột `C_UNIT_PRICE_BASE/END`. Bảng: `T_SI_BALANCE`/`T_SI_CURRENT`/`T_MASTER_BALANCE`/`T_MASTER_CURRENT`; `C_NAV`→`C_AUM`. Mô tả unit/UP bên dưới = LỊCH SỬ.
+
 > **Phạm vi tài liệu này = tầng SERVE (SP đọc cho API)**. Phần tổng-hợp-cuối-ngày cần cho PM đã làm ở **Track 1** (`SDI-spec` §8/§9: receivables→NAV, master `C_CASH_IN`/`C_CASH_OUT`/`C_TOTAL_ACCOUNT`). UI/giao diện ngoài phạm vi.
 
 ---
@@ -10,9 +12,9 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 
 - **User = PM**, theo dõi **cấp master** (10 master, ~50k KH, ~5k KH/master). US4/US5 có tính per-KH rồi **tổng hợp/xếp hạng** (đếm lãi/lỗ, phân phối, top-N theo mã KH) — KHÔNG drill-down chi tiết tài khoản KH.
 - **2 bản chất dữ liệu** (BRD gán nhãn):
-  - **Snapshot (current)**: AUM, cash, #KH, cash drag, net flow → tính **on-query từ state hiện tại** (`T_MASTER_NAV_CURRENT`/`T_SI_NAV_CURRENT`), "realtime" = mới tới EOD sync gần nhất.
+  - **Snapshot (current)**: AUM, cash, #KH, cash drag, net flow → tính **on-query từ state hiện tại** (`T_MASTER_CURRENT`/`T_SI_CURRENT`), "realtime" = mới tới EOD sync gần nhất.
   - **Hiệu suất (T-1)**: return, %PnL, TE, deviation, index, phân phối → từ daily tables, **T-1 theo bản chất** (cần giá đóng cửa).
-- **Tất cả ON-READ** (scale nhỏ): không materialize thêm (TE/deviation/dist tính lúc đọc). Building-block EOD đã đủ. Chỉ cần **1 index** `(C_MASTER_CODE, C_BUSINESS_DATE)` trên `T_SI_NAV_BALANCE` để quét per-master nhanh.
+- **Tất cả ON-READ** (scale nhỏ): không materialize thêm (TE/deviation/dist tính lúc đọc). Building-block EOD đã đủ. Chỉ cần **1 index** `(C_MASTER_CODE, C_BUSINESS_DATE)` trên `T_SI_BALANCE` để quét per-master nhanh.
 - **SP master-keyed**: nhận `@p_master_code` (+ range), KHÔNG nhận/không trả định danh KH ngoài top-N ranking (mã KH).
 
 ---
@@ -21,16 +23,16 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 
 | Đại lượng | Công thức | Nguồn |
 |---|---|---|
-| **AUM** (1 master) | `Σ total_asset` các tiểu khoản ACTIVE = `Σ (stock + tiền mặt + tiền bán chờ về + cổ tức tiền)` | `T_MASTER_NAV_CURRENT.C_TOTAL_ASSET` (current) / `T_MASTER_NAV_BALANCE` (daily) |
+| **AUM** (1 master) | `Σ total_asset` các tiểu khoản ACTIVE = `Σ (stock + tiền mặt + tiền bán chờ về + cổ tức tiền)` | `T_MASTER_CURRENT.C_TOTAL_ASSET` (current) / `T_MASTER_BALANCE` (daily) |
 | **Tăng trưởng AUM** | `AUM hiện tại − AUM đầu kỳ` ; `% = (AUM_now / AUM_đầu kỳ − 1)×100` | master daily theo range |
-| **Net in/out** | `NET_IN = Σ cash_in`, `NET_OUT = Σ cash_out`, `NET = IN − OUT` trong kỳ | `Σ T_MASTER_NAV_BALANCE.C_CASH_IN/C_CASH_OUT` |
+| **Net in/out** | `NET_IN = Σ cash_in`, `NET_OUT = Σ cash_out`, `NET = IN − OUT` trong kỳ | `Σ T_MASTER_BALANCE.C_CASH_IN/C_CASH_OUT` |
 | **Cash drag** | `Σ Tiền / Σ AUM × 100%` (Tiền = cash + pending + div) | master current/daily |
 | **#KH (DM KH)** | `C_TOTAL_ACCOUNT` (tiểu khoản ACTIVE) | master current |
 | **Hiệu suất master (model)** | `Master Index` PR: `Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref` (CA: P_ref điều chỉnh) | `T_MASTER_INDEX_DAILY` |
-| **Hiệu suất DM tổng KH** | **AUM-weighted (end-weight)**: `Σ Wᵢ·PnLᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `PnLᵢ = UP_i(cuối)/UP_i(mốc) − 1` (TWR). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** — KH nạp định kỳ hằng tháng → tỷ số AUM bị nhiễm dòng tiền, sai hiệu suất. | per-KH `T_SI_NAV_BALANCE.C_UNIT_PRICE` 2 mốc + AUM cuối (current) |
+| **Hiệu suất DM tổng KH** | **AUM-weighted (end-weight)**: `Σ Wᵢ·PnLᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `PnLᵢ = UP_i(cuối)/UP_i(mốc) − 1` (TWR). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** — KH nạp định kỳ hằng tháng → tỷ số AUM bị nhiễm dòng tiền, sai hiệu suất. | per-KH `T_SI_BALANCE.C_UNIT_PRICE` 2 mốc + AUM cuối (current) |
 | **Deviation (per dev)** | `(AUM-weighted Return KH − Return Master) × 10000` (BPS) | như trên + index |
-| **Tracking Error (TE)** | per-KH `TE_i = STDEV(dᵢ,t) × √X`, `dᵢ,t = R_KH,i,t − R_master,t` (active return ngày t); `X = số ngày GD kỳ (cap 252)`. Master: `Σ(TE_i × AUM_i)/Σ AUM_i` (AUM-weighted) | `T_SI_NAV_BALANCE.C_DAILY_RETURN` (KH) − `T_MASTER_INDEX_DAILY.C_DAILY_RETURN` (master), STDEV on-read |
-| **%PnL per-KH** | `UP_i(cuối kỳ)/UP_i(mốc) − 1` (TWR, miễn nhiễm dòng tiền) | `T_SI_NAV_BALANCE.C_UNIT_PRICE` |
+| **Tracking Error (TE)** | per-KH `TE_i = STDEV(dᵢ,t) × √X`, `dᵢ,t = R_KH,i,t − R_master,t` (active return ngày t); `X = số ngày GD kỳ (cap 252)`. Master: `Σ(TE_i × AUM_i)/Σ AUM_i` (AUM-weighted) | `T_SI_BALANCE.C_DAILY_RETURN` (KH) − `T_MASTER_INDEX_DAILY.C_DAILY_RETURN` (master), STDEV on-read |
+| **%PnL per-KH** | `UP_i(cuối kỳ)/UP_i(mốc) − 1` (TWR, miễn nhiễm dòng tiền) | `T_SI_BALANCE.C_UNIT_PRICE` |
 | **VN-Index** | `(điểm cuối/điểm mốc − 1)×100` | `T_BENCHMARK_DAILY` |
 
 **Ngày mốc (đầu kỳ)** theo filter `1D/1W/MTD/1M/QTD/3T/6T/YTD/INCEP` — dùng `UDF_RANGE_CUTOFF` (đã có ở 05_API). KH/master tham gia sau mốc → mốc = ngày tham gia.
@@ -85,7 +87,7 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 ```sql
 ;WITH ar AS (   -- active return ngày = R_KH − R_master_index
   SELECT b.C_SI_ACCOUNT, (b.C_DAILY_RETURN - idx.C_DAILY_RETURN) AS d
-  FROM T_SI_NAV_BALANCE b
+  FROM T_SI_BALANCE b
   JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=b.C_BUSINESS_DATE
   WHERE b.C_MASTER_CODE=@m AND b.C_BUSINESS_DATE BETWEEN @a AND @b)
 SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
@@ -102,7 +104,7 @@ SELECT C_SI_ACCOUNT, STDEV(d) * SQRT(@X) AS TE_KH FROM ar GROUP BY C_SI_ACCOUNT;
   - Fallback: master chưa cấu hình → default hệ thống (`UDF_PM_CONFIG` hardcode cho TE/cash-drag). Chỉ giữ current + updated_by/time (không lịch sử).
   - **`C_DRIFT_THRESHOLD` / `C_SYMBOL_WEIGHT_ALERT` / `C_INDUSTRY_WEIGHT_ALERT`** (ratio, vd 0.15=15%): NULL=chưa cấu hình ⇒ alert type TẮT (không default). **Consumer = `SP_GET_MASTER_ALERTS`** (đã build): drift/symbol so actual vs target weight; industry Σ theo `T_TICKER_INDUSTRY`.
 - **`T_TICKER_INDUSTRY`** (dimension mã→ngành: `C_TICKER` PK, `C_INDUSTRY_CODE`, `C_INDUSTRY_NAME`) — cho industryWeight alert. **Seed hiện ở smoke; nguồn nạp THẬT (FO/market data) = task data-ops chưa làm.**
-- **3 cột TE prefix-sum trên `T_SI_NAV_BALANCE`** (`accum_active_ret`, `accum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
+- **3 cột TE prefix-sum trên `T_SI_BALANCE`** (`accum_active_ret`, `accum_active_ret_sq`, `ret_day_count`) + **EOD job J12B** maintain chúng + **index `IX_SI_NAV_BALANCE_MASTER`**: **KHÔNG định nghĩa ở đây — thuộc BRD EOD** ([SDI-spec.md](./SDI-spec.md) §8 schema + §9.2 job J12B). PM tool chỉ **TIÊU THỤ**. (Cột cùng bảng EOD ⇒ giữ một nguồn định nghĩa, tránh tách rời nhiều doc.)
 - **Cách serve-layer tiêu thụ** (đọc 2 lát base/end, không quét): TE range = HIỆU 2 mốc `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TEᵢ=√Var×√min(n,252)` (n per-KH). Return/deviation = `UPᵢ,end` (current) + `UPᵢ,base` (lát @base; KH join sau base → 10000). ⇒ US1 ~48s→~1s, **end-weight GIỮ NGUYÊN**.
 
 ---
@@ -155,7 +157,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 | US4 PNL_DIST | ~2.4 s | 48 ms | |
 | US5 TOP_KH | ~2.3 s | 16 ms | |
 
-**Cách fix** (end-weight nguyên vẹn): (1) **Return** — bỏ subquery GROUP-BY quét lịch sử, đọc thẳng lát `@base` + current (return chỉ cần `UPᵢ,base`/`UPᵢ,end`, KHÔNG cần precompute). (2) **TE** — prefix-sum 3 cột lũy kế trên `T_SI_NAV_BALANCE` (EOD J12B), query đọc HIỆU 2 mốc base/end. Cả 2 đọc 2 lát ngày (dùng `IX_SI_NAV_BALANCE_MASTER`) thay vì quét toàn bộ. Verify số khớp 100% bản STDEV trực tiếp (smoke). EOD J12B ~676ms/phiên @50k account (bench medium), J07 không regression.
+**Cách fix** (end-weight nguyên vẹn): (1) **Return** — bỏ subquery GROUP-BY quét lịch sử, đọc thẳng lát `@base` + current (return chỉ cần `UPᵢ,base`/`UPᵢ,end`, KHÔNG cần precompute). (2) **TE** — prefix-sum 3 cột lũy kế trên `T_SI_BALANCE` (EOD J12B), query đọc HIỆU 2 mốc base/end. Cả 2 đọc 2 lát ngày (dùng `IX_SI_NAV_BALANCE_MASTER`) thay vì quét toàn bộ. Verify số khớp 100% bản STDEV trực tiếp (smoke). EOD J12B ~676ms/phiên @50k account (bench medium), J07 không regression.
 - Lưu ý: TE annualize bằng `√(n per-KH)` (n = số ngày active trong range của từng KH) — KH join giữa kỳ scale theo cửa sổ thực của họ (chính xác hơn dùng X master đồng nhất).
 
 ## 11. Còn mở

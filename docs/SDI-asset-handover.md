@@ -36,7 +36,7 @@ Hệ quả: SDI chuyển từ *engine định giá* → **consumer + index engin
 
 | Đại lượng | Nguồn sự thật | SDI làm gì |
 |---|---|---|
-| NAV per-SI | **Asset** (gửi) | lưu (`T_SI_NAV_BALANCE`/`_CURRENT`) |
+| NAV per-SI | **Asset** (gửi) | lưu (`T_SI_BALANCE`/`_CURRENT`) |
 | cash_in / cash_out per-SI | **Asset** (gửi) | lưu + derive PnL |
 | ~~phí (lũy kế/ngày)~~ | **[BRD asset-sync] KHÔNG gửi** | phí QL đã trừ sẵn trong NAV ròng Asset (model realized); SDI không lưu/hiển thị số phí |
 | units / unit_price / TWR | **SDI derive** từ NAV+flow+history | tính (quy ước §4) |
@@ -96,7 +96,7 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 - `SP_EOD_RECOMPUTE_RANGE` (recompute NAV từ history) → thay bằng **re-ingest** (§7.D).
 
 **ĐỔI THÀNH INGEST:**
-- `T_SI_NAV_BALANCE` / `T_SI_NAV_CURRENT` ← `SP_INGEST_ASSET_NAV` (per-SI: **[BRD asset-sync]** `{nav, stock_value, cash, cash_in, cash_out}` — KHÔNG còn `fee`; SDI derive units/UP/PnL/return rồi ghi).
+- `T_SI_BALANCE` / `T_SI_CURRENT` ← `SP_INGEST_ASSET_NAV` (per-SI: **[BRD asset-sync]** `{nav, stock_value, cash, cash_in, cash_out}` — KHÔNG còn `fee`; SDI derive units/UP/PnL/return rồi ghi).
 
 ## 6. Cơ chế giảm vênh: NAV-bridge reconcile (SDI làm validator)
 
@@ -113,7 +113,7 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 - **A. Granularity**: bắt buộc per-SI (đã chốt ràng buộc §3).
 - **B. Index (SDI) vs NAV (Asset) — so sánh chéo nguồn**: deviation PM = return KH (Asset-NAV) − return index (SDI). 🔶 Phải chốt index & NAV **cùng giá BO + cùng thời điểm chốt** để không sinh "deviation giả".
 - **C. Timing/dependency**: thêm 1 hop — BO/FO → Asset tính → Asset gửi SDI. PM/TE chờ NAV Asset về; **Index chạy độc lập** (chỉ cần BO). Thêm nguồn `ASSET_NAV` vào `T_EOD_PIPELINE` (gate chờ trước khi serve/TE).
-- **D. Sửa quá khứ → RE-INGEST, không recompute**: Asset sửa NAV ngày cũ → SDI nhận lại → tính lại units/UP/TWR/lũy kế **từ ngày sửa trở đi** (cần lưu **NAV+flow history per (date,si)** — đã có `T_SI_NAV_BALANCE`). `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV) thành obsolete.
+- **D. Sửa quá khứ → RE-INGEST, không recompute**: Asset sửa NAV ngày cũ → SDI nhận lại → tính lại units/UP/TWR/lũy kế **từ ngày sửa trở đi** (cần lưu **NAV+flow history per (date,si)** — đã có `T_SI_BALANCE`). `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV) thành obsolete.
 - ~~**E. Ngày dương lịch vs ngày GD cho phí**~~ **[BRD asset-sync] MOOT**: SDI không nhận/nội suy phí (phí QL đã trừ trong NAV ròng Asset — model realized).
 - ~~**F. Làm tròn phí**~~ **[BRD asset-sync] MOOT**: không còn field `fee` ở SDI.
 

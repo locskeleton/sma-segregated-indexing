@@ -2,6 +2,8 @@
 
 Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) và công thức tính toán dùng trong module SDI (Asset & Performance Engine). Mục tiêu: một nơi tra cứu duy nhất, giải thích dễ hiểu kèm ví dụ.
 
+> **⚠️ THIN-LAYER (2026-06-26):** SDI KHÔNG tự tính hiệu suất — Asset gửi **AUM + daily_return (TWR)**. Đã GỠ unit/unit_price/PnL-tiền/TWR-do-SDI. %PnL kỳ = compound `∏(1+daily_return)−1`. Các mục §5–§7 nói về `unit`/`unit_price`/`NAV=NAV/Unit`/TWR-tính-từ-UP là **LỊCH SỬ** (đang cập nhật). Bảng đổi tên: `T_SI_BALANCE`/`T_SI_CURRENT`/`T_MASTER_BALANCE`/`T_MASTER_CURRENT`; `C_NAV`→`C_AUM`.
+
 > Bổ trợ: [SDI-spec.md](./SDI-spec.md) (đặc tả chi tiết + job EOD), [SDI-db-architecture.md](./SDI-db-architecture.md) (kiến trúc DB), [SDI-eod-data-exchange.md](./SDI-eod-data-exchange.md) (luồng dữ liệu), [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) (dashboard PM). Khi lệch, **doc đặc tả gốc là chuẩn**; tài liệu này chỉ tổng hợp.
 
 ---
@@ -34,7 +36,7 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. | spec §3 ; eod (J07) |
 | Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). | spec §3 ; pm §2 |
 | Phí phải trả (ĐÃ GỠ) | Payable (accrued) fee | ~~`C_PAYABLE_FEE`~~ | [BRD asset-sync] **ĐÃ GỠ** — SDI không accrue phí; Asset gửi NAV ròng (đã trừ phí QL sẵn). | — |
-| NAV ròng | Net Asset Value | `C_NAV` | NAV do **Asset gửi trực tiếp** (đã trừ phí QL). `= Tổng tài sản (stock + tiền)`. Giá trị thực thuộc nhà đầu tư. | spec §3 |
+| NAV ròng | Net Asset Value | `C_AUM` | NAV do **Asset gửi trực tiếp** (đã trừ phí QL). `= Tổng tài sản (stock + tiền)`. Giá trị thực thuộc nhà đầu tư. | spec §3 |
 | AUM = NAV | — | — | Phí QL đã trừ trong NAV Asset gửi ⇒ **AUM (gross) = NAV (net)**, KHÔNG tách payable. | spec §3 |
 | Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. | spec §8 |
 | Giá vốn bình quân | Average cost | `C_AVG_COST` | Tham chiếu lãi/lỗ; **KHÔNG** vào NAV (NAV theo giá thị trường). | spec §8 |
@@ -184,7 +186,7 @@ Return_DM_tổng_KH = Σᵢ Wᵢ · PnLᵢ
 >
 > **Vì sao `PnLᵢ` dùng Unit Price (TWR) chứ KHÔNG dùng `AUM_cuối/AUM_đầu − 1`:** KH nạp định kỳ hằng tháng (lãi tự chuyển vào) ⇒ AUM tăng do *nạp tiền*, không phải do lãi. Tỷ số `AUM_cuối/AUM_đầu − 1` (công thức return đơn giản kiểu "ending/beginning − 1") gộp luôn phần nạp vào → **thổi phồng hiệu suất**. Công thức đơn giản đó chỉ đúng khi danh mục KHÔNG có dòng tiền vào/ra giữa kỳ. Unit Price khử dòng tiền (`nạp tiền chỉ tăng số Unit, không đổi tỷ lệ giá Unit`) nên `UP_cuối/UP_mốc − 1` mới là hiệu suất đầu tư thật (TWR). Đây cũng là điều kiện để so KH vs Master Index và tính Tracking Error có nghĩa.
 >
-> **AUM = NAV (không tách payable):** [BRD asset-sync] Asset gửi NAV ròng (đã trừ phí QL); SDI không accrue ⇒ `AUMᵢ = NAVᵢ = C_LAST_NAV`. **2 cách hiện thực `Σ Wᵢ·Rᵢ`** (cùng kết quả — dùng đối chiếu, bắt lỗi data): `SP_GET_MASTER_RETURN_RETINDEX` (`Rᵢ = UP_cuối/UP_mốc − 1`, đọc 2 lát — NHANH) và `SP_GET_MASTER_RETURN_COMPOUND` (`Rᵢ = ∏(1+rₜ) − 1 = EXP(Σ ln(1+rₜ))−1`, quét daily return). Vì `UPₜ = UP₍ₜ₋₁₎·(1+rₜ)` nên `UP_cuối/UP_mốc ≡ ∏(1+rₜ)` ⇒ 2 cách đồng nhất. **BRD = RET_INDEX** (2 lát); COMPOUND chỉ là bản quét để verify, KHÔNG phải công thức khác.
+> **AUM = NAV (không tách payable):** [BRD asset-sync] Asset gửi NAV ròng (đã trừ phí QL); SDI không accrue ⇒ `AUMᵢ = NAVᵢ = C_LAST_AUM`. **2 cách hiện thực `Σ Wᵢ·Rᵢ`** (cùng kết quả — dùng đối chiếu, bắt lỗi data): `SP_GET_MASTER_RETURN_RETINDEX` (`Rᵢ = UP_cuối/UP_mốc − 1`, đọc 2 lát — NHANH) và `SP_GET_MASTER_RETURN_COMPOUND` (`Rᵢ = ∏(1+rₜ) − 1 = EXP(Σ ln(1+rₜ))−1`, quét daily return). Vì `UPₜ = UP₍ₜ₋₁₎·(1+rₜ)` nên `UP_cuối/UP_mốc ≡ ∏(1+rₜ)` ⇒ 2 cách đồng nhất. **BRD = RET_INDEX** (2 lát); COMPOUND chỉ là bản quét để verify, KHÔNG phải công thức khác.
 
 ### 7.9 Độ lệch hiệu suất (Deviation, BPS)
 ```
@@ -199,7 +201,7 @@ aₜ        = r_KH,t − r_masterIndex,t                  (active return ngày)
 TEᵢ (per KH) = STDEV(aₜ qua kỳ) × √X        X = số ngày GD trong kỳ (cap 252)
 TE master = Σᵢ (TEᵢ · AUMᵢ) / Σ AUMᵢ                  (AUM-weighted)
 ```
-**Tính nhanh on-read bằng prefix-sum** (lưu lũy kế ở `T_SI_NAV_BALANCE`, maintain EOD J12B):
+**Tính nhanh on-read bằng prefix-sum** (lưu lũy kế ở `T_SI_BALANCE`, maintain EOD J12B):
 ```
 Trên đoạn (base, end]:
    n   = ret_day_count(end)     − ret_day_count(base)
