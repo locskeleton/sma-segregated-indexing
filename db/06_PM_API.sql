@@ -7,7 +7,7 @@ GO
   master-keyed: nhận @p_master_code (+ range); KHÔNG trả định danh KH ngoài top-N (US5).
   2 bản chất: Snapshot (current, T_MASTER/SI_NAV_CURRENT) | Hiệu suất (T-1, *_NAV_BALANCE).
   Công thức (spec §2):
-    AUM = total_asset (gross) = stock+cash+pending+div = C_LAST_NAV + C_PAYABLE_FEE (per KH)
+    AUM = C_LAST_NAV (per KH) — [BRD] phí QL đã trừ trong NAV Asset gửi ⇒ AUM = NAV (gross = net)
     DM tổng KH = AUM-weighted (end-weight): Σ Wᵢ·PnLᵢ, Wᵢ=AUMᵢ/ΣAUM, PnLᵢ=UPᵢ(end)/UPᵢ(base)−1 (TWR)
     Deviation = (Return − Master Index Return) × 10000 (BPS)
     TE per-KH = STDEV(Rᵢ,t − R_master,t) × √X ; Master = Σ(TEᵢ·AUMᵢ)/ΣAUM (X = #ngày GD, cap 252)
@@ -159,7 +159,7 @@ BEGIN
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
 
     INSERT #kh (si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE, nc.C_LAST_UNIT_PRICE,
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV, nc.C_LAST_UNIT_PRICE,
            nc.C_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
@@ -264,7 +264,7 @@ BEGIN
     -- end-weight per KH: W_i = aum_i/Σaum ; up_base = lát @base (join sau base → 10000)
     CREATE TABLE #kw (si VARCHAR(20), w DECIMAL(18,12), up_base DECIMAL(18,6));
     ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum
         FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), tot AS (SELECT SUM(aum) s FROM kh)
     INSERT #kw (si, w, up_base)
@@ -428,7 +428,7 @@ BEGIN
 
     CREATE TABLE #p (si VARCHAR(20), aum DECIMAL(20,6), pnl DECIMAL(18,10));
     INSERT #p (si, aum, pnl)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
            nc.C_LAST_UNIT_PRICE / NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1
     FROM T_SI_NAV_CURRENT nc
     LEFT JOIN T_SI_NAV_BALANCE b
@@ -500,7 +500,7 @@ BEGIN
 
     ;WITH k AS (
         SELECT nc.C_CUST_CODE, nc.C_SI_ACCOUNT,
-               nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS C_AUM,
+               nc.C_LAST_NAV AS C_AUM,
                nc.C_LAST_UNIT_PRICE AS C_UNIT_PRICE_END,
                COALESCE(b.C_UNIT_PRICE,10000) AS C_UNIT_PRICE_BASE,
                CAST(nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1 AS DECIMAL(18,6)) AS C_PNL_PCT
@@ -579,7 +579,7 @@ BEGIN
                       up_base DECIMAL(18,6), up_end DECIMAL(18,6), tien DECIMAL(20,0),
                       car_b FLOAT, car2_b FLOAT, n_b INT, car_e FLOAT, car2_e FLOAT, n_e INT, te FLOAT);
     INSERT #kh (m, si, aum, up_end, tien, car_b,car2_b,n_b, car_e,car2_e,n_e)
-    SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
+    SELECT nc.C_MASTER_CODE, nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
            nc.C_LAST_UNIT_PRICE, nc.C_CASH, 0,0,0, 0,0,0
     FROM T_SI_NAV_CURRENT nc
     INNER JOIN #md d ON d.m=nc.C_MASTER_CODE
@@ -825,7 +825,7 @@ BEGIN
     -- per-KH deviation (BPS) = (TWR KH − return master) × 10000
     CREATE TABLE #d (si VARCHAR(20), aum DECIMAL(20,6), dev_bps DECIMAL(18,6));
     INSERT #d (si, aum, dev_bps)
-    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV + nc.C_PAYABLE_FEE,
+    SELECT nc.C_SI_ACCOUNT, nc.C_LAST_NAV,
            ((nc.C_LAST_UNIT_PRICE/NULLIF(COALESCE(b.C_UNIT_PRICE,10000),0) - 1) - @rMaster) * 10000
     FROM T_SI_NAV_CURRENT nc
     LEFT JOIN T_SI_NAV_BALANCE b
@@ -880,7 +880,7 @@ GO
 
 /*===========================================================================
   [BRD đối chiếu] AUM-weighted return KH của 1 master — 2 API, 2 CÔNG THỨC tính Rᵢ (hiệu suất kỳ KH i).
-    Cả 2: wᵢ = AUMᵢ/ΣAUM (AUMᵢ = C_LAST_NAV + C_PAYABLE_FEE, current ACTIVE); return = Σ wᵢ·Rᵢ. Khung base/end giống US2.
+    Cả 2: wᵢ = AUMᵢ/ΣAUM (AUMᵢ = C_LAST_NAV, current ACTIVE; AUM = NAV vì phí QL đã trừ); return = Σ wᵢ·Rᵢ. Khung base/end giống US2.
     RS: C_MASTER_CODE, C_BASE_DATE, C_END_DATE, C_METHOD, C_KH_RETURN_AUMW.
     (1) RET_INDEX : Rᵢ = UP_end/UP_base − 1  (ret_index = C_UNIT_PRICE, đọc 2-lát) — NHANH.
     (2) COMPOUND  : Rᵢ = ∏(1+C_DAILY_RETURN) qua (base,end] = EXP(Σ ln(1+r))−1 (QUÉT ngày) — đúng công thức literal.
@@ -902,7 +902,7 @@ BEGIN
     IF @base IS NULL SET @base=@first;
 
     ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum, nc.C_LAST_UNIT_PRICE AS up_end
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum, nc.C_LAST_UNIT_PRICE AS up_end
         FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), b AS (   -- up_base lát @base; KH join sau base → 10000 (mốc inception)
         SELECT k.si, k.aum, k.up_end, COALESCE(nb.C_UNIT_PRICE,10000) AS up_base
@@ -931,7 +931,7 @@ BEGIN
     IF @base IS NULL SET @base=@first;
 
     ;WITH kh AS (
-        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV + nc.C_PAYABLE_FEE AS aum
+        SELECT nc.C_SI_ACCOUNT AS si, nc.C_LAST_NAV AS aum
         FROM T_SI_NAV_CURRENT nc WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
     ), comp AS (   -- ∏(1+r) qua (base,end] = EXP(Σ ln(1+r))−1 ; QUÉT ngày; bỏ ngày return NULL (vd ngày đầu)
         SELECT b.C_SI_ACCOUNT AS si, EXP(SUM(LOG(1.0 + b.C_DAILY_RETURN))) - 1 AS R

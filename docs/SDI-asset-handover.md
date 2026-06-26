@@ -12,7 +12,7 @@ Có quan ngại kiến trúc: **SDI là nơi phát sinh nghiệp vụ chính** �
 
 | # | Quyết định | Chốt |
 |---|---|---|
-| 1 | `fee` Asset gửi dạng nào | **LŨY KẾ đến ngày** (cumulative). SDI lưu thẳng (khớp SMO); phí/ngày = hiệu 2 ngày. |
+| 1 | `fee` Asset gửi dạng nào | **[BRD asset-sync] SUPERSEDED 2026-06-25: Asset KHÔNG gửi số phí lũy kế.** Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); `AUM = NAV` (gross = net, không tách payable). |
 | 2 | Granularity | **Chỉ per-SI**. SDI **tự SUM lên master** cuối ngày + **tính lại unit/unit_price per-SI**. (Không cross-check Σ vs master-Asset vì master do SDI tự gộp.) |
 | 3 | Index↔NAV giá BO | **Cùng giá BO close + cùng cutoff.** MỞ RỘNG: **MỌI hệ (BO/Asset/SDI) tham chiếu CÙNG 1 bộ giá đóng cửa** → không deviation giả. |
 | 4 | Ngày gửi NAV | **Chỉ ngày GD**; T7/CN/lễ SDI **carry-forward**. |
@@ -38,7 +38,7 @@ Hệ quả: SDI chuyển từ *engine định giá* → **consumer + index engin
 |---|---|---|
 | NAV per-SI | **Asset** (gửi) | lưu (`T_SI_NAV_BALANCE`/`_CURRENT`) |
 | cash_in / cash_out per-SI | **Asset** (gửi) | lưu + derive PnL |
-| phí (lũy kế/ngày) | **Asset** (gửi) | lưu, hiển thị |
+| ~~phí (lũy kế/ngày)~~ | **[BRD asset-sync] KHÔNG gửi** | phí QL đã trừ sẵn trong NAV ròng Asset (model realized); SDI không lưu/hiển thị số phí |
 | units / unit_price / TWR | **SDI derive** từ NAV+flow+history | tính (quy ước §4) |
 | PnL / daily_return | **SDI derive** từ NAV+flow | tính |
 | Index danh mục mẫu | **SDI** (giá BO × target weight) | tính (J12, giữ nguyên) |
@@ -50,14 +50,14 @@ Vì units/UP/PnL/TWR đều derive từ **NAV+flow của Asset** (chỉ dùng UP
 
 Mỗi `(business_date, si_account)` — **chỉ ngày GD** (QĐ4), **per-SI** (QĐ2):
 ```
-nav            -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Chốt 2026-06-25.
+nav            -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (đã trừ phí QL; SDI KHÔNG tự tính/trừ). Chốt 2026-06-25.
 stock_value    -- tổng tiền CP nắm giữ (Asset ĐÃ định giá) -- SỐ TỔNG cấp SI, KHÔNG chi tiết từng mã
 cash           -- TỔNG tiền dư (1 SỐ: gộp tiền mặt + bán chờ về T+ + cổ tức tiền). Chốt 2026-06-25 — KHÔNG chia nhỏ.
-fee            -- LŨY KẾ PHẢI TRẢ đến ngày (QĐ1) — AUM_gross = nav + fee
 cash_in        -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhập — QĐ5)
 cash_out       -- rút trong ngày (ĐỐI SOÁT)
+-- [BRD asset-sync] KHÔNG còn field `fee`/`fee_accum`: BO không gửi số phí lũy kế; phí QL đã trừ sẵn trong `nav` (model realized).
 ```
-- **NAV = Asset gửi trực tiếp** (`nav`). SDI KHÔNG lắp/trừ. Components (stock, cash tổng) + fee gửi kèm để hiển thị (FR-06) + AUM (= stock+cash) + reconcile NAV_CONSISTENCY (`nav` vs `stock+cash−fee` → bắt Asset tự lệch).
+- **NAV = Asset gửi trực tiếp** (`nav`, đã RÒNG phí QL). SDI KHÔNG lắp/trừ. Components (stock, cash tổng) gửi kèm để hiển thị (FR-06) + `AUM = stock + cash = NAV` (không tách payable) + reconcile NAV_CONSISTENCY (`nav` vs `stock + cash` → bắt Asset tự lệch).
 - **GIÁ EOD THỐNG NHẤT (QĐ3 mở rộng):** Asset định giá `stock_value` bằng **đúng giá BO close** mà SDI dùng cho index → index ↔ NAV apples-to-apples.
 - **Per-SI** (QĐ2): PM tool toàn bộ per-KH; SDI tự SUM lên master.
 - **QĐ5:** SDI dùng `cash_in/cash_out` **của chính nó** (originator) để tính unit/UP; `cash_in/out` Asset gửi chỉ để **đối soát**. Reconcile lệch → ghi break, chặn publish (vì NAV Asset & unit SDI phải cùng dòng tiền).
@@ -96,7 +96,7 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 - `SP_EOD_RECOMPUTE_RANGE` (recompute NAV từ history) → thay bằng **re-ingest** (§7.D).
 
 **ĐỔI THÀNH INGEST:**
-- `T_SI_NAV_BALANCE` / `T_SI_NAV_CURRENT` ← `SP_INGEST_ASSET_NAV` (per-SI: NAV + cash_in + cash_out + fee; SDI derive units/UP/PnL/return rồi ghi).
+- `T_SI_NAV_BALANCE` / `T_SI_NAV_CURRENT` ← `SP_INGEST_ASSET_NAV` (per-SI: **[BRD asset-sync]** `{nav, stock_value, cash, cash_in, cash_out}` — KHÔNG còn `fee`; SDI derive units/UP/PnL/return rồi ghi).
 
 ## 6. Cơ chế giảm vênh: NAV-bridge reconcile (SDI làm validator)
 
@@ -114,8 +114,8 @@ PnL_t    = NAV_t − NAV_{t-1} + cash_out − cash_in
 - **B. Index (SDI) vs NAV (Asset) — so sánh chéo nguồn**: deviation PM = return KH (Asset-NAV) − return index (SDI). 🔶 Phải chốt index & NAV **cùng giá BO + cùng thời điểm chốt** để không sinh "deviation giả".
 - **C. Timing/dependency**: thêm 1 hop — BO/FO → Asset tính → Asset gửi SDI. PM/TE chờ NAV Asset về; **Index chạy độc lập** (chỉ cần BO). Thêm nguồn `ASSET_NAV` vào `T_EOD_PIPELINE` (gate chờ trước khi serve/TE).
 - **D. Sửa quá khứ → RE-INGEST, không recompute**: Asset sửa NAV ngày cũ → SDI nhận lại → tính lại units/UP/TWR/lũy kế **từ ngày sửa trở đi** (cần lưu **NAV+flow history per (date,si)** — đã có `T_SI_NAV_BALANCE`). `SP_EOD_RECOMPUTE_RANGE` (reconstruct NAV) thành obsolete.
-- **E. Ngày dương lịch vs ngày GD cho phí**: nếu Asset gửi `fee` sẵn thì SDI khỏi lo day-count; nếu SDI phải nội suy phí ngày nghỉ → cần quy ước carry-forward khớp Asset.
-- **F. Làm tròn**: nếu `fee` per-day, giữ precision cao, chỉ round khi hiển thị.
+- ~~**E. Ngày dương lịch vs ngày GD cho phí**~~ **[BRD asset-sync] MOOT**: SDI không nhận/nội suy phí (phí QL đã trừ trong NAV ròng Asset — model realized).
+- ~~**F. Làm tròn phí**~~ **[BRD asset-sync] MOOT**: không còn field `fee` ở SDI.
 
 ## 8. Trạng thái quyết định
 

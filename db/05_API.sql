@@ -181,8 +181,8 @@ BEGIN
                  ELSE CAST((@end_nav - @base_nav - @cf_net) / @denom AS DECIMAL(10,6)) END AS C_MWR_PCT;
 
     -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu). [BRD] bỏ C_STOCK_VALUE master (đã drop).
-    SELECT TOP 1 C_BUSINESS_DATE, C_NAV, C_UNIT_PRICE, C_DAILY_RETURN,
-                 C_AUM, C_CASH
+    SELECT TOP 1 C_BUSINESS_DATE, C_AUM, C_UNIT_PRICE, C_DAILY_RETURN,
+                 C_CASH
     FROM T_MASTER_NAV_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
     END TRY
     BEGIN CATCH
@@ -368,7 +368,7 @@ BEGIN
     DECLARE @master VARCHAR(20) = (SELECT C_MASTER_CODE FROM T_SI_NAV_CURRENT WHERE C_SI_ACCOUNT=@p_si_account);
     IF @master IS NULL BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
-    -- [BRD asset-sync] BỎ guard @nAccrue (T_FEE_CONFIG đã drop). Phí = số tổng lũy kế từ Asset (C_FEE_ACCUM).
+    -- [BRD asset-sync] Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng) ⇒ AUM = NAV.
 
     IF @p_asof IS NULL
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_NAV_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
@@ -382,8 +382,8 @@ BEGIN
         RAISERROR(@p_err_msg, 16, 1); END
 
     -- [BRD] Thành phần tài sản số TỔNG từ Asset (T_SI_ASSET_DAILY @asof) — SDI KHÔNG tự định giá. cash = TỔNG tiền (1 số).
-    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0), @fee DECIMAL(20,6);
-    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH, @fee=C_FEE_ACCUM
+    DECLARE @stock DECIMAL(20,0), @cash DECIMAL(20,0);
+    SELECT @stock=C_STOCK_VALUE, @cash=C_CASH
     FROM T_SI_ASSET_DAILY WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
 
     -- Holdings chi tiết per-mã (FO holdings reconstruct @asof × giá ≤ asof) cho RS2. ⚠️ Σ(FO×giá) CÓ THỂ lệch
@@ -398,15 +398,14 @@ BEGIN
     WHERE h.C_SI_ACCOUNT=@p_si_account
       AND h.C_VALID_FROM <= @p_asof AND (h.C_VALID_TO > @p_asof OR h.C_VALID_TO IS NULL);
 
-    -- RS1: summary (NAV/unit/UP derive @asof + thành phần Asset + phí lũy kế Asset)
+    -- RS1: summary (NAV/unit/UP derive @asof + thành phần Asset). AUM = stock+cash = NAV (phí QL đã trừ trong NAV)
     SELECT  @p_asof                AS C_ASOF,
             @p_si_account          AS C_SI_ACCOUNT,
             @master                AS C_MASTER_CODE,
             nd.C_NAV, nd.C_UNIT, nd.C_UNIT_PRICE,
             ISNULL(@cash,0)        AS C_CASH,        -- TỔNG tiền (1 số)
             ISNULL(@stock,0)       AS C_STOCK_VALUE,
-            ISNULL(@stock,0)+ISNULL(@cash,0) AS C_AUM,  -- AUM gross = stock + tổng tiền
-            ISNULL(@fee,0)         AS C_FEE_ACCRUED_TOTAL    -- phí QL lũy kế (Asset) — đã trừ khỏi NAV
+            ISNULL(@stock,0)+ISNULL(@cash,0) AS C_AUM  -- AUM = stock + tổng tiền = NAV
     FROM (SELECT 1 x) z
     LEFT JOIN T_SI_NAV_BALANCE nd ON nd.C_SI_ACCOUNT=@p_si_account AND nd.C_BUSINESS_DATE = @p_asof;
 
@@ -418,7 +417,7 @@ BEGIN
     ORDER BY C_MARKET_VALUE DESC;
 
     -- [BRD asset-sync] BỎ RS3/RS4/RS5 (chi tiết income/fee): SDI không quản chi tiết giao dịch phí nữa.
-    --   Phí QL = số tổng lũy kế (C_FEE_ACCRUED_TOTAL ở RS1, từ Asset). Cổ tức đã gộp trong tiền/NAV Asset gửi.
+    --   Phí QL đã trừ sẵn trong NAV ròng Asset gửi (không tách riêng). Cổ tức đã gộp trong tiền/NAV Asset gửi.
 
     DROP TABLE #hold;
     END TRY

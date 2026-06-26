@@ -2,7 +2,7 @@
 
 Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `EXEC` proc.
 
-> **⚠️ BRD 2026-06-22 — SDI→Asset gỡ 2 / giữ 1:** BO/FO/Market nay đẩy dữ liệu **THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR). SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset**. Đã gỡ khỏi `05_API.sql` **2 producer**: `SP_GET_ASSET_SNAPSHOT` (per-SI tài sản), `SP_GET_ASSET_MASTER_SNAPSHOT` (master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset theo luồng RIÊNG khi BO báo price-ready (path `SP_EOD_RUN_INDEX`); đây là luồng SDI→Asset DUY NHẤT còn lại. **BO còn đẩy phí QL accrued/ngày → Asset** (Asset tự tính NAV ròng). Read API (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) GIỮ NGUYÊN — phục vụ **giao diện riêng của SDI**. **`SP_GET_ASSET_REPORT` (FR-06) là read API báo cáo tài sản KH — GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` đã gỡ). **Đã GỠ stage asset-sync trong pipeline** (`SP_EOD_SET_ASSET_SYNCED` + cột `C_ASSET_SYNC_*` + trạng thái `COMPLETED`) — trạng thái CUỐI pipeline nay = `EOD_DONE` (reconcile PASS); luồng index (`SP_EOD_RUN_INDEX` → Asset) VẪN chạy. Còn lại = reconcile R1 payable + R3 TWR. Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).
+> **⚠️ BRD 2026-06-22 — SDI→Asset gỡ 2 / giữ 1:** BO/FO/Market nay đẩy dữ liệu **THẲNG sang Asset** và **Asset tự tính** (tài sản gộp + NAV ròng + Unit/TWR). SDI **KHÔNG còn đồng bộ tài sản KH/NAV-perf master sang Asset**. Đã gỡ khỏi `05_API.sql` **2 producer**: `SP_GET_ASSET_SNAPSHOT` (per-SI tài sản), `SP_GET_ASSET_MASTER_SNAPSHOT` (master NAV/perf). **VẪN GIỮ `SP_GET_ASSET_INDEX_SNAPSHOT`** — SDI vẫn đẩy Master Index sang Asset theo luồng RIÊNG khi BO báo price-ready (path `SP_EOD_RUN_INDEX`); đây là luồng SDI→Asset DUY NHẤT còn lại. **BO KHÔNG đẩy phí QL accrued** — Asset NAV theo model REALIZED (phí trừ khi BO cắt thật, qua cash); **AUM = NAV** (SDI đã gỡ accrual `C_PAYABLE_FEE`/`C_FEE_ACCUM`/J06/`T_FEE_CONFIG`/`SP_INGEST_FEE_CHARGE`). Read API (`SP_GET_SI_*` FR-01..06, PM `SP_GET_MASTER_*`) GIỮ NGUYÊN — phục vụ **giao diện riêng của SDI**. **`SP_GET_ASSET_REPORT` (FR-06) là read API báo cáo tài sản KH — GIỮ** (đừng nhầm với `SP_GET_ASSET_SNAPSHOT` đã gỡ). **Đã GỠ stage asset-sync trong pipeline** (`SP_EOD_SET_ASSET_SYNCED` + cột `C_ASSET_SYNC_*` + trạng thái `COMPLETED`) — trạng thái CUỐI pipeline nay = `EOD_DONE` (reconcile PASS); luồng index (`SP_EOD_RUN_INDEX` → Asset) VẪN chạy. Còn lại = reconcile R3 TWR (R1 payable đã gỡ — 2 hệ đều không accrue). Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).
 
 ## Naming convention
 | Đối tượng | Quy ước |
@@ -73,22 +73,22 @@ EXEC SP_EOD_RUN @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_ms
 --   để gate cho job chạy LẠI — GIỮ NGUYÊN T_EOD_RUN làm log/audit, KHÔNG xóa; clear break; recompute)
 ```
 
-### Rerun quá khứ — tính lại NAV ngày cũ KHÔNG re-feed (`SP_EOD_RECOMPUTE_RANGE`)
-KH báo NAV một ngày quá khứ SAI → **sửa data nguồn đã lưu** (giá/holding/cash/phí @ngày đó) → tính lại chuỗi từ ngày đó tới nay, **KHÔNG cần FO/BO bắn lại Kafka**. Luồng **RIÊNG, KHÔNG đụng forward path** (`SP_EOD_RUN` không đổi).
+### Sửa quá khứ — RE-INGEST Asset NAV (KHÔNG reconstruct-from-history)
+[BRD asset-sync] **`SP_EOD_RECOMPUTE_RANGE` ĐÃ GỠ**: SDI không tự tính NAV nên không reconstruct từ history. NAV ngày quá khứ SAI → **Asset GỬI LẠI** dòng `T_SI_ASSET_DAILY` ngày đó (`SP_INGEST_ASSET_NAV` idempotent: DELETE+INSERT theo `(date, si)`), rồi **chạy lại** compute/agg/TE ngày đó để derive lại unit/UP/PnL/lũy kế:
 ```sql
 DECLARE @ec INT, @em NVARCHAR(400);
--- toàn hệ từ 2026-01-06 → phiên mới nhất (default @p_to_date NULL):
-EXEC SP_EOD_RECOMPUTE_RANGE @p_from_date='2026-01-06', @p_user='ops',
-     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
--- 1 KH: thêm @p_cust_code='CUST001'; 1 tiểu khoản: @p_si_account='CUST001-M1' (→ tính lại ở mức MASTER của các master bị ảnh hưởng)
--- range cụ thể: thêm @p_to_date='2026-01-10'.  err: 1=scope rỗng, 20=range không hợp lệ
+-- Asset re-feed NAV ngày cũ (idempotent) rồi tính lại chuỗi từ ngày đó:
+EXEC SP_INGEST_ASSET_NAV @p_json=N'[{"si_account":"...","nav":...,"stock_value":...,"cash":...,"cash_in":0,"cash_out":0}]',
+     @p_business_date='2026-01-06', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_EOD_COMPUTE   '2026-01-06';   -- derive lại unit/UP/PnL/return (NAV lấy từ Asset)
+EXEC SP_EOD_SI_AGG    '2026-01-06';   -- master agg (AUM/unit price)
+EXEC SP_EOD_TE_ACCUM  '2026-01-06';   -- lũy kế active return (TE prefix-sum)
 ```
-- **Reconstruct AS-OF** mỗi phiên trong `[from,to]` từ bảng DATED: holdings=`T_SI_HOLDING_HIST`@d×giá@d; cash/pending/div=`T_SI_CASH_HIST`@d (interval); anchor+payable base=`T_SI_NAV_BALANCE`@prev; fee cut=`T_SI_INCOME_FEE`(loại accrue, charge_date=@d). Mỗi ngày `EXEC SP_EOD_COMPUTE_CORE → SP_EOD_SI_AGG → SP_EOD_TE_ACCUM`.
-- **Atomic toàn range** (XACT_ABORT); roll-forward `NAV_CURRENT` chỉ khi `@p_to_date` chạm phiên mới nhất.
-- **Tái dựng đủ:** nav_balance (SI+master) + TE + composition `T_MASTER_HOLDING_BALANCE` as-of. Index master sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception).
-- **Giới hạn:** chính xác chỉ cho ngày từ khi bắt đầu capture history pending/div (`T_SI_CASH_HIST` đủ 3 khoản).
+- **Index master** sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception) — GIỮ (index do SDI tính từ giá×weight, không phụ thuộc Asset NAV).
+- **Composition** (`T_MASTER_HOLDING_BALANCE`) as-of: FO gửi lại holdings ngày đó (qua `SP_INGEST_CUSTOMER`) nếu cần sửa.
+- **Idempotent**: re-ingest cùng ngày → DELETE+INSERT, chạy lại compute = ghi đè sạch (`T_SI_NAV_BALANCE` UQ theo (date,si)).
 
-> **`SP_EOD_COMPUTE_CORE @p_d`** = lõi công thức per-ngày (CF → J06 accrue → J08 NAV → J09 PnL → J10 Unit → ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE` SCOPE theo các tiểu khoản trong `T_EOD_WORK`), chạy trên `T_EOD_WORK` ĐÃ seed. **Forward (`SP_EOD_COMPUTE`) + rerun DÙNG CHUNG** lõi này (DRY, 1 công thức). Forward = seed từ current + J07 MTM (holdings hiện tại) + EXEC core + roll-forward `NAV_CURRENT` (hành vi KHÔNG đổi). `T_EOD_WORK` thêm 2 cột staged: `C_PREV_DATE` (gap accrue + guard), `C_FEE_CUT` (phí cắt trừ khỏi accrue; forward=0).
+> **`SP_EOD_COMPUTE_CORE @p_d`** = lõi công thức per-ngày (CF → NAV=Asset gửi (KHÔNG tự tính/trừ) → J09 PnL → J10 Unit → ghi `T_SI_UNIT_LEDGER` + `T_SI_NAV_BALANCE` SCOPE theo các tiểu khoản trong `T_EOD_WORK`), chạy trên `T_EOD_WORK` ĐÃ seed. **Forward (`SP_EOD_COMPUTE`) + rerun DÙNG CHUNG** lõi này (DRY, 1 công thức). Forward = seed từ `T_SI_ASSET_DAILY` (Asset NAV) + EXEC core + roll-forward `NAV_CURRENT`. [BRD] SDI KHÔNG accrue phí (không J06/payable).
 **Trạng thái `T_EOD_PIPELINE`**: MKT_DATA (PENDING|READY — pull API BO, không đếm) + FO_INGEST (PENDING|READY, kèm total/received cust_code) → INDEX (PENDING|DONE) →
 EOD (PENDING|RUNNING|DONE|FAILED) → RECONCILE (PENDING|PASS|**BREAK**);
 overall WAITING_DATA→READY→EOD_RUNNING→(RECONCILE_BREAK | **EOD_DONE**). **EOD_DONE = trạng thái CUỐI khi reconcile PASS** (BRD 2026-06-22: bỏ ASSET_SYNC/COMPLETED — SDI không push asset sang Asset).
@@ -99,13 +99,13 @@ INDEX DONE) gọi tuần tự:
 `J0 gate → J07 compute (MTM→NAV→PnL→Unit) → J11 SI agg → J12B TE accum (đọc index đã tính) → J13 reconcile (recorder break) → [CỔNG: có break ⇒ chặn, KHÔNG chạy J14] → J14 snapshot`.
 (J13 GHI chi tiết lệch vào **`T_EOD_RECON_BREAK`** — KHÔNG throw để break được commit; `SP_EOD_RUN` đọc bảng break sau J13 → có break ⇒ RECONCILE=BREAK + chặn publish. Data J07-J12B đã commit từng step → nghiệp vụ soi break trên data đó; sửa nguồn → `SP_EOD_RESET` → chạy lại.)
 (J12B `SP_EOD_TE_ACCUM` [PM tool]: lũy kế per-KH `C_ACCUM_ACTIVE_RET/_SQ` + `C_RET_DAY_COUNT` vào `T_SI_NAV_BALANCE` — active return = KH return − master index return; chạy sau J12 vì cần index daily return. Cho phép tính TE qua range BẤT KỲ bằng HIỆU 2 mốc base/end (prefix-sum) → serve-layer PM đọc 2 lát thay vì quét lịch sử. Idempotent: accum@d = accum@prev + a@d. Bench medium ~676ms/phiên.)
-(J06 phí ACCRUE = **BO-driven, ĐA-LOẠI config-driven**: SDI accrue payable hằng ngày theo NGÀY DƯƠNG LỊCH trong J07 cho MỌI dòng `C_FEE_GROUP='PAYABLE' AND C_RATE>0` khai trong catalog `T_FEE_CONFIG` (GLOBAL toàn hệ, 1 dòng/loại áp mọi master; per-master defer) (`payable += AUM_gross × DATEDIFF(ngày) × Σ(C_RATE/C_DAY_COUNT)`, mỗi loại có rate + day_count riêng [default 365]; INCOME / rate NULL không accrue). `C_FEE_TYPE` + `C_FEE_GROUP` khớp vocabulary `T_SI_INCOME_FEE`. Thêm chính sách phí mới = INSERT 1 dòng config, KHÔNG sửa schema/SP. BO cắt phí 1 cục/tháng → event Kafka → `SP_INGEST_FEE_CHARGE` net-off payable (log `T_SI_INCOME_FEE` group PAYABLE, type theo `fee_type` của charge [default MGMT_FEE], dedup `C_SOURCE_EVENT_ID`). **`C_PAYABLE_FEE` = TỔNG phí phải trả ACCRUED chưa cắt của MỌI loại; NAV = total_asset − payable**; total_asset = stock + cash + tiền bán chờ về + cổ tức tiền (gồm receivables). Phí point-event trừ thẳng cash (thuế GD, phí lưu ký) KHÔNG khai config → không accrue. Đã BỎ `T_SDI_CONFIG`/`T_SI_FEE_SCHEDULE`/`SP_EOD_FEE_CHARGE`.)
+([BRD asset-sync] **SDI KHÔNG còn accrue phí QL.** Asset gửi NAV RÒNG (đã trừ phí QL sẵn) → SDI dùng trực tiếp; BO KHÔNG gửi số accrued (phí chỉ effect khi BO cắt thật, qua cash — model realized). **AUM = NAV** (gross = net, không tách payable). Đã GỠ: cột `C_PAYABLE_FEE` + `C_FEE_ACCUM` + J06 accrue + catalog `T_FEE_CONFIG` + `SP_INGEST_FEE_CHARGE` + ledger `T_SI_INCOME_FEE`. Thuế GD/phí lưu ký: FO/Asset net thẳng vào cash.)
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
 FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):
 - **Cash** → cập nhật `T_SI_NAV_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff interval `T_SI_CASH_HIST` (**đủ 3 khoản** `C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH` — trước chỉ cash; SCD-2: dòng mới khi BẤT KỲ khoản nào đổi → reconstruct receivables AS-OF cho rerun quá khứ). Maintain tại ingest + `SP_EOD_HISTORY`.
 - **Holdings** → overwrite `T_SI_PORTFOLIO_HOLDING` (current) + diff interval `T_SI_HOLDING_HIST`.
-- **Cổ tức/phí** → append `T_SI_INCOME_FEE` (DIVIDEND group INCOME, CUSTODY_FEE group PAYABLE; dedup theo `C_SOURCE_EVENT_ID`). (Phí ACCRUE đa-loại khai trong catalog `T_FEE_CONFIG` GLOBAL toàn hệ, dòng group=PAYABLE & rate>0; type+group khớp `T_SI_INCOME_FEE`; BO cắt phí qua `SP_INGEST_FEE_CHARGE` mang `fee_type`.)
+- **Cổ tức/phí**: [BRD asset-sync] đã gộp trong tiền/NAV ròng Asset gửi (SDI KHÔNG quản chi tiết income/fee; `T_SI_INCOME_FEE` + accrue + `T_FEE_CONFIG` + `SP_INGEST_FEE_CHARGE` đã GỠ).
 - Set watermark `C_LAST_SYNC_DATE=@d` (J0 GATE đếm received vs expected = tiểu khoản ACTIVE).
 
 → **Interval history maintain TẠI INGEST** (per-event), KHÔNG còn job J14b trong EOD → EOD batch nhẹ hẳn (đo medium: ~11s vs ~32–48s trước). **Idempotent**: cash/holdings so-trạng-thái (redelivery=no-op); fee dedup. **FORWARD-ONLY**: event quá khứ (< watermark) bị THROW (history sẽ làm sau: FO resync full D→nay + replay). Cashflow nạp/rút **KHÔNG** qua Kafka (SDI là nguồn → ghi thẳng `T_SI_CASHFLOW_EVENT`). `SP_EOD_HISTORY` giữ lại làm **utility bulk-backfill** (không trong pipeline).
@@ -130,7 +130,7 @@ Mỗi API = app `EXEC` 1 proc; tính/derive trong DB, app chỉ serialize JSON. 
 | FR-03 | `SP_GET_SI_PERFORMANCE` | si_account, range | chuỗi ngày: unit_price sub-account + master UP (TR) + master index (PR) + benchmark (PR) |
 | FR-04 | `SP_GET_SI_INFO` | si_account | config sub-account + master (mgmt fee effective) |
 | FR-05 | `SP_GET_SI_HOLDINGS` | si_account, top=20 | holdings current sub-account định giá mới nhất, top-N + `OTHER` |
-| FR-06 | `SP_GET_ASSET_REPORT` | si_account, asOf | RS1 summary (NAV + cash/stock **reconstruct interval** + cổ tức/phí lưu ký lũy kế + **phí: đã thu `C_ACCUM_MGMT_FEE_PAID` + accrued `C_FEE_ACCRUED_TOTAL`** [tổng phí phải trả accrued chưa cắt @asOf, mọi loại]); RS2 holdings @asOf; RS3 chi tiết cổ tức/phí lưu ký; **RS4 chi tiết lệnh thu phí**; **RS5 kê khoản phải trả per-type (Option B)** (`C_FEE_TYPE`, `C_FEE_PENDING`=`C_PAYABLE_FEE` đã lưu @asOf [exact, khớp NAV], `C_FEE_PAID`=Σ cắt loại đó, `C_FEE_ACCRUED`=pending+paid; payable = 1 tổng dồn, KHÔNG reconstruct, bảng dày `T_SI_FEE_ACCRUAL` đã bỏ; GUARD `err_code=4` nếu >1 loại accrue → cần nâng cấp JSON per-type) |
+| FR-06 | `SP_GET_ASSET_REPORT` | si_account, asOf | RS1 summary (NAV + cash + stock từ Asset @asOf; **AUM = stock + cash = NAV** — phí QL đã trừ sẵn trong NAV, KHÔNG có cột phí accrued); RS2 holdings @asOf. [BRD asset-sync] **đã GỠ RS3/RS4/RS5** (chi tiết income/fee) + cột `C_FEE_ACCRUED_TOTAL`/`C_PAYABLE_FEE` + guard Option B — SDI không quản chi tiết phí |
 
 `range` ∈ {`1D`,`1W`,`MTD`,`1M`,`3M`/`3T`,`6M`/`6T`,`QTD`,`1Y`,`3Y`,`YTD`,`INCEPTION`} — ngày mốc = phiên gần nhất ≤ cutoff; KH tham gia sau mốc → ngày sớm nhất. Verify SQL Express (data smoke): FR-01..06 đúng; reconstruct interval FR-06 @05 ra BBB=80000 (trước rebalance); MWR mid-period cashflow = 0.075 khớp Modified Dietz tay (TWR=0.2, cf_net=5M).
 
@@ -147,6 +147,6 @@ Serve-layer **on-read** cho PM theo dõi cấp **master** (spec: `docs/SDI-pm-to
 | US5 | `SP_GET_MASTER_TOP_KH` | master, range, topN, dir | top-N mã KH theo %PnL (TWR) |
 | US1 | `SP_GET_PM_OVERVIEW_ALL` | range, sort | RS1 #master/#KH; RS2 tổng (ΣAUM+growth, net in/out, cash drag, #master cash>ngưỡng); RS3 list master |
 
-Công thức (spec §2): AUM = total_asset = `C_LAST_NAV+C_PAYABLE_FEE` (per KH); DM tổng KH = AUM-weighted end-weight (`ΣWᵢ·PnLᵢ`, PnL=TWR unit_price); deviation = (R_KH−R_master_index)×10000 BPS; TE per-KH = `STDEV(R_KH,t−R_master,t)×√X` (X=#ngày GD, cap 252), master = AUM-weighted. Ngưỡng per-master `T_MASTER_PM_CONFIG` (NULL→default `UDF_PM_CONFIG`). Verify: `07_PM_SMOKE.sql` (3 KH, số tính tay — KH_ret=.08/master=.071/dev=90BPS/TE≈.0297 MED/histogram/top-N đúng).
+Công thức (spec §2): AUM = `C_LAST_NAV` (per KH; phí QL đã trừ trong NAV Asset gửi ⇒ AUM = NAV); DM tổng KH = AUM-weighted end-weight (`ΣWᵢ·PnLᵢ`, PnL=TWR unit_price; 2 API đối chiếu RET_INDEX/COMPOUND cùng kết quả); deviation = (R_KH−R_master_index)×10000 BPS; TE per-KH = `STDEV(R_KH,t−R_master,t)×√X` (X=#ngày GD, cap 252), master = AUM-weighted. Ngưỡng per-master `T_MASTER_PM_CONFIG` (NULL→default `UDF_PM_CONFIG`). Verify: `07_PM_SMOKE.sql` (3 KH, số tính tay — KH_ret=.08/master=.071/dev=90BPS/TE≈.0297 MED/histogram/top-N đúng).
 
 > Chưa implement (mở rộng): ingestion file FO → `T_SI_PORTFOLIO_HOLDING` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_SI_INCOME_FEE` (cổ tức/phí, `BULK INSERT`), XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_SI_NAV_BALANCE` CCI + interval hist partition theo `valid_from`). *(J15 publish tài sản KH + master NAV/perf → Asset đã bỏ — BRD 2026-06-22; Master Index VẪN đẩy Asset qua `SP_EOD_RUN_INDEX` (`SP_GET_ASSET_INDEX_SNAPSHOT`). Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).)*

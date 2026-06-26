@@ -33,9 +33,9 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 | Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). | spec §3 |
 | Giá trị cổ phiếu | Stock value (MTM) | `C_STOCK_VALUE` | Định giá theo thị trường = `Σ (số lượng × giá đóng cửa)`. | spec §3 ; eod (J07) |
 | Tổng tài sản | Total asset / AUM | `C_TOTAL_ASSET` | `= Giá trị cổ phiếu + Tiền` (gồm receivable). Ở cấp master = AUM (Assets Under Management). | spec §3 ; pm §2 |
-| Phí phải trả | Payable (accrued) fee | `C_PAYABLE_FEE` | **TỔNG** phí đã tính dồn (accrue) nhưng **chưa thu** của MỌI loại phí accrue (QL/thuế/perf…). | spec §3 ; §9 (J06) |
-| NAV ròng | Net Asset Value (net) | `C_NAV` | `= Tổng tài sản − Phí phải trả`. Giá trị thực thuộc về nhà đầu tư. | spec §3 |
-| NAV gộp | Gross NAV | — | `= Tổng tài sản = NAV ròng + Phí phải trả`. | spec §3 |
+| Phí phải trả (ĐÃ GỠ) | Payable (accrued) fee | ~~`C_PAYABLE_FEE`~~ | [BRD asset-sync] **ĐÃ GỠ** — SDI không accrue phí; Asset gửi NAV ròng (đã trừ phí QL sẵn). | — |
+| NAV ròng | Net Asset Value | `C_NAV` | NAV do **Asset gửi trực tiếp** (đã trừ phí QL). `= Tổng tài sản (stock + tiền)`. Giá trị thực thuộc nhà đầu tư. | spec §3 |
+| AUM = NAV | — | — | Phí QL đã trừ trong NAV Asset gửi ⇒ **AUM (gross) = NAV (net)**, KHÔNG tách payable. | spec §3 |
 | Số lượng | Quantity | `C_QUANTITY` | Số cổ phiếu nắm giữ. | spec §8 |
 | Giá vốn bình quân | Average cost | `C_AVG_COST` | Tham chiếu lãi/lỗ; **KHÔNG** vào NAV (NAV theo giá thị trường). | spec §8 |
 | Dòng tiền vào/ra | Cashflow in/out | `C_CF_IN`/`C_CF_OUT`, `CF` | Nạp/rút của KH (external). **Không** tính vào lãi/lỗ (PnL khử dòng tiền). | spec §4 |
@@ -83,12 +83,9 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
-| Phí quản lý | Management fee | `C_RATE` (type MGMT_FEE) | Phí %/**năm** trên tài sản. SDI tính dồn (accrue) hằng ngày; BO thực hiện cắt tiền. Rate khai trong `T_FEE_CONFIG` (type MGMT_FEE, group PAYABLE). | spec §9 (J06) |
-| Catalog chính sách phí/thuế | Fee/tax policy catalog | `T_FEE_CONFIG` | **Catalog chính sách phí/thuế chung TOÀN HỆ** (GLOBAL, PK clustered (C_FEE_TYPE) — 1 dòng/loại áp mọi master, KHÔNG có master_code; per-master defer): cột `C_FEE_TYPE` + `C_FEE_GROUP`[INCOME\|PAYABLE] (DÙNG CHUNG vocabulary, khớp `T_SI_INCOME_FEE`), `C_RATE` NULL-able (NULL = không accrue), `C_DAY_COUNT`. J06 chỉ accrue dòng group=PAYABLE & rate>0. Thêm chính sách phí mới = INSERT 1 dòng, không sửa schema/SP. | spec §8 ; db-arch §3 |
-| Loại phí | Fee type | `C_FEE_TYPE` | MGMT_FEE \| TAX \| PERF_FEE \| … — phân loại phí accrue (config) + dòng cắt trong ledger. | spec §8 |
-| Tính dồn (phí) | Accrue | — | Cộng dồn phí phải trả mỗi ngày dương lịch (chưa thu tiền), ĐA-LOẠI theo config. | spec §9 (J06) |
-| Cắt phí (net-off) | Fee charge / net-off | `T_SI_INCOME_FEE` (group PAYABLE) | BO cắt tiền phí 1 cục/tháng (mang `fee_type`) → báo về → SDI trừ vào khoản phải trả (trừ tổng mọi loại). | spec §9 ; eod (B) |
-| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán (FO đẩy về, ghi `T_SI_INCOME_FEE` group PAYABLE). Point-event, KHÔNG accrue config. | spec §3 ; eod (B) |
+| Phí quản lý | Management fee | — | [BRD asset-sync] SDI **KHÔNG còn accrue**. Asset tính & trừ sẵn trong NAV ròng gửi sang (phí chỉ effect khi BO cắt thật — model realized). | — |
+| (ĐÃ GỠ) Catalog phí, accrue, net-off | Fee catalog / accrue (removed) | ~~`T_FEE_CONFIG`~~, ~~`C_FEE_TYPE`~~, ~~`SP_INGEST_FEE_CHARGE`~~ | **ĐÃ GỠ** toàn bộ cơ chế accrue phí của SDI (catalog rate, J06 accrue, net-off khi BO cắt). Phí do Asset xử lý. | — |
+| Phí lưu ký | Custody fee | `CUSTODY_FEE` | Phí lưu ký chứng khoán — đã gộp trong tiền/NAV ròng Asset gửi (SDI không quản chi tiết). | spec §3 |
 | Phí giao dịch / thuế | Trading fee / tax | — | FO đã NET vào tiền mặt khi khớp lệnh — SDI không tính lại. | spec §3 ; eod (B) |
 
 ---
@@ -116,11 +113,10 @@ Quy ước: `t` = ngày; `(t-1)` = ngày giao dịch trước; `@base`/`@end` = 
 ```
 Tiền          = C_CASH + C_PENDING_CASH + C_DIV_CASH
 Tổng tài sản  = Giá trị cổ phiếu + Tiền                       (= AUM ở cấp master)
-NAV (ròng)    = Tổng tài sản − Phí phải trả
-NAV gộp       = Tổng tài sản                                  (= NAV ròng + Phí phải trả)
+NAV           = Tổng tài sản = stock + Tiền        (Asset gửi NAV ròng; phí QL đã trừ ⇒ AUM = NAV)
 ```
-**Ví dụ:** stock 900tr, cash 60tr, pending 40tr, div 0, payable 0.85tr →
-Tiền = 100tr; Tổng tài sản = 1.000tr; NAV ròng = 999.15tr.
+**Ví dụ:** stock 900tr, cash 60tr, pending 40tr, div 0 →
+Tiền = 100tr; Tổng tài sản = NAV = 1.000tr.
 *Bán cổ phiếu 40tr (chờ về T+2):* stock 860tr, pending 40tr → Tổng tài sản vẫn 1.000tr (NAV không hụt giả).
 
 ### 7.2 Unit & Unit Price (TWR sạch)
@@ -185,6 +181,10 @@ Return_DM_tổng_KH = Σᵢ Wᵢ · PnLᵢ
 **Ví dụ (3 KH):** PnL S1=8% S2=6% S3=12%; AUM 100tr/200tr/100tr (Σ=400tr) →
 `(0,08·100 + 0,06·200 + 0,12·100)/400 = 0,08 = +8,0%`.
 > Lưu ý: đây là **end-weight** (trọng số AUM cuối kỳ), KHÁC pooled Master Unit Price (§7.7, ~begin-weight). Hai số đo khác nhau có chủ đích.
+>
+> **Vì sao `PnLᵢ` dùng Unit Price (TWR) chứ KHÔNG dùng `AUM_cuối/AUM_đầu − 1`:** KH nạp định kỳ hằng tháng (lãi tự chuyển vào) ⇒ AUM tăng do *nạp tiền*, không phải do lãi. Tỷ số `AUM_cuối/AUM_đầu − 1` (công thức return đơn giản kiểu "ending/beginning − 1") gộp luôn phần nạp vào → **thổi phồng hiệu suất**. Công thức đơn giản đó chỉ đúng khi danh mục KHÔNG có dòng tiền vào/ra giữa kỳ. Unit Price khử dòng tiền (`nạp tiền chỉ tăng số Unit, không đổi tỷ lệ giá Unit`) nên `UP_cuối/UP_mốc − 1` mới là hiệu suất đầu tư thật (TWR). Đây cũng là điều kiện để so KH vs Master Index và tính Tracking Error có nghĩa.
+>
+> **AUM = NAV (không tách payable):** [BRD asset-sync] Asset gửi NAV ròng (đã trừ phí QL); SDI không accrue ⇒ `AUMᵢ = NAVᵢ = C_LAST_NAV`. **2 cách hiện thực `Σ Wᵢ·Rᵢ`** (cùng kết quả — dùng đối chiếu, bắt lỗi data): `SP_GET_MASTER_RETURN_RETINDEX` (`Rᵢ = UP_cuối/UP_mốc − 1`, đọc 2 lát — NHANH) và `SP_GET_MASTER_RETURN_COMPOUND` (`Rᵢ = ∏(1+rₜ) − 1 = EXP(Σ ln(1+rₜ))−1`, quét daily return). Vì `UPₜ = UP₍ₜ₋₁₎·(1+rₜ)` nên `UP_cuối/UP_mốc ≡ ∏(1+rₜ)` ⇒ 2 cách đồng nhất. **BRD = RET_INDEX** (2 lát); COMPOUND chỉ là bản quét để verify, KHÔNG phải công thức khác.
 
 ### 7.9 Độ lệch hiệu suất (Deviation, BPS)
 ```
@@ -226,18 +226,14 @@ Net flow = Net in − Net out
 AUM growth % = AUM(hiện tại) / AUM(đầu kỳ) − 1
 ```
 
-### 7.13 Phí ACCRUE đa-loại — accrue & net-off (BO-driven, config-driven)
+### 7.13 Phí quản lý — [BRD asset-sync] SDI KHÔNG còn accrue
 ```
-Accrue (EOD J06, mỗi ngày) — đọc T_FEE_CONFIG (WHERE C_FEE_GROUP='PAYABLE' AND C_RATE>0):
-   Phí phải trả += AUM gộp × (số NGÀY DƯƠNG LỊCH kể từ lần tính trước) × Σ_loại (C_RATE / C_DAY_COUNT)
-   (mỗi loại phí có rate + day_count riêng [default 365]; không khai config / rate NULL / group INCOME → loại đó không accrue)
-Net-off (khi BO cắt, ngoài EOD):
-   Phí phải trả −= số tiền BO báo đã cắt        (trừ TỔNG mọi loại; thiếu/đủ cứ trừ; phần dư treo tiếp)
-NAV ròng = Tổng tài sản − Phí phải trả          (Phí phải trả = tổng accrued mọi loại)
+SDI KHÔNG tự tính/trích phí QL nữa. Asset gửi NAV RÒNG (đã trừ phí QL sẵn) → SDI dùng trực tiếp.
+BO KHÔNG tính số phí lũy kế (accrued) gửi Asset; phí chỉ giảm tài sản khi BO cắt THẬT (qua cash,
+   model REALIZED — Asset phản ánh, SDI nhận qua NAV). ⇒ AUM = NAV (gross = net), KHÔNG tách payable.
+Đã gỡ: cột C_PAYABLE_FEE (mọi bảng) + C_FEE_ACCUM (T_SI_ASSET_DAILY) + J06 accrue + catalog
+   T_FEE_CONFIG + SP_INGEST_FEE_CHARGE. Thuế GD: FO net thẳng vào cash (như cũ).
 ```
-**Ví dụ (1 loại MGMT_FEE):** AUM 1.000tr, rate 1%/năm (day_count 365), 31 ngày dương lịch →
-`accrue = 1.000.000.000 × 31 × 0,01/365 = 849.315 đ`. BO cắt 800.000 → phải trả còn treo 49.315 đ.
-**Đa-loại:** thêm TAX 0,1%/năm → `Σ(rate/dc) = (0,01+0,001)/365`; accrue/ngày = AUM × ngày × tổng đó.
 
 ---
 
@@ -248,7 +244,7 @@ NAV ròng = Tổng tài sản − Phí phải trả          (Phí phải trả 
 | Tiền, Số lượng | `(20,0)` | đồng (VND) / cổ phiếu, không lẻ |
 | Giá | `(18,4)` | giá đóng cửa, giá vốn |
 | % / return / fee_rate | `(10,6)` | tỷ lệ (0,01 = 1%) |
-| Phí lũy kế ngày (payable/accrued) | `(20,6)` | giữ thập phân, không round VND/ngày |
+| Giá trị đối chiếu/chênh lệch (reconcile) | `(20,6)` | giữ thập phân khi so 2 nguồn |
 | Unit & Unit Price | `(18,6)` | Unit Price gốc 10.000 |
 | Trọng số (weight) | `(12,8)` | Σ = 1.0 |
 | Index value | `(18,x)` | gốc 1000 |

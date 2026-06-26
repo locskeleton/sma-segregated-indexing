@@ -15,13 +15,13 @@
 | P5 self-review | ✅ thêm guard ASSET_NAV completeness per-SI (err=12); docs |
 
 **Quyết định khi code (ĐÃ CHỐT với user 2026-06-25):**
-- **Giữ TÊN cột `C_PAYABLE_FEE`**, đổi NGHĨA = **lũy kế phải trả** (Asset gửi). AUM_gross = NAV + C_PAYABLE_FEE. Đổi tên C_FEE_ACCUM là cosmetic, để sau.
-- **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_NAV` ingest trực tiếp; SP_EOD_COMPUTE seed C_NAV; CORE **bỏ J08** (không lắp NAV). Components (stock/cash/pending/div) + fee gửi kèm để display (FR-06) + AUM + reconcile.
-- **Reconcile NAV_CONSISTENCY** (mới, vì NAV độc lập components): `nav` Asset vs `(stock+cash+pending+div − fee)` → bắt Asset tự mâu thuẫn. (5 check: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_CONSISTENCY.)
+- **[BRD asset-sync] GỠ phí hoàn toàn (chốt 2026-06-25):** không còn `C_PAYABLE_FEE`/`C_FEE_ACCUM`/`fee_accum`. Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); `AUM = stock + cash = NAV` (gross = net, không tách payable). *(Thiết kế trung gian "giữ tên C_PAYABLE_FEE đổi nghĩa lũy kế / AUM_gross = NAV + fee" đã bị thay.)*
+- **Asset GỬI CẢ NAV (ròng) — SDI KHÔNG tự tính/trừ.** `T_SI_ASSET_DAILY.C_NAV` ingest trực tiếp; CORE **bỏ J08** (không lắp NAV). Components (`stock`, `cash` tổng) gửi kèm để display (FR-06) + AUM + reconcile.
+- **Reconcile NAV_CONSISTENCY**: `nav` Asset vs `(stock + cash)` → bắt Asset tự mâu thuẫn. (5 check: NAV_NEGATIVE, SI_NAV_MISMATCH, CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_CONSISTENCY.)
 - **Sửa quá khứ = RE-INGEST** (Asset gửi lại asset_daily → chạy lại EOD ngày đó). SP_EOD_RECOMPUTE_RANGE đã bỏ.
 - **err mới**: SP_EOD_RUN err=12 = thiếu Asset NAV per-SI (completeness).
-- FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient; cột fee cũ unused).
-- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_NAV_BALANCE/CURRENT) — PM không đọc; AUM gross vẫn = stock+cash+pending+div (tính từ work). Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + T_EOD_WORK + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
+- FO holdings GIỮ (composition + near-realtime future). T_EOD_WORK giữ (transient).
+- **Rename `C_TOTAL_ASSET`→`C_AUM`** (master tables + PM SP + FR-06 + bench). **Bỏ `C_STOCK_VALUE` cấp MASTER** (T_MASTER_NAV_BALANCE/CURRENT) — PM không đọc; `AUM = stock + cash = NAV`. Stock GIỮ ở Asset feed (T_SI_ASSET_DAILY) + reconcile + FR-06. "Cổ phiếu chờ về"/"cổ tức cổ phiếu" không tồn tại trong model.
 
 **Tests:** `03_SMOKE` (customer ingest/derive incl cashflow-day, reconcile vênh, reset, date-guard, index guards, asset-completeness) · `07_PM_SMOKE` (PM serve, seed NAV trực tiếp) · `04_BENCH`/`08_PM_BENCH` (seed asset_daily). Build 01/02/05/06 clean.
 
@@ -37,14 +37,14 @@
 ## P0 — Schema (`01_TABLES.sql`)
 
 **THÊM:**
-- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · `C_STOCK_VALUE, C_CASH, C_PENDING_CASH, C_DIV_CASH, C_FEE_ACCUM, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`.
+- `T_SI_ASSET_DAILY` (raw feed Asset, audit + re-ingest history): PK `(C_BUSINESS_DATE, C_SI_ACCOUNT)` · **[BRD asset-sync]** `C_NAV, C_STOCK_VALUE, C_CASH, C_CASH_IN, C_CASH_OUT` · `C_INGESTED_AT`. **KHÔNG có `C_FEE_ACCUM`** (Asset gửi NAV ròng; `cash` = tổng tiền 1 số, không tách pending/div).
 - `T_EOD_PIPELINE.C_ASSET_NAV_STATUS` (PENDING|READY) + `C_ASSET_NAV_AT` — nguồn mới để gate.
 - `T_EOD_RECON_BREAK`: đã có `C_VALUE_SDI/C_VALUE_CHECK/C_DIFF` → tái dùng; thêm `C_CHECK_NAME` mới (CASHFLOW_MISMATCH, HOLDINGS_MISMATCH, NAV_BRIDGE). Cân nhắc cột `C_WITHIN_THRESHOLD BIT` để log diff cả khi không break (đo vênh).
 
 **SỬA:**
-- `T_SI_NAV_BALANCE`: bỏ `C_PAYABLE_FEE`; thêm `C_FEE_ACCUM` (lũy kế từ Asset), `C_CASH_IN`, `C_CASH_OUT`. Giữ NAV/UNIT/UNIT_PRICE/PNL/RETURN (giờ derive từ ingest) + cột TE.
-- `T_SI_NAV_CURRENT`: bỏ `C_PAYABLE_FEE`; cash/pending/div giờ từ Asset (giữ cột, đổi nguồn ghi).
-- `T_EOD_WORK`: bỏ cột phí (`C_PAYABLE_FEE`, `C_FEE_CUT`); có thể bỏ luôn nếu ingest ghi thẳng (đánh giá ở P2).
+- `T_SI_NAV_BALANCE`: bỏ `C_PAYABLE_FEE`; **[BRD asset-sync] KHÔNG thêm `C_FEE_ACCUM`** (Asset gửi NAV ròng); thêm `C_CASH_IN`, `C_CASH_OUT`. Giữ NAV/UNIT/UNIT_PRICE/PNL/RETURN (derive từ ingest) + cột TE.
+- `T_SI_NAV_CURRENT`: bỏ `C_PAYABLE_FEE`; NAV + components (stock, cash tổng) từ Asset (đổi nguồn ghi).
+- `T_EOD_WORK`: bỏ cột phí (`C_PAYABLE_FEE`, `C_FEE_CUT`).
 
 **BỎ:**
 - `T_FEE_CONFIG`, `T_SI_INCOME_FEE` (chi tiết phí), `T_SI_CASH_HIST` (interval cash cho NAV).
@@ -56,10 +56,10 @@
 ## P1 — Ingest + derive (`02_SP_ENGINE.sql`)
 
 **THÊM `SP_INGEST_ASSET_NAV @p_json`** (per-SI, 1 batch/ngày GD):
-- Parse JSON per-SI `{si_account, stock_value, cash, pending, div_cash, fee_accum, cash_in, cash_out}` → ghi `T_SI_ASSET_DAILY` (idempotent MERGE theo date,si).
+- **[BRD asset-sync]** Parse JSON per-SI `{si_account, nav, stock_value, cash, cash_in, cash_out}` → ghi `T_SI_ASSET_DAILY` (idempotent MERGE theo date,si). KHÔNG còn `fee_accum`/`pending`/`div_cash`.
 - **Derive** per-SI (quy ước §4 handover, init UP=10.000, prior-day historic):
   ```
-  NAV   = stock_value + cash + pending + div_cash − fee_accum   (fee lũy kế đã trừ? -> xác nhận net; nếu Asset gửi NAV net thì lắp thẳng)
+  NAV   = nav   (Asset GỬI TRỰC TIẾP, đã trừ phí QL — model realized; SDI KHÔNG lắp/trừ).  AUM = stock + cash = NAV
   UP_{t-1}, units_{t-1} ← T_SI_NAV_BALANCE @prev (UDF_PREV_BUSINESS_DATE); thiếu → UP=10.000
   Δunits = (cash_in − cash_out)/UP_{t-1};  units_t = units_{t-1}+Δunits
   UP_t   = NAV_t/units_t;  return_t = UP_t/UP_{t-1}−1;  PnL_t = NAV_t−NAV_{t-1}+cash_out−cash_in
@@ -126,6 +126,6 @@ P0 → P1 (build + unit test derive) → P2 (pipeline chạy 1 phiên) → P3 (r
 Mỗi P: build fresh DB + smoke phần liên quan trước khi sang P kế. Self-review ruthless cuối mỗi P.
 
 ## Rủi ro / cần xác nhận khi code
-- `fee_accum` Asset gửi: NAV gửi đã **net** (trừ phí) hay SDI phải tự trừ? → quyết ở P1.
+- ~~`fee_accum` Asset gửi: NAV net hay SDI tự trừ?~~ **[BRD asset-sync] ĐÃ QUYẾT (2026-06-25):** Asset gửi NAV RÒNG (đã net phí QL); KHÔNG gửi `fee_accum`. SDI lắp thẳng, `AUM = NAV`.
 - Ngưỡng reconcile (b/c) — cấu hình per-master hay global.
 - Near-realtime (d) — out of scope đợt này (chỉ giữ holdings + ghi TODO).

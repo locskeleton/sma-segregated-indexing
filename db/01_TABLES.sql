@@ -15,7 +15,7 @@ GO
   Naming: T_/C_ UPPERCASE. Khóa surrogate public GUID `PK_<table>` (NEWID, IDOR-safe). Clustered theo
     tải: append-fact → BIGINT IDENTITY (PK_<t>_ID); point/join → natural (PK_<t>_NK); nhỏ → GUID.
     Natural giữ UQ_<t>_NK (idempotency). T_MASTER_PORTFOLIO: PK = C_MASTER_CODE (không GUID).
-  DECIMAL: Tiền & Quantity = (20,0); Giá = (18,4); % / return / fee_rate = (10,6); phí lũy kế ngày (payable/accrued, net-off định kỳ) = (20,6);
+  DECIMAL: Tiền & Quantity = (20,0); Giá = (18,4); % / return / fee_rate = (10,6); giá trị đối chiếu/chênh lệch (reconcile) = (20,6);
     Unit & Unit Price = (18,6); Weight (12,8); CA ratio (18,8); index_value (18,x).
 ==============================================================================*/
 
@@ -161,8 +161,8 @@ CREATE INDEX IX_SI_HOLDING_HIST_OPEN ON T_SI_HOLDING_HIST (C_SI_ACCOUNT, C_TICKE
 
 -- [BRD asset-sync] RAW FEED Asset → SDI: số TỔNG per-SI mỗi ngày GD (KHÔNG chi tiết mã). Nguồn duy nhất
 --   NAV/tiền/phí. Lưu raw để: derive unit/UP/PnL/return, đối soát (reconcile), re-ingest sửa quá khứ.
---   Idempotent theo (date, si). NAV RÒNG do Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Components (stock/cash/
---   pending/div) + fee_accum gửi kèm để hiển thị/đối soát (reconcile NAV-consistency: nav vs comp−fee).
+--   Idempotent theo (date, si). NAV RÒNG do Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Components (stock/cash)
+--   gửi kèm để hiển thị/đối soát (reconcile NAV-consistency: nav vs comp). Phí QL đã trừ sẵn trong NAV ròng Asset gửi.
 CREATE TABLE T_SI_ASSET_DAILY (
     C_ASSET_DAILY_ID BIGINT IDENTITY(1,1) NOT NULL,
     PK_SI_ASSET_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_ASSET_DAILY_PKID DEFAULT NEWID(),
@@ -173,7 +173,6 @@ CREATE TABLE T_SI_ASSET_DAILY (
     C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ)
     C_STOCK_VALUE    DECIMAL(20,0)   NOT NULL,   -- tổng tiền CP nắm giữ (Asset ĐÃ định giá; KHÔNG chi tiết mã)
     C_CASH           DECIMAL(20,0)   NOT NULL,   -- [BRD] TỔNG tiền dư (1 số: gộp tiền mặt + bán chờ về + cổ tức tiền), Asset gửi
-    C_FEE_ACCUM      DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SAD_FEE  DEFAULT 0,  -- phí QL LŨY KẾ PHẢI TRẢ đến ngày (AUM_gross=NAV+nó)
     C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_CIN  DEFAULT 0,  -- nạp trong ngày (đối soát cashflow SDI)
     C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_COUT DEFAULT 0,  -- rút trong ngày (đối soát)
     C_INGESTED_AT    DATETIME        NOT NULL CONSTRAINT DF_SAD_AT DEFAULT GETDATE(),
@@ -182,7 +181,7 @@ CREATE TABLE T_SI_ASSET_DAILY (
 ) WITH (DATA_COMPRESSION = PAGE);
 -- đọc per-SI theo ngày (derive prev + reconcile per-si)
 CREATE INDEX IX_SI_ASSET_DAILY_ACCT ON T_SI_ASSET_DAILY (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_NAV, C_STOCK_VALUE, C_CASH, C_FEE_ACCUM, C_CASH_IN, C_CASH_OUT);
+    INCLUDE (C_NAV, C_STOCK_VALUE, C_CASH, C_CASH_IN, C_CASH_OUT);
 
 -- External cashflow (nạp/rút) — SDI-side, per sub-account
 CREATE TABLE T_SI_CASHFLOW_EVENT (
@@ -227,8 +226,7 @@ CREATE TABLE T_SI_NAV_CURRENT (
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
     C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_CNC_UNIT DEFAULT 0,      -- tổng đơn vị quỹ (lũy kế); biến động chỉ do dòng tiền (TWR sạch)
     C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- TIỀN MẶT khả dụng (FO sync). Đã NET phí GD + thuế.
-    C_PAYABLE_FEE      DECIMAL(20,6)  NOT NULL CONSTRAINT DF_CNC_PAY DEFAULT 0,      -- PHÍ QL accrued chưa net-off (khoản PHẢI TRẢ). TIỀN = C_CASH; NAV = (stock+TIỀN) − C_PAYABLE_FEE
-    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- NAV NET phí gần nhất = tổng tài sản (stock+TIỀN) − payable
+    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- NAV gần nhất = Asset gửi trực tiếp (đã trừ phí QL). AUM = NAV (không tách payable)
     C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                           -- Unit Price gần nhất = NAV/Unit (T0=10.000). %hiệu suất TWR = UP_cuối/UP_mốc − 1
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
     C_LAST_BUSINESS_DATE DATE         NULL,                       -- ngày EOD compute gần nhất
@@ -237,9 +235,9 @@ CREATE TABLE T_SI_NAV_CURRENT (
     CONSTRAINT UQ_SI_NAV_CURRENT_PKID UNIQUE NONCLUSTERED (PK_SI_NAV_CURRENT)
 ) WITH (DATA_COMPRESSION = PAGE);
 -- [PM tool] PM SP đọc current theo MASTER (WHERE C_MASTER_CODE=@m AND C_STATUS='ACTIVE') — clustered theo si
---   nên by-master phải có index riêng (AUM/cash/up_end/payable per-KH cho US1/US2/US4/US5).
+--   nên by-master phải có index riêng (AUM/cash/up_end per-KH cho US1/US2/US4/US5).
 CREATE INDEX IX_SI_NAV_CURRENT_MASTER ON T_SI_NAV_CURRENT (C_MASTER_CODE, C_STATUS)
-    INCLUDE (C_SI_ACCOUNT, C_LAST_NAV, C_PAYABLE_FEE, C_CASH, C_LAST_UNIT_PRICE);
+    INCLUDE (C_SI_ACCOUNT, C_LAST_NAV, C_CASH, C_LAST_UNIT_PRICE);
 
 -- Holdings HIỆN TẠI — FO nạp THẲNG mỗi EOD (overwrite). NGUỒN DUY NHẤT cho EOD core (MTM/agg).
 CREATE TABLE T_SI_PORTFOLIO_HOLDING (
@@ -262,16 +260,13 @@ CREATE TABLE T_EOD_WORK (
     C_MASTER_CODE     VARCHAR(20)    NOT NULL,
     -- seed từ T_SI_NAV_CURRENT (trạng thái đầu ngày) + delta ngày @d:
     C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN MẶT @d (FO sync)
-    C_PAYABLE_FEE     DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- vào: BASE payable_prev; ra J06: base + accrue − cut = payable @d
-    C_PREV_DATE       DATE           NULL,                 -- ngày GD trước (mốc accrue gap + guard); seed forward=NAV_CURRENT.C_LAST_BUSINESS_DATE, rerun=ngày GD trước @d
-    C_FEE_CUT         DECIMAL(20,6)  NOT NULL DEFAULT 0,   -- phí BO cắt TRỪ trong J06 (forward=0 vì đã net-off NAV_CURRENT; rerun=Σ cắt charge_date=@d)
     C_LAST_NAV        DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- NAV cuối ngày TRƯỚC (để tính PnL J09)
     C_LAST_UNIT_PRICE DECIMAL(18,6) NULL,                  -- Unit Price cuối ngày trước (mẫu số ΔUnit J10)
     C_UNIT_PREV       DECIMAL(18,6) NOT NULL DEFAULT 0,    -- Unit đầu ngày (trước biến động dòng tiền)
     C_CF_IN           DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN vào ngày @d (Σ INITIAL/TOPUP/SIP/INTEREST_IN)
     C_CF_OUT          DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN ra ngày @d (Σ WITHDRAW)
     C_STOCK_VALUE     DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J07 MTM = Σ qty × close_price (định giá cổ phiếu)
-    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J08 = C_STOCK_VALUE + C_CASH − C_PAYABLE_FEE
+    C_NAV             DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- [BRD] seed TRỰC TIẾP từ Asset (T_SI_ASSET_DAILY.C_NAV) — SDI KHÔNG tự tính
     C_DAILY_PNL       DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- J09 = C_NAV − C_LAST_NAV + C_CF_OUT − C_CF_IN (loại ảnh hưởng dòng tiền)
     C_DELTA_UNIT      DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = (C_CF_IN − C_CF_OUT) / C_LAST_UNIT_PRICE (init: NAV/10000 khi UP_prev=0)
     C_UNIT            DECIMAL(18,6) NOT NULL DEFAULT 0,    -- J10 = C_UNIT_PREV + C_DELTA_UNIT
@@ -287,8 +282,7 @@ CREATE TABLE T_SI_NAV_BALANCE (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV NET phí (= gross − payable). Khi accrual OFF: payable=0 ⇒ = gross
-    C_PAYABLE_FEE    DECIMAL(20,6)   NOT NULL CONSTRAINT DF_SI_NAV_BAL_PAY DEFAULT 0,  -- phí QL accrued chưa thu @ngày; NAV_gross = C_NAV + C_PAYABLE_FEE
+    C_NAV            DECIMAL(20,0)   NOT NULL,   -- NAV cuối ngày = Asset gửi trực tiếp (đã trừ phí QL). AUM = NAV (không tách payable)
     C_UNIT           DECIMAL(18,6)  NOT NULL,    -- Unit cuối ngày (snapshot lịch sử)
     C_UNIT_PRICE     DECIMAL(18,6)  NULL,        -- Unit Price NET phí = NAV/Unit. TWR kỳ = UP_cuối/UP_mốc − 1 (chart FR-03, US3 composite)
     C_DAILY_PNL      DECIMAL(20,0)   NOT NULL,   -- lãi/lỗ TIỀN trong ngày (đã loại dòng tiền)
@@ -310,11 +304,11 @@ CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_NAV_BALANCE (C_MASTER_CODE, C_BUSI
 -- [Customer API FR-02/03/06] đọc lịch sử theo SUB-ACCOUNT. UQ_NK (date,si) là date-leading (cho EOD
 --   DELETE WHERE date=@d) → KHÔNG seek được by si. Index này (si,date) phủ truy vấn per-si (chart/asOf).
 CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_NAV_BALANCE (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_NAV, C_PAYABLE_FEE, C_UNIT, C_UNIT_PRICE, C_DAILY_RETURN);
+    INCLUDE (C_NAV, C_UNIT, C_UNIT_PRICE, C_DAILY_RETURN);
 
 -- [BRD asset-sync] ĐÃ BỎ T_SI_INCOME_FEE (chi tiết phí/thu nhập): SDI không quản chi tiết giao dịch phí nữa.
---   Phí QL: số tổng lũy kế từ Asset (T_SI_ASSET_DAILY.C_FEE_ACCUM). Cổ tức/lưu ký: đã gộp trong tiền/NAV Asset gửi.
---   C_PAYABLE_FEE (NAV_CURRENT/BALANCE/MASTER) GIỮ TÊN nhưng đổi NGHĨA = phí lũy kế Asset báo (AUM_gross = NAV + nó).
+--   Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng). Cổ tức/lưu ký: đã gộp trong tiền/NAV.
+--   ⇒ SDI KHÔNG còn cột phí phải trả (C_PAYABLE_FEE đã gỡ). AUM = NAV (gross = net).
 
 /*------------------------------------------------ MASTER-LEVEL DAILY (output) -*/
 CREATE TABLE T_MASTER_INDEX_DAILY (
@@ -349,12 +343,10 @@ CREATE TABLE T_MASTER_NAV_BALANCE (
     C_BUSINESS_DATE    DATE          NOT NULL,
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
     C_CASH             DECIMAL(20,0) NOT NULL,                                   -- Σ TIỀN MẶT các tiểu khoản
-    -- [BRD] BỎ C_STOCK_VALUE cấp master (PM tool KHÔNG đọc; AUM gross đã gồm stock). Stock per-mã ở T_MASTER_HOLDING_BALANCE.
-    C_PAYABLE_FEE      DECIMAL(20,6) NULL,     -- Σ lũy kế PHẢI TRẢ (Asset). AUM_gross = C_NAV + C_PAYABLE_FEE.
-    C_AUM      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = stock + cash + pending + div (gồm tiền chờ về)
-    C_NAV              DECIMAL(20,0)  NOT NULL, -- = C_AUM − C_PAYABLE_FEE (NAV net phí)
+    -- [BRD] BỎ C_STOCK_VALUE cấp master (PM tool KHÔNG đọc; AUM đã gồm stock). Stock per-mã ở T_MASTER_HOLDING_BALANCE.
+    C_AUM      DECIMAL(20,0) NOT NULL,  -- TỔNG TÀI SẢN (AUM) = Σ NAV tiểu khoản (phí QL đã trừ). AUM = NAV — gộp 1 cột, KHÔNG tách C_NAV.
     C_UNIT             DECIMAL(18,6) NOT NULL,  -- Σ Unit toàn master
-    C_UNIT_PRICE       DECIMAL(18,6) NULL,      -- = C_NAV / C_UNIT (pooled master unit price)
+    C_UNIT_PRICE       DECIMAL(18,6) NULL,      -- = C_AUM / C_UNIT (pooled master unit price)
     C_DAILY_PNL        DECIMAL(20,0)  NOT NULL, -- Σ lãi/lỗ TIỀN ngày
     C_DAILY_RETURN     DECIMAL(10,6) NULL,      -- lợi suất pooled master ngày
     C_CASH_IN          DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_CIN  DEFAULT 0,  -- [PM] Σ nạp/SIP/initial/lãi master/ngày
@@ -370,10 +362,9 @@ CREATE TABLE T_MASTER_NAV_CURRENT (
     C_MASTER_CODE      VARCHAR(20)    NOT NULL,
     C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_CASH DEFAULT 0,
     -- [BRD] BỎ C_STOCK_VALUE cấp master (PM không đọc).
-    C_AUM      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- TỔNG TÀI SẢN (AUM) hiện tại = stock+cash+pending+div (gross). Nguồn nhanh US1/US2 AUM + cash drag.
-    C_LAST_NAV         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_NAV DEFAULT 0,    -- NAV net phí = C_AUM − Σpayable
+    C_AUM      DECIMAL(20,0)  NOT NULL CONSTRAINT DF_SNC_TOTAL DEFAULT 0,  -- TỔNG TÀI SẢN (AUM) hiện tại = Σ NAV tiểu khoản. AUM = NAV (gộp 1 cột). Nguồn nhanh US1/US2 AUM + cash drag.
     C_UNIT             DECIMAL(18,6) NOT NULL CONSTRAINT DF_SNC_UNIT DEFAULT 0,
-    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                          -- pooled master unit price = NAV/Unit
+    C_LAST_UNIT_PRICE  DECIMAL(18,6) NULL,                                          -- pooled master unit price = C_AUM/Unit
     C_TOTAL_ACCOUNT    INT           NOT NULL CONSTRAINT DF_SNC_TACC DEFAULT 0,  -- [PM] #tiểu khoản ACTIVE
     C_LAST_BUSINESS_DATE DATE         NULL,
     CONSTRAINT PK_MASTER_NAV_CURRENT PRIMARY KEY CLUSTERED (PK_MASTER_NAV_CURRENT),

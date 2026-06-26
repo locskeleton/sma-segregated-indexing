@@ -27,7 +27,7 @@ Spec tầng **dữ liệu/SP** cho dashboard PM quản lý danh mục **master**
 | **Cash drag** | `Σ Tiền / Σ AUM × 100%` (Tiền = cash + pending + div) | master current/daily |
 | **#KH (DM KH)** | `C_TOTAL_ACCOUNT` (tiểu khoản ACTIVE) | master current |
 | **Hiệu suất master (model)** | `Master Index` PR: `Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref` (CA: P_ref điều chỉnh) | `T_MASTER_INDEX_DAILY` |
-| **Hiệu suất DM tổng KH** | **AUM-weighted (end-weight, theo BRD)**: `Σ Wᵢ·PnLᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `PnLᵢ = UP_i(cuối)/UP_i(mốc) − 1` | per-KH `T_SI_NAV_BALANCE.C_UNIT_PRICE` 2 mốc + AUM cuối (current) |
+| **Hiệu suất DM tổng KH** | **AUM-weighted (end-weight)**: `Σ Wᵢ·PnLᵢ`, `Wᵢ = AUM_i cuối kỳ / Σ AUM cuối kỳ`, `PnLᵢ = UP_i(cuối)/UP_i(mốc) − 1` (TWR). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** — KH nạp định kỳ hằng tháng → tỷ số AUM bị nhiễm dòng tiền, sai hiệu suất. | per-KH `T_SI_NAV_BALANCE.C_UNIT_PRICE` 2 mốc + AUM cuối (current) |
 | **Deviation (per dev)** | `(AUM-weighted Return KH − Return Master) × 10000` (BPS) | như trên + index |
 | **Tracking Error (TE)** | per-KH `TE_i = STDEV(dᵢ,t) × √X`, `dᵢ,t = R_KH,i,t − R_master,t` (active return ngày t); `X = số ngày GD kỳ (cap 252)`. Master: `Σ(TE_i × AUM_i)/Σ AUM_i` (AUM-weighted) | `T_SI_NAV_BALANCE.C_DAILY_RETURN` (KH) − `T_MASTER_INDEX_DAILY.C_DAILY_RETURN` (master), STDEV on-read |
 | **%PnL per-KH** | `UP_i(cuối kỳ)/UP_i(mốc) − 1` (TWR, miễn nhiễm dòng tiền) | `T_SI_NAV_BALANCE.C_UNIT_PRICE` |
@@ -122,7 +122,7 @@ Mỗi phase: build SP + test bằng dataset (smoke/bench), verify công thức t
 ---
 
 ## 7. Quyết định đã chốt (tham chiếu)
-- "DM tổng KH" = **AUM-weighted end-weight** (`ΣWᵢPnLᵢ`, theo BRD) — KHÔNG dùng pooled `master unit_price` (begin-weight, khác).
+- "DM tổng KH" = **AUM-weighted end-weight** (`ΣWᵢPnLᵢ`), per-KH `PnLᵢ = UP_cuối/UP_mốc − 1` (TWR qua unit price). **KHÔNG dùng `AUM_cuối/AUM_đầu − 1`** (công thức return đơn giản kiểu "ending/beginning − 1"): KH nạp định kỳ hằng tháng nên tỷ số AUM bị nhiễm dòng tiền (nạp vào làm AUM tăng nhưng không phải lãi); unit price khử dòng tiền nên mới đo đúng hiệu suất đầu tư. Cũng KHÔNG dùng pooled `master unit_price` (begin-weight, khác). *Nếu BRD bản gốc viết literal `AUM_cuối/AUM_đầu − 1` thì đây là sai lệch CỐ Ý vì lý do trên — cần owner BRD ký.*
 - TE = on-read (join 2 chuỗi return có sẵn, STDEV × √X); scale nhỏ → không materialize.
 - Snapshot realtime-on-query, hiệu suất T-1.
 - Ngưỡng per-master (`T_MASTER_PM_CONFIG`).
