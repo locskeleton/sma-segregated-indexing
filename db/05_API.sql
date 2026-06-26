@@ -417,7 +417,7 @@ BEGIN
         SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
 
     -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_BALANCE) cho ĐÚNG sub-account này (chặn ngày
-    --   nghỉ/tương lai/trước-mở/sau-đóng). NAV_BALANCE @asof tồn tại ⇒ T_SI_ASSET_DAILY @asof cũng có (compute cần).
+    --   nghỉ/tương lai/trước-mở/sau-đóng). [thin-layer] T_SI_BALANCE là nguồn trực tiếp (Asset ghi thẳng).
     IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
     BEGIN SET @p_err_code = 5;
         SET @p_err_msg = CONCAT(N'Không có dữ liệu EOD cho sub-account ', @p_si_account, N' @ ',
@@ -428,7 +428,7 @@ BEGIN
     --   Stock value = AUM − cash (suy ra, vì AUM = stock + tổng tiền). cash = TỔNG tiền (gộp tiền mặt + bán chờ + cổ tức tiền).
     DECLARE @aum DECIMAL(20,0), @cash DECIMAL(20,0), @stock DECIMAL(20,0);
     SELECT @aum=C_AUM, @cash=C_CASH
-    FROM T_SI_ASSET_DAILY WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
     SET @stock = ISNULL(@aum,0) - ISNULL(@cash,0);   -- stock suy ra (Asset không gửi tách riêng)
 
     -- [thin-layer] return tích lũy INCEPTION→@asof = EXP(Σ LN(1+r))−1 (compound daily_return ≤ @asof).

@@ -159,29 +159,9 @@ CREATE INDEX IX_SI_HOLDING_HIST_OPEN ON T_SI_HOLDING_HIST (C_SI_ACCOUNT, C_TICKE
 -- [BRD asset-sync] ĐÃ BỎ T_SI_CASH_HIST: SDI không tự tính NAV nên không cần interval cash.
 --   Tiền (cash/pending/div) nhận từ Asset per ngày GD (T_SI_ASSET_DAILY).
 
--- [BRD asset-sync] RAW FEED Asset → SDI: số TỔNG per-SI mỗi ngày GD (KHÔNG chi tiết mã). Nguồn duy nhất
---   NAV/tiền/phí. Lưu raw để: derive unit/UP/PnL/return, đối soát (reconcile), re-ingest sửa quá khứ.
---   Idempotent theo (date, si). NAV RÒNG do Asset GỬI TRỰC TIẾP (SDI KHÔNG tự tính/trừ). Components (stock/cash)
---   gửi kèm để hiển thị/đối soát (reconcile NAV-consistency: nav vs comp). Phí QL đã trừ sẵn trong NAV ròng Asset gửi.
-CREATE TABLE T_SI_ASSET_DAILY (
-    C_ASSET_DAILY_ID BIGINT IDENTITY(1,1) NOT NULL,
-    PK_SI_ASSET_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_SI_ASSET_DAILY_PKID DEFAULT NEWID(),
-    C_BUSINESS_DATE  DATE            NOT NULL,
-    C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
-    C_CUST_CODE      VARCHAR(10)     NOT NULL,
-    C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_AUM            DECIMAL(20,0)   NOT NULL,   -- [thin-layer] AUM cuối ngày — Asset GỬI TRỰC TIẾP (= NAV ròng đã trừ phí). (rename→C_AUM ở bước cuối)
-    C_DAILY_RETURN   DECIMAL(10,6)   NULL,       -- [thin-layer] lợi suất NGÀY (TWR, Asset ĐÃ khử dòng tiền) — SDI KHÔNG tự tính. NULL ngày đầu/không có mốc trước.
-    C_CASH           DECIMAL(20,0)   NOT NULL,   -- [BRD] TỔNG tiền dư (1 số: gộp tiền mặt + bán chờ về + cổ tức tiền), Asset gửi — cho cash drag
-    C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_CIN  DEFAULT 0,  -- nạp trong ngày (net flow)
-    C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SAD_COUT DEFAULT 0,  -- rút trong ngày (net flow)
-    C_INGESTED_AT    DATETIME        NOT NULL CONSTRAINT DF_SAD_AT DEFAULT GETDATE(),
-    CONSTRAINT PK_SI_ASSET_DAILY_ID PRIMARY KEY CLUSTERED (C_BUSINESS_DATE, C_SI_ACCOUNT),  -- date-leading (ingest/seed theo ngày)
-    CONSTRAINT UQ_SI_ASSET_DAILY_PKID UNIQUE NONCLUSTERED (PK_SI_ASSET_DAILY)
-) WITH (DATA_COMPRESSION = PAGE);
--- đọc per-SI theo ngày (derive prev + reconcile per-si)
-CREATE INDEX IX_SI_ASSET_DAILY_ACCT ON T_SI_ASSET_DAILY (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_AUM, C_DAILY_RETURN, C_CASH, C_CASH_IN, C_CASH_OUT);
+-- [thin-layer] ĐÃ GỠ T_SI_ASSET_DAILY: SDI KHÔNG còn landing-table riêng. Asset gửi per-SI qua Kafka batch
+--   → SP_INGEST_ASSET_NAV ghi THẲNG vào T_SI_BALANCE (history: aum/daily_return/cash/cash_in/cash_out) +
+--   roll-forward T_SI_CURRENT. EOD đọc balance trực tiếp (agg/TE/reconcile/completeness). Re-ingest = DELETE+INSERT balance.
 
 -- External cashflow (nạp/rút) — SDI-side, per sub-account
 CREATE TABLE T_SI_CASHFLOW_EVENT (
@@ -242,7 +222,7 @@ CREATE TABLE T_EOD_WORK (
     C_SI_ACCOUNT      VARCHAR(20)    NOT NULL,
     C_CUST_CODE       VARCHAR(10)    NOT NULL,
     C_MASTER_CODE     VARCHAR(20)    NOT NULL,
-    -- [thin-layer] seed từ T_SI_ASSET_DAILY (Asset gửi) — SDI KHÔNG derive gì, chỉ stage để ghi balance + scope TE:
+    -- [thin-layer] seed từ T_SI_BALANCE @d (Asset đã ghi thẳng) — SDI KHÔNG derive gì, work chỉ là SCOPE cho agg/TE/reconcile:
     C_CASH            DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- TIỀN @d (Asset gửi) — cash drag
     C_CF_IN           DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- nạp ngày @d (net flow → master agg)
     C_CF_OUT          DECIMAL(20,0)  NOT NULL DEFAULT 0,   -- rút ngày @d (net flow → master agg)
@@ -259,8 +239,11 @@ CREATE TABLE T_SI_BALANCE (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_AUM            DECIMAL(20,0)   NOT NULL,   -- AUM cuối ngày = Asset gửi trực tiếp. (rename→C_AUM ở bước cuối)
+    C_AUM            DECIMAL(20,0)   NOT NULL,   -- AUM cuối ngày = Asset gửi TRỰC TIẾP (ingest ghi thẳng, KHÔNG qua compute)
     C_DAILY_RETURN   DECIMAL(10,6)  NULL,        -- lợi suất ngày (Asset gửi, TWR). %PnL kỳ = ∏(1+r)−1 (on-read compound). Vào active return TE (KH − master index)
+    C_CASH           DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CASH DEFAULT 0,  -- [thin-layer] tiền (Asset gửi) — cash drag lịch sử + master agg
+    C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CIN  DEFAULT 0,  -- [thin-layer] nạp ngày (Asset) — net flow master + reconcile vs cashflow SDI
+    C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_COUT DEFAULT 0,  -- [thin-layer] rút ngày (Asset) — net flow + reconcile
     -- [PM tool] TE prefix-sum: lũy kế active return (= KH return − master index return) từ inception.
     --   Cho phép tính STDEV(active) qua range BẤT KỲ bằng HIỆU 2 mốc (base/end) → đọc 2 lát, không quét.
     --   Maintain ở EOD bước SP_EOD_TE_ACCUM (sau J12, cần index daily return). FLOAT (double) cho ổn số.
@@ -273,12 +256,12 @@ CREATE TABLE T_SI_BALANCE (
 );
 -- [PM tool] quét per-master theo ngày (US3 chart) + đọc 2 lát base/end (US1/US2 return+TE prefix-sum).
 CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_BALANCE (C_MASTER_CODE, C_BUSINESS_DATE)
-    INCLUDE (C_SI_ACCOUNT, C_DAILY_RETURN, C_AUM,
+    INCLUDE (C_SI_ACCOUNT, C_DAILY_RETURN, C_AUM, C_CASH, C_CASH_IN, C_CASH_OUT,
              C_ACCUM_ACTIVE_RET, C_ACCUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT);
 -- [Customer API FR-02/03/06] đọc lịch sử theo SUB-ACCOUNT. UQ_NK (date,si) là date-leading (cho EOD
 --   DELETE WHERE date=@d) → KHÔNG seek được by si. Index này (si,date) phủ truy vấn per-si (chart/asOf).
 CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_BALANCE (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_AUM, C_DAILY_RETURN);
+    INCLUDE (C_AUM, C_DAILY_RETURN, C_CASH);
 
 -- [BRD asset-sync] ĐÃ BỎ T_SI_INCOME_FEE (chi tiết phí/thu nhập): SDI không quản chi tiết giao dịch phí nữa.
 --   Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng). Cổ tức/lưu ký: đã gộp trong tiền/NAV.
@@ -370,7 +353,7 @@ CREATE TABLE T_EOD_PIPELINE (
     C_FO_INGEST_TOTAL    INT          NULL,        -- total cust_code FO khai báo (break event)
     C_FO_INGEST_RECEIVED INT          NULL,        -- cust_code SDI đếm nhận được
     C_FO_INGEST_AT       DATETIME     NULL,
-    -- [thin-layer] ASSET_NAV: Asset gửi per-SI (aum/daily_return/cash) qua Kafka BATCH (≤100 item/msg) → T_SI_ASSET_DAILY.
+    -- [thin-layer] ASSET_NAV: Asset gửi per-SI (aum/daily_return/cash) qua Kafka BATCH (≤100 item/msg) → ghi thẳng T_SI_BALANCE.
     --   Completeness: Asset khai TOTAL = #SI; SDI đếm RECEIVED = #SI distinct @ngày (Σ batch); READY khi RECEIVED>=TOTAL.
     --   Gate: EOD chỉ chạy khi ASSET_NAV=READY. Đơn vị = SI (như FO đếm cust_code).
     C_ASSET_NAV_STATUS   VARCHAR(10)  NOT NULL CONSTRAINT DF_EODP_ANAV DEFAULT 'PENDING',  -- PENDING|READY (Asset, batch)
