@@ -71,6 +71,14 @@ DECLARE @mnav DECIMAL(20,0)=(SELECT C_AUM FROM T_MASTER_BALANCE WHERE C_MASTER_C
 IF @mnav=11484000 PRINT CONCAT('  OK master agg @06: AUM=',@mnav); ELSE PRINT CONCAT('  !!! master agg @06: ',@mnav);
 DECLARE @nullRows INT=(SELECT COUNT(*) FROM T_EOD_RUN WHERE C_STATUS='DONE' AND C_ROWS IS NULL);
 IF @nullRows=0 PRINT '  OK C_ROWS populate đủ (0 job DONE NULL)'; ELSE PRINT CONCAT('  !!! C_ROWS NULL: ',@nullRows);
+-- [BRD fee] nếu module 09_FEE đã cài → phí chốt TRONG EOD: J15/J16 PHẢI chạy (DONE) sau reconcile PASS.
+IF OBJECT_ID('SP_EOD_FEE_ACCRUE','P') IS NOT NULL
+BEGIN
+    DECLARE @feeJobs INT=(SELECT COUNT(*) FROM T_EOD_RUN WHERE C_BUSINESS_DATE='2026-01-06'
+        AND C_JOB IN ('J15_FEE_ACCRUE','J16_FEE_CLOSE') AND C_STATUS='DONE');
+    IF @feeJobs=2 PRINT '  OK fee J15/J16 chạy trong EOD (DONE)'; ELSE PRINT CONCAT('  !!! fee jobs EOD: ',@feeJobs,'/2');
+END
+ELSE PRINT '  -- (09_FEE chưa cài → bỏ qua check fee jobs in EOD)';
 
 PRINT '';
 PRINT '======== RECONCILE: đo vênh 2 nguồn ========';

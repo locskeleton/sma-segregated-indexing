@@ -7,7 +7,7 @@ GO
   Mô hình roll-forward: T_SI_CURRENT (current) + áp delta ngày @d → tính lại.
   INGEST: SP_INGEST_ASSET_NAV → Asset gửi NAV RÒNG + components (stock/cash) + cash_in/out per-SI/ngày;
     SP_INGEST_CUSTOMER → FO gửi holdings (per-mã, composition) + registry. SDI derive unit/UP/PnL/return.
-  Thứ tự (master SP_EOD_RUN): J0_GATE → J07 → J11 → J12 → J13 → J14
+  Thứ tự (master SP_EOD_RUN): J0_GATE → J07 → J11 → J12 → J13 → J14 → [J15_FEE_ACCRUE → J16_FEE_CLOSE nếu cài 09_FEE]
   NAV = Asset gửi trực tiếp (đã trừ phí QL); AUM = NAV (không tách payable).
   [BRD asset-sync] SDI KHÔNG còn accrue phí QL: phí do Asset tính & trừ sẵn trong NAV ròng. Thuế GD FO net.
 ==============================================================================*/
@@ -758,6 +758,17 @@ BEGIN
 
         EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';   -- snapshot NỘI BỘ (T_MASTER_HOLDING_BALANCE) cho read API SDI
 
+        -- [BRD fee] CHỐT PHÍ QL trong EOD (sau reconcile PASS). Asset đã nhận ĐỦ dữ liệu (precondition
+        --   ASSET_NAV=READY + completeness per-SI ở trên) → tính phí ngày look-forward (J15) + chốt kỳ (J16,
+        --   no-op nếu chưa ngày GD cuối tháng). KHÔNG xử lý trong luồng đồng bộ Asset (eager) nữa — chạy ở đây
+        --   để chỉ chốt trên data đã đối soát sạch. Module 09_FEE PLUGGABLE: guard OBJECT_ID → chưa cài 09 thì
+        --   bỏ qua (03_SMOKE/04_BENCH không load 09 vẫn chạy). Cả 2 job STEP-compatible + idempotent (MERGE).
+        IF OBJECT_ID('dbo.SP_EOD_FEE_ACCRUE','P') IS NOT NULL
+        BEGIN
+            EXEC SP_EOD_STEP @d, 'J15_FEE_ACCRUE', 'SP_EOD_FEE_ACCRUE';
+            EXEC SP_EOD_STEP @d, 'J16_FEE_CLOSE',  'SP_FEE_CLOSE_PERIOD';
+        END
+
         -- EOD_DONE = trạng thái CUỐI (BRD 2026-06-22: SDI không push asset sang Asset → bỏ stage COMPLETED/asset-sync).
         UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='DONE', C_EOD_AT=GETDATE(), C_OVERALL_STATUS='EOD_DONE',
                C_UPDATED_AT=GETDATE() WHERE C_BUSINESS_DATE=@d;
@@ -898,23 +909,11 @@ BEGIN
     END
 
     -- cả 3 nguồn READY + chưa bắt đầu EOD ⇒ overall READY (đủ điều kiện chạy)
+    --   [BRD fee] KHÔNG chốt phí ở đây nữa (eager trong luồng sync). Phí QL chốt trong EOD (SP_EOD_RUN
+    --   J15/J16) — chạy SAU khi Asset nhận đủ data (ASSET_NAV=READY) + reconcile PASS, trên data đã đối soát.
     UPDATE T_EOD_PIPELINE SET C_OVERALL_STATUS='READY'
     WHERE C_BUSINESS_DATE=@p_business_date AND C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY'
       AND C_ASSET_NAV_STATUS='READY' AND C_OVERALL_STATUS='WAITING_DATA';
-
-    -- [BRD fee] HOOK luồng đồng bộ tài sản: ASSET_NAV gom đủ batch (READY) = AUM@d hoàn tất →
-    --   tính phí QL hàng ngày (look-forward) + chốt kỳ (no-op nếu chưa ngày GD cuối tháng). Cả 2 idempotent
-    --   (re-ingest ngày cũ → SET_SOURCE_READY lại → re-accrue trên AUM đã sửa). Module 09_FEE PLUGGABLE:
-    --   guard OBJECT_ID → chưa cài 09_FEE thì bỏ qua (03_SMOKE/04_BENCH không load 09 vẫn chạy). COLLECT
-    --   KHÔNG ở đây (emit RS payload sang BO → app/orchestrator gọi SP_FEE_COLLECT post-sync rồi forward BO).
-    IF @p_source='ASSET_NAV'
-       AND (SELECT C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)='READY'
-       AND OBJECT_ID('dbo.SP_EOD_FEE_ACCRUE','P') IS NOT NULL
-    BEGIN
-        DECLARE @feeRows BIGINT;
-        EXEC SP_EOD_FEE_ACCRUE   @p_business_date, @p_rows=@feeRows OUTPUT;
-        EXEC SP_FEE_CLOSE_PERIOD @p_business_date, @p_rows=@feeRows OUTPUT;
-    END
     END TRY
     BEGIN CATCH
         IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END

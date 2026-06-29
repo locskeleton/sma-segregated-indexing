@@ -206,22 +206,27 @@ INSERT INTO @R SELECT 'INGEST collected=0 → UNPAID + event clear (SUBONE)',
         AND (SELECT C_BO_EVENT_ID FROM T_SI_FEE_CHARGE WHERE C_SI_ACCOUNT='SUBONE' AND C_PERIOD='202604') IS NULL THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
-  5) HOOK đồng bộ Asset — SP_EOD_SET_SOURCE_READY 'ASSET_NAV' READY ⇒ accrue tự fire
-     (02_SP_ENGINE gọi SP_EOD_FEE_ACCRUE+CLOSE khi gom đủ batch, guard OBJECT_ID).
+  5) WIRING EOD — phí chốt trong SP_EOD_RUN (J15/J16), KHÔNG eager trong luồng sync.
+     (a) SP_EOD_SET_SOURCE_READY 'ASSET_NAV' READY KHÔNG còn tự accrue (hook đã gỡ).
+     (b) SP_EOD_RUN có 2 job J15_FEE_ACCRUE + J16_FEE_CLOSE, guard OBJECT_ID pluggable.
 ==============================================================================*/
 INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS)
  VALUES ('SUBHOOK','KH09','SDIF','2026-01-01','ACTIVE');
 EXEC SP_SET_SI_FEE_RATE @p_si_account='SUBHOOK',@p_effective_from='2026-01-01',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_IN,C_CASH_OUT)
  VALUES ('2026-06-15','SUBHOOK','KH09','SDIF',1000000000,NULL,0,0,0);
--- gom đủ batch (1 SI @ 2026-06-15) → ASSET_NAV READY → hook fire accrue
+-- (a) SET_SOURCE_READY ASSET_NAV READY → PHẢI KHÔNG accrue (đã gỡ hook eager)
 EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-06-15',@p_source='ASSET_NAV',@p_total_record=1,
      @p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'HOOK ASSET_NAV READY → accrue tự fire',
-  CASE WHEN @ec=0
-        AND EXISTS (SELECT 1 FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK' AND C_ACCRUED_ON='2026-06-15'
-              AND C_PERIOD='202606' AND C_DAYS=1) THEN 1 ELSE 0 END,
-  CONCAT('err=',@ec,' rows=',(SELECT COUNT(*) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK'));
+INSERT INTO @R SELECT '★ Sync ASSET_NAV READY KHÔNG accrue (hook đã gỡ)',
+  CASE WHEN NOT EXISTS (SELECT 1 FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK') THEN 1 ELSE 0 END,
+  CONCAT('rows=',(SELECT COUNT(*) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK'));
+-- (b) SP_EOD_RUN wiring 2 job phí + guard pluggable
+INSERT INTO @R SELECT '★ SP_EOD_RUN có J15_FEE_ACCRUE + J16_FEE_CLOSE (guard)',
+  CASE WHEN OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%J15_FEE_ACCRUE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%J16_FEE_CLOSE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%SP_EOD_FEE_ACCRUE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_SET_SOURCE_READY')) NOT LIKE '%SP_EOD_FEE_ACCRUE%' THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
   KẾT QUẢ
