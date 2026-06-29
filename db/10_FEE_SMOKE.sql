@@ -139,6 +139,28 @@ INSERT INTO @R SELECT 'CLOSE daily 202604=CLOSED, 202605=ACCRUED',
         AND (SELECT C_STATUS FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202605')='ACCRUED' THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
+  2b) BẤT BIẾN SAU CHỐT (no-delete) — re-accrue Apr29 SAU khi đã CLOSE 202604:
+      daily 202604 (CLOSED) PHẢI giữ nguyên (fee + status), KHÔNG bị xoá/đổi.
+      (Bug DELETE cũ: re-accrue sẽ xoá sạch daily đã chốt → mất backing của charge.)
+==============================================================================*/
+DECLARE @feeBefore DECIMAL(20,6) = (SELECT C_FEE_AMOUNT FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202604');
+EXEC SP_EOD_FEE_ACCRUE '2026-04-29',@p_rows=@rows OUTPUT;   -- re-accrue sau close
+INSERT INTO @R SELECT '★ Re-accrue sau CLOSE: daily 202604 BẤT BIẾN',
+  CASE WHEN (SELECT COUNT(*) FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202604')=1
+        AND (SELECT C_STATUS     FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202604')='CLOSED'
+        AND (SELECT C_FEE_AMOUNT FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202604')=@feeBefore THEN 1 ELSE 0 END,
+  CONCAT('fee giữ=',@feeBefore);
+-- 202605 (ACCRUED, chưa chốt) thì VẪN được cập nhật tại chỗ → còn đúng 1 dòng, không nhân đôi
+INSERT INTO @R SELECT '★ Re-accrue: 202605 (ACCRUED) update tại chỗ, không nhân đôi',
+  CASE WHEN (SELECT COUNT(*) FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202605')=1
+        AND (SELECT C_STATUS FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX' AND C_PERIOD='202605')='ACCRUED' THEN 1 ELSE 0 END,
+  CONCAT('count=',(SELECT COUNT(*) FROM T_SI_FEE_DAILY WHERE C_SI_ACCOUNT='SUBX'));
+-- không có DELETE: tổng daily toàn bộ smoke không giảm bất thường (no VOID trong luồng thường)
+INSERT INTO @R SELECT '★ No VOID trong luồng thường (chỉ orphan calendar mới VOID)',
+  CASE WHEN (SELECT COUNT(*) FROM T_SI_FEE_DAILY WHERE C_STATUS='VOID')=0 THEN 1 ELSE 0 END,
+  CONCAT('void=',(SELECT COUNT(*) FROM T_SI_FEE_DAILY WHERE C_STATUS='VOID'));
+
+/*==============================================================================
   3) COLLECT — FIFO theo SI, all-or-nothing per món, gác số dư cash
      SUBX : thêm món cũ 202603 due=50,000 + 202604 due=82,192. Cash=60,000
             → FIFO: 202603 (cum 50,000 ≤ 60,000)✓; 202604 (cum 132,192 > 60,000)✗ → chỉ 202603
