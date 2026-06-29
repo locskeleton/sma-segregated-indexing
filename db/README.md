@@ -26,11 +26,14 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 02_SP_ENGINE.sql   -- engine core: UDF + SP_EOD_* + master SP_EOD_RUN + dispatcher SP_EOD_STEP
 05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho UI riêng SDI (BRD 2026-06-22: gỡ 2 producer SP_GET_ASSET_SNAPSHOT + _MASTER_SNAPSHOT; GIỮ SP_GET_ASSET_INDEX_SNAPSHOT — đẩy Master Index khi BO price-ready)
 06_PM_API.sql      -- read API PM (master-keyed): UDF_PM_CONFIG + SP_GET_MASTER_*/PM_OVERVIEW_ALL + SP_SET_MASTER_PM_CONFIG
+09_FEE.sql         -- phí QL: lịch GD (T_TRADING_HOLIDAY+UDF) + 4 bảng phí + accrue/close/collect/BO-result. Hook đồng bộ Asset (SP_EOD_SET_SOURCE_READY 'ASSET_NAV' READY → accrue+close, guard OBJECT_ID = pluggable)
 03_SMOKE.sql       -- smoke test core (1 SI, 1 KH, 4 phiên) — verify số đúng
 07_PM_SMOKE.sql    -- smoke PM (1 master × 3 KH × 3 phiên) — verify AUM-weighted/TE/deviation/dist/top-N
+10_FEE_SMOKE.sql   -- smoke phí (case 30/4-1/5 tách 2 dòng + FIFO collect + BO result + hook) — cần 09
 04_BENCH.sql       -- (benchmark) seed dataset lớn theo scale + chạy EOD — dùng qua bench.ps1
 ```
 (`05_API`/`06_PM_API` chạy sau `02` — read-only, không cần cho EOD/bench; cần cho API. `07_PM_SMOKE` cần `06`.)
+(`09_FEE` chạy sau `02` — phí tách riêng AUM; hook trong `SP_EOD_SET_SOURCE_READY` resolve runtime qua deferred-name nên KHÔNG cài `09` thì EOD vẫn chạy (guard skip fee). `10_FEE_SMOKE` cần `09`.)
 (Tùy chọn `00_INFRA.sql` — DBA: filegroups, partition function/scheme, RCSI, resource governor — xem `docs/SDI-db-architecture.md`.)
 
 ## Benchmark perf (theo dõi regression sau refactor)

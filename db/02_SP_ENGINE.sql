@@ -901,6 +901,20 @@ BEGIN
     UPDATE T_EOD_PIPELINE SET C_OVERALL_STATUS='READY'
     WHERE C_BUSINESS_DATE=@p_business_date AND C_MKT_DATA_STATUS='READY' AND C_FO_INGEST_STATUS='READY'
       AND C_ASSET_NAV_STATUS='READY' AND C_OVERALL_STATUS='WAITING_DATA';
+
+    -- [BRD fee] HOOK luồng đồng bộ tài sản: ASSET_NAV gom đủ batch (READY) = AUM@d hoàn tất →
+    --   tính phí QL hàng ngày (look-forward) + chốt kỳ (no-op nếu chưa ngày GD cuối tháng). Cả 2 idempotent
+    --   (re-ingest ngày cũ → SET_SOURCE_READY lại → re-accrue trên AUM đã sửa). Module 09_FEE PLUGGABLE:
+    --   guard OBJECT_ID → chưa cài 09_FEE thì bỏ qua (03_SMOKE/04_BENCH không load 09 vẫn chạy). COLLECT
+    --   KHÔNG ở đây (emit RS payload sang BO → app/orchestrator gọi SP_FEE_COLLECT post-sync rồi forward BO).
+    IF @p_source='ASSET_NAV'
+       AND (SELECT C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)='READY'
+       AND OBJECT_ID('dbo.SP_EOD_FEE_ACCRUE','P') IS NOT NULL
+    BEGIN
+        DECLARE @feeRows BIGINT;
+        EXEC SP_EOD_FEE_ACCRUE   @p_business_date, @p_rows=@feeRows OUTPUT;
+        EXEC SP_FEE_CLOSE_PERIOD @p_business_date, @p_rows=@feeRows OUTPUT;
+    END
     END TRY
     BEGIN CATCH
         IF @p_err_code=0 BEGIN SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END
