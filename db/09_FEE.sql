@@ -96,7 +96,7 @@ CREATE TABLE T_SI_FEE_BALANCE (
     C_RATE           DECIMAL(10,6) NOT NULL,
     C_DAY_COUNT      INT           NOT NULL,
     C_FEE_AMOUNT     DECIMAL(20,6) NOT NULL,   -- = AUM × rate/day_count × C_DAYS (thập phân, KHÔNG round)
-    C_STATUS         VARCHAR(10)   NOT NULL CONSTRAINT DF_SI_FEE_BALANCE_ST DEFAULT 'ACCRUED', -- ACCRUED|CLOSED|VOID
+    C_STATUS         BIT           NOT NULL CONSTRAINT DF_SI_FEE_BALANCE_ST DEFAULT 1, -- 1=hợp lệ (vào charge) | 0=invalid (mồ côi/loại). "Đã thu khóa" suy từ T_SI_FEE_CHARGE.C_STATUS='PAID'.
     CONSTRAINT PK_SI_FEE_BALANCE PRIMARY KEY CLUSTERED (C_SI_FEE_BAL_ID),
     CONSTRAINT UQ_SI_FEE_BALANCE_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_BALANCE),
     CONSTRAINT UQ_SI_FEE_BALANCE_NK UNIQUE (C_SI_ACCOUNT, C_FROM_DATE),   -- idempotency: 1 dải/SI bắt đầu 1 ngày
@@ -196,12 +196,13 @@ GO
     Dải = [@p_d, ngày_GD_kế) ngày dương lịch (look-FORWARD). TÁCH theo ranh giới THÁNG → mỗi
     tháng 1 dòng. AUM = AUM cuối @p_d (T_SI_BALANCE); rate = eff @seg_start (T_SI_FEE_RATE).
     fee = AUM × rate/day_count × #ngày (= DATEDIFF(from,to)+1).
-    ── AN TOÀN GD THẬT (KHÔNG DELETE) ──────────────────────────────────────────
+    ── AN TOÀN GD THẬT (KHÔNG DELETE + KHÔNG ĐÈ DỮ LIỆU ĐÃ THU) ─────────────────
     Idempotent bằng MERGE upsert trên natural key (SI, C_FROM_DATE):
-      • MATCHED + C_STATUS='ACCRUED' → cập nhật TẠI CHỖ (giữ PK/GUID + audit), KHÔNG xoá-tạo lại.
-      • MATCHED + C_STATUS='CLOSED'  → BỎ QUA (bất biến sau chốt — không đụng phí đã/đang thu).
-      • NOT MATCHED → insert dải mới.
-      • Mồ côi (calendar đổi giữa 2 lần accrue, segment cũ không còn) → đánh 'VOID' (KHÔNG xoá).
+      • ĐÃ THU BÊN BO (kỳ có T_SI_FEE_CHARGE.C_STATUS='PAID') → KHÓA: KHÔNG update / insert / void.
+        (re-run EOD quá khứ KHÔNG đè được phí đã thu — detail luôn khớp số đã cắt.)
+      • MATCHED + C_STATUS=1 (hợp lệ) + kỳ CHƯA thu → cập nhật TẠI CHỖ (giữ PK/GUID + audit).
+      • NOT MATCHED + kỳ CHƯA thu → insert dải mới.
+      • Mồ côi (calendar đổi, segment cũ không còn; kỳ chưa thu) → đánh C_STATUS=0 (KHÔNG xoá).
 ============================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_FEE_ACCRUE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -226,7 +227,12 @@ BEGIN
            DATEDIFF(DAY, g.seg_start, g.seg_end) + 1 AS C_DAYS, rt.C_RATE, rt.C_DAY_COUNT,
            CAST(CAST(CAST(b.C_AUM AS DECIMAL(38,6)) * rt.C_RATE
                 * (DATEDIFF(DAY, g.seg_start, g.seg_end) + 1) AS DECIMAL(38,12))
-                / rt.C_DAY_COUNT AS DECIMAL(20,6)) AS C_FEE_AMOUNT   -- cast tích scale 12 TRƯỚC khi chia → 6-dp chuẩn
+                / rt.C_DAY_COUNT AS DECIMAL(20,6)) AS C_FEE_AMOUNT,   -- cast tích scale 12 TRƯỚC khi chia → 6-dp chuẩn
+           -- KHÓA: kỳ của dải này đã THU bên BO (charge PAID) chưa? đã thu → bỏ qua mọi thao tác.
+           CAST(CASE WHEN EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c
+                       WHERE c.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+                         AND c.C_PERIOD=CONVERT(CHAR(6), g.seg_start, 112)
+                         AND c.C_STATUS='PAID') THEN 1 ELSE 0 END AS BIT) AS is_paid
     INTO #src
     FROM seg g
     CROSS JOIN T_SI_BALANCE b
@@ -236,25 +242,26 @@ BEGIN
                  ORDER BY r.C_EFFECTIVE_FROM DESC) rt
     WHERE b.C_BUSINESS_DATE=@p_d AND rt.C_RATE IS NOT NULL;   -- rate NULL = SI không thu phí
 
-    -- UPSERT (no-delete) trên UQ_SI_FEE_BALANCE_NK (SI, C_FROM_DATE).
+    -- UPSERT (no-delete) trên UQ_SI_FEE_BALANCE_NK (SI, C_FROM_DATE). is_paid=1 → KHÓA (không thao tác).
     MERGE T_SI_FEE_BALANCE AS tgt
     USING #src AS src
       ON tgt.C_SI_ACCOUNT = src.C_SI_ACCOUNT AND tgt.C_FROM_DATE = src.C_FROM_DATE
-    WHEN MATCHED AND tgt.C_STATUS='ACCRUED' THEN      -- CHỈ sửa dòng chưa chốt; CLOSED bất biến
+    WHEN MATCHED AND tgt.C_STATUS=1 AND src.is_paid=0 THEN      -- hợp lệ + kỳ CHƯA thu → update tại chỗ
         UPDATE SET C_TO_DATE=src.C_TO_DATE, C_ACCRUED_ON=src.C_ACCRUED_ON, C_CUST_CODE=src.C_CUST_CODE,
                    C_MASTER_CODE=src.C_MASTER_CODE, C_PERIOD=src.C_PERIOD, C_AUM=src.C_AUM, C_DAYS=src.C_DAYS,
                    C_RATE=src.C_RATE, C_DAY_COUNT=src.C_DAY_COUNT, C_FEE_AMOUNT=src.C_FEE_AMOUNT
-    WHEN NOT MATCHED BY TARGET THEN
+    WHEN NOT MATCHED BY TARGET AND src.is_paid=0 THEN          -- dải mới + kỳ CHƯA thu → insert
         INSERT (C_FROM_DATE,C_TO_DATE,C_ACCRUED_ON,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_PERIOD,C_AUM,C_DAYS,C_RATE,C_DAY_COUNT,C_FEE_AMOUNT)
         VALUES (src.C_FROM_DATE,src.C_TO_DATE,src.C_ACCRUED_ON,src.C_SI_ACCOUNT,src.C_CUST_CODE,src.C_MASTER_CODE,src.C_PERIOD,src.C_AUM,src.C_DAYS,src.C_RATE,src.C_DAY_COUNT,src.C_FEE_AMOUNT);
     SET @p_rows = @@ROWCOUNT;
 
-    -- Mồ côi: dòng accrue ngày @p_d, đang ACCRUED, KHÔNG còn trong segment set hiện tại (calendar đổi)
-    --   → đánh 'VOID' (zeroed, loại khỏi chốt kỳ) thay vì DELETE. Dùng index IX_SI_FEE_BALANCE_ACCRUED.
-    UPDATE d SET d.C_STATUS='VOID', d.C_FEE_AMOUNT=0
+    -- Mồ côi: dòng accrue ngày @p_d, đang hợp lệ (=1), KHÔNG còn trong segment set hiện tại (calendar đổi)
+    --   VÀ kỳ CHƯA thu → đánh C_STATUS=0 (zeroed, loại khỏi tổng) thay vì DELETE. Kỳ đã PAID → giữ nguyên.
+    UPDATE d SET d.C_STATUS=0, d.C_FEE_AMOUNT=0
     FROM T_SI_FEE_BALANCE d
-    WHERE d.C_ACCRUED_ON=@p_d AND d.C_STATUS='ACCRUED'
-      AND NOT EXISTS (SELECT 1 FROM #src s WHERE s.C_SI_ACCOUNT=d.C_SI_ACCOUNT AND s.C_FROM_DATE=d.C_FROM_DATE);
+    WHERE d.C_ACCRUED_ON=@p_d AND d.C_STATUS=1
+      AND NOT EXISTS (SELECT 1 FROM #src s WHERE s.C_SI_ACCOUNT=d.C_SI_ACCOUNT AND s.C_FROM_DATE=d.C_FROM_DATE)
+      AND NOT EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c WHERE c.C_SI_ACCOUNT=d.C_SI_ACCOUNT AND c.C_PERIOD=d.C_PERIOD AND c.C_STATUS='PAID');
 
     DROP TABLE #src;
 END
@@ -262,7 +269,7 @@ GO
 
 /*============================================================================
   SP_FEE_CLOSE_PERIOD @p_d — chốt kỳ (tháng) TREO nợ. CHỉ chạy khi @p_d là NGÀY GD
-    CUỐI THÁNG (ngày GD kế sang tháng khác). Gom daily kỳ này (loại VOID) per-SI → T_SI_FEE_CHARGE.
+    CUỐI THÁNG (ngày GD kế sang tháng khác). Gom dải HỢP LỆ (C_STATUS=1) kỳ này per-SI → T_SI_FEE_CHARGE.
     ── AN TOÀN GD THẬT (KHÔNG DELETE) ──────────────────────────────────────────
     Re-close idempotent bằng MERGE upsert trên (SI, period):
       • MATCHED + UNPAID + CHƯA gửi BO (C_BO_EVENT_ID NULL) → cập nhật số chốt tại chỗ.
@@ -281,7 +288,7 @@ BEGIN
     ;WITH agg AS (
         SELECT C_SI_ACCOUNT, MAX(C_CUST_CODE) cust, MAX(C_MASTER_CODE) mc,
                SUM(C_FEE_AMOUNT) total, MIN(C_FROM_DATE) pf, MAX(C_TO_DATE) pt
-        FROM T_SI_FEE_BALANCE WHERE C_PERIOD=@period AND C_STATUS<>'VOID' GROUP BY C_SI_ACCOUNT
+        FROM T_SI_FEE_BALANCE WHERE C_PERIOD=@period AND C_STATUS=1 GROUP BY C_SI_ACCOUNT   -- chỉ dải hợp lệ
         HAVING SUM(C_FEE_AMOUNT) > 0
     )
     MERGE T_SI_FEE_CHARGE AS tgt
@@ -293,8 +300,7 @@ BEGIN
         INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_PERIOD,C_PERIOD_FROM,C_PERIOD_TO,C_FEE_TOTAL,C_FEE_DUE)
         VALUES (src.C_SI_ACCOUNT,src.cust,src.mc,@period,src.pf,src.pt,src.total,CAST(ROUND(src.total,0) AS DECIMAL(20,0)));
     SET @p_rows = @@ROWCOUNT;
-
-    UPDATE T_SI_FEE_BALANCE SET C_STATUS='CLOSED' WHERE C_PERIOD=@period AND C_STATUS='ACCRUED';   -- đóng băng dải kỳ
+    -- (KHÔNG còn mark CLOSED trên balance: "đã chốt/đã thu" suy từ T_SI_FEE_CHARGE; accrue khóa theo charge PAID.)
 END
 GO
 
