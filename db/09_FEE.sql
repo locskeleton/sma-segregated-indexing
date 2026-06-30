@@ -122,7 +122,7 @@ CREATE TABLE T_SI_FEE_CHARGE (
     C_STATUS         VARCHAR(10)   NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_ST DEFAULT 'UNPAID', -- UNPAID|PAID
     C_CLOSED_AT      DATETIME      NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_CL DEFAULT GETDATE(),
     C_COLLECTED_AT   DATETIME      NULL,
-    C_BO_EVENT_ID    VARCHAR(64)   NULL,       -- event gửi BO lần thu gần nhất (map kết quả)
+    C_BO_EVENT_ID    VARCHAR(64)   NULL,       -- REQUEST ID gửi BO (unique/món = 1 bút toán); BO echo lại id này + trạng thái → map kết quả (KHÔNG cần period)
     CONSTRAINT PK_SI_FEE_CHARGE PRIMARY KEY CLUSTERED (PK_SI_FEE_CHARGE),
     CONSTRAINT UQ_SI_FEE_CHARGE_NK UNIQUE (C_SI_ACCOUNT, C_PERIOD)
 );
@@ -305,16 +305,17 @@ END
 GO
 
 /*============================================================================
-  SP_FEE_COLLECT @p_d, @p_event_id — thu nợ FIFO (mỗi NGÀY GD). Per-SI: số dư khả dụng
-    (T_SI_CURRENT.C_CASH); FIFO kỳ cũ→mới; món đủ tiền (cộng dồn ≤ số dư) → đưa vào event;
-    thiếu → skip (không cắt lẻ). Đánh dấu C_BO_EVENT_ID; trả RS payload gửi BO. KHÔNG mark PAID
-    (chờ SP_INGEST_FEE_COLLECT_RESULT). Chỉ chạy ngày GD (caller gác).
+  SP_FEE_COLLECT @p_d, @p_batch_id — thu nợ FIFO (mỗi NGÀY GD). Per-SI: số dư khả dụng
+    (T_SI_CURRENT.C_CASH); FIFO kỳ cũ→mới; món đủ tiền (cộng dồn ≤ số dư) → đưa vào lệnh thu;
+    thiếu → skip (không cắt lẻ). Mỗi món sinh 1 REQUEST ID UNIQUE (= 1 bút toán), lưu C_BO_EVENT_ID;
+    trả RS payload gửi BO. KHÔNG mark PAID (chờ SP_INGEST_FEE_COLLECT_RESULT). Chỉ chạy ngày GD.
+    @p_batch_id = prefix gom lô (trace), tùy chọn; id thật vẫn unique/món.
 ============================================================================*/
-CREATE OR ALTER PROCEDURE SP_FEE_COLLECT @p_d DATE, @p_event_id VARCHAR(64) = NULL, @p_rows BIGINT = NULL OUTPUT
+CREATE OR ALTER PROCEDURE SP_FEE_COLLECT @p_d DATE, @p_batch_id VARCHAR(40) = NULL, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF @p_event_id IS NULL SET @p_event_id = CONVERT(VARCHAR(64), CONVERT(CHAR(8),@p_d,112)) + '-' + LEFT(REPLACE(CONVERT(VARCHAR(36),NEWID()),'-',''),12);
+    DECLARE @batch VARCHAR(40) = ISNULL(@p_batch_id, CONVERT(CHAR(8),@p_d,112));
 
     ;WITH unpaid AS (
         SELECT fp.PK_SI_FEE_CHARGE, fp.C_SI_ACCOUNT, fp.C_CUST_CODE, fp.C_MASTER_CODE, fp.C_PERIOD, fp.C_FEE_DUE,
@@ -324,23 +325,28 @@ BEGIN
         INNER JOIN T_SI_CURRENT nc ON nc.C_SI_ACCOUNT=fp.C_SI_ACCOUNT
         WHERE fp.C_STATUS='UNPAID' AND fp.C_FEE_DUE > 0
     )
-    SELECT PK_SI_FEE_CHARGE, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, C_PERIOD, C_FEE_DUE
+    SELECT PK_SI_FEE_CHARGE, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, C_PERIOD, C_FEE_DUE,
+           -- REQUEST ID = id/bút toán gửi BO, UNIQUE mỗi món (BO echo lại để map kết quả). prefix lô + GUID/row.
+           CONCAT(@batch, '-', LEFT(REPLACE(CONVERT(VARCHAR(36),NEWID()),'-',''),20)) AS C_REQUEST_ID
     INTO #tc
     FROM unpaid WHERE cum_due <= avail;   -- FIFO greedy: prefix kỳ cũ nhất phủ trong số dư
 
-    UPDATE fp SET fp.C_BO_EVENT_ID=@p_event_id
+    UPDATE fp SET fp.C_BO_EVENT_ID = t.C_REQUEST_ID   -- lưu request id/món → map kết quả BO theo id
     FROM T_SI_FEE_CHARGE fp INNER JOIN #tc t ON t.PK_SI_FEE_CHARGE=fp.PK_SI_FEE_CHARGE;
 
     SET @p_rows = (SELECT COUNT(*) FROM #tc);
-    -- RS payload gửi BO (FIFO)
-    SELECT @p_event_id AS C_BO_EVENT_ID, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, C_PERIOD, C_FEE_DUE
+    -- RS payload gửi BO: MỖI MÓN 1 request id (BO trả lại id này + trạng thái bút toán)
+    SELECT C_REQUEST_ID, C_SI_ACCOUNT, C_CUST_CODE, C_MASTER_CODE, C_PERIOD, C_FEE_DUE
     FROM #tc ORDER BY C_SI_ACCOUNT, C_PERIOD;
 END
 GO
 
 /*============================================================================
-  SP_INGEST_FEE_COLLECT_RESULT — BO trả kết quả cắt. collected=1 → PAID; 0 → giữ UNPAID (retry).
-    JSON: [{"si_account","period","collected"(0|1),"amount"}]
+  SP_INGEST_FEE_COLLECT_RESULT — BO trả kết quả thu. Map theo REQUEST ID (= id SDI gửi ở
+    SP_FEE_COLLECT, lưu C_BO_EVENT_ID), KÈM trạng thái bút toán. KHÔNG có period/si_account.
+    collected=1 (bút toán cắt thành công) → PAID (số cắt = amount nếu BO gửi, mặc định = C_FEE_DUE
+      vì all-or-nothing). collected=0 (thất bại) → giữ UNPAID + clear C_BO_EVENT_ID (lần sau quét lại).
+    JSON: [{"request_id":"<id SDI đã gửi>","collected":0|1,"amount":<tùy chọn>}]
 ============================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_FEE_COLLECT_RESULT
     @p_json     NVARCHAR(MAX),
@@ -351,18 +357,20 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
-        DECLARE @res TABLE (C_SI_ACCOUNT VARCHAR(20), C_PERIOD CHAR(6), C_COLLECTED BIT, C_AMOUNT DECIMAL(20,0));
+        DECLARE @res TABLE (C_REQUEST_ID VARCHAR(64) NOT NULL, C_COLLECTED BIT, C_AMOUNT DECIMAL(20,0) NULL);
         INSERT @res
-        SELECT j.si_account, j.period, ISNULL(j.collected,0), ISNULL(j.amount,0)
-        FROM OPENJSON(@p_json) WITH (si_account VARCHAR(20) '$.si_account', period CHAR(6) '$.period',
-                                     collected BIT '$.collected', amount DECIMAL(20,0) '$.amount') j;
+        SELECT j.request_id, ISNULL(j.collected,0), j.amount
+        FROM OPENJSON(@p_json) WITH (request_id VARCHAR(64) '$.request_id',
+                                     collected BIT '$.collected', amount DECIMAL(20,0) '$.amount') j
+        WHERE j.request_id IS NOT NULL;
         BEGIN TRAN;
-        UPDATE fp SET fp.C_STATUS='PAID', fp.C_FEE_PAID=r.C_AMOUNT, fp.C_COLLECTED_AT=GETDATE()
-        FROM T_SI_FEE_CHARGE fp INNER JOIN @res r ON r.C_SI_ACCOUNT=fp.C_SI_ACCOUNT AND r.C_PERIOD=fp.C_PERIOD
+        -- cắt thành công → PAID (map theo request id = C_BO_EVENT_ID); số cắt mặc định = C_FEE_DUE (all-or-nothing)
+        UPDATE fp SET fp.C_STATUS='PAID', fp.C_FEE_PAID=ISNULL(r.C_AMOUNT, fp.C_FEE_DUE), fp.C_COLLECTED_AT=GETDATE()
+        FROM T_SI_FEE_CHARGE fp INNER JOIN @res r ON r.C_REQUEST_ID = fp.C_BO_EVENT_ID
         WHERE r.C_COLLECTED=1 AND fp.C_STATUS='UNPAID';
-        -- không cắt → bỏ event id để lần thu sau quét lại
+        -- thất bại → giữ UNPAID, clear request id để lần thu sau quét lại
         UPDATE fp SET fp.C_BO_EVENT_ID=NULL
-        FROM T_SI_FEE_CHARGE fp INNER JOIN @res r ON r.C_SI_ACCOUNT=fp.C_SI_ACCOUNT AND r.C_PERIOD=fp.C_PERIOD
+        FROM T_SI_FEE_CHARGE fp INNER JOIN @res r ON r.C_REQUEST_ID = fp.C_BO_EVENT_ID
         WHERE r.C_COLLECTED=0 AND fp.C_STATUS='UNPAID';
         COMMIT;
     END TRY
