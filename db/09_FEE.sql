@@ -377,3 +377,21 @@ BEGIN
     BEGIN CATCH IF @@TRANCOUNT>0 ROLLBACK; SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE(); END CATCH
 END
 GO
+
+/*============================================================================
+  UDF_SI_FEE_DEBT — NỢ PHÍ QL của 1 SI TẠI THỜI ĐIỂM HIỆN TẠI (VND, DECIMAL(20,0)).
+    = tổng phí ĐÃ CHỐT KỲ nhưng CHƯA THU = Σ(C_FEE_DUE − C_FEE_PAID) các kỳ UNPAID
+      trong T_SI_FEE_CHARGE. (Thu all-or-nothing nên UNPAID ⇒ C_FEE_PAID=0; trừ PAID cho chắc.)
+    KHÔNG gồm phí kỳ hiện tại đang TÍCH LŨY (T_SI_FEE_BALANCE chưa chốt) — đó là accrued,
+      chưa treo thành nợ. Cần cả phần tích lũy → xem UDF_SI_FEE_ACCRUING (tách riêng).
+    Trả 0 nếu SI không nợ / không tồn tại. Scalar → nhúng inline: WHERE dbo.UDF_SI_FEE_DEBT(si) > 0.
+============================================================================*/
+CREATE OR ALTER FUNCTION UDF_SI_FEE_DEBT (@p_si_account VARCHAR(20))
+RETURNS DECIMAL(20,0)
+AS
+BEGIN
+    RETURN ISNULL((SELECT SUM(C_FEE_DUE - C_FEE_PAID)
+                   FROM T_SI_FEE_CHARGE
+                   WHERE C_SI_ACCOUNT = @p_si_account AND C_STATUS = 'UNPAID'), 0);
+END
+GO

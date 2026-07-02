@@ -225,6 +225,21 @@ INSERT INTO @R SELECT 'INGEST by request_id collected=0 → UNPAID + req id clea
         AND (SELECT C_BO_EVENT_ID FROM T_SI_FEE_CHARGE WHERE C_SI_ACCOUNT='SUBONE' AND C_PERIOD='202604') IS NULL THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
+  4b) UDF_SI_FEE_DEBT — nợ phí (đã chốt chưa thu) tại hiện tại.
+      SUBX: kỳ 202603 PAID + kỳ 202604 UNPAID(due 82192) → nợ = 82192.
+      SUBLOCK: 202603 PAID → nợ = 0.  SUBONE: 202604 UNPAID(due 41096) → nợ = 41096.
+==============================================================================*/
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBX = 82192 (còn nợ 202604)',
+  CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBX') = 82192 THEN 1 ELSE 0 END,
+  CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBX'));
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBLOCK = 0 (đã thu hết)',
+  CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBLOCK') = 0 THEN 1 ELSE 0 END,
+  CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBLOCK'));
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBONE = 41096 (chưa thu)',
+  CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBONE') = 41096 THEN 1 ELSE 0 END,
+  CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBONE'));
+
+/*==============================================================================
   5) WIRING EOD — phí chốt trong SP_EOD_RUN (J15/J16), KHÔNG eager trong luồng sync.
      (a) SP_EOD_SET_SOURCE_READY 'ASSET_NAV' READY KHÔNG còn tự accrue (hook đã gỡ).
      (b) SP_EOD_RUN có 2 job J15_FEE_ACCRUE + J16_FEE_CLOSE, guard OBJECT_ID pluggable.
