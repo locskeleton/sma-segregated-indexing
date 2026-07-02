@@ -220,14 +220,17 @@ GO
 /*===========================================================================
   [thin-layer] SP_INGEST_ASSET_NAV — Asset gửi per-SI qua Kafka BATCH (≤100 item/msg) → GHI THẲNG
   T_SI_BALANCE (aum/daily_return/cash/cash_in/cash_out) + roll-forward T_SI_CURRENT. KHÔNG landing-table/compute.
-  Idempotent (DELETE+INSERT theo date,si → re-ingest/correction = gửi lại). Validate: si registry + aum/cash NOT NULL.
+  Idempotent (DELETE+INSERT theo date,si → re-ingest/correction = gửi lại).
+  [BRD] Asset đẩy CẢ indexing acc KHÔNG thuộc SDI → BỎ QUA (chỉ nhận SI có trong registry T_SI_PORTFOLIO,
+    acc lạ tự bị lọc qua INNER JOIN — KHÔNG reject batch). Validate NOT NULL aum/cash CHỈ cho SI thuộc SDI.
   JSON: [{"si_account","aum","daily_return"(NULL ngày đầu),"cash"(TỔNG tiền 1 số),"cash_in","cash_out"}, ...]
-  err: 0 OK · 20 JSON sai · 21 validate FAIL · -1 runtime.
-  ALL-OR-NOTHING: validate TRƯỚC (ngoài tran) + ghi trong BEGIN TRAN + XACT_ABORT ON → err=0 ⟺ ghi ĐỦ;
+  err: 0 OK · 20 JSON sai · 21 thiếu aum/cash (SI thuộc SDI) · -1 runtime.
+  ALL-OR-NOTHING: validate TRƯỚC (ngoài tran) + ghi trong BEGIN TRAN + XACT_ABORT ON → err=0 ⟺ ghi ĐỦ (SI thuộc SDI);
     err≠0 ⟺ ghi 0 (rollback). si_account TRÙNG trong batch → vỡ PK @src → từ chối cả batch (0).
-  @p_rows OUTPUT = SỐ DÒNG SI đã COMMIT (0 nếu lỗi). C# đối chiếu per-batch: gửi N item → PHẢI err=0 & @p_rows=N.
-    (Mark job sync DONE ở tầng SET: SP_EOD_SET_SOURCE_READY 'ASSET_NAV' @p_total_record=<tổng SI> → READY khi
-     COUNT(DISTINCT si @date) ≥ total. Re-ingest idempotent nên gửi lại không làm phồng distinct-count.)
+  @p_rows OUTPUT = SỐ SI THUỘC SDI đã COMMIT (0 nếu lỗi); có thể < #item Asset gửi (acc lạ bị bỏ qua) → KHÔNG
+    dùng để đối chiếu "gửi==ghi". ĐỦ/THIẾU dùng completeness gate: SP_EOD_SET_SOURCE_READY 'ASSET_NAV'
+    @p_total_record=<tổng SI ACTIVE của SDI> → READY khi COUNT(DISTINCT si @date) ≥ total (+ EOD err=12 chặn nếu
+    còn SI ACTIVE thiếu balance). Re-ingest idempotent nên gửi lại không phồng distinct-count.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_ASSET_NAV
     @p_json          NVARCHAR(MAX),
@@ -254,10 +257,13 @@ BEGIN
             cash DECIMAL(20,0) '$.cash',
             cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out') j;
 
-        IF EXISTS (SELECT 1 FROM @src WHERE C_SI_ACCOUNT IS NULL OR C_AUM IS NULL OR C_CASH IS NULL)
-            BEGIN SET @p_err_code=21; SET @p_err_msg=N'Thiếu si_account/aum/cash'; RETURN; END
-        IF EXISTS (SELECT 1 FROM @src s WHERE NOT EXISTS (SELECT 1 FROM T_SI_PORTFOLIO p WHERE p.C_SI_ACCOUNT=s.C_SI_ACCOUNT))
-            BEGIN SET @p_err_code=21; SET @p_err_msg=N'si_account chưa đăng ký registry (T_SI_PORTFOLIO)'; RETURN; END
+        -- [BRD] Asset đẩy CẢ indexing acc KHÔNG có trên SDI → BỎ QUA (KHÔNG reject batch). SDI chỉ nhận SI
+        --   có trong registry (T_SI_PORTFOLIO) qua INNER JOIN bên dưới; acc lạ tự bị lọc. "Đủ/thiếu" do
+        --   completeness gate lo (SP_EOD_SET_SOURCE_READY 'ASSET_NAV' + EOD err=12), KHÔNG check tồn tại ở đây.
+        -- Validate NOT NULL CHỈ trên SI ĐƯỢC NHẬN (thuộc SDI) — acc lạ không cần data sạch.
+        IF EXISTS (SELECT 1 FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT
+                   WHERE s.C_AUM IS NULL OR s.C_CASH IS NULL)
+            BEGIN SET @p_err_code=21; SET @p_err_msg=N'Thiếu aum/cash cho SI thuộc SDI'; RETURN; END
 
         BEGIN TRAN;
         -- [thin-layer] GHI THẲNG T_SI_BALANCE (history) — KHÔNG qua landing-table/compute. Idempotent (DELETE+INSERT
@@ -268,8 +274,8 @@ BEGIN
             C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_IN,C_CASH_OUT)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
                s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_IN, s.C_CASH_OUT
-        FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;
-        SET @p_rows = @@ROWCOUNT;   -- #dòng SI ghi vào balance (= #item batch hợp lệ) → C# đối chiếu = #item gửi
+        FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;   -- INNER JOIN lọc acc lạ (Asset đẩy dư)
+        SET @p_rows = @@ROWCOUNT;   -- #SI THUỘC SDI đã ghi (≤ #item Asset gửi, vì acc lạ bị bỏ qua)
 
         -- roll-forward T_SI_CURRENT (aum+cash). CHỈ khi @ngày >= ngày current hiện có (re-ingest quá khứ KHÔNG lùi current).
         MERGE T_SI_CURRENT t
