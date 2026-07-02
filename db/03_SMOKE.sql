@@ -35,6 +35,13 @@ EXEC SP_EOD_SET_SOURCE_READY '2026-01-02','FO_INGEST',1,NULL,@ec OUTPUT,@em OUTP
 EXEC SP_EOD_RUN '2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;
 IF @ec<>0 PRINT CONCAT('  !!! EOD 02 ec=',@ec,' ',@em);
 
+-- [BRD reconcile C#] SP_INGEST_ASSET_NAV @p_rows = #dòng SI đã ghi (all-or-nothing) → C# đối chiếu batch.
+DECLARE @ir BIGINT;
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10000000,"daily_return":null,"cash":0,"cash_in":10000000,"cash_out":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT,@p_rows=@ir OUTPUT;   -- re-ingest idempotent (giữ nguyên số @02)
+IF @ec=0 AND @ir=1 PRINT '  OK ingest @p_rows=1 (gửi 1 SI → ghi 1)'; ELSE PRINT CONCAT('  !!! ingest rows: ec=',@ec,' rows=',@ir);
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","cash":0}]','2026-01-02',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT,@p_rows=@ir OUTPUT;   -- thiếu aum → validate FAIL trước tran
+IF @ec<>0 AND @ir=0 PRINT '  OK ingest lỗi → @p_rows=0 (all-or-nothing, 0 ghi)'; ELSE PRINT CONCAT('  !!! ingest fail: ec=',@ec,' rows=',@ir);
+
 -- DAY 05: thị trường tăng → Asset gửi aum=10.44tr, daily_return=0.044 (no flow)
 EXEC SP_INGEST_CUSTOMER N'{"cust_code":"KH001","business_date":"2026-01-05","sub_accounts":[{"si_account":"SUB001","holdings":[{"ticker":"AAA","quantity":60000,"avg_cost":100},{"ticker":"BBB","quantity":80000,"avg_cost":50}]}]}';
 EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":10440000,"daily_return":0.044,"cash":0,"cash_in":0,"cash_out":0}]','2026-01-05',@p_err_code=@ec OUTPUT,@p_err_msg=@em OUTPUT;

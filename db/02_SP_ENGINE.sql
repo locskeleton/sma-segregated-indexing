@@ -223,17 +223,23 @@ GO
   Idempotent (DELETE+INSERT theo date,si → re-ingest/correction = gửi lại). Validate: si registry + aum/cash NOT NULL.
   JSON: [{"si_account","aum","daily_return"(NULL ngày đầu),"cash"(TỔNG tiền 1 số),"cash_in","cash_out"}, ...]
   err: 0 OK · 20 JSON sai · 21 validate FAIL · -1 runtime.
+  ALL-OR-NOTHING: validate TRƯỚC (ngoài tran) + ghi trong BEGIN TRAN + XACT_ABORT ON → err=0 ⟺ ghi ĐỦ;
+    err≠0 ⟺ ghi 0 (rollback). si_account TRÙNG trong batch → vỡ PK @src → từ chối cả batch (0).
+  @p_rows OUTPUT = SỐ DÒNG SI đã COMMIT (0 nếu lỗi). C# đối chiếu per-batch: gửi N item → PHẢI err=0 & @p_rows=N.
+    (Mark job sync DONE ở tầng SET: SP_EOD_SET_SOURCE_READY 'ASSET_NAV' @p_total_record=<tổng SI> → READY khi
+     COUNT(DISTINCT si @date) ≥ total. Re-ingest idempotent nên gửi lại không làm phồng distinct-count.)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_ASSET_NAV
     @p_json          NVARCHAR(MAX),
     @p_business_date DATE,
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
-    @p_err_msg       NVARCHAR(400) OUTPUT
+    @p_err_msg       NVARCHAR(400) OUTPUT,
+    @p_rows          BIGINT        = NULL OUTPUT   -- #dòng SI đã ghi (commit). 0 nếu lỗi/rollback.
 AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
-    SET @p_err_code=0; SET @p_err_msg=NULL;
+    SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_rows=0;
     BEGIN TRY
         IF @p_business_date IS NULL BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
@@ -263,6 +269,7 @@ BEGIN
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
                s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_IN, s.C_CASH_OUT
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;
+        SET @p_rows = @@ROWCOUNT;   -- #dòng SI ghi vào balance (= #item batch hợp lệ) → C# đối chiếu = #item gửi
 
         -- roll-forward T_SI_CURRENT (aum+cash). CHỈ khi @ngày >= ngày current hiện có (re-ingest quá khứ KHÔNG lùi current).
         MERGE T_SI_CURRENT t
@@ -277,6 +284,7 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT>0 ROLLBACK;
+        SET @p_rows=0;   -- rollback → 0 dòng commit (all-or-nothing)
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
     END CATCH
 END
