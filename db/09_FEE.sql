@@ -379,19 +379,38 @@ END
 GO
 
 /*============================================================================
-  UDF_SI_FEE_DEBT — NỢ PHÍ QL của 1 SI TẠI THỜI ĐIỂM HIỆN TẠI (VND, DECIMAL(20,0)).
-    = tổng phí ĐÃ CHỐT KỲ nhưng CHƯA THU = Σ(C_FEE_DUE − C_FEE_PAID) các kỳ UNPAID
-      trong T_SI_FEE_CHARGE. (Thu all-or-nothing nên UNPAID ⇒ C_FEE_PAID=0; trừ PAID cho chắc.)
-    KHÔNG gồm phí kỳ hiện tại đang TÍCH LŨY (T_SI_FEE_BALANCE chưa chốt) — đó là accrued,
-      chưa treo thành nợ. Cần cả phần tích lũy → xem UDF_SI_FEE_ACCRUING (tách riêng).
-    Trả 0 nếu SI không nợ / không tồn tại. Scalar → nhúng inline: WHERE dbo.UDF_SI_FEE_DEBT(si) > 0.
+  UDF_SI_FEE_ACCRUING — phí QL kỳ HIỆN TẠI đang TÍCH LŨY (chưa chốt) của 1 SI (DECIMAL(20,6)).
+    = Σ C_FEE_AMOUNT các dải HỢP LỆ (C_STATUS=1) trong T_SI_FEE_BALANCE mà kỳ CHƯA có charge
+      (NOT EXISTS T_SI_FEE_CHARGE cùng SI+period = chưa tới ngày chốt). Số thập phân (chưa round VND).
+    Kỳ đã chốt → balance bị loại (đã nằm ở charge/nợ) → KHÔNG double-count với UDF_SI_FEE_DEBT.
 ============================================================================*/
-CREATE OR ALTER FUNCTION UDF_SI_FEE_DEBT (@p_si_account VARCHAR(20))
-RETURNS DECIMAL(20,0)
+CREATE OR ALTER FUNCTION UDF_SI_FEE_ACCRUING (@p_si_account VARCHAR(20))
+RETURNS DECIMAL(20,6)
 AS
 BEGIN
-    RETURN ISNULL((SELECT SUM(C_FEE_DUE - C_FEE_PAID)
-                   FROM T_SI_FEE_CHARGE
-                   WHERE C_SI_ACCOUNT = @p_si_account AND C_STATUS = 'UNPAID'), 0);
+    RETURN ISNULL((SELECT SUM(b.C_FEE_AMOUNT)
+                   FROM T_SI_FEE_BALANCE b
+                   WHERE b.C_SI_ACCOUNT = @p_si_account AND b.C_STATUS = 1
+                     AND NOT EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c
+                                     WHERE c.C_SI_ACCOUNT = b.C_SI_ACCOUNT AND c.C_PERIOD = b.C_PERIOD)), 0);
+END
+GO
+
+/*============================================================================
+  UDF_SI_FEE_DEBT — NỢ PHÍ QL của 1 SI TẠI THỜI ĐIỂM HIỆN TẠI (DECIMAL(20,6)).
+    = (A) nợ ĐÃ CHỐT KỲ chưa thu: Σ(C_FEE_DUE − C_FEE_PAID) kỳ UNPAID (T_SI_FEE_CHARGE, VND)
+    + (B) phí kỳ HIỆN TẠI đang TÍCH LŨY chưa chốt: UDF_SI_FEE_ACCRUING (thập phân, ước tính tới nay).
+    Phần (B) là ước tính (chưa chốt) → caller ROUND nếu cần hiển thị VND. Trả 0 nếu không nợ.
+    Chỉ cần phần đã treo (collectible) → dùng riêng: nợ = DEBT − ACCRUING (hoặc query UNPAID charge).
+============================================================================*/
+CREATE OR ALTER FUNCTION UDF_SI_FEE_DEBT (@p_si_account VARCHAR(20))
+RETURNS DECIMAL(20,6)
+AS
+BEGIN
+    -- CAST nợ về (20,0) trước khi cộng: SUM(20,0)→(38,0), cộng thẳng (20,6) sẽ bị ép scale=0 (mất thập phân).
+    RETURN CAST(ISNULL((SELECT SUM(C_FEE_DUE - C_FEE_PAID)
+                        FROM T_SI_FEE_CHARGE
+                        WHERE C_SI_ACCOUNT = @p_si_account AND C_STATUS = 'UNPAID'), 0) AS DECIMAL(20,0))
+         + dbo.UDF_SI_FEE_ACCRUING(@p_si_account);
 END
 GO

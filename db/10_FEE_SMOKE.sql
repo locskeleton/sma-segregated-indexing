@@ -225,17 +225,20 @@ INSERT INTO @R SELECT 'INGEST by request_id collected=0 → UNPAID + req id clea
         AND (SELECT C_BO_EVENT_ID FROM T_SI_FEE_CHARGE WHERE C_SI_ACCOUNT='SUBONE' AND C_PERIOD='202604') IS NULL THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
-  4b) UDF_SI_FEE_DEBT — nợ phí (đã chốt chưa thu) tại hiện tại.
-      SUBX: kỳ 202603 PAID + kỳ 202604 UNPAID(due 82192) → nợ = 82192.
-      SUBLOCK: 202603 PAID → nợ = 0.  SUBONE: 202604 UNPAID(due 41096) → nợ = 41096.
+  4b) UDF nợ phí = (A) đã chốt chưa thu + (B) kỳ hiện tại tích lũy chưa chốt.
+      SUBX: nợ 202604=82192 (B) + tích lũy 202605=123287.671233 → DEBT=205479.671233.
+      SUBLOCK: 202603 PAID + ko dải chưa chốt → 0.  SUBONE: nợ 202604=41096, ko tích lũy → 41096.
 ==============================================================================*/
-INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBX = 82192 (còn nợ 202604)',
-  CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBX') = 82192 THEN 1 ELSE 0 END,
+INSERT INTO @R SELECT 'UDF_SI_FEE_ACCRUING SUBX = 123287.671233 (kỳ 202605 chưa chốt)',
+  CASE WHEN ROUND(dbo.UDF_SI_FEE_ACCRUING('SUBX'),6) = 123287.671233 THEN 1 ELSE 0 END,
+  CONCAT('accruing=', dbo.UDF_SI_FEE_ACCRUING('SUBX'));
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBX = 205479.671233 (nợ+tích lũy)',
+  CASE WHEN ROUND(dbo.UDF_SI_FEE_DEBT('SUBX'),6) = 205479.671233 THEN 1 ELSE 0 END,
   CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBX'));
-INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBLOCK = 0 (đã thu hết)',
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBLOCK = 0 (đã thu, ko tích lũy)',
   CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBLOCK') = 0 THEN 1 ELSE 0 END,
   CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBLOCK'));
-INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBONE = 41096 (chưa thu)',
+INSERT INTO @R SELECT 'UDF_SI_FEE_DEBT SUBONE = 41096 (nợ, ko tích lũy)',
   CASE WHEN dbo.UDF_SI_FEE_DEBT('SUBONE') = 41096 THEN 1 ELSE 0 END,
   CONCAT('debt=', dbo.UDF_SI_FEE_DEBT('SUBONE'));
 
