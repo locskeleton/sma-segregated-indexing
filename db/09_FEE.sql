@@ -93,7 +93,7 @@ CREATE TABLE T_SI_FEE_BALANCE (
     C_AUM            DECIMAL(20,0) NOT NULL,   -- AUM cuối ngày GD (C_ACCRUED_ON)
     C_RATE           DECIMAL(10,6) NOT NULL,
     C_DAY_COUNT      INT           NOT NULL,
-    C_FEE_AMOUNT     DECIMAL(20,6) NOT NULL,   -- = AUM × rate/day_count (1 ngày, thập phân, KHÔNG round)
+    C_FEE_AMOUNT     DECIMAL(20,2) NOT NULL,   -- phí 1 ngày = CEILING(AUM×rate/day_count, 2dp); AUM≤0 ⇒ 0. Làm tròn LÊN 2 số lẻ.
     C_STATUS         BIT           NOT NULL CONSTRAINT DF_SI_FEE_BALANCE_ST DEFAULT 1, -- 1=hợp lệ (vào charge) | 0=invalid (mồ côi/loại). "Đã thu khóa" suy từ T_SI_FEE_CHARGE.C_STATUS='PAID'.
     CONSTRAINT PK_SI_FEE_BALANCE PRIMARY KEY CLUSTERED (C_SI_FEE_BAL_ID),
     CONSTRAINT UQ_SI_FEE_BALANCE_PKID UNIQUE NONCLUSTERED (PK_SI_FEE_BALANCE),
@@ -113,8 +113,8 @@ CREATE TABLE T_SI_FEE_CHARGE (
     C_PERIOD         CHAR(6)       NOT NULL,   -- YYYYMM
     C_PERIOD_FROM    DATE          NOT NULL,
     C_PERIOD_TO      DATE          NOT NULL,
-    C_FEE_TOTAL      DECIMAL(20,6) NOT NULL,   -- Σ daily kỳ (thập phân)
-    C_FEE_DUE        DECIMAL(20,0) NOT NULL,   -- số phải thu = ROUND(total) VND (BO cắt số tròn)
+    C_FEE_TOTAL      DECIMAL(20,2) NOT NULL,   -- Σ daily kỳ (2dp)
+    C_FEE_DUE        DECIMAL(20,0) NOT NULL,   -- số phải thu = CEILING(total) VND (chốt kỳ làm tròn LÊN đến đồng)
     C_FEE_PAID       DECIMAL(20,0) NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_PAID DEFAULT 0,
     C_STATUS         VARCHAR(10)   NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_ST DEFAULT 'UNPAID', -- UNPAID|PAID
     C_CLOSED_AT      DATETIME      NOT NULL CONSTRAINT DF_SI_FEE_CHARGE_CL DEFAULT GETDATE(),
@@ -192,7 +192,8 @@ GO
   SP_EOD_FEE_ACCRUE @p_d — tính phí QL (trong EOD, sau khi có AUM @d).
     [BRD] HẠCH TOÁN MỖI NGÀY 1 DÒNG: dải [@p_d, ngày_GD_kế) ngày dương lịch (look-FORWARD) → BUNG
     thành nhiều dòng, MỖI NGÀY 1 dòng (Thứ 6 → T6/T7/CN = 3 dòng). Mỗi dòng: C_FEE_DATE = ngày đó,
-    C_AUM = AUM @p_d, fee = AUM × rate/day_count (1 ngày). Cross-month tự nhiên (mỗi ngày tự thuộc kỳ).
+    C_AUM = AUM @p_d, fee/ngày = CEILING(AUM×rate/day_count, 2dp) — làm tròn LÊN 2 số lẻ; AUM≤0 ⇒ 0.
+    Cross-month tự nhiên (mỗi ngày tự thuộc kỳ). Chốt kỳ: CEILING đến đồng (SP_FEE_CLOSE_PERIOD).
     rate = eff @C_FEE_DATE (T_SI_FEE_RATE). C_ACCRUED_ON = @p_d (chữ ký lần accrue).
     ── AN TOÀN GD THẬT (KHÔNG DELETE + KHÔNG ĐÈ DỮ LIỆU ĐÃ THU) ─────────────────
     Idempotent bằng MERGE upsert trên natural key (SI, C_FEE_DATE):
@@ -216,8 +217,10 @@ BEGIN
     SELECT g.d AS C_FEE_DATE, @p_d AS C_ACCRUED_ON,
            b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE,
            CONVERT(CHAR(6), g.d, 112) AS C_PERIOD, b.C_AUM, rt.C_RATE, rt.C_DAY_COUNT,
-           CAST(CAST(CAST(b.C_AUM AS DECIMAL(38,6)) * rt.C_RATE AS DECIMAL(38,12))
-                / rt.C_DAY_COUNT AS DECIMAL(20,6)) AS C_FEE_AMOUNT,   -- phí 1 ngày (cast tích scale 12 trước khi chia)
+           CAST(CASE WHEN b.C_AUM <= 0 THEN 0   -- AUM ≤ 0 ⇒ phí ngày = 0
+                     ELSE CEILING(CAST(CAST(b.C_AUM AS DECIMAL(38,6)) * rt.C_RATE AS DECIMAL(38,12))
+                                  / rt.C_DAY_COUNT * 100) / 100.0   -- CEILING 2dp = làm tròn LÊN 2 số lẻ
+                END AS DECIMAL(20,2)) AS C_FEE_AMOUNT,
            -- KHÓA: kỳ của ngày này đã THU bên BO (charge PAID) chưa? đã thu → bỏ qua mọi thao tác.
            CAST(CASE WHEN EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c
                        WHERE c.C_SI_ACCOUNT=b.C_SI_ACCOUNT
@@ -285,11 +288,11 @@ BEGIN
     MERGE T_SI_FEE_CHARGE AS tgt
     USING agg AS src ON tgt.C_SI_ACCOUNT=src.C_SI_ACCOUNT AND tgt.C_PERIOD=@period
     WHEN MATCHED AND tgt.C_STATUS='UNPAID' AND tgt.C_BO_EVENT_ID IS NULL THEN   -- chưa thu & chưa gửi BO mới ghi đè
-        UPDATE SET C_FEE_TOTAL=src.total, C_FEE_DUE=CAST(ROUND(src.total,0) AS DECIMAL(20,0)),
+        UPDATE SET C_FEE_TOTAL=src.total, C_FEE_DUE=CAST(CEILING(src.total) AS DECIMAL(20,0)),   -- chốt kỳ làm tròn LÊN
                    C_PERIOD_FROM=src.pf, C_PERIOD_TO=src.pt, C_CLOSED_AT=GETDATE()
     WHEN NOT MATCHED BY TARGET THEN
         INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_PERIOD,C_PERIOD_FROM,C_PERIOD_TO,C_FEE_TOTAL,C_FEE_DUE)
-        VALUES (src.C_SI_ACCOUNT,src.cust,src.mc,@period,src.pf,src.pt,src.total,CAST(ROUND(src.total,0) AS DECIMAL(20,0)));
+        VALUES (src.C_SI_ACCOUNT,src.cust,src.mc,@period,src.pf,src.pt,src.total,CAST(CEILING(src.total) AS DECIMAL(20,0)));
     SET @p_rows = @@ROWCOUNT;
     -- (KHÔNG còn mark CLOSED trên balance: "đã chốt/đã thu" suy từ T_SI_FEE_CHARGE; accrue khóa theo charge PAID.)
 END
