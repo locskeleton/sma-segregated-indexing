@@ -408,3 +408,79 @@ BEGIN
          + dbo.UDF_SI_FEE_ACCRUING(@p_si_account);
 END
 GO
+
+/*============================================================================
+  BÁO CÁO PHÍ QL (read-only, range/list — miễn date-guard). 3 SP theo BRD WS3.1 §Báo cáo:
+    (1) SP_RPT_FEE_DAILY      — Danh sách SINH PHÍ HÀNG NGÀY (per-day accrual)
+    (2) SP_RPT_FEE_CHARGE     — Danh sách CHỐT PHÍ HÀNG KỲ (Nợ Phí QL)
+    (3) SP_RPT_FEE_COLLECTION — Danh sách GIAO DỊCH THU PHÍ (đã gửi BO / đã thu)
+  Mọi filter NULL = bỏ qua (lấy tất cả). Chỉ trả result-set, không OUTPUT err.
+============================================================================*/
+
+/*---- (1) SINH PHÍ HÀNG NGÀY — nguồn T_SI_FEE_BALANCE (dòng hợp lệ C_STATUS=1) ----*/
+CREATE OR ALTER PROCEDURE SP_RPT_FEE_DAILY
+    @p_from_date   DATE,                      -- lọc theo C_FEE_DATE [from,to]
+    @p_to_date     DATE,
+    @p_si_account  VARCHAR(20) = NULL,
+    @p_master_code VARCHAR(20) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE,
+           b.C_FEE_DATE, b.C_ACCRUED_ON, b.C_PERIOD,
+           b.C_AUM, b.C_RATE, b.C_DAY_COUNT, b.C_FEE_AMOUNT
+    FROM T_SI_FEE_BALANCE b
+    WHERE b.C_STATUS = 1
+      AND b.C_FEE_DATE BETWEEN @p_from_date AND @p_to_date
+      AND (@p_si_account  IS NULL OR b.C_SI_ACCOUNT  = @p_si_account)
+      AND (@p_master_code IS NULL OR b.C_MASTER_CODE = @p_master_code)
+    ORDER BY b.C_SI_ACCOUNT, b.C_FEE_DATE;
+END
+GO
+
+/*---- (2) CHỐT PHÍ HÀNG KỲ / NỢ PHÍ QL — nguồn T_SI_FEE_CHARGE ----*/
+CREATE OR ALTER PROCEDURE SP_RPT_FEE_CHARGE
+    @p_period      CHAR(6)     = NULL,        -- YYYYMM; NULL = mọi kỳ
+    @p_si_account  VARCHAR(20) = NULL,
+    @p_master_code VARCHAR(20) = NULL,
+    @p_status      VARCHAR(10) = NULL         -- NULL | 'UNPAID' | 'PAID'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT c.C_SI_ACCOUNT, c.C_CUST_CODE, c.C_MASTER_CODE, c.C_PERIOD,
+           c.C_PERIOD_FROM, c.C_PERIOD_TO,
+           c.C_FEE_TOTAL, c.C_FEE_DUE, c.C_FEE_PAID,
+           C_FEE_REMAIN = c.C_FEE_DUE - c.C_FEE_PAID,   -- còn nợ
+           c.C_STATUS, c.C_CLOSED_AT, c.C_COLLECTED_AT, c.C_BO_EVENT_ID
+    FROM T_SI_FEE_CHARGE c
+    WHERE (@p_period      IS NULL OR c.C_PERIOD      = @p_period)
+      AND (@p_si_account  IS NULL OR c.C_SI_ACCOUNT  = @p_si_account)
+      AND (@p_master_code IS NULL OR c.C_MASTER_CODE = @p_master_code)
+      AND (@p_status      IS NULL OR c.C_STATUS      = @p_status)
+    ORDER BY c.C_SI_ACCOUNT, c.C_PERIOD;
+END
+GO
+
+/*---- (3) GIAO DỊCH THU PHÍ — charge đã gửi BO (có request id) HOẶC đã PAID ----*/
+CREATE OR ALTER PROCEDURE SP_RPT_FEE_COLLECTION
+    @p_from_date   DATE        = NULL,        -- lọc theo C_COLLECTED_AT [from,to] (NULL = tất cả)
+    @p_to_date     DATE        = NULL,
+    @p_si_account  VARCHAR(20) = NULL,
+    @p_master_code VARCHAR(20) = NULL,
+    @p_status      VARCHAR(10) = NULL         -- NULL | 'UNPAID'(đã gửi chờ kết quả) | 'PAID'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT c.C_SI_ACCOUNT, c.C_CUST_CODE, c.C_MASTER_CODE, c.C_PERIOD,
+           c.C_BO_EVENT_ID AS C_REQUEST_ID, c.C_FEE_DUE, c.C_FEE_PAID,
+           c.C_STATUS, c.C_COLLECTED_AT
+    FROM T_SI_FEE_CHARGE c
+    WHERE (c.C_BO_EVENT_ID IS NOT NULL OR c.C_STATUS = 'PAID')   -- đã phát sinh giao dịch thu
+      AND (@p_from_date   IS NULL OR c.C_COLLECTED_AT >= @p_from_date)
+      AND (@p_to_date     IS NULL OR c.C_COLLECTED_AT <  DATEADD(DAY,1,@p_to_date))
+      AND (@p_si_account  IS NULL OR c.C_SI_ACCOUNT  = @p_si_account)
+      AND (@p_master_code IS NULL OR c.C_MASTER_CODE = @p_master_code)
+      AND (@p_status      IS NULL OR c.C_STATUS      = @p_status)
+    ORDER BY c.C_COLLECTED_AT, c.C_SI_ACCOUNT, c.C_PERIOD;
+END
+GO

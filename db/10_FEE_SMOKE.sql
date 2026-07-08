@@ -276,6 +276,28 @@ INSERT INTO @R SELECT '★ SP_EOD_RUN có J15_FEE_ACCRUE + J16_FEE_CLOSE (guard)
         AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_SET_SOURCE_READY')) NOT LIKE '%SP_EOD_FEE_ACCRUE%' THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
+  6) BÁO CÁO — 3 report SP chạy + trả đúng số dòng (INSERT EXEC)
+==============================================================================*/
+DECLARE @rc INT;
+-- (1) SINH PHÍ HÀNG NGÀY: SUBFRI Apr24-26 = 3 dòng per-day
+CREATE TABLE #rd (si VARCHAR(20),cust VARCHAR(10),mc VARCHAR(20),fee_date DATE,accrued DATE,period CHAR(6),aum DECIMAL(20,0),rate DECIMAL(10,6),dc INT,fee DECIMAL(20,2));
+INSERT #rd EXEC SP_RPT_FEE_DAILY @p_from_date='2026-04-24',@p_to_date='2026-04-26',@p_si_account='SUBFRI';
+SET @rc=(SELECT COUNT(*) FROM #rd);
+INSERT INTO @R SELECT 'RPT_FEE_DAILY SUBFRI Apr24-26 = 3 dòng', CASE WHEN @rc=3 THEN 1 ELSE 0 END, CONCAT('rows=',@rc);
+-- (2) CHỐT PHÍ HÀNG KỲ: kỳ 202604 = 3 charge (SUBONE/SUBFRI/SUBX)
+CREATE TABLE #rc2 (si VARCHAR(20),cust VARCHAR(10),mc VARCHAR(20),period CHAR(6),pf DATE,pt DATE,total DECIMAL(20,2),due DECIMAL(20,0),paid DECIMAL(20,0),remain DECIMAL(20,0),status VARCHAR(10),closed DATETIME,collected DATETIME,evt VARCHAR(64));
+INSERT #rc2 EXEC SP_RPT_FEE_CHARGE @p_period='202604';
+SET @rc=(SELECT COUNT(*) FROM #rc2);
+INSERT INTO @R SELECT 'RPT_FEE_CHARGE kỳ 202604 = 3 charge', CASE WHEN @rc=3 THEN 1 ELSE 0 END, CONCAT('rows=',@rc);
+-- (3) GIAO DỊCH THU PHÍ: SUBX = 1 (kỳ 202603 PAID có request id); 202604 UNPAID no event → loại
+CREATE TABLE #rc3 (si VARCHAR(20),cust VARCHAR(10),mc VARCHAR(20),period CHAR(6),req VARCHAR(64),due DECIMAL(20,0),paid DECIMAL(20,0),status VARCHAR(10),collected DATETIME);
+INSERT #rc3 EXEC SP_RPT_FEE_COLLECTION @p_si_account='SUBX';
+SET @rc=(SELECT COUNT(*) FROM #rc3);
+INSERT INTO @R SELECT 'RPT_FEE_COLLECTION SUBX = 1 (202603 PAID)',
+  CASE WHEN @rc=1 AND EXISTS(SELECT 1 FROM #rc3 WHERE period='202603' AND status='PAID') THEN 1 ELSE 0 END, CONCAT('rows=',@rc);
+DROP TABLE #rd, #rc2, #rc3;
+
+/*==============================================================================
   KẾT QUẢ
 ==============================================================================*/
 SELECT name AS [Check], CASE WHEN ok=1 THEN 'PASS' ELSE 'FAIL' END AS [Result], detail AS [Detail] FROM @R ORDER BY id;
