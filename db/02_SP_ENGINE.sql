@@ -434,7 +434,10 @@ GO
 
 /*===========================================================================
   J12 — SI INDEX (danh mục mẫu, 100% cổ phiếu) → T_MASTER_INDEX_DAILY
-        Index_t = Index_(t-1) × Σ w^(t) × P_t / P_ref ;  w^(t)=eff_date≤@d mới nhất
+        FACTOR   = Σ w^(t) × P_t / P_ref ; w^(t)=eff_date≤@d mới nhất
+        [Cách A] Index_raw_t = Index_raw_(t-1) × FACTOR (chain PRECISION CAO — chống trôi)
+                 Index_publish = ROUND(Index_raw_t, 2)                        -- con số 2dp user thấy
+                 daily_return  = Index_publish_t / Index_publish_(t-1) − 1     -- TỪ 2dp → user suy ra KHỚP (hết lệch)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_INDEX @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -520,12 +523,17 @@ BEGIN
         INNER JOIN T_PRICE_DAILY p ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@p_d
         GROUP BY W.C_MASTER_CODE
     )
-    INSERT INTO T_MASTER_INDEX_DAILY (C_BUSINESS_DATE,C_MASTER_CODE,C_INDEX_VALUE,C_DAILY_RETURN)
+    -- [Cách A] CHAIN ở raw precision cao (COALESCE prev.raw, nếu legacy thiếu raw thì fallback prev 2dp, else 1000)
+    --   → publish = ROUND(raw,2). daily_return = publish_t / publish_(t-1) − 1 (TỪ 2dp đã publish, FLOAT tránh crush scale).
+    INSERT INTO T_MASTER_INDEX_DAILY (C_BUSINESS_DATE,C_MASTER_CODE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN)
     SELECT @p_d, f.C_MASTER_CODE,
-           COALESCE(pi.C_INDEX_VALUE, 1000) * f.FACTOR,
-           f.FACTOR - 1
+           r.rawval,
+           v.pubval,
+           CAST(CAST(v.pubval AS FLOAT) / COALESCE(pi.C_INDEX_VALUE, 1000) - 1 AS DECIMAL(10,6))
     FROM FACT f
-    LEFT JOIN T_MASTER_INDEX_DAILY pi ON pi.C_MASTER_CODE=f.C_MASTER_CODE AND pi.C_BUSINESS_DATE=@prev;
+    LEFT JOIN T_MASTER_INDEX_DAILY pi ON pi.C_MASTER_CODE=f.C_MASTER_CODE AND pi.C_BUSINESS_DATE=@prev
+    CROSS APPLY (SELECT rawval = CAST(COALESCE(pi.C_INDEX_VALUE_RAW, pi.C_INDEX_VALUE, 1000) * f.FACTOR AS DECIMAL(28,12))) r
+    CROSS APPLY (SELECT pubval = CAST(ROUND(r.rawval, 2) AS DECIMAL(18,2))) v;
     SET @p_rows = @@ROWCOUNT;   -- #master index ghi @p_d
 END
 GO

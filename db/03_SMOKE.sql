@@ -88,6 +88,16 @@ BEGIN
 END
 ELSE PRINT '  -- (09_FEE chưa cài → bỏ qua check fee jobs in EOD)';
 
+-- [Cách A] INDEX consistency: C_DAILY_RETURN PHẢI = index_2dp_t / index_2dp_(t-1) − 1 (user suy từ 2dp ra KHỚP, hết lệch).
+DECLARE @idxLech INT = (
+    SELECT COUNT(*) FROM (
+        SELECT C_DAILY_RETURN,
+               recon = CAST(CAST(C_INDEX_VALUE AS FLOAT) / LAG(C_INDEX_VALUE) OVER (PARTITION BY C_MASTER_CODE ORDER BY C_BUSINESS_DATE) - 1 AS DECIMAL(10,6))
+        FROM T_MASTER_INDEX_DAILY
+    ) t WHERE t.recon IS NOT NULL AND t.C_DAILY_RETURN <> t.recon);
+IF @idxLech=0 PRINT '  OK index daily_return = reconstruct từ index 2dp (Cách A, hết lệch)';
+ELSE PRINT CONCAT('  !!! index return lệch reconstruct 2dp: ',@idxLech,' dòng');
+
 PRINT '';
 PRINT '======== RECONCILE: đo vênh 2 nguồn ========';
 DECLARE @brk6 INT=(SELECT COUNT(*) FROM T_EOD_RECON_BREAK WHERE C_BUSINESS_DATE='2026-01-06');

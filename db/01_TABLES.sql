@@ -272,9 +272,10 @@ CREATE TABLE T_MASTER_INDEX_DAILY (
     PK_MASTER_INDEX_DAILY UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_INDEX_DAILY_PKID DEFAULT NEWID(),
     C_BUSINESS_DATE  DATE            NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_INDEX_VALUE    DECIMAL(18,2)   NOT NULL,   -- Index danh mục mẫu (PR, daily-rebalanced): Index_t = Index_(t-1) × Σ wᵢ·Pᵢ,t/P_ref. Gốc 1000. 2 chữ số thập phân (index quote chuẩn).
-    C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- lợi suất index NGÀY-TRÊN-NGÀY = FACTOR − 1 = Index_t/Index_(t-1) − 1
-                                                  --   (so với hôm trước qua P_ref = close hôm trước / giá sau chia ngày ex-rights).
+    C_INDEX_VALUE_RAW DECIMAL(28,12) NULL,       -- [Cách A] Index level PRECISION CAO — CHAIN nội bộ (Index_raw_t = Index_raw_(t-1) × FACTOR), chống trôi. KHÔNG publish. Engine LUÔN set; seed thủ công có thể bỏ trống → chain fallback COALESCE(raw, C_INDEX_VALUE 2dp, 1000).
+    C_INDEX_VALUE    DECIMAL(18,2)   NOT NULL,   -- Index PUBLISH = ROUND(C_INDEX_VALUE_RAW, 2). Gốc 1000. 2 chữ số thập phân (index quote chuẩn). Đây là con số user NHÌN THẤY.
+    C_DAILY_RETURN   DECIMAL(10,6)  NULL,         -- [Cách A] lợi suất NGÀY-TRÊN-NGÀY = C_INDEX_VALUE_t / C_INDEX_VALUE_(t-1) − 1 (TỪ index 2dp ĐÃ PUBLISH,
+                                                  --   KHÔNG phải FACTOR−1) → user suy index_t/index_(t-1)−1 từ 2dp ra KHỚP 100%, hết lệch. Đánh đổi: mịn tới ~2dp cho phép.
                                                   --   DÙNG Ở: J12B SP_EOD_TE_ACCUM — active return = C_DAILY_RETURN(KH) − C_DAILY_RETURN(index này)
                                                   --   → tích lũy prefix-sum (Σa, Σa²) tính TE (tracking error) cho PM tool US1/US2. KHÔNG bỏ được.
     CONSTRAINT PK_MASTER_INDEX_DAILY PRIMARY KEY CLUSTERED (PK_MASTER_INDEX_DAILY),
