@@ -14,25 +14,136 @@ GO
 SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON;
 GO
 
-/*---------------------------------------------------- UDF: prev business date */
+/*---------------------------------------------------- UDF: NGÀY GIAO DỊCH? (LỊCH — authority)
+  1 = ngày sở có phiên; 0 = T7/CN hoặc ngày nghỉ khai trong T_TRADING_HOLIDAY (hoặc @d NULL).
+  ⚠️ ĐÂY LÀ ĐỊNH NGHĨA DUY NHẤT của "ngày giao dịch" trong SDI. (Trước 2026-07-11 hàm này chỉ có trong 09_FEE
+     và CHỈ subsystem phí dùng; engine thì suy ngày GD từ "T_PRICE_DAILY có dòng" ⇒ giá carry-forward ngày nghỉ
+     biến T7/CN/lễ thành PHIÊN GIẢ và master index — chuỗi NHÂN DỒN — nhân thêm 1 factor mỗi ngày nghỉ ⇒ 1 cuối
+     tuần sai +21%. Nay kéo lên CORE, mọi đường TÍNH đều gate bằng nó.)
+  Rule cuối tuần: DATEDIFF(DAY,0,@d)%7 → 0=T2..5=T7,6=CN. KHÔNG dùng DATEPART(WEEKDAY) (phụ thuộc @@DATEFIRST).
+  ⚠️ KHÔNG gate SP_INGEST_ASSET_NAV bằng hàm này: Asset gửi aum/tiền/daily_return MỌI ngày lịch. */
+CREATE OR ALTER FUNCTION UDF_IS_BUSINESS_DATE (@d DATE)
+RETURNS BIT AS
+BEGIN
+    RETURN CASE WHEN @d IS NULL THEN 0
+                WHEN DATEDIFF(DAY,0,@d) % 7 >= 5 THEN 0
+                WHEN EXISTS (SELECT 1 FROM T_TRADING_HOLIDAY WHERE C_HOLIDAY_DATE=@d) THEN 0
+                ELSE 1 END;
+END
+GO
+
+/*---------------------------------------------------- UDF: ngày GD KẾ tiếp (bỏ cuối tuần + nghỉ) */
+CREATE OR ALTER FUNCTION UDF_NEXT_BUSINESS_DATE (@d DATE)
+RETURNS DATE AS
+BEGIN
+    DECLARE @n DATE = DATEADD(DAY,1,@d);
+    WHILE dbo.UDF_IS_BUSINESS_DATE(@n) = 0 SET @n = DATEADD(DAY,1,@n);
+    RETURN @n;
+END
+GO
+
+/*---------------------------------------------------- UDF: prev business date
+  PHIÊN GD liền trước @d (theo LỊCH) đã có giá. Là anchor của mọi roll-forward (index prev, TE prev) ⇒ nếu trả
+  về T7/CN/lễ thì chuỗi nhân dồn thêm 1 phiên giả. Điều kiện lịch INLINE (không gọi UDF_IS_BUSINESS_DATE) để
+  tránh scalar-UDF chạy per-row khi quét ngày — rule PHẢI KHỚP UDF_IS_BUSINESS_DATE. */
 CREATE OR ALTER FUNCTION UDF_PREV_BUSINESS_DATE (@d DATE)
 RETURNS DATE
 AS
 BEGIN
-    RETURN (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE < @d);
+    RETURN (SELECT MAX(x.d)
+            FROM (SELECT DISTINCT C_BUSINESS_DATE AS d FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE < @d) x
+            WHERE DATEDIFF(DAY,0,x.d) % 7 < 5
+              AND NOT EXISTS (SELECT 1 FROM T_TRADING_HOLIDAY h WHERE h.C_HOLIDAY_DATE = x.d));
+END
+GO
+
+/*---------------------------------------------------- UDF: PHIÊN GD MỚI NHẤT đã có giá
+  "Hôm nay" theo nghĩa dữ liệu thị trường. MAX(C_BUSINESS_DATE) trần trụi sẽ trỏ vào T7/CN nếu 1 dòng giá ngày
+  nghỉ lọt vào T_PRICE_DAILY → định giá/serve theo "phiên" không tồn tại. Rule khớp UDF_IS_BUSINESS_DATE. */
+CREATE OR ALTER FUNCTION UDF_LAST_BUSINESS_DATE ()
+RETURNS DATE
+AS
+BEGIN
+    RETURN (SELECT MAX(x.d)
+            FROM (SELECT DISTINCT C_BUSINESS_DATE AS d FROM T_PRICE_DAILY) x
+            WHERE DATEDIFF(DAY,0,x.d) % 7 < 5
+              AND NOT EXISTS (SELECT 1 FROM T_TRADING_HOLIDAY h WHERE h.C_HOLIDAY_DATE = x.d));
 END
 GO
 
 /*---------------------------------------------------- UDF: ngày ĐÃ CÓ GIÁ chưa (data-driven)
-  1 nếu BO đã publish giá @d (T_PRICE_DAILY có dòng); 0 nếu chưa. ĐÂY KHÔNG PHẢI "ngày giao dịch theo lịch":
-  ngày GD hiện tại mà giá EOD CHƯA về cũng trả 0. Vì vậy CHỈ dùng để chọn ngày QUÁ KHỨ có data (recompute loop).
-  Việc "ngày hiện tại có sẵn sàng chạy EOD" do precondition MKT_DATA=READY ở SP_EOD_RUN quyết (không dùng UDF này). */
+  1 nếu BO đã publish giá @d (T_PRICE_DAILY có dòng); 0 nếu chưa. ĐÂY KHÔNG PHẢI "ngày giao dịch theo lịch"
+  (ngày GD mà giá chưa về cũng trả 0; ngày nghỉ có giá rác lọt vào lại trả 1) ⇒ MỌI loop rerun PHẢI kẹp
+  UDF_IS_BUSINESS_DATE(@d)=1 AND UDF_HAS_PRICE_DATA(@d)=1: LỊCH quyết ngày nào ĐƯỢC tính, UDF này chỉ trả lời
+  ngày đó ĐÃ CÓ data để tính chưa. */
 CREATE OR ALTER FUNCTION UDF_HAS_PRICE_DATA (@d DATE)
 RETURNS BIT
 AS
 BEGIN
     RETURN CASE WHEN @d IS NOT NULL AND EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_BUSINESS_DATE=@d)
                 THEN 1 ELSE 0 END;
+END
+GO
+
+/*===========================================================================
+  SP_INGEST_TRADING_HOLIDAY — ops/BO nạp LỊCH NGHỈ. T7/CN KHÔNG cần khai (rule tự loại); bảng chỉ chứa ngày
+    nghỉ TRONG TUẦN: lễ dương lịch, Tết/Giỗ Tổ (âm lịch), nghỉ bù.
+    JSON: [{"holiday_date":"2026-02-17","note":"Tết Bính Ngọ","is_delete":0}, …]  is_delete=1 → gỡ khỏi lịch.
+    VALIDATE all-or-nothing TRƯỚC khi ghi: ngày sai định dạng / TRÙNG trong batch / is_delete ∉{0,1} ⇒ TỪ CHỐI
+    CẢ batch (không ghi dòng nào). err: 0 OK · 20 JSON sai · 21 validate FAIL · -1 runtime.
+    ⚠️ Nạp lễ cho ngày QUÁ KHỨ đã tính index ⇒ số cũ VẪN SAI: chạy lại SP_EOD_RECOMPUTE_INDEX_RANGE từ inception.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_INGEST_TRADING_HOLIDAY
+    @p_json     NVARCHAR(MAX),
+    @p_user     VARCHAR(64)   = NULL,
+    @p_err_code INT           OUTPUT,
+    @p_err_msg  NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+        IF @p_json IS NULL OR ISJSON(@p_json) <> 1
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không phải JSON hợp lệ'; RETURN; END
+
+        -- Đọc holiday_date dạng CHUỖI rồi TRY_CONVERT (KHÔNG ép DATE trong OPENJSON WITH: ngày sai định dạng sẽ
+        --   THROW conversion error khó hiểu → err=-1 thay vì báo rõ). rn>1 = TRÙNG ngày (MERGE sẽ vỡ PK).
+        --   PARTITION theo ngày ĐÃ CONVERT: 2 chuỗi khác nhau vẫn có thể ra cùng 1 ngày.
+        DECLARE @src TABLE (C_RAW NVARCHAR(30), C_HOLIDAY_DATE DATE, C_NOTE NVARCHAR(100), C_IS_DELETE TINYINT, rn INT);
+        INSERT @src (C_RAW, C_HOLIDAY_DATE, C_NOTE, C_IS_DELETE, rn)
+        SELECT j.holiday_date, TRY_CONVERT(DATE, j.holiday_date, 23), j.note, ISNULL(j.is_delete,0),
+               ROW_NUMBER() OVER (PARTITION BY TRY_CONVERT(DATE, j.holiday_date, 23) ORDER BY (SELECT NULL))
+        FROM OPENJSON(@p_json) WITH (
+            holiday_date NVARCHAR(30)  '$.holiday_date',
+            note         NVARCHAR(100) '$.note',
+            is_delete    TINYINT       '$.is_delete') j;
+
+        IF NOT EXISTS (SELECT 1 FROM @src)
+            BEGIN SET @p_err_code=21; SET @p_err_msg=N'Batch rỗng (0 ngày) — từ chối'; RETURN; END
+
+        DECLARE @bad NVARCHAR(300) = (
+            SELECT TOP 1 CASE
+                WHEN C_HOLIDAY_DATE IS NULL   THEN CONCAT(N'holiday_date NULL/sai định dạng (cần YYYY-MM-DD): ', ISNULL(C_RAW,N'(null)'))
+                WHEN rn > 1                   THEN CONCAT(N'ngày TRÙNG trong batch: ', C_RAW)
+                WHEN C_IS_DELETE NOT IN (0,1) THEN CONCAT(N'is_delete phải 0/1 @', C_RAW)
+                END
+            FROM @src WHERE C_HOLIDAY_DATE IS NULL OR rn > 1 OR C_IS_DELETE NOT IN (0,1));
+        IF @bad IS NOT NULL
+            BEGIN SET @p_err_code=21;
+                SET @p_err_msg=CONCAT(N'Validate FAIL — batch BỊ TỪ CHỐI (không ghi dòng nào): ', @bad);
+                RETURN; END
+
+        DELETE h FROM T_TRADING_HOLIDAY h INNER JOIN @src s ON s.C_HOLIDAY_DATE=h.C_HOLIDAY_DATE WHERE s.C_IS_DELETE=1;
+
+        MERGE T_TRADING_HOLIDAY AS t
+        USING (SELECT C_HOLIDAY_DATE, C_NOTE FROM @src WHERE C_IS_DELETE=0) s
+           ON t.C_HOLIDAY_DATE = s.C_HOLIDAY_DATE
+        WHEN MATCHED THEN UPDATE SET t.C_NOTE = s.C_NOTE
+        WHEN NOT MATCHED THEN INSERT (C_HOLIDAY_DATE, C_NOTE) VALUES (s.C_HOLIDAY_DATE, s.C_NOTE);
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END
+    END CATCH
 END
 GO
 
@@ -244,6 +355,9 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_rows=0;
     BEGIN TRY
+        -- ⚠️ KHÔNG gate lịch ở ĐÂY: Asset gửi aum/tiền/daily_return MỌI NGÀY LỊCH (kể cả T7/CN/lễ — nạp/rút cuối
+        --   tuần vẫn đổi AUM). Chặn ngày nghỉ ở đây = mất trắng dòng tiền cuối tuần. Lịch chỉ gate TÍNH TOÁN
+        --   (index/EOD/TE) và ingest GIÁ (SP_INGEST_PRICE_DAILY err=23).
         IF @p_business_date IS NULL BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
 
@@ -324,6 +438,17 @@ BEGIN
     BEGIN TRY
         IF @p_business_date IS NULL
             BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
+        -- CALENDAR GUARD (err=23): TỪ CHỐI GIÁ ngày KHÔNG GD (T7/CN/lễ). Nguồn giá thường carry-forward phiên
+        --   gần nhất cho ngày nghỉ → nhận vào là biến ngày nghỉ thành "phiên giả" trong T_PRICE_DAILY, và master
+        --   index (chuỗi nhân dồn) nhân thêm 1 factor. Chặn tại cửa ngõ = data sạch. (Engine vẫn miễn nhiễm nếu
+        --   ai đó INSERT thẳng: mọi đường TÍNH đều gate lịch.)
+        --   ⚠️ KHÁC SP_INGEST_ASSET_NAV: Asset gửi aum/tiền MỌI ngày lịch → KHÔNG gate. GIÁ thì chỉ có ngày GD.
+        IF dbo.UDF_IS_BUSINESS_DATE(@p_business_date) = 0
+            BEGIN SET @p_err_code=23;
+                SET @p_err_msg=CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@p_business_date,23),
+                    N' KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — TỪ CHỐI batch giá. ',
+                    N'Nạp giá ngày nghỉ sẽ làm master index nhân dồn sai. Nếu đây LÀ ngày GD, kiểm tra T_TRADING_HOLIDAY.');
+                RETURN; END
         IF @p_json IS NULL OR ISJSON(@p_json) <> 1
             BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không phải JSON hợp lệ'; RETURN; END
 
@@ -444,6 +569,19 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
+
+    -- CALENDAR HARD-FAIL (TRƯỚC mọi DML; phủ MỌI đường gọi: forward/direct/recompute). Index là chuỗi NHÂN DỒN
+    --   (Index_t = Index_(t-1) × FACTOR) ⇒ tính cho 1 ngày KHÔNG GD = nhân thêm factor của PHIÊN GIẢ (nguồn giá
+    --   carry-forward ngày nghỉ ⇒ FACTOR lặp lại lợi suất phiên trước) → index phồng theo cấp số nhân (chuỗi
+    --   +10%/phiên: 1 cuối tuần đẩy 1210 → 1464.10, +21%). THROW ⇒ dù có dòng giá ngày nghỉ LỌT vào
+    --   T_PRICE_DAILY, KHÔNG bao giờ sinh được index row ngoài lịch.
+    IF dbo.UDF_IS_BUSINESS_DATE(@p_d) = 0
+    BEGIN
+        DECLARE @cmsg NVARCHAR(2000) = CONCAT(N'INDEX @', CONVERT(VARCHAR(10),@p_d,23),
+            N': KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — KHÔNG tính index ',
+            N'(tính ngày nghỉ = nhân dồn factor phiên giả ⇒ index sai cấp số nhân).');
+        THROW 51013, @cmsg, 1;
+    END
 
     -- COMPLETENESS HARD-FAIL (mọi đường gọi: forward/direct/recompute): MỌI mã trong rổ hiệu lực @p_d của MỌI
     --   master ACTIVE PHẢI có giá @p_d. Thiếu DÙ 1 mã (của BẤT KỲ master nào) → THROW, KHÔNG ghi index master nào
@@ -721,9 +859,17 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
-    -- (KHÔNG còn guard "ngày giao dịch" bằng price-existence: ngày GD hiện tại mà giá EOD chưa về sẽ bị báo
-    --   nhầm "không phải ngày GD". Data-driven: precondition MKT_DATA=READY bên dưới mới là cổng đúng — giá
-    --   chưa về ⇒ MKT chưa READY; ngày nghỉ/tương lai ⇒ pipeline không tồn tại/không READY ⇒ cùng err=10.)
+    -- CALENDAR GATE (err=13): ngày KHÔNG GD (T7/CN/lễ) ⇒ KHÔNG có EOD. Guard theo LỊCH, KHÔNG theo
+    --   price-existence (guard cũ bỏ vì báo nhầm khi giá EOD chưa về — lịch không có nhược điểm đó: ngày GD mà
+    --   giá chưa về vẫn qua gate này rồi dừng ở precondition MKT_DATA=READY, err=10 như cũ).
+    --   ⚠️ Asset VẪN ingest AUM/tiền ngày nghỉ (SP_INGEST_ASSET_NAV không bị gate) — chỉ EOD/index không chạy.
+    IF dbo.UDF_IS_BUSINESS_DATE(@d) = 0
+    BEGIN
+        SET @p_err_code = 13;
+        SET @p_err_msg = CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@d,23),
+            N' KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — KHÔNG chạy EOD.');
+        RETURN;
+    END
 
     -- PRECONDITION: BO market data READY + FO ingest(holdings) READY + [BRD] ASSET_NAV READY (cần NAV để derive)
     --   + master INDEX đã tính (J12 riêng SP_EOD_RUN_INDEX). J12B TE cần index daily_return.
@@ -821,6 +967,16 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     DECLARE @d DATE = @p_business_date;
 
+    -- CALENDAR GATE (err=13) — báo sớm/sạch trước khi tới THROW 51013 trong SP_EOD_SI_INDEX.
+    IF dbo.UDF_IS_BUSINESS_DATE(@d) = 0
+    BEGIN
+        SET @p_err_code=13;
+        SET @p_err_msg=CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@d,23),
+            N' KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — KHÔNG tính index ',
+            N'(index nhân dồn: tính ngày nghỉ ⇒ sai cấp số nhân).');
+        RETURN;
+    END
+
     DECLARE @mkt VARCHAR(10) = (SELECT C_MKT_DATA_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@d);
     IF @mkt IS NULL OR @mkt<>'READY'
     BEGIN
@@ -883,6 +1039,17 @@ BEGIN
     BEGIN TRY
     IF @p_source NOT IN ('MKT_DATA','FO_INGEST','ASSET_NAV')
         BEGIN SET @p_err_code=2; SET @p_err_msg=N'@p_source phải MKT_DATA | FO_INGEST | ASSET_NAV'; RAISERROR(@p_err_msg, 16, 1); END
+
+    -- CALENDAR GATE (err=13): KHÔNG mở pipeline EOD cho ngày không GD → không tạo dòng T_EOD_PIPELINE rác cho
+    --   T7/CN/lễ. ⚠️ APP: ngày nghỉ VẪN ingest Asset (aum/tiền) bình thường, nhưng KHÔNG gọi proc này và KHÔNG
+    --   chạy EOD — gọi vào sẽ nhận err=13 (fail loud, không im lặng).
+    IF dbo.UDF_IS_BUSINESS_DATE(@p_business_date) = 0
+    BEGIN
+        SET @p_err_code=13;
+        SET @p_err_msg=CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@p_business_date,23),
+            N' KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — KHÔNG mở pipeline EOD.');
+        RETURN;
+    END
 
     IF NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE=@p_business_date)
         INSERT INTO T_EOD_PIPELINE (C_BUSINESS_DATE, C_UPDATED_BY) VALUES (@p_business_date, @p_user);
@@ -985,11 +1152,15 @@ GO
 
 /*===========================================================================
   SP_EOD_RECOMPUTE_INDEX_RANGE — tính LẠI master index (danh mục mẫu) cho [from..to].
-    Dùng khi: sửa công thức/giá/weight → chuỗi index cũ SAI (vd nổ cấp số nhân do weight %). Loop ngày GD
-    THEO THỨ TỰ (mỗi ngày prev = ngày vừa tính lại → chuỗi đúng). SP_EOD_SI_INDEX idempotent (DELETE+INSERT @d).
+    Dùng khi: sửa công thức/giá/weight/LỊCH NGHỈ → chuỗi index cũ SAI (nổ cấp số nhân do weight %, hoặc do CỘNG
+    DỒN NGÀY NGHỈ). Nhận DẢI NGÀY DƯƠNG LỊCH và TỰ LỌC ngày GD (UDF_IS_BUSINESS_DATE), chạy THEO THỨ TỰ (mỗi
+    ngày prev = phiên vừa tính lại → chuỗi đúng). SP_EOD_SI_INDEX idempotent (DELETE+INSERT @d).
     ⚠️ Để sửa chuỗi hỏng phải chạy TỪ INCEPTION (prev ngày đầu = base 1000); chạy từ giữa → prev vẫn số cũ.
+    ⚠️ KHÔNG xoá index rác đã ghi ở ngày nghỉ (từ trước khi có lịch): chỉ không tạo thêm. Dọn = xoá
+       T_MASTER_INDEX_DAILY ở ngày UDF_IS_BUSINESS_DATE=0 rồi chạy lại từ inception.
     Index là MASTER-level (giá×weight), KHÔNG theo KH → luôn tính mọi master có weight+giá @d.
-    err: 0 OK · 11 thiếu giá mã rổ (completeness) · 12 Σweight=0 (cấu hình rổ sai) · 20 range không hợp lệ · -1 runtime.
+    err: 0 OK · 11 thiếu giá mã rổ (completeness) · 12 Σweight=0 (cấu hình rổ sai) · 13 ngày không GD
+         · 20 range không hợp lệ · -1 runtime.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RECOMPUTE_INDEX_RANGE
     @p_from_date DATE,
@@ -1001,7 +1172,7 @@ AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     SET @p_err_code=0; SET @p_err_msg=NULL;
-    IF @p_to_date IS NULL SET @p_to_date = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
+    IF @p_to_date IS NULL SET @p_to_date = dbo.UDF_LAST_BUSINESS_DATE();   -- phiên GD mới nhất (bỏ dòng giá rác ngày nghỉ)
     IF @p_from_date IS NULL OR @p_to_date IS NULL OR @p_from_date > @p_to_date
         BEGIN SET @p_err_code=20; SET @p_err_msg=N'Khoảng ngày không hợp lệ.'; RETURN; END
     BEGIN TRY
@@ -1009,7 +1180,10 @@ BEGIN
         DECLARE @d DATE = @p_from_date;
         WHILE @d <= @p_to_date
         BEGIN
-            IF dbo.UDF_HAS_PRICE_DATA(@d) = 1 EXEC SP_EOD_SI_INDEX @d;   -- idempotent, prev=ngày có giá trước (đã tính lại)
+            -- LỊCH trước, DATA sau: ngày nghỉ BỊ BỎ QUA dù T_PRICE_DAILY có dòng → loop nhận DẢI NGÀY DƯƠNG LỊCH
+            --   vẫn ra chuỗi index đúng (chỉ nhân factor các phiên thật).
+            IF dbo.UDF_IS_BUSINESS_DATE(@d) = 1 AND dbo.UDF_HAS_PRICE_DATA(@d) = 1
+                EXEC SP_EOD_SI_INDEX @d;   -- idempotent, prev = phiên GD có giá trước đó (đã tính lại)
             SET @d = DATEADD(DAY, 1, @d);
         END
         COMMIT;
@@ -1017,7 +1191,9 @@ BEGIN
     BEGIN CATCH
         IF @@TRANCOUNT>0 ROLLBACK;
         -- map lỗi hard-fail từ SP_EOD_SI_INDEX: 51011 completeness→11, 51012 weight Σ=0→12; còn lại runtime -1.
-        SET @p_err_code = CASE ERROR_NUMBER() WHEN 51011 THEN 11 WHEN 51012 THEN 12 ELSE -1 END;
+        -- 51011 completeness→11, 51012 weight Σ=0→12, 51013 ngày không GD→13 (loop đã skip ngày nghỉ nên chỉ
+        --   xảy ra nếu lịch bị sửa giữa chừng); còn lại runtime -1.
+        SET @p_err_code = CASE ERROR_NUMBER() WHEN 51011 THEN 11 WHEN 51012 THEN 12 WHEN 51013 THEN 13 ELSE -1 END;
         SET @p_err_msg = ERROR_MESSAGE();
     END CATCH
 END

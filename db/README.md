@@ -61,6 +61,30 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 02_SP_ENGINE.sql
 sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 ```
 
+## Lịch giao dịch (`T_TRADING_HOLIDAY`) — CORE, không phải chuyện riêng của phí
+**`UDF_IS_BUSINESS_DATE(@d)`** = định nghĩa DUY NHẤT của "ngày GD": `KHÔNG T7/CN` **AND** `KHÔNG có trong T_TRADING_HOLIDAY`. *(Trước 2026-07-11, lịch chỉ nằm trong `09_FEE.sql`; engine thì suy ngày GD từ "`T_PRICE_DAILY` có dòng" → app backfill giá theo **lịch dương** (nguồn giá carry-forward phiên gần nhất cho ngày nghỉ) biến T7/CN/lễ thành **phiên giả**, và master index — chuỗi **nhân dồn** — nhân thêm 1 factor mỗi ngày nghỉ ⇒ **1 cuối tuần sai +21%** (1210 → 1464.10). Nay lịch nằm ở CORE, mọi đường TÍNH đều gate bằng nó.)*
+
+**Cái gì bị gate, cái gì KHÔNG:**
+
+| | Ngày T7/CN/lễ |
+|---|---|
+| `SP_INGEST_ASSET_NAV` (aum, tiền, tiền khả dụng, daily_return) | ✅ **VẪN NHẬN** — Asset gửi **mọi ngày lịch**; nạp/rút cuối tuần vẫn đổi AUM |
+| `SP_INGEST_PRICE_DAILY` (giá) | ❌ **err=23** — sở không có phiên thì không có giá |
+| `SP_EOD_RUN` / `SP_EOD_RUN_INDEX` / `SP_EOD_SET_SOURCE_READY` | ❌ **err=13** |
+| `SP_EOD_SI_INDEX` (gọi thẳng) | ❌ **THROW 51013** trước mọi DML |
+| `SP_EOD_RECOMPUTE_INDEX_RANGE` | nhận **dải ngày dương lịch**, tự bỏ ngày nghỉ |
+| `UDF_PREV_BUSINESS_DATE` / `UDF_LAST_BUSINESS_DATE` | chỉ trả **phiên GD** (không anchor vào T7/CN/lễ) |
+
+⇒ **Dù dòng giá ngày nghỉ LỌT vào `T_PRICE_DAILY` (INSERT thẳng), index vẫn ĐÚNG** — smoke có test đúng case này.
+
+```sql
+-- ops/BO nạp lịch nghỉ (T7/CN KHÔNG cần khai — rule tự loại). is_delete=1 để gỡ.
+DECLARE @ec INT, @em NVARCHAR(400);
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"2026-02-17","note":"Tết Bính Ngọ"}]',
+     @p_user='ops', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+```
+⚠️ Seed `01_TABLES.sql` **CHỈ có lễ dương lịch cố định** (1/1, 30/4, 1/5, 2/9 — 2025..2027). **Tết / Giỗ Tổ / nghỉ bù là âm lịch ⇒ ops PHẢI nạp hằng năm.** Thiếu 1 ngày lễ mà hôm đó có dòng giá ⇒ index cộng dồn sai đúng ngày đó. Nạp lễ cho ngày QUÁ KHỨ đã tính index ⇒ phải chạy lại `SP_EOD_RECOMPUTE_INDEX_RANGE` **từ inception**.
+
 ## EOD: pipeline control (T_EOD_PIPELINE) + app gọi 1 proc
 Toàn luồng /ngày track ở **`T_EOD_PIPELINE`** (1 dòng/ngày): upstream → EOD → đối soát → Asset.
 ```sql

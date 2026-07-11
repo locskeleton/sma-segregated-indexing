@@ -71,6 +71,29 @@ CREATE INDEX IX_SI_PORTFOLIO_CUST ON T_SI_PORTFOLIO (C_CUST_CODE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_STATUS, C_JOIN_DATE);
 
 /*-------------------------------------------------------------- MARKET DATA ---*/
+-- LỊCH NGHỈ — CORE (trước ở 09_FEE.sql, kéo lên đây 2026-07-11 vì ENGINE cũng phải dùng, không chỉ phí).
+-- NGÀY GD = KHÔNG cuối tuần (T7/CN) AND KHÔNG có trong bảng này  → UDF_IS_BUSINESS_DATE (02_SP_ENGINE).
+-- VÌ SAO ENGINE CẦN: master index là chuỗi NHÂN DỒN (Index_t = Index_(t-1) × FACTOR_t). Trước đây engine suy
+--   "ngày GD" = "T_PRICE_DAILY có dòng" → app backfill giá theo lịch dương (nguồn giá carry-forward phiên gần
+--   nhất cho T7/CN/lễ) làm ngày nghỉ thành PHIÊN GIẢ và index nhân thêm 1 factor mỗi ngày nghỉ ⇒ chỉ 1 cuối
+--   tuần đã sai +21%. Nay lịch là AUTHORITY: EOD/index/recompute CHỈ chạy ngày GD.
+-- ⚠️ KHÔNG áp cho SP_INGEST_ASSET_NAV: Asset gửi aum/tiền/daily_return MỌI NGÀY LỊCH (kể cả T7/CN) → ingest
+--   nhận hết; chỉ TÍNH TOÁN (index/EOD/TE) mới bị chặn theo lịch.
+CREATE TABLE T_TRADING_HOLIDAY (
+    C_HOLIDAY_DATE DATE NOT NULL,
+    C_NOTE         NVARCHAR(100) NULL,
+    CONSTRAINT PK_TRADING_HOLIDAY PRIMARY KEY CLUSTERED (C_HOLIDAY_DATE)
+);
+-- SEED: CHỈ lễ dương lịch CỐ ĐỊNH (1/1, 30/4, 1/5, 2/9). KHÔNG seed Tết/Giỗ Tổ/nghỉ bù (âm lịch, đổi từng năm
+--   → đoán sai còn tệ hơn không có): ops nạp qua SP_INGEST_TRADING_HOLIDAY theo thông báo của Sở.
+INSERT INTO T_TRADING_HOLIDAY (C_HOLIDAY_DATE, C_NOTE) VALUES
+ ('2025-01-01',N'Tết Dương lịch'), ('2025-04-30',N'Giải phóng miền Nam'),
+ ('2025-05-01',N'Quốc tế Lao động'),('2025-09-02',N'Quốc khánh'),
+ ('2026-01-01',N'Tết Dương lịch'), ('2026-04-30',N'Giải phóng miền Nam'),
+ ('2026-05-01',N'Quốc tế Lao động'),('2026-09-02',N'Quốc khánh'),
+ ('2027-01-01',N'Tết Dương lịch'), ('2027-04-30',N'Giải phóng miền Nam'),
+ ('2027-05-01',N'Quốc tế Lao động'),('2027-09-02',N'Quốc khánh');
+
 -- GỘP giá daily + sự kiện quyền vào 1 bảng: mỗi (mã, phiên) 1 dòng giá. Sở publish EOD
 -- đủ thông tin của CHÍNH ngày đó → engine KHÔNG cần ngó bản ghi hôm trước.
 -- C_REF_PRICE = giá tham chiếu đầu phiên (mẫu số daily-return J12): phiên thường = close

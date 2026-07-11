@@ -175,4 +175,106 @@ IF @ag1=4 AND @ast1='PENDING' AND @ag2=0 AND @ast2='READY'
    PRINT '  OK batch gate: 1/2 → err=4 PENDING ; 1/1 → READY';
 ELSE PRINT CONCAT('  !!! batch gate: ag1=',@ag1,' st1=',@ast1,' ag2=',@ag2,' st2=',@ast2);
 
+PRINT '';
+PRINT '======== LỊCH GD: ngày nghỉ KHÔNG được cộng dồn vào index (T_TRADING_HOLIDAY + rule T7/CN) ========';
+-- Ngày dùng: 2026-07-01 T4, 02 T5, 03 T6, 04 T7, 05 CN, 06 T2. Lễ: 30/04, 02/09.
+DECLARE @ecH INT, @emH NVARCHAR(400);
+-- TỰ CHỨA: không dựa vào seed 01_TABLES (10_FEE_SMOKE.sql XOÁ SẠCH T_TRADING_HOLIDAY rồi nạp lịch riêng → chạy
+--   fee-smoke trước file này sẽ làm assert lễ vỡ). Upsert lại 2 ngày lễ block này cần (idempotent).
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"2026-04-30","note":"30/4"},{"holiday_date":"2026-09-02","note":"Quốc khánh"}]',
+     'smoke', @ecH OUTPUT, @emH OUTPUT;
+
+-- (A) UDF_IS_BUSINESS_DATE: T7/CN → 0 (rule), lễ 02/09 → 0 (T_TRADING_HOLIDAY), ngày thường → 1
+DECLARE @isSat BIT=dbo.UDF_IS_BUSINESS_DATE('2026-07-04'), @isSun BIT=dbo.UDF_IS_BUSINESS_DATE('2026-07-05'),
+        @isHol BIT=dbo.UDF_IS_BUSINESS_DATE('2026-09-02'), @isWed BIT=dbo.UDF_IS_BUSINESS_DATE('2026-07-01');
+IF @isSat=0 AND @isSun=0 AND @isHol=0 AND @isWed=1
+   PRINT '  OK UDF_IS_BUSINESS_DATE: T7=0, CN=0, lễ 02/09=0, ngày thường=1';
+ELSE PRINT CONCAT('  !!! UDF_IS_BUSINESS_DATE sai: T7=',@isSat,' CN=',@isSun,' lễ=',@isHol,' thường=',@isWed);
+
+-- (B) INGEST GIÁ ngày nghỉ → err=23, KHÔNG ghi dòng nào
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"HX1","ref_price":100,"close_price":110}]','2026-07-04',NULL,NULL,@ecH OUTPUT,@emH OUTPUT;
+DECLARE @ecSat INT=@ecH;
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"HX1","ref_price":100,"close_price":110}]','2026-04-30',NULL,NULL,@ecH OUTPUT,@emH OUTPUT;
+IF @ecSat=23 AND @ecH=23 AND NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_TICKER='HX1')
+   PRINT '  OK ingest GIÁ ngày T7 + lễ 30/04 → err=23, KHÔNG ghi dòng nào';
+ELSE PRINT CONCAT('  !!! ingest giá ngày nghỉ KHÔNG bị chặn: T7 err=',@ecSat,' lễ err=',@ecH);
+
+-- (C) ⚠️ NGƯỢC LẠI — SP_INGEST_ASSET_NAV ngày T7 PHẢI VẪN NHẬN (Asset gửi aum/tiền MỌI ngày lịch).
+--     Nếu guard lịch bị áp nhầm vào đây thì nạp/rút cuối tuần sẽ mất trắng.
+EXEC SP_INGEST_ASSET_NAV N'[{"si_account":"SUB001","aum":11000000,"daily_return":0,"cash":1000000,"cash_in":1000000,"cash_out":0}]',
+     '2026-07-04', NULL, @ecH OUTPUT, @emH OUTPUT;
+IF @ecH=0 AND EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_SI_ACCOUNT='SUB001' AND C_BUSINESS_DATE='2026-07-04')
+   PRINT '  OK ingest ASSET_NAV ngày T7 VẪN NHẬN (err=0) — nạp/rút cuối tuần không mất';
+ELSE PRINT CONCAT('  !!! ASSET_NAV ngày T7 bị chặn nhầm: err=',@ecH,' ',ISNULL(@emH,''));
+DELETE FROM T_SI_BALANCE WHERE C_BUSINESS_DATE='2026-07-04';
+
+-- (D) SP_INGEST_TRADING_HOLIDAY: nạp lễ mới (17/02 T3) → giá ngày đó bị chặn; is_delete=1 → gỡ → nạp lại OK
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"2026-02-17","note":"Tết Bính Ngọ"}]','ops',@ecH OUTPUT,@emH OUTPUT;
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"HX2","ref_price":10,"close_price":11}]','2026-02-17',NULL,NULL,@ecH OUTPUT,@emH OUTPUT;
+DECLARE @ecTet INT=@ecH;
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"2026-02-17","is_delete":1}]','ops',@ecH OUTPUT,@emH OUTPUT;
+EXEC SP_INGEST_PRICE_DAILY N'[{"ticker":"HX2","ref_price":10,"close_price":11}]','2026-02-17',NULL,NULL,@ecH OUTPUT,@emH OUTPUT;
+IF @ecTet=23 AND @ecH=0 AND EXISTS (SELECT 1 FROM T_PRICE_DAILY WHERE C_TICKER='HX2')
+   PRINT '  OK SP_INGEST_TRADING_HOLIDAY: nạp lễ → giá bị chặn (23); gỡ lễ → nạp lại OK';
+ELSE PRINT CONCAT('  !!! SP_INGEST_TRADING_HOLIDAY sai: có lễ err=',@ecTet,' (cần 23); sau gỡ err=',@ecH,' (cần 0)');
+-- validate all-or-nothing: trùng ngày / sai định dạng / add+delete cùng ngày → err=21, không ghi
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"2026-06-10"},{"holiday_date":"2026-06-10"}]','ops',@ecH OUTPUT,@emH OUTPUT;
+DECLARE @ecDup INT=@ecH;
+EXEC SP_INGEST_TRADING_HOLIDAY N'[{"holiday_date":"khong-phai-ngay"}]','ops',@ecH OUTPUT,@emH OUTPUT;
+IF @ecDup=21 AND @ecH=21 AND NOT EXISTS (SELECT 1 FROM T_TRADING_HOLIDAY WHERE C_HOLIDAY_DATE='2026-06-10')
+   PRINT '  OK validate lịch: ngày trùng / sai định dạng → err=21, không ghi dòng nào';
+ELSE PRINT CONCAT('  !!! validate lịch sai: dup=',@ecDup,' format=',@ecH);
+DELETE FROM T_PRICE_DAILY WHERE C_TICKER='HX2';
+
+-- (E) CỐT LÕI — giá ngày nghỉ LỌT vào DB (INSERT thẳng, bypass guard) thì index VẪN ĐÚNG.
+--     HAA: T4 flat → T5 +10% → T6 +10%; T7/CN có dòng giá RÁC (carry-forward y hệt phiên T6); T2 flat.
+--     Không lịch: nhân thêm 1.1 hai lần → 1464.10 (sai +21%). Có lịch: dừng ở 1210.
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES ('MHOL',N'HolidayGuard','ACTIVE','2026-07-01','VNINDEX');
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MHOL','2026-07-01','HAA',1.0);
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
+ ('HAA','2026-07-01',100,100),('HAA','2026-07-02',100,110),('HAA','2026-07-03',110,121),
+ ('HAA','2026-07-04',110,121),   -- T7 RÁC
+ ('HAA','2026-07-05',110,121),   -- CN RÁC
+ ('HAA','2026-07-06',121,121);
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-07-01', @p_to_date='2026-07-06', @p_err_code=@ecH OUTPUT, @p_err_msg=@emH OUTPUT;
+DECLARE @hFri DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL' AND C_BUSINESS_DATE='2026-07-03');
+DECLARE @hMon DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL' AND C_BUSINESS_DATE='2026-07-06');
+DECLARE @hWkn INT=(SELECT COUNT(*) FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL' AND C_BUSINESS_DATE IN ('2026-07-04','2026-07-05'));
+DECLARE @hAll INT=(SELECT COUNT(*) FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL');
+IF @ecH=0 AND @hFri=1210.00 AND @hMon=1210.00 AND @hWkn=0 AND @hAll=4
+   PRINT CONCAT('  OK loop DẢI NGÀY có giá rác T7/CN: index T6=',@hFri,' → T2=',@hMon,' (KHÔNG cộng dồn; nếu hỏng sẽ là 1464.10), 0 dòng index cuối tuần');
+ELSE PRINT CONCAT('  !!! index CỘNG DỒN NGÀY NGHỈ: err=',@ecH,' T6=',@hFri,' T2=',@hMon,' #row cuối tuần=',@hWkn,' #row=',@hAll);
+
+-- (F) UDF_PREV_BUSINESS_DATE nhảy qua ngày rác: prev(T2 06/07) = T6 03/07 (KHÔNG phải CN 05/07)
+DECLARE @prevMon DATE = dbo.UDF_PREV_BUSINESS_DATE('2026-07-06');
+DECLARE @lastBiz DATE = dbo.UDF_LAST_BUSINESS_DATE();
+IF @prevMon='2026-07-03' AND @lastBiz='2026-07-06'
+   PRINT '  OK UDF_PREV/LAST_BUSINESS_DATE bỏ qua T7/CN dù 2 ngày đó CÓ dòng giá';
+ELSE PRINT CONCAT('  !!! prev/last business date SAI: prev=',ISNULL(CONVERT(VARCHAR(10),@prevMon,23),'(null)'),
+                  ' last=',ISNULL(CONVERT(VARCHAR(10),@lastBiz,23),'(null)'));
+
+-- (G) gọi THẲNG SP_EOD_SI_INDEX ngày T7 → THROW 51013, không ghi index
+DECLARE @ecTh INT=0;
+BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-07-04'; END TRY BEGIN CATCH SET @ecTh=ERROR_NUMBER(); END CATCH
+IF @ecTh=51013 AND NOT EXISTS (SELECT 1 FROM T_MASTER_INDEX_DAILY WHERE C_BUSINESS_DATE='2026-07-04')
+   PRINT '  OK gọi thẳng SP_EOD_SI_INDEX ngày T7 → THROW 51013, không ghi index';
+ELSE PRINT CONCAT('  !!! direct call ngày nghỉ KHÔNG throw: ec=',@ecTh);
+
+-- (H) EOD pipeline ngày nghỉ: SET_SOURCE_READY / RUN_INDEX / RUN đều err=13, KHÔNG mở pipeline
+EXEC SP_EOD_SET_SOURCE_READY '2026-07-04','MKT_DATA',NULL,NULL,@ecH OUTPUT,@emH OUTPUT;
+DECLARE @ecRdy INT=@ecH;
+EXEC SP_EOD_RUN_INDEX '2026-07-04', @p_err_code=@ecH OUTPUT, @p_err_msg=@emH OUTPUT;
+DECLARE @ecRix INT=@ecH;
+EXEC SP_EOD_RUN '2026-07-05', @p_err_code=@ecH OUTPUT, @p_err_msg=@emH OUTPUT;
+IF @ecRdy=13 AND @ecRix=13 AND @ecH=13 AND NOT EXISTS (SELECT 1 FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE IN ('2026-07-04','2026-07-05'))
+   PRINT '  OK ngày nghỉ: SET_SOURCE_READY/RUN_INDEX/RUN đều err=13, KHÔNG mở pipeline';
+ELSE PRINT CONCAT('  !!! EOD ngày nghỉ không chặn: ready=',@ecRdy,' run_index=',@ecRix,' run=',@ecH);
+
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MHOL';
+DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE='MHOL';
+DELETE FROM T_PRICE_DAILY WHERE C_TICKER='HAA';
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
+
 PRINT '======== END SMOKE ========';

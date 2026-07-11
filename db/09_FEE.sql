@@ -16,35 +16,11 @@ GO
   Load sau 01_TABLES + 02_SP_ENGINE.
 ==============================================================================*/
 
-/*------------------------------------- Lịch nghỉ (forward) cho look-forward ----*/
--- Ngày GD = KHÔNG cuối tuần (Sat/Sun) VÀ KHÔNG trong T_TRADING_HOLIDAY (nguồn: sở/FO publish trước).
-CREATE TABLE T_TRADING_HOLIDAY (
-    C_HOLIDAY_DATE DATE NOT NULL,
-    C_NOTE         NVARCHAR(100) NULL,
-    CONSTRAINT PK_TRADING_HOLIDAY PRIMARY KEY CLUSTERED (C_HOLIDAY_DATE)
-);
-GO
-
--- 1 nếu @d là NGÀY GD (không cuối tuần + không nghỉ). DATEDIFF(DAY,0,@d)%7: 0=Mon..5=Sat,6=Sun (độc lập @@DATEFIRST).
-CREATE OR ALTER FUNCTION UDF_IS_BUSINESS_DATE (@d DATE)
-RETURNS BIT AS
-BEGIN
-    RETURN CASE WHEN @d IS NULL THEN 0
-                WHEN DATEDIFF(DAY,0,@d) % 7 >= 5 THEN 0
-                WHEN EXISTS (SELECT 1 FROM T_TRADING_HOLIDAY WHERE C_HOLIDAY_DATE=@d) THEN 0
-                ELSE 1 END;
-END
-GO
-
--- Ngày GD KẾ tiếp sau @d (bỏ cuối tuần + nghỉ). Dùng cho look-forward accrual + phát hiện cuối tháng.
-CREATE OR ALTER FUNCTION UDF_NEXT_BUSINESS_DATE (@d DATE)
-RETURNS DATE AS
-BEGIN
-    DECLARE @n DATE = DATEADD(DAY,1,@d);
-    WHILE dbo.UDF_IS_BUSINESS_DATE(@n) = 0 SET @n = DATEADD(DAY,1,@n);
-    RETURN @n;
-END
-GO
+/*------------------------------------- Lịch nghỉ — ĐÃ CHUYỂN LÊN CORE (2026-07-11) ------------
+  T_TRADING_HOLIDAY (01_TABLES.sql) + UDF_IS_BUSINESS_DATE / UDF_NEXT_BUSINESS_DATE (02_SP_ENGINE.sql).
+  Lý do: ENGINE cũng phải dùng lịch (master index là chuỗi nhân dồn — tính nhầm 1 ngày nghỉ là sai cấp số
+  nhân), không riêng subsystem phí. 09_FEE giờ CHỈ TIÊU THỤ 2 UDF này. Deploy: 01 → 02 → … → 09 (không đổi).
+  Module vẫn PLUGGABLE (EOD guard OBJECT_ID); chỉ khác: 09 không còn tự định nghĩa lịch. */
 
 /*------------------------------ Rate phí SẢN PHẨM (per-master) effective-dated --*/
 -- Mỗi dòng = 1 version (lịch sử). Đổi rate sản phẩm áp sub MỚI; sub cũ giữ rate ở T_SI_FEE_RATE.

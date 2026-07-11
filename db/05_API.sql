@@ -346,9 +346,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_SI_CURRENT WHERE C_SI_ACCOUNT=@p_si_account)
         BEGIN SET @p_err_code = 1; SET @p_err_msg = N'Sub-account not found'; RAISERROR(@p_err_msg, 16, 1); END
 
-    -- @pd = ngày giá mới nhất TOÀN THỊ TRƯỜNG (mốc định giá "hiện tại"). Lấy MAX trên clustered
-    --   (C_BUSINESS_DATE, C_TICKER) leading-date ⇒ seek dòng cuối, rẻ.
-    DECLARE @pd DATE = (SELECT MAX(C_BUSINESS_DATE) FROM T_PRICE_DAILY);
+    -- @pd = PHIÊN GD mới nhất có giá (mốc định giá "hiện tại"). Lọc theo LỊCH: MAX(C_BUSINESS_DATE) trần trụi
+    --   sẽ trỏ vào T7/CN nếu 1 dòng giá ngày nghỉ lọt vào bảng ⇒ định giá holdings theo phiên không tồn tại.
+    DECLARE @pd DATE = dbo.UDF_LAST_BUSINESS_DATE();
 
     ;WITH h AS (
         -- Định giá MỖI holding bằng giá ĐÓNG CỬA MỚI NHẤT ≤ @pd CỦA CHÍNH MÃ ĐÓ (per-ticker), KHÔNG

@@ -18,6 +18,16 @@ DECLARE @price DECIMAL(18,4) = 10000, @qty DECIMAL(20,0) = 100;
 PRINT CONCAT('BENCH seed: nCust=',@nCust,' nSi=',@nSi,' nTick=',@nTick,
              ' → subaccount=',@nCust*@nSi,' holdings=',@nCust*@nSi*@nTick,' @ ',CONVERT(VARCHAR,@d,23));
 
+-- Ngày bench PHẢI là ngày GD: mọi proc EOD/index gate bằng lịch (err=13) → bench trên T7/CN/lễ sẽ ra bảng
+--   thời gian toàn NULL (job không chạy) + ghi 1 dòng rác vào perf-history.csv. Fail SỚM + rõ.
+IF dbo.UDF_IS_BUSINESS_DATE(@d) = 0
+BEGIN
+    DECLARE @bmsg NVARCHAR(300) = CONCAT(N'BENCH: ', CONVERT(VARCHAR(10),@d,23),
+        N' KHÔNG phải ngày giao dịch (T7/CN hoặc nghỉ lễ trong T_TRADING_HOLIDAY) — chọn -BusinessDate khác.');
+    RAISERROR(@bmsg, 16, 1);
+    RETURN;
+END
+
 /*--- reset (TRUNCATE: schema KHÔNG có FK constraint nên an toàn, nhanh, no-log) ---*/
 TRUNCATE TABLE T_EOD_WORK;
 TRUNCATE TABLE T_SI_BALANCE;   TRUNCATE TABLE T_MASTER_BALANCE;
