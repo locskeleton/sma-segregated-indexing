@@ -17,7 +17,7 @@ Có quan ngại kiến trúc: **SDI là nơi phát sinh nghiệp vụ chính** �
 | 1 | `fee` Asset gửi dạng nào | **[BRD asset-sync] SUPERSEDED 2026-06-25: Asset KHÔNG gửi số phí lũy kế.** Asset gửi **NAV RÒNG** (phí QL đã trừ sẵn — model realized); `AUM = NAV` (gross = net, không tách payable). |
 | 2 | Granularity | **Chỉ per-SI**. SDI **tự SUM lên master** cuối ngày (`aum` Σ + `daily_return` AUM-weighted). **[thin-layer] KHÔNG còn "tính lại unit/unit_price"** — Asset cấp `daily_return`. |
 | 3 | Index↔NAV giá BO | **Cùng giá BO close + cùng cutoff.** MỞ RỘNG: **MỌI hệ (BO/Asset/SDI) tham chiếu CÙNG 1 bộ giá đóng cửa** → không deviation giả. |
-| 4 | Ngày gửi NAV | **Chỉ ngày GD**; T7/CN/lễ SDI **carry-forward**. |
+| 4 | Ngày gửi NAV | ~~Chỉ ngày GD; T7/CN/lễ SDI carry-forward~~ → **SUPERSEDED 2026-07-11: Asset gửi MỌI NGÀY LỊCH (365)**, kể cả T7/CN/lễ. Lý do: **nạp/rút cuối tuần VẪN đổi AUM** ⇒ đổi base phí QL ngày đó (phí tính theo ngày dương lịch). Ngày nghỉ: **`daily_return` = 0 hoặc NULL** (không có phiên ⇒ không có lợi suất; dòng tiền đã bị khử) — xem [SDI-daily-return-contract.md](./SDI-daily-return-contract.md). SDI: `SP_INGEST_ASSET_NAV` **KHÔNG gate lịch** (nhận mọi ngày); nhưng EOD/index/TE **CHỈ chạy ngày GD**. |
 | 5 | Originator cashflow | **SDI VẪN nhập cashflow** (giữ `T_SI_CASHFLOW_EVENT`) + Asset cũng gửi `cash_in/out` → **đối soát 2 nguồn**. Unit/UP tính theo cashflow SDI (authoritative); **reconcile phải PASS** để NAV(Asset) & unit(SDI) nhất quán (cùng dòng tiền). |
 
 **Bổ sung — giá cuối ngày + thành phần tài sản (chốt 2026-06-24):** ~~Asset gửi ĐỦ thành phần tài sản dạng SỐ TỔNG cấp SI (`stock_value + ... + cash`)~~ **[thin-layer 2026-06-26] cập nhật:** Asset gửi `aum` (NAV ròng) + `daily_return` + `cash` (tổng), **KHÔNG `stock_value`**. SDI **không tự định giá EOD**, chỉ **LƯU**. **Mọi hệ (BO/Asset/SDI) tham chiếu CÙNG 1 bộ giá đóng cửa.**
@@ -51,15 +51,23 @@ Hệ quả: SDI chuyển từ *engine định giá* → **consumer + index engin
 
 ## 3. Data contract Asset → SDI (CHỐT 2026-06-24)
 
-Mỗi `(business_date, si_account)` — **chỉ ngày GD** (QĐ4), **per-SI** (QĐ2). **[thin-layer 2026-06-26] cập nhật contract:**
+Mỗi `(business_date, si_account)` — **MỌI NGÀY LỊCH (365), kể cả T7/CN/lễ** (QĐ4 cập nhật 2026-07-11), **per-SI** (QĐ2).
 ```
-aum            -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (đã trừ phí QL; AUM = NAV).
-daily_return   -- [thin-layer] TWR ngày (Asset ĐÃ khử dòng tiền). NULL ngày đầu. SDI LƯU, KHÔNG tự tính.
-cash           -- TỔNG tiền dư (1 SỐ: gộp tiền mặt + bán chờ về T+ + cổ tức tiền) — KHÔNG chia nhỏ.
-cash_in        -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhập — QĐ5)
-cash_out       -- rút trong ngày (ĐỐI SOÁT)
--- [thin-layer] KHÔNG còn `stock_value` (Asset không gửi) / `fee`/`fee_accum` (phí QL đã trừ trong aum — model realized).
+aum             -- NAV RÒNG cuối ngày — Asset GỬI TRỰC TIẾP (đã trừ phí QL; AUM = NAV).
+daily_return    -- TWR ngày (Asset ĐÃ khử dòng tiền): r = AUM_t/(AUM_(t−1)+CF_t) − 1. NULL ngày đầu.
+                --   ⚠️ NGÀY T7/CN/LỄ: PHẢI = 0 (hoặc NULL) — không có phiên ⇒ không có lợi suất.
+                --   TUYỆT ĐỐI KHÔNG dùng AUM_t/AUM_(t−1) − 1: nạp tiền sẽ thành "lãi" (+50% giả).
+                --   Chi tiết + ví dụ số: SDI-daily-return-contract.md. SDI LƯU + compound, KHÔNG tự tính.
+cash            -- TỔNG tiền dư (gộp tiền mặt + bán chờ về T+ + cổ tức tiền) — hiển thị + cash drag.
+cash_available  -- [2026-07-11] TIỀN KHẢ DỤNG (số THẬT SỰ rút/cắt được — trừ phong toả/chờ khớp/T+ chưa về).
+                --   NGUỒN THU PHÍ: SP_FEE_COLLECT cắt theo số này, KHÔNG theo `cash` tổng.
+cash_in         -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhập — QĐ5). VALUE DATE THẬT: tiền về T7
+cash_out        -- rút trong ngày (ĐỐI SOÁT).  thì ghi ở row ngày T7, KHÔNG dồn sang T2.
+                --   ⚠️ CHỈ dòng tiền của KHÁCH. KHÔNG gộp khoản BO cắt phí QL (phí là CHI PHÍ, phải làm
+                --   giảm daily_return; gộp vào cash_out sẽ khử mất phí ⇒ hiệu suất báo GROSS).
+-- KHÔNG còn `stock_value` / `fee`/`fee_accum` (phí QL đã trừ trong aum — model realized).
 ```
+> **Ngày nghỉ (T7/CN/lễ):** Asset **vẫn gửi** row (aum/cash/cash_available/cash_in/cash_out) vì dòng tiền vẫn phát sinh; `daily_return`=0/NULL. SDI **nhận ingest bình thường** nhưng **KHÔNG chạy EOD/index/TE** ngày đó (lịch = `T_TRADING_HOLIDAY` + rule T7/CN, `UDF_IS_BUSINESS_DATE`). Phí QL thì tính **theo ngày dương lịch** trên **AUM của chính ngày đó** ⇒ nạp/rút cuối tuần vào base phí ngay hôm đó.
 - **[thin-layer] AUM = NAV = Asset gửi trực tiếp** (`aum`, đã RÒNG phí QL) + **`daily_return` (TWR)**. SDI KHÔNG lắp/trừ/derive. `cash` gửi kèm để hiển thị (FR-06) + cash drag. *(Bản 2026-06-24 gửi `nav`+`stock_value` để SDI derive unit/UP — đã thay: Asset gửi luôn `daily_return`, bỏ `stock_value` + reconcile NAV_CONSISTENCY.)*
 - **GIÁ EOD THỐNG NHẤT (QĐ3 mở rộng):** Asset định giá `aum` bằng **đúng giá BO close** mà SDI dùng cho index → index ↔ NAV apples-to-apples.
 - **Per-SI** (QĐ2): PM tool toàn bộ per-KH; SDI tự SUM lên master.

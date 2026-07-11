@@ -68,7 +68,8 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 
 | | Ngày T7/CN/lễ |
 |---|---|
-| `SP_INGEST_ASSET_NAV` (aum, tiền, tiền khả dụng, daily_return) | ✅ **VẪN NHẬN** — Asset gửi **mọi ngày lịch**; nạp/rút cuối tuần vẫn đổi AUM |
+| `SP_INGEST_ASSET_NAV` (aum, tiền, **tiền khả dụng**, daily_return) | ✅ **VẪN NHẬN** — Asset gửi **mọi ngày lịch (365)**; nạp/rút cuối tuần vẫn đổi AUM. Ngày nghỉ `daily_return` phải = 0/NULL ([contract](../docs/SDI-daily-return-contract.md)) |
+| **Phí QL** (`SP_EOD_FEE_ACCRUE`, 09_FEE) | ✅ **VẪN TÍNH** — phí theo **ngày dương lịch**, base = **AUM của CHÍNH ngày đó** ⇒ tiền nằm trong TK ngày nào chịu phí ngày đó. Accrue **look-backward** tại phiên GD kế tiếp; chốt kỳ ở **ngày GD đầu tháng sau**; **chưa chốt tháng chưa thu** |
 | `SP_INGEST_PRICE_DAILY` (giá) | ❌ **err=23** — sở không có phiên thì không có giá |
 | `SP_EOD_RUN` / `SP_EOD_RUN_INDEX` / `SP_EOD_SET_SOURCE_READY` | ❌ **err=13** |
 | `SP_EOD_SI_INDEX` (gọi thẳng) | ❌ **THROW 51013** trước mọi DML |

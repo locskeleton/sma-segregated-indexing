@@ -88,7 +88,12 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 ### E. Asset → SDI (feed EOD) — **[BRD asset-sync] MỚI**
 
-> **Cơ chế:** Asset gửi 1 batch JSON per-SI/ngày GD → `SP_INGEST_ASSET_NAV` (idempotent DELETE+INSERT `T_SI_ASSET_DAILY` theo date,si) rồi SDI **LƯU thẳng** `aum`+`daily_return` (KHÔNG derive). Carry-forward T7/CN/lễ (Asset chỉ gửi ngày GD).
+> **Cơ chế:** Asset gửi 1 batch JSON per-SI → `SP_INGEST_ASSET_NAV` (idempotent DELETE+INSERT `T_SI_BALANCE` theo date,si) rồi SDI **LƯU thẳng** `aum` + `cash` + `cash_available` + `daily_return` (KHÔNG derive).
+>
+> ⚠️ **CẬP NHẬT 2026-07-11 — Asset gửi MỌI NGÀY LỊCH (365), kể cả T7/CN/lễ** (trước: chỉ ngày GD + SDI carry-forward). Lý do: **nạp/rút cuối tuần vẫn đổi AUM** ⇒ đổi base **phí QL** ngày đó (phí tính theo ngày dương lịch, `SP_EOD_FEE_ACCRUE` lấy **AUM của chính ngày đó**). Hệ quả:
+> - `SP_INGEST_ASSET_NAV` **KHÔNG gate lịch** — nhận ngày nghỉ bình thường. Nhưng **EOD/index/TE CHỈ chạy ngày GD** (`SP_EOD_RUN`/`SP_EOD_RUN_INDEX`/`SP_EOD_SET_SOURCE_READY` → err=13 nếu gọi vào ngày nghỉ).
+> - **Ngày nghỉ: `daily_return` PHẢI = 0 hoặc NULL** — không có phiên ⇒ không có lợi suất; dòng tiền đã bị khử. Nếu Asset tính `AUM_t/AUM_(t−1) − 1` thì **khoản nạp thành lãi** và SDI compound ra số sai. Công thức + ví dụ số: **[SDI-daily-return-contract.md](./SDI-daily-return-contract.md)**.
+> - `cash_in`/`cash_out` ghi theo **value date thật** (tiền về T7 → row T7). Reconcile `CASHFLOW_MISMATCH` so theo **dải (phiên GD trước, @d]** nên vẫn bắt được lệch của ngày nghỉ.
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
