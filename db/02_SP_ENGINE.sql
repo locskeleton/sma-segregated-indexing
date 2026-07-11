@@ -759,18 +759,29 @@ BEGIN
     WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_AUM - a.NAV) > 1;
 
     -- [BRD] Check 3 CASHFLOW_MISMATCH (đo vênh 2 nguồn): cashflow SDI tự nhập vs cash_in/out Asset gửi.
-    --   Lệch (số nguyên VND, exact) → 2 nguồn net flow KHÔNG khớp (cảnh báo đối soát).
+    --   ⚠️ CỬA SỔ = (phiên_GD_trước, @p_d] — KHÔNG phải đúng 1 ngày @p_d. Vì sao: KH nạp/rút vào T7/CN thì
+    --     SDI ghi cashflow theo VALUE DATE THẬT (ngày T7) và Asset cũng gửi row ngày T7, nhưng EOD chỉ chạy
+    --     NGÀY GD ⇒ so đúng-1-ngày sẽ KHÔNG BAO GIỜ đối soát cặp đó → dòng tiền cuối tuần thành VÙNG MÙ
+    --     (lệch bao nhiêu cũng không ai biết). Gộp cả kỳ nghỉ vừa qua vào 1 phép so ở phiên GD kế tiếp.
+    --     Ngày GD thường (prev = hôm qua) ⇒ cửa sổ = đúng 1 ngày → hành vi KHÔNG đổi.
+    DECLARE @cfprev DATE = dbo.UDF_PREV_BUSINESS_DAY(@p_d);   -- lịch (không cần giá): kỳ nghỉ không được thủng
     ;WITH sdicf AS (
         SELECT C_SI_ACCOUNT,
                SUM(CASE WHEN C_EVENT_TYPE='WITHDRAW' THEN -C_AMOUNT ELSE C_AMOUNT END) AS NET
-        FROM T_SI_CASHFLOW_EVENT WHERE C_BUSINESS_DATE=@p_d GROUP BY C_SI_ACCOUNT)
+        FROM T_SI_CASHFLOW_EVENT
+        WHERE C_BUSINESS_DATE > @cfprev AND C_BUSINESS_DATE <= @p_d GROUP BY C_SI_ACCOUNT),
+    astcf AS (   -- Asset: cộng cash_in/out của MỌI ngày lịch trong dải (Asset gửi cả T7/CN)
+        SELECT C_SI_ACCOUNT, MAX(C_MASTER_CODE) AS C_MASTER_CODE, SUM(C_CASH_IN - C_CASH_OUT) AS NET
+        FROM T_SI_BALANCE
+        WHERE C_BUSINESS_DATE > @cfprev AND C_BUSINESS_DATE <= @p_d GROUP BY C_SI_ACCOUNT)
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
     SELECT @p_d, 'CASHFLOW_MISMATCH', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
-           ISNULL(s.NET,0), (a.C_CASH_IN - a.C_CASH_OUT), ISNULL(s.NET,0) - (a.C_CASH_IN - a.C_CASH_OUT),
-           N'Cashflow SDI != Asset cash_in/out'
-    FROM T_SI_BALANCE a
+           ISNULL(s.NET,0), a.NET, ISNULL(s.NET,0) - a.NET,
+           CONCAT(N'Cashflow SDI != Asset cash_in/out (dải ', CONVERT(VARCHAR(10),DATEADD(DAY,1,@cfprev),23),
+                  N'..', CONVERT(VARCHAR(10),@p_d,23), N' — gồm ngày nghỉ)')
+    FROM astcf a
     LEFT JOIN sdicf s ON s.C_SI_ACCOUNT=a.C_SI_ACCOUNT
-    WHERE a.C_BUSINESS_DATE=@p_d AND ISNULL(s.NET,0) <> (a.C_CASH_IN - a.C_CASH_OUT);
+    WHERE ISNULL(s.NET,0) <> a.NET;
 
     -- [thin-layer] ĐÃ GỠ check 4 HOLDINGS_MISMATCH + check 5 NAV_CONSISTENCY: Asset KHÔNG gửi stock_value nữa
     --   (chỉ AUM + daily_return + cash) ⇒ SDI không có components để đối soát holdings / nav-vs-components.
