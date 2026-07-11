@@ -111,25 +111,63 @@ TE = STDEV(a) × √(số phiên)
 
 **Vấn đề:** người dùng bấm xem TE cho **khoảng bất kỳ** (1 tháng / 1 năm / từ đầu). Muốn tính stdev thì phải có `Σa`, `Σa²`, `n` **của đúng khoảng đó** → nếu không lưu sẵn thì mỗi lần bấm phải **quét lại toàn bộ lịch sử của 50.000 khách**. Chết máy.
 
-**Mẹo (prefix-sum):** mỗi ngày lưu **cộng dồn từ đầu đời**:
+**Mẹo (prefix-sum):** mỗi ngày lưu **cộng dồn TỪ ĐẦU ĐỜI** (không phải giá trị riêng của ngày đó!):
 
 ```
-C_ACCUM_ACTIVE_RET     = Σ a   (từ inception tới ngày đó)
+C_ACCUM_ACTIVE_RET     = Σ a    (từ inception tới HẾT ngày đó)
 C_ACCUM_ACTIVE_RET_SQ  = Σ a²
 C_RET_DAY_COUNT        = n
 ```
 
-Khi cần khoảng `[base → end]`, chỉ **lấy hiệu 2 lát** (đọc **2 dòng**, không quét):
+#### Cách ghi (job `J12B_TE_ACCUM`, chỉ ngày GD)
+
+Đọc **dòng của phiên GD hôm trước** rồi cộng thêm phần hôm nay:
 
 ```
-Σa (kỳ)  = ACCUM(end) − ACCUM(base)
-Σa² (kỳ) = ACCUM_SQ(end) − ACCUM_SQ(base)
-n (kỳ)   = COUNT(end) − COUNT(base)
+a_d    = daily_return(KH, d) − daily_return(index, d)     ← "active return" ngày d
 
-Var = ( Σa² − (Σa)²/n ) / (n−1)          →  TE = √Var × √n
+Σa(d)  = Σa(d−1)  + a_d
+Σa²(d) = Σa²(d−1) + a_d²
+n(d)   = n(d−1)   + 1
 ```
 
-Đó là toàn bộ lý do 3 cột đó tồn tại. **Job `J12B_TE_ACCUM` ghi chúng, chỉ ngày GD.**
+Ngày thiếu return (KH hoặc index NULL) → đóng góp **0**, `n` **không tăng**.
+
+#### Ví dụ số
+
+| Ngày | r_KH | r_index | `a` (riêng ngày) | **Σa (LƯU)** | **Σa² (LƯU)** | **n (LƯU)** |
+|---|---|---|---|---|---|---|
+| d1 | +1,0% | +0,8% | **+0,002** | 0,002 | 0,000004 | 1 |
+| d2 | −0,5% | −0,3% | **−0,002** | 0,000 | 0,000008 | 2 |
+| d3 | +0,7% | +0,5% | **+0,002** | 0,002 | 0,000012 | 3 |
+| d4 | +0,2% | +0,4% | **−0,002** | 0,000 | 0,000016 | 4 |
+
+> Cột `a` (riêng ngày) **KHÔNG được lưu** — chỉ lưu 3 cột cộng dồn bên phải.
+
+#### Lấy ra cho khoảng bất kỳ = **TRỪ 2 LÁT**
+
+TE của khoảng **d1 → d4** (tức 3 ngày d2, d3, d4):
+
+```
+Σa  = Σa(d4)  − Σa(d1)  = 0,000    − 0,002    = −0,002
+Σa² = Σa²(d4) − Σa²(d1) = 0,000016 − 0,000004 =  0,000012
+n   = n(d4)   − n(d1)   = 4 − 1 = 3
+
+Var = ( Σa² − (Σa)²/n ) / (n−1) = (0,000012 − 0,0000013) / 2 = 0,0000053
+TE  = √Var × √n = 0,00231 × √3 = 0,4%
+```
+
+Đọc **đúng 2 dòng** (d1 và d4) thay vì quét 250 dòng × 50.000 khách. Đó là toàn bộ lý do 3 cột đó tồn tại.
+
+#### ⚠️ Hai chỗ dễ vấp
+
+**1. Khoảng luôn là `(base, end]` — KHÔNG tính ngày base.** Vì `Σa(base)` đã bao gồm cả ngày base; trừ nó ra thì ngày base biến mất. Đó là lý do khắp code viết `C_BUSINESS_DATE > @base AND <= @end`, **không phải `>=`**.
+
+**2. Vì sao lưu `Σa²` chứ không lưu thẳng phương sai?** Vì **phương sai KHÔNG cộng/trừ được** giữa các khoảng, còn **tổng bình phương thì cộng/trừ được**. Lưu `Σa²` rồi ráp phương sai lúc đọc là cách **duy nhất** làm được trò "trừ 2 lát".
+
+**3. BẪY từ khi Asset gửi 365 ngày:** `T_SI_BALANCE` giờ có cả dòng T7/CN, nhưng **J12B chỉ update dòng NGÀY GD** ⇒ **dòng ngày nghỉ có `Σa = Σa² = n = 0`** (giá trị default), *không phải* số cộng dồn.
+> **TUYỆT ĐỐI không lấy lát của ngày nghỉ làm mốc base/end** → ra TE rác.
+> Code hiện tại an toàn vì PM API lấy mốc ngày từ `T_MASTER_BALANCE` (chỉ EOD ghi ⇒ chỉ có ngày GD). Ai viết API mới mà lấy `MAX(C_BUSINESS_DATE)` từ `T_SI_BALANCE` làm mốc là **dính ngay**.
 
 ---
 
