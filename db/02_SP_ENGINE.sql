@@ -362,13 +362,17 @@ BEGIN
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
 
         DECLARE @src TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_AUM DECIMAL(20,0), C_DAILY_RETURN DECIMAL(10,6),
-                            C_CASH DECIMAL(20,0), C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
+                            C_CASH DECIMAL(20,0), C_CASH_AVAILABLE DECIMAL(20,0),
+                            C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
         INSERT @src
-        SELECT j.si_account, j.aum, j.daily_return, j.cash,
+        -- cash_available: Asset gửi TIỀN KHẢ DỤNG (số thật sự rút/cắt được — loại phần phong toả/chờ khớp/T+).
+        --   Fallback ISNULL(...,cash): payload CŨ chưa có field này ⇒ coi như = tổng tiền (hành vi như trước,
+        --   KHÔNG vỡ ingest cũ). Khi Asset đã gửi field → thu phí bám theo số khả dụng thật.
+        SELECT j.si_account, j.aum, j.daily_return, j.cash, ISNULL(j.cash_available, j.cash),
                ISNULL(j.cash_in,0), ISNULL(j.cash_out,0)
         FROM OPENJSON(@p_json) WITH (
             si_account VARCHAR(20) '$.si_account', aum DECIMAL(20,0) '$.aum', daily_return DECIMAL(10,6) '$.daily_return',
-            cash DECIMAL(20,0) '$.cash',
+            cash DECIMAL(20,0) '$.cash', cash_available DECIMAL(20,0) '$.cash_available',
             cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out') j;
 
         -- [BRD] Asset đẩy CẢ indexing acc KHÔNG có trên SDI → BỎ QUA (KHÔNG reject batch). SDI chỉ nhận SI
@@ -385,21 +389,23 @@ BEGIN
         DELETE FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_business_date
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM @src);
         INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-            C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_IN,C_CASH_OUT)
+            C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_AVAILABLE,C_CASH_IN,C_CASH_OUT)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
-               s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_IN, s.C_CASH_OUT
+               s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_AVAILABLE, s.C_CASH_IN, s.C_CASH_OUT
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;   -- INNER JOIN lọc acc lạ (Asset đẩy dư)
         SET @p_rows = @@ROWCOUNT;   -- #SI THUỘC SDI đã ghi (≤ #item Asset gửi, vì acc lạ bị bỏ qua)
 
-        -- roll-forward T_SI_CURRENT (aum+cash). CHỈ khi @ngày >= ngày current hiện có (re-ingest quá khứ KHÔNG lùi current).
+        -- roll-forward T_SI_CURRENT (aum + tiền tổng + tiền KHẢ DỤNG). CHỈ khi @ngày >= ngày current hiện có
+        --   (re-ingest quá khứ KHÔNG lùi current). C_CASH_AVAILABLE = nguồn số dư của SP_FEE_COLLECT.
         MERGE T_SI_CURRENT t
-        USING (SELECT s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE, s.C_AUM, s.C_CASH
+        USING (SELECT s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE, s.C_AUM, s.C_CASH, s.C_CASH_AVAILABLE
                FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT) w
         ON t.C_SI_ACCOUNT=w.C_SI_ACCOUNT
         WHEN MATCHED AND @p_business_date >= ISNULL(t.C_LAST_BUSINESS_DATE,'1900-01-01') THEN UPDATE SET
-            t.C_CASH=w.C_CASH, t.C_LAST_AUM=w.C_AUM, t.C_LAST_BUSINESS_DATE=@p_business_date
-        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_LAST_AUM,C_STATUS,C_LAST_BUSINESS_DATE)
-            VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_CASH,w.C_AUM,'ACTIVE',@p_business_date);
+            t.C_CASH=w.C_CASH, t.C_CASH_AVAILABLE=w.C_CASH_AVAILABLE,
+            t.C_LAST_AUM=w.C_AUM, t.C_LAST_BUSINESS_DATE=@p_business_date
+        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_CASH_AVAILABLE,C_LAST_AUM,C_STATUS,C_LAST_BUSINESS_DATE)
+            VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_CASH,w.C_CASH_AVAILABLE,w.C_AUM,'ACTIVE',@p_business_date);
         COMMIT;
     END TRY
     BEGIN CATCH

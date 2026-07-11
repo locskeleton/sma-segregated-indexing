@@ -275,8 +275,10 @@ END
 GO
 
 /*============================================================================
-  SP_FEE_COLLECT @p_d, @p_batch_id — thu nợ FIFO (mỗi NGÀY GD). Per-SI: số dư khả dụng
-    (T_SI_CURRENT.C_CASH); FIFO kỳ cũ→mới; món đủ tiền (cộng dồn ≤ số dư) → đưa vào lệnh thu;
+  SP_FEE_COLLECT @p_d, @p_batch_id — thu nợ FIFO (mỗi NGÀY GD). Per-SI: số dư KHẢ DỤNG
+    (T_SI_CURRENT.C_CASH_AVAILABLE — Asset gửi; KHÔNG dùng C_CASH tổng: tổng gồm tiền phong toả/chờ khớp/T+
+    chưa về ⇒ thu theo tổng sẽ sinh lệnh vượt số rút được → BO reject hoặc âm tiền KH);
+    FIFO kỳ cũ→mới; món đủ tiền (cộng dồn ≤ số dư) → đưa vào lệnh thu;
     thiếu → skip (không cắt lẻ). Mỗi món sinh 1 REQUEST ID UNIQUE (= 1 bút toán), lưu C_BO_EVENT_ID;
     trả RS payload gửi BO. KHÔNG mark PAID (chờ SP_INGEST_FEE_COLLECT_RESULT). Chỉ chạy ngày GD.
     @p_batch_id = prefix gom lô (trace), tùy chọn; id thật vẫn unique/món.
@@ -289,7 +291,7 @@ BEGIN
 
     ;WITH unpaid AS (
         SELECT fp.PK_SI_FEE_CHARGE, fp.C_SI_ACCOUNT, fp.C_CUST_CODE, fp.C_MASTER_CODE, fp.C_PERIOD, fp.C_FEE_DUE,
-               nc.C_CASH AS avail,
+               nc.C_CASH_AVAILABLE AS avail,   -- KHẢ DỤNG (không phải tổng tiền) — xem header
                SUM(fp.C_FEE_DUE) OVER (PARTITION BY fp.C_SI_ACCOUNT ORDER BY fp.C_PERIOD ROWS UNBOUNDED PRECEDING) AS cum_due
         FROM T_SI_FEE_CHARGE fp
         INNER JOIN T_SI_CURRENT nc ON nc.C_SI_ACCOUNT=fp.C_SI_ACCOUNT

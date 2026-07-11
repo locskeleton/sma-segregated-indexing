@@ -213,7 +213,11 @@ CREATE TABLE T_SI_CURRENT (
     C_SI_ACCOUNT       VARCHAR(20)   NOT NULL,
     C_CUST_CODE        VARCHAR(10)   NOT NULL,
     C_MASTER_CODE      VARCHAR(20)   NOT NULL,
-    C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- TIỀN (Asset gửi) — cho cash drag
+    C_CASH             DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASH DEFAULT 0,     -- TỔNG tiền (Asset gửi) — cho cash drag
+    C_CASH_AVAILABLE   DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_CASHAV DEFAULT 0,   -- TIỀN KHẢ DỤNG (Asset gửi) — số THẬT SỰ rút/cắt được.
+                                                                                     --   NGUỒN DUY NHẤT của SP_FEE_COLLECT: thu phí phải theo KHẢ DỤNG, KHÔNG theo
+                                                                                     --   C_CASH (tổng gồm tiền đang bị phong toả/chờ khớp/T+ chưa về ⇒ thu theo tổng
+                                                                                     --   sẽ sinh lệnh thu vượt số rút được → BO reject / âm tiền KH).
     C_LAST_AUM         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- AUM gần nhất = Asset gửi trực tiếp. (rename→C_AUM ở bước cuối)
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
     C_LAST_BUSINESS_DATE DATE         NULL,                       -- ngày EOD compute gần nhất
@@ -262,9 +266,16 @@ CREATE TABLE T_SI_BALANCE (
     C_SI_ACCOUNT     VARCHAR(20)     NOT NULL,
     C_CUST_CODE      VARCHAR(10)     NOT NULL,
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
+    -- ⚠️ 1 DÒNG / NGÀY DƯƠNG LỊCH (365) — KHÔNG chỉ ngày GD: Asset gửi cả T7/CN/lễ vì nạp/rút cuối tuần VẪN
+    --   đổi AUM (⇒ đổi base phí ngày đó). Ngày nghỉ: C_DAILY_RETURN phải = 0/NULL (không có phiên ⇒ không có
+    --   lợi suất; dòng tiền đã bị khử) — xem docs/SDI-daily-return-contract.md.
+    --   Hệ quả: MAX(C_BUSINESS_DATE) trên bảng này CÓ THỂ là T7/CN → chỗ nào cần "phiên GD" phải lọc lịch.
+    --   TE accum (3 cột dưới) CHỈ được J12B set ở ngày GD ⇒ dòng ngày nghỉ giữ 0; PM API neo base/end vào
+    --   T_MASTER_BALANCE (chỉ EOD ghi = chỉ ngày GD) nên KHÔNG đọc nhầm dòng ngày nghỉ.
     C_AUM            DECIMAL(20,0)   NOT NULL,   -- AUM cuối ngày = Asset gửi TRỰC TIẾP (ingest ghi thẳng, KHÔNG qua compute)
-    C_DAILY_RETURN   DECIMAL(10,6)  NULL,        -- lợi suất ngày (Asset gửi, TWR). %PnL kỳ = ∏(1+r)−1 (on-read compound). Vào active return TE (KH − master index)
-    C_CASH           DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CASH DEFAULT 0,  -- [thin-layer] tiền (Asset gửi) — cash drag lịch sử + master agg
+    C_DAILY_RETURN   DECIMAL(10,6)  NULL,        -- lợi suất ngày (Asset gửi, TWR ĐÃ khử dòng tiền). %PnL kỳ = ∏(1+r)−1 (on-read compound). Vào active return TE (KH − master index)
+    C_CASH           DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CASH DEFAULT 0,  -- [thin-layer] TỔNG tiền (Asset gửi) — cash drag lịch sử + master agg
+    C_CASH_AVAILABLE DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CASHAV DEFAULT 0, -- TIỀN KHẢ DỤNG (Asset gửi) — số thật sự rút/cắt được (lịch sử; nguồn thu phí = bản current)
     C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CIN  DEFAULT 0,  -- [thin-layer] nạp ngày (Asset) — net flow master + reconcile vs cashflow SDI
     C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_COUT DEFAULT 0,  -- [thin-layer] rút ngày (Asset) — net flow + reconcile
     -- [PM tool] TE prefix-sum: lũy kế active return (= KH return − master index return) từ inception.
