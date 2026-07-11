@@ -42,7 +42,20 @@ BEGIN
 END
 GO
 
-/*---------------------------------------------------- UDF: prev business date
+/*---------------------------------------------------- UDF: ngày GD LIỀN TRƯỚC theo LỊCH (không cần giá)
+  ⚠️ KHÁC UDF_PREV_BUSINESS_DATE (bên dưới): hàm KIA đòi ngày đó phải CÓ GIÁ trong T_PRICE_DAILY (đúng cho
+  anchor index/TE — không có giá thì không tính được). Hàm NÀY thuần LỊCH — dùng cho PHÍ: dải accrue
+  (@prev, @d] phải phủ ĐỦ ngày dương lịch kể cả khi 1 phiên GD nào đó thiếu giá, nếu không sẽ THỦNG ngày phí. */
+CREATE OR ALTER FUNCTION UDF_PREV_BUSINESS_DAY (@d DATE)
+RETURNS DATE AS
+BEGIN
+    DECLARE @p DATE = DATEADD(DAY,-1,@d);
+    WHILE dbo.UDF_IS_BUSINESS_DATE(@p) = 0 SET @p = DATEADD(DAY,-1,@p);
+    RETURN @p;
+END
+GO
+
+/*---------------------------------------------------- UDF: prev business date (CÓ GIÁ)
   PHIÊN GD liền trước @d (theo LỊCH) đã có giá. Là anchor của mọi roll-forward (index prev, TE prev) ⇒ nếu trả
   về T7/CN/lễ thì chuỗi nhân dồn thêm 1 phiên giả. Điều kiện lịch INLINE (không gọi UDF_IS_BUSINESS_DATE) để
   tránh scalar-UDF chạy per-row khi quét ngày — rule PHẢI KHỚP UDF_IS_BUSINESS_DATE. */
