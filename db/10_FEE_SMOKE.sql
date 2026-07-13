@@ -89,11 +89,14 @@ INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE
  ('2026-05-04','SUBX'   ,'KH03','SDIF',1000000000,NULL,0,0,0),
  ('2026-04-22','SUBZERO','KH04','SDIF',         0,NULL,0,0,0);   -- AUM=0 → phí ngày = 0
 
-EXEC SP_EOD_FEE_ACCRUE '2026-04-22',@p_rows=@rows OUTPUT;   -- SUBONE + SUBZERO
-EXEC SP_EOD_FEE_ACCRUE '2026-04-24',@p_rows=@rows OUTPUT;   -- SUBFRI: Apr24
-EXEC SP_EOD_FEE_ACCRUE '2026-04-27',@p_rows=@rows OUTPUT;   -- SUBFRI: Apr25,26,27 (base 2e9)
-EXEC SP_EOD_FEE_ACCRUE '2026-04-29',@p_rows=@rows OUTPUT;   -- SUBX: Apr29
-EXEC SP_EOD_FEE_ACCRUE '2026-05-04',@p_rows=@rows OUTPUT;   -- SUBX: Apr30 + May1..4
+-- ★ CHẠY MỖI NGÀY LỊCH (365) — kể cả T7/CN/lễ. 1 ngày = 1 lần = 1 dòng/SI. KHÔNG quét ngược.
+EXEC SP_EOD_FEE_ACCRUE '2026-04-22',@p_rows=@rows OUTPUT;   -- T4: SUBONE + SUBZERO
+EXEC SP_EOD_FEE_ACCRUE '2026-04-24',@p_rows=@rows OUTPUT;   -- T6: SUBFRI base 1e9
+EXEC SP_EOD_FEE_ACCRUE '2026-04-25',@p_rows=@rows OUTPUT;   -- T7 (NGÀY NGHỈ): SUBFRI base 2e9 ← nạp tiền
+EXEC SP_EOD_FEE_ACCRUE '2026-04-26',@p_rows=@rows OUTPUT;   -- CN (NGÀY NGHỈ): SUBFRI base 2e9
+EXEC SP_EOD_FEE_ACCRUE '2026-04-27',@p_rows=@rows OUTPUT;   -- T2: SUBFRI base 2e9
+EXEC SP_EOD_FEE_ACCRUE '2026-04-29',@p_rows=@rows OUTPUT;   -- T4: SUBX
+EXEC SP_EOD_FEE_ACCRUE '2026-04-30',@p_rows=@rows OUTPUT;   -- LỄ 30/4 (= NGÀY CUỐI THÁNG): SUBX
 
 -- ★ AUM=0 → phí ngày = 0 (dòng vẫn tạo, fee 0.00) + KHÔNG sinh charge rác
 INSERT INTO @R SELECT '★ AUM=0 → phí ngày 0, KHÔNG sinh charge',
@@ -119,10 +122,18 @@ INSERT INTO @R SELECT '★★ Nạp T7: phí T7/CN base = AUM ngày đó (2e9), 
         AND (SELECT C_FEE_AMOUNT FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI' AND C_FEE_DATE='2026-04-25')=@feeDay2   -- T7
         AND (SELECT C_FEE_AMOUNT FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI' AND C_FEE_DATE='2026-04-26')=@feeDay2   -- CN
         AND (SELECT C_FEE_AMOUNT FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI' AND C_FEE_DATE='2026-04-27')=@feeDay2   -- T2
-        -- 3 ngày T7/CN/T2 accrue CÙNG 1 ngày GD (T2 27/04) — look-backward
-        AND (SELECT COUNT(DISTINCT C_ACCRUED_ON) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI')=2 THEN 1 ELSE 0 END,
+        -- MỖI NGÀY TỰ ACCRUE CHÍNH NÓ ⇒ C_ACCRUED_ON = C_FEE_DATE (4 ngày = 4 giá trị).
+        --   (Bản look-backward cũ: T7/CN/T2 cùng accrue vào T2 ⇒ chỉ 2 giá trị.)
+        AND (SELECT COUNT(DISTINCT C_ACCRUED_ON) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI')=4
+        AND (SELECT COUNT(*) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI' AND C_ACCRUED_ON<>C_FEE_DATE)=0 THEN 1 ELSE 0 END,
   (SELECT CONCAT('feeT7=',C_FEE_AMOUNT,' (look-forward cũ sẽ là ',@feeDay,')')
      FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBFRI' AND C_FEE_DATE='2026-04-25');
+
+-- May1..May4: chạy tiếp từng ngày lịch (lễ 1/5, T7 2/5, CN 3/5, T2 4/5)
+EXEC SP_EOD_FEE_ACCRUE '2026-05-01',@p_rows=@rows OUTPUT;
+EXEC SP_EOD_FEE_ACCRUE '2026-05-02',@p_rows=@rows OUTPUT;
+EXEC SP_EOD_FEE_ACCRUE '2026-05-03',@p_rows=@rows OUTPUT;
+EXEC SP_EOD_FEE_ACCRUE '2026-05-04',@p_rows=@rows OUTPUT;
 
 -- ★ SUBX: 6 dòng per-day (vắt tháng); 202604 = Apr29,30 (2) ; 202605 = May1,2,3,4 (4)
 INSERT INTO @R SELECT '★ ACCRUE SUBX 6 dòng per-day (dải nghỉ vắt tháng)',
@@ -147,18 +158,18 @@ INSERT INTO @R SELECT '★ Charge sinh NGAY khi accrue, C_CLOSED_AT NULL (đang 
   (SELECT CONCAT('total=',C_FEE_TOTAL) FROM T_SI_FEE_CHARGE WHERE C_SI_ACCOUNT='SUBONE' AND C_PERIOD='202604');
 
 /*==============================================================================
-  2) CLOSE PERIOD — chốt ở ngày GD ĐẦU tháng SAU (May04), KHÔNG phải ngày GD cuối tháng.
-     Lý do: look-backward ⇒ tại EOD ngày GD cuối tháng, T7/CN cuối tháng CHƯA accrue.
+  2) CLOSE PERIOD — chốt ở NGÀY CUỐI THÁNG DƯƠNG LỊCH (30/4 = ngày LỄ, vẫn chốt được).
+     Làm được vì phí accrue MỖI NGÀY LỊCH ⇒ tới 30/4 là kỳ 202604 đã đủ ngày.
 ==============================================================================*/
--- close giữa tháng (Apr29: prev=Apr28 cùng tháng) → no-op; charge vẫn CHƯA chốt
+-- close giữa tháng (Apr29, không phải ngày cuối tháng) → no-op; charge vẫn CHƯA chốt
 EXEC SP_FEE_CLOSE_PERIOD '2026-04-29',@p_rows=@rows OUTPUT;
 INSERT INTO @R SELECT 'CLOSE giữa tháng (Apr29) = no-op, chưa chốt kỳ nào',
   CASE WHEN @rows=0 AND (SELECT COUNT(*) FROM T_SI_FEE_CHARGE WHERE C_CLOSED_AT IS NOT NULL)=0 THEN 1 ELSE 0 END,
   CONCAT('rows=',@rows);
 
--- ★ chốt 202604 tại May04 (ngày GD ĐẦU tháng 5; prev=Apr29 khác tháng)
-EXEC SP_FEE_CLOSE_PERIOD '2026-05-04',@p_rows=@rows OUTPUT;
-INSERT INTO @R SELECT '★ CLOSE 202604 tại ngày GD đầu tháng 5 → 3 charge chốt',
+-- ★★ chốt 202604 tại 30/04 — NGÀY CUỐI THÁNG mà cũng là NGÀY LỄ (không phải ngày GD) → vẫn chốt
+EXEC SP_FEE_CLOSE_PERIOD '2026-04-30',@p_rows=@rows OUTPUT;
+INSERT INTO @R SELECT '★★ CLOSE 202604 tại ngày CUỐI THÁNG dù là NGÀY LỄ (30/4) → 3 charge chốt',
   CASE WHEN @rows=3
         AND (SELECT COUNT(*) FROM T_SI_FEE_CHARGE WHERE C_PERIOD='202604' AND C_CLOSED_AT IS NOT NULL)=3
         AND (SELECT COUNT(*) FROM T_SI_FEE_CHARGE WHERE C_PERIOD='202605' AND C_CLOSED_AT IS NOT NULL)=0 THEN 1 ELSE 0 END,
@@ -193,7 +204,7 @@ INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE
  ('2026-03-31','SUBLOCK' ,'KH07','SDIF',1000000000,NULL,0,0,0),
  ('2026-03-31','SUBLOCK2','KH08','SDIF',1000000000,NULL,0,0,0);
 EXEC SP_EOD_FEE_ACCRUE   '2026-03-31',@p_rows=@rows OUTPUT;   -- 1 ngày kỳ 202603, fee=feeDay
-EXEC SP_FEE_CLOSE_PERIOD '2026-04-01',@p_rows=@rows OUTPUT;   -- Apr01 = ngày GD ĐẦU tháng 4 → chốt 202603
+EXEC SP_FEE_CLOSE_PERIOD '2026-03-31',@p_rows=@rows OUTPUT;   -- 31/03 = NGÀY CUỐI THÁNG → chốt 202603
 -- BO thu XONG SUBLOCK → charge PAID; SUBLOCK2 vẫn UNPAID
 UPDATE T_SI_FEE_CHARGE SET C_STATUS='PAID', C_FEE_PAID=C_FEE_DUE, C_COLLECTED_AT=GETDATE()
  WHERE C_SI_ACCOUNT='SUBLOCK' AND C_PERIOD='202603';
@@ -318,12 +329,22 @@ EXEC SP_EOD_SET_SOURCE_READY @p_business_date='2026-06-15',@p_source='ASSET_NAV'
 INSERT INTO @R SELECT '★ Sync ASSET_NAV READY KHÔNG accrue (hook đã gỡ)',
   CASE WHEN NOT EXISTS (SELECT 1 FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK') THEN 1 ELSE 0 END,
   CONCAT('rows=',(SELECT COUNT(*) FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK'));
--- (b) SP_EOD_RUN wiring 2 job phí + guard pluggable
-INSERT INTO @R SELECT '★ SP_EOD_RUN có J15_FEE_ACCRUE + J16_FEE_CLOSE (guard)',
-  CASE WHEN OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%J15_FEE_ACCRUE%'
-        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%J16_FEE_CLOSE%'
-        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) LIKE '%SP_EOD_FEE_ACCRUE%'
-        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_SET_SOURCE_READY')) NOT LIKE '%SP_EOD_FEE_ACCRUE%' THEN 1 ELSE 0 END, NULL;
+-- (b) ★★ PHÍ ĐÃ TÁCH KHỎI EOD: SP_EOD_RUN KHÔNG được gọi accrue nữa (EOD gate ngày GD ⇒ để trong đó là
+--     MẤT PHÍ ~115 ngày nghỉ/năm). Điểm vào duy nhất = SP_FEE_RUN_DAILY (app gọi mỗi ngày lịch).
+INSERT INTO @R SELECT '★★ Phí TÁCH khỏi EOD: SP_EOD_RUN không accrue; SP_FEE_RUN_DAILY là điểm vào',
+  CASE WHEN OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) NOT LIKE '%SP_EOD_FEE_ACCRUE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_RUN')) NOT LIKE '%SP_FEE_CLOSE_PERIOD%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_EOD_SET_SOURCE_READY')) NOT LIKE '%SP_EOD_FEE_ACCRUE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_FEE_RUN_DAILY')) LIKE '%SP_EOD_FEE_ACCRUE%'
+        AND OBJECT_DEFINITION(OBJECT_ID('SP_FEE_RUN_DAILY')) LIKE '%SP_FEE_CLOSE_PERIOD%' THEN 1 ELSE 0 END, NULL;
+-- ★ SP_FEE_RUN_DAILY chạy được cho NGÀY NGHỈ (T7) — đây là toàn bộ lý do nó tồn tại
+DECLARE @ecFD INT, @emFD NVARCHAR(400), @rFD BIGINT;
+INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_AVAILABLE,C_CASH_IN,C_CASH_OUT)
+ VALUES ('2026-06-13','SUBHOOK','KH09','SDIF',1000000000,0,0,0,0,0);   -- T7 13/06
+EXEC SP_FEE_RUN_DAILY '2026-06-13', @p_err_code=@ecFD OUTPUT, @p_err_msg=@emFD OUTPUT, @p_rows=@rFD OUTPUT;
+INSERT INTO @R SELECT '★ SP_FEE_RUN_DAILY chạy NGÀY T7 → vẫn sinh phí (err=0)',
+  CASE WHEN @ecFD=0 AND (SELECT C_FEE_AMOUNT FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK' AND C_FEE_DATE='2026-06-13')=@feeDay THEN 1 ELSE 0 END,
+  CONCAT('err=',@ecFD,' fee=',(SELECT C_FEE_AMOUNT FROM T_SI_FEE_BALANCE WHERE C_SI_ACCOUNT='SUBHOOK' AND C_FEE_DATE='2026-06-13'));
 
 /*==============================================================================
   6) BÁO CÁO — 3 report SP chạy + trả đúng số dòng (INSERT EXEC)

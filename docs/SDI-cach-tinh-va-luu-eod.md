@@ -181,8 +181,8 @@ TE  = √Var × √n = 0,00231 × √3 = 0,4%
 | **`T_MASTER_BALANCE`** | 1 master × **1 ngày GD** | **J11**, EOD | `C_AUM` (=Σ SI), `C_DAILY_RETURN` (AUM-weighted), `C_CASH_IN/OUT`, `C_TOTAL_ACCOUNT` | Số cấp master + **mốc ngày** cho PM API |
 | **`T_MASTER_INDEX_DAILY`** | 1 master × **1 ngày GD** | **J12** (luồng riêng, chỉ cần giá) | `C_INDEX_VALUE`, `C_DAILY_RETURN` | Benchmark để so |
 | **`T_MASTER_HOLDING_BALANCE`** | 1 master × mã × ngày GD | **J14** | qty, giá, tỷ trọng | Composition, drift |
-| **`T_SI_FEE_BALANCE`** | 1 tiểu khoản × **1 NGÀY LỊCH** | **J15**, đồng hồ 365 | `C_AUM` (của **chính ngày đó**), `C_FEE_AMOUNT` | Phí từng ngày |
-| **`T_SI_FEE_CHARGE`** | 1 tiểu khoản × **1 tháng** | **J15** (cộng dồn) + **J16** (chốt) | `C_FEE_TOTAL`, `C_FEE_DUE`, `C_CLOSED_AT` | Nợ phí; `C_CLOSED_AT` NULL = **chưa chốt ⇒ chưa thu** |
+| **`T_SI_FEE_BALANCE`** | 1 tiểu khoản × **1 NGÀY LỊCH** | **`SP_FEE_RUN_DAILY`** (ngoài EOD, đồng hồ 365) | `C_AUM` (của **chính ngày đó**), `C_FEE_AMOUNT` | Phí từng ngày |
+| **`T_SI_FEE_CHARGE`** | 1 tiểu khoản × **1 tháng** | **`SP_FEE_RUN_DAILY`** (cộng dồn + chốt cuối tháng) | `C_FEE_TOTAL`, `C_FEE_DUE`, `C_CLOSED_AT` | Nợ phí; `C_CLOSED_AT` NULL = **chưa chốt ⇒ chưa thu** |
 
 ### Thứ tự job trong EOD (chỉ chạy ngày GD)
 
@@ -196,8 +196,12 @@ TE  = √Var × √n = 0,00231 × √3 = 0,4%
   J12B TE_ACCUM      cộng dồn active return      → 3 cột trên T_SI_BALANCE
   J13  RECONCILE     đối soát → có lệch thì CHẶN publish
   J14  SNAPSHOT      composition                 → T_MASTER_HOLDING_BALANCE
-  J15  FEE_ACCRUE    phí từng ngày lịch          → T_SI_FEE_BALANCE + charge cộng dồn
-  J16  FEE_CLOSE     chốt kỳ (ngày GD ĐẦU tháng sau) → C_CLOSED_AT
+
+[luồng PHÍ — TÁCH RIÊNG, chạy MỌI NGÀY LỊCH kể cả T7/CN/lễ]
+  SP_FEE_RUN_DAILY @d
+     ├─ SP_EOD_FEE_ACCRUE    phí ĐÚNG ngày đó (AUM ngày đó × rate/365) → T_SI_FEE_BALANCE
+     │                        + upsert charge tháng (cộng dồn, C_CLOSED_AT = NULL)
+     └─ SP_FEE_CLOSE_PERIOD  đóng sổ nếu là NGÀY CUỐI THÁNG (+ bắt-kịp kỳ cũ) → C_CLOSED_AT
 ```
 
 ---
@@ -217,7 +221,15 @@ phí ngày d = AUM(CỦA CHÍNH NGÀY d) × rate / 365        ← ngày dương 
 ```
 
 - **Tiền nằm trong tài khoản ngày nào thì chịu phí ngày đó.** Nạp 1 tỷ vào T7 ⇒ phí T7/CN tính trên số tiền mới.
-- Accrue **look-backward**: EOD thứ Hai tính phí cho T7 + CN + T2 (vì lúc đó mới biết AUM 3 ngày đó).
+- **Phí KHÔNG nằm trong EOD.** EOD bị gate lịch (chỉ ngày GD, vì index/TE không được tính ngày nghỉ) — để phí trong đó thì **mất phí ~115 ngày nghỉ/năm**.
+  ⇒ App gọi **`SP_FEE_RUN_DAILY @d`** **mỗi ngày lịch**, ngay sau khi ingest Asset xong ngày đó. **1 ngày = 1 lần = 1 dòng/SI.**
 - Bản ghi phí tháng **sinh ngay từ đầu kỳ**, cộng dồn theo ngày. **Chưa chốt tháng ⇒ chưa thu.**
-- **Chốt kỳ ở ngày GD ĐẦU tháng sau** (không phải cuối tháng) — vì T7/CN cuối tháng tới hôm đó mới được tính.
-- Thu tiền: cắt theo **`cash_available`**, không phải tổng tiền.
+- **Chốt kỳ ở NGÀY CUỐI THÁNG dương lịch** — kể cả khi ngày đó là T7/CN/lễ (vì phí đã accrue tới tận ngày đó). Có cơ chế **bắt-kịp**: lỡ một ngày chạy thì lần chạy sau tự đóng nốt kỳ cũ.
+- Thu tiền (`SP_FEE_COLLECT`, **chỉ ngày GD** vì phải qua BO): cắt theo **`cash_available`**, không phải tổng tiền.
+
+```
+Ngày GD        :  ingest Asset  →  SP_FEE_RUN_DAILY  →  SP_EOD_RUN (index/TE/reconcile)  →  SP_FEE_COLLECT
+Ngày nghỉ (T7/CN/lễ) :  ingest Asset  →  SP_FEE_RUN_DAILY                    (KHÔNG EOD, KHÔNG thu tiền)
+```
+
+> ⚠️ Ngày nghỉ **không có reconcile** (J13 nằm trong EOD). Nên phí T7/CN tính trên số Asset gửi **chưa qua đối soát**. Chấp nhận được vì phí chỉ là `AUM × rate/365` (không dính index/TE), và phiên GD kế tiếp reconcile **theo dải** (gồm ngày nghỉ) → nếu lệch thì **chạy lại accrue** là số tự đúng (proc idempotent).

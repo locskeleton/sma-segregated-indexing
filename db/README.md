@@ -26,7 +26,7 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 02_SP_ENGINE.sql   -- engine core: UDF + SP_EOD_* + master SP_EOD_RUN + dispatcher SP_EOD_STEP
 05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho UI riêng SDI (BRD 2026-06-22: gỡ 2 producer SP_GET_ASSET_SNAPSHOT + _MASTER_SNAPSHOT; GIỮ SP_GET_ASSET_INDEX_SNAPSHOT — đẩy Master Index khi BO price-ready)
 06_PM_API.sql      -- read API PM (master-keyed): UDF_PM_CONFIG + SP_GET_MASTER_*/PM_OVERVIEW_ALL + SP_SET_MASTER_PM_CONFIG
-09_FEE.sql         -- phí QL: lịch GD (T_TRADING_HOLIDAY+UDF) + 4 bảng phí + accrue/close/collect/BO-result + UDF nợ phí (DEBT/ACCRUING) + 3 báo cáo (SP_RPT_FEE_DAILY/_CHARGE/_COLLECTION). Wire vào EOD (SP_EOD_RUN J15/J16, guard OBJECT_ID = pluggable)
+09_FEE.sql         -- phí QL: 4 bảng phí + SP_FEE_RUN_DAILY (điểm vào — app gọi MỖI NGÀY LỊCH, NGOÀI EOD) = accrue + close; collect/BO-result + UDF nợ phí (DEBT/ACCRUING) + 3 báo cáo (SP_RPT_FEE_DAILY/_CHARGE/_COLLECTION). (Lịch GD T_TRADING_HOLIDAY + UDF_IS_BUSINESS_DATE đã lên CORE 01/02.)
 03_SMOKE.sql       -- smoke test core (1 SI, 1 KH, 4 phiên) — verify số đúng
 07_PM_SMOKE.sql    -- smoke PM (1 master × 3 KH × 3 phiên) — verify AUM-weighted/TE/deviation/dist/top-N
 10_FEE_SMOKE.sql   -- smoke phí (case 30/4-1/5 tách 2 dòng + FIFO collect + BO result + hook) — cần 09
@@ -69,7 +69,7 @@ sqlcmd -S .\SQLEXPRESS -E -d SDI_TEST -b -f 65001 -i 03_SMOKE.sql
 | | Ngày T7/CN/lễ |
 |---|---|
 | `SP_INGEST_ASSET_NAV` (aum, tiền, **tiền khả dụng**, daily_return) | ✅ **VẪN NHẬN** — Asset gửi **mọi ngày lịch (365)**; nạp/rút cuối tuần vẫn đổi AUM. Ngày nghỉ `daily_return` phải = 0/NULL ([contract](../docs/SDI-daily-return-contract.md)) |
-| **Phí QL** (`SP_EOD_FEE_ACCRUE`, 09_FEE) | ✅ **VẪN TÍNH** — phí theo **ngày dương lịch**, base = **AUM của CHÍNH ngày đó** ⇒ tiền nằm trong TK ngày nào chịu phí ngày đó. Accrue **look-backward** tại phiên GD kế tiếp; chốt kỳ ở **ngày GD đầu tháng sau**; **chưa chốt tháng chưa thu** |
+| **Phí QL** — **`SP_FEE_RUN_DAILY`** (09_FEE, **NGOÀI EOD**) | ✅ **VẪN CHẠY** — app gọi **mỗi ngày lịch**, ngay sau ingest Asset. Phí theo **ngày dương lịch**, base = **AUM của CHÍNH ngày đó** ⇒ nạp/rút cuối tuần vào base phí ngay hôm đó. Chốt kỳ ở **ngày CUỐI THÁNG dương lịch** (kể cả T7/CN/lễ); **chưa chốt tháng chưa thu**. ⚠️ Cố tình KHÔNG để trong `SP_EOD_RUN` — EOD bị gate ngày GD nên sẽ **mất phí ~115 ngày nghỉ/năm** |
 | `SP_INGEST_PRICE_DAILY` (giá) | ❌ **err=23** — sở không có phiên thì không có giá |
 | `SP_EOD_RUN` / `SP_EOD_RUN_INDEX` / `SP_EOD_SET_SOURCE_READY` | ❌ **err=13** |
 | `SP_EOD_SI_INDEX` (gọi thẳng) | ❌ **THROW 51013** trước mọi DML |

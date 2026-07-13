@@ -956,16 +956,12 @@ BEGIN
 
         EXEC SP_EOD_STEP @d, 'J14_SNAPSHOT', 'SP_EOD_SNAPSHOT';   -- snapshot NỘI BỘ (T_MASTER_HOLDING_BALANCE) cho read API SDI
 
-        -- [BRD fee] CHỐT PHÍ QL trong EOD (sau reconcile PASS). Asset đã nhận ĐỦ dữ liệu (precondition
-        --   ASSET_NAV=READY + completeness per-SI ở trên) → tính phí ngày look-forward (J15) + chốt kỳ (J16,
-        --   no-op nếu chưa ngày GD cuối tháng). KHÔNG xử lý trong luồng đồng bộ Asset (eager) nữa — chạy ở đây
-        --   để chỉ chốt trên data đã đối soát sạch. Module 09_FEE PLUGGABLE: guard OBJECT_ID → chưa cài 09 thì
-        --   bỏ qua (03_SMOKE/04_BENCH không load 09 vẫn chạy). Cả 2 job STEP-compatible + idempotent (MERGE).
-        IF OBJECT_ID('dbo.SP_EOD_FEE_ACCRUE','P') IS NOT NULL
-        BEGIN
-            EXEC SP_EOD_STEP @d, 'J15_FEE_ACCRUE', 'SP_EOD_FEE_ACCRUE';
-            EXEC SP_EOD_STEP @d, 'J16_FEE_CLOSE',  'SP_FEE_CLOSE_PERIOD';
-        END
+        -- [PHÍ QL] ĐÃ TÁCH KHỎI EOD (2026-07-13). Pipeline này chỉ chạy NGÀY GD (gate lịch — index/TE không
+        --   được tính ngày nghỉ), nhưng PHÍ chạy theo NGÀY DƯƠNG LỊCH (365): tiền nằm trong TK ngày T7 thì
+        --   vẫn chịu phí ngày T7, và Asset gửi AUM MỌI ngày lịch nên số liệu luôn sẵn.
+        --   ⇒ App gọi **SP_FEE_RUN_DAILY @d** MỖI NGÀY LỊCH (ngay sau khi ingest Asset xong), KHÔNG qua EOD.
+        --   Cố tình KHÔNG để lại J15/J16 ở đây: nếu vẫn accrue trong EOD thì ngày GD có phí / ngày nghỉ mất
+        --   phí một cách ÂM THẦM (app quên đấu job daily cũng không ai biết). Tách hẳn = thiếu là thấy ngay.
 
         -- EOD_DONE = trạng thái CUỐI (BRD 2026-06-22: SDI không push asset sang Asset → bỏ stage COMPLETED/asset-sync).
         UPDATE T_EOD_PIPELINE SET C_EOD_STATUS='DONE', C_EOD_AT=GETDATE(), C_OVERALL_STATUS='EOD_DONE',

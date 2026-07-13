@@ -168,79 +168,58 @@ END
 GO
 
 /*============================================================================
-  SP_EOD_FEE_ACCRUE @p_d — tính phí QL (trong EOD, sau khi có AUM @d). CHẠY NGÀY GD.
+  SP_EOD_FEE_ACCRUE @p_d — tính phí QL của ĐÚNG NGÀY @p_d. **CHẠY MỌI NGÀY LỊCH** (365), kể cả T7/CN/lễ.
 
-  ⚠️ LOOK-BACKWARD (đổi 2026-07-11 — trước là look-FORWARD):
-    Dải accrue = **(phiên_GD_trước, @p_d]** ngày dương lịch → BUNG mỗi ngày 1 dòng.
-    Ví dụ EOD thứ Hai: accrue T7 + CN + T2 (3 dòng). EOD thứ Ba: chỉ T3 (1 dòng).
+  ⚠️ ĐỔI 2026-07-13: bỏ vòng quét dải. Trước đây phí nằm TRONG EOD (J15) mà EOD chỉ chạy ngày GD, nên
+    phiên GD kế tiếp phải "quét dọn ngược" các ngày nghỉ (WITH days). Nay AUM là realtime — **Asset gửi
+    aum/tiền MỌI ngày lịch** — nên phí tách hẳn khỏi EOD và chạy mỗi ngày: **1 ngày = 1 lần = 1 dòng/SI**.
+    App gọi qua SP_FEE_RUN_DAILY (accrue + close) ngay sau khi ingest Asset xong ngày đó.
 
-    VÌ SAO ĐỔI: bản look-forward accrue T6/T7/CN ngay tại EOD thứ Sáu và lấy **AUM thứ Sáu** làm base cho
-    cả 3 ngày. Nhưng KH **nạp/rút vào T7/CN** thì AUM 2 ngày đó ĐÃ KHÁC — Asset gửi bản ghi cho MỌI ngày
-    lịch (365), nên số thật có sẵn. Look-forward ⇒ thu phí sai (tiền về T7 không bị tính phí T7/CN; ngược
-    lại tiền rút T7 vẫn bị tính phí như chưa rút). Nay: **tiền nằm trong TK ngày nào thì chịu phí ngày đó**.
+  Vì sao phí theo NGÀY DƯƠNG LỊCH mà không theo phiên GD: tiền nằm trong TK ngày T7 thì vẫn chịu phí
+    ngày T7 (rate/365). Còn index/TE thì ngược lại — chỉ tồn tại ở PHIÊN GD (xem SP_EOD_RUN gate lịch).
 
-    C_AUM mỗi dòng = AUM **CỦA CHÍNH NGÀY ĐÓ** (T_SI_BALANCE @C_FEE_DATE). Thiếu dòng ngày nghỉ (Asset
-    không gửi) → carry-forward AUM ngày gần nhất ≤ ngày đó trong dải (fallback = phiên GD trước).
-    SI mới (chưa có balance ở ngày nghỉ trước khi mở TK) → ngày đó KHÔNG có AUM ⇒ KHÔNG accrue (đúng).
+  C_AUM = AUM CỦA CHÍNH NGÀY @p_d (T_SI_BALANCE @p_d) ⇒ nạp/rút cuối tuần vào base phí NGAY hôm đó.
+  fee/ngày = CEILING(AUM × rate/day_count, 2dp); AUM ≤ 0 ⇒ 0. rate = eff @p_d. C_ACCRUED_ON = @p_d.
+  SI chưa có dòng balance @p_d (chưa mở TK / Asset chưa gửi) ⇒ KHÔNG accrue ngày đó (đúng).
 
-    fee/ngày = CEILING(AUM_ngày × rate/day_count, 2dp); AUM ≤ 0 ⇒ 0. rate = eff @C_FEE_DATE.
-    C_ACCRUED_ON = @p_d (chữ ký lần accrue).
+  RECONCILE: ngày nghỉ KHÔNG có J13 (reconcile nằm trong EOD, chỉ ngày GD) ⇒ phí T7/CN tính trên số Asset
+    gửi CHƯA qua đối soát. Chấp nhận được: phí = AUM × rate/365, không dính index/TE; và reconcile phiên GD
+    kế tiếp so cashflow theo DẢI (gồm ngày nghỉ) → phát hiện lệch thì **accrue lại** (proc idempotent,
+    MERGE upsert) là số tự đúng. Chỉ khoá khi kỳ ĐÃ/ĐANG THU.
 
-  CHARGE CỘNG DỒN: sau khi ghi dòng ngày, proc **upsert luôn T_SI_FEE_CHARGE** của các kỳ bị chạm với TỔNG
-    ĐANG TÍCH LŨY (C_CLOSED_AT = NULL = chưa chốt). ⇒ "bản ghi phí kỳ sinh ra ngay, tiền cộng dồn theo ngày;
+  CHARGE CỘNG DỒN: sau khi ghi dòng ngày, proc **upsert luôn T_SI_FEE_CHARGE** của kỳ đó với TỔNG ĐANG
+    TÍCH LŨY (C_CLOSED_AT = NULL = chưa chốt) ⇒ "bản ghi phí kỳ sinh ra ngay, tiền cộng dồn theo ngày;
     CHƯA CHỐT THÁNG CHƯA THU" (SP_FEE_COLLECT chỉ lấy kỳ đã chốt). Chốt = SP_FEE_CLOSE_PERIOD.
 
   ── AN TOÀN GD THẬT (KHÔNG DELETE + KHÔNG ĐÈ DỮ LIỆU ĐÃ/ĐANG THU) ─────────────
     MERGE upsert trên natural key (SI, C_FEE_DATE). KHÓA (bỏ qua mọi thao tác) nếu kỳ của ngày đó ĐÃ THU
     (charge PAID) **hoặc ĐANG THU** (C_BO_EVENT_ID đã gửi BO) → số đã đi vào bút toán thì bất biến.
-    Mồ côi (lịch đổi ⇒ ngày cũ rơi khỏi dải; kỳ chưa/đang không thu) → C_STATUS=0 (KHÔNG xoá).
 ============================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_FEE_ACCRUE @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-    -- Dải = (@prev, @p_d]. @prev theo LỊCH (UDF_PREV_BUSINESS_DAY) chứ KHÔNG theo giá: 1 phiên GD thiếu giá
-    --   cũng không được làm thủng ngày phí.
-    DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DAY(@p_d);
 
-    ;WITH days AS (
-        SELECT DATEADD(DAY,1,@prev) AS d
-        UNION ALL
-        SELECT DATEADD(DAY,1,d) FROM days WHERE d < @p_d
-    ),
-    si AS (   -- tập SI cần accrue = SI ACTIVE có bản ghi AUM @p_d (Asset đã gửi)
-        SELECT b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE
-        FROM T_SI_BALANCE b
-        INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_STATUS='ACTIVE'
-        WHERE b.C_BUSINESS_DATE=@p_d
-    ),
-    aum AS (  -- AUM CỦA CHÍNH NGÀY g.d (set-based: lấy dòng balance có ngày LỚN NHẤT ≤ g.d trong dải)
-        SELECT s.C_SI_ACCOUNT, s.C_CUST_CODE, s.C_MASTER_CODE, g.d AS C_FEE_DATE, x.C_AUM,
-               ROW_NUMBER() OVER (PARTITION BY s.C_SI_ACCOUNT, g.d ORDER BY x.C_BUSINESS_DATE DESC) AS rn
-        FROM si s
-        CROSS JOIN days g
-        INNER JOIN T_SI_BALANCE x ON x.C_SI_ACCOUNT=s.C_SI_ACCOUNT
-             AND x.C_BUSINESS_DATE BETWEEN @prev AND g.d   -- bounded → seek trên IX_SI_NAV_BALANCE_ACCT
-    )
-    SELECT a.C_FEE_DATE, @p_d AS C_ACCRUED_ON,
-           a.C_SI_ACCOUNT, a.C_CUST_CODE, a.C_MASTER_CODE,
-           CONVERT(CHAR(6), a.C_FEE_DATE, 112) AS C_PERIOD, a.C_AUM, rt.C_RATE, rt.C_DAY_COUNT,
-           CAST(CASE WHEN a.C_AUM <= 0 THEN 0   -- AUM ≤ 0 ⇒ phí ngày = 0
-                     ELSE CEILING(CAST(CAST(a.C_AUM AS DECIMAL(38,6)) * rt.C_RATE AS DECIMAL(38,12))
+    -- 1 NGÀY = 1 DÒNG/SI. Không quét ngược, không carry-forward: AUM ngày nào lấy đúng ngày đó.
+    SELECT @p_d AS C_FEE_DATE, @p_d AS C_ACCRUED_ON,
+           b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE,
+           CONVERT(CHAR(6), @p_d, 112) AS C_PERIOD, b.C_AUM, rt.C_RATE, rt.C_DAY_COUNT,
+           CAST(CASE WHEN b.C_AUM <= 0 THEN 0   -- AUM ≤ 0 ⇒ phí ngày = 0
+                     ELSE CEILING(CAST(CAST(b.C_AUM AS DECIMAL(38,6)) * rt.C_RATE AS DECIMAL(38,12))
                                   / rt.C_DAY_COUNT * 100) / 100.0   -- CEILING 2dp = làm tròn LÊN 2 số lẻ
                 END AS DECIMAL(20,2)) AS C_FEE_AMOUNT,
            -- KHÓA: kỳ của ngày này ĐÃ THU (PAID) hoặc ĐANG THU (đã gửi BO) → bất biến, bỏ qua.
            CAST(CASE WHEN EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c
-                       WHERE c.C_SI_ACCOUNT=a.C_SI_ACCOUNT
-                         AND c.C_PERIOD=CONVERT(CHAR(6), a.C_FEE_DATE, 112)
+                       WHERE c.C_SI_ACCOUNT=b.C_SI_ACCOUNT
+                         AND c.C_PERIOD=CONVERT(CHAR(6), @p_d, 112)
                          AND (c.C_STATUS='PAID' OR c.C_BO_EVENT_ID IS NOT NULL)) THEN 1 ELSE 0 END AS BIT) AS is_locked
     INTO #src
-    FROM aum a
+    FROM T_SI_BALANCE b
+    INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_STATUS='ACTIVE'
     OUTER APPLY (SELECT TOP 1 r.C_RATE, r.C_DAY_COUNT FROM T_SI_FEE_RATE r
-                 WHERE r.C_SI_ACCOUNT=a.C_SI_ACCOUNT AND r.C_EFFECTIVE_FROM <= a.C_FEE_DATE
+                 WHERE r.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND r.C_EFFECTIVE_FROM <= @p_d
                  ORDER BY r.C_EFFECTIVE_FROM DESC) rt
-    WHERE a.rn = 1 AND rt.C_RATE IS NOT NULL   -- rn=1: AUM của ngày đó; rate NULL = SI không thu phí
-    OPTION (MAXRECURSION 366);
+    WHERE b.C_BUSINESS_DATE=@p_d AND rt.C_RATE IS NOT NULL;   -- rate NULL = SI không thu phí
 
     -- UPSERT (no-delete) trên UQ_SI_FEE_BALANCE_NK (SI, C_FEE_DATE). is_locked=1 → KHÔNG thao tác.
     MERGE T_SI_FEE_BALANCE AS tgt
@@ -291,49 +270,92 @@ END
 GO
 
 /*============================================================================
-  SP_FEE_CLOSE_PERIOD @p_d — chốt kỳ (tháng) TREO nợ. CHỉ chạy khi @p_d là NGÀY GD
-    ĐẦU THÁNG SAU — CHỐT KỲ THÁNG TRƯỚC (đổi 2026-07-11 cùng look-backward).
-    ⚠️ VÌ SAO KHÔNG CHỐT Ở NGÀY GD CUỐI THÁNG NỮA: accrue nay là look-BACKWARD (dải (phiên_GD_trước, @p_d]),
-      nên tại EOD ngày GD cuối tháng, các ngày T7/CN CUỐI THÁNG **chưa được accrue** (chúng thuộc dải của
-      phiên GD kế tiếp — đã sang tháng sau). Chốt lúc đó ⇒ THIẾU 1-2 ngày phí. Nay chốt ở **ngày GD ĐẦU
-      tháng sau**: J15 (chạy ngay trước J16 trong cùng EOD) vừa accrue nốt đuôi tháng trước ⇒ kỳ ĐỦ NGÀY.
-      Ví dụ tháng 11/2025 kết thúc CN 30/11: EOD T6 28/11 accrue tới 28; EOD T2 01/12 accrue 29+30 (kỳ 202511)
-      và 01/12 (kỳ 202512) → rồi chốt 202511. Tháng kết thúc đúng ngày GD (31/10 T6) → 202510 đã đủ từ EOD
-      31/10, chốt tại ngày GD đầu tháng 11 → vẫn đúng.
-    Kỳ chưa chốt (C_CLOSED_AT NULL) đã có sẵn dòng charge cộng dồn từ J15 ⇒ đây CHỈ là bước ĐÓNG SỔ: refresh
-      số cuối + stamp C_CLOSED_AT ⇒ mở khoá cho SP_FEE_COLLECT ("chưa chốt tháng chưa thu").
-    ── AN TOÀN GD THẬT (KHÔNG DELETE) ──────────────────────────────────────────
+  SP_FEE_CLOSE_PERIOD @p_d — ĐÓNG SỔ kỳ (tháng) → mở khoá cho thu. Chạy MỌI NGÀY LỊCH (no-op nếu chưa tới).
+
+  ⚠️ ĐỔI 2026-07-13: chốt ở **NGÀY CUỐI THÁNG DƯƠNG LỊCH** (kể cả khi ngày đó là T7/CN/lễ).
+    Làm được vì phí nay accrue MỖI NGÀY LỊCH (SP_FEE_RUN_DAILY) ⇒ tới ngày cuối tháng là kỳ ĐÃ ĐỦ NGÀY.
+    (Bản 2026-07-11 phải chốt ở ngày GD ĐẦU tháng sau vì accrue nằm trong EOD, T7/CN cuối tháng lúc đó
+     chưa được tính. Nay hết ràng buộc đó ⇒ trả lịch chốt về đúng cuối tháng, KHÔNG phải báo BO đổi lịch.)
+
+  CHỐT KỲ NÀO: (a) kỳ của @p_d nếu @p_d là ngày CUỐI THÁNG; **(b) BẮT-KỊP** — mọi kỳ < tháng của @p_d mà
+    chưa đóng sổ (lỡ 1 ngày chạy / deploy muộn → lần chạy sau tự đóng nốt, không mất kỳ nào).
+
+  Kỳ chưa chốt (C_CLOSED_AT NULL) đã có sẵn dòng charge cộng dồn từ accrue ⇒ đây CHỈ là bước ĐÓNG SỔ:
+    refresh số cuối + stamp C_CLOSED_AT ⇒ SP_FEE_COLLECT mới thấy ("chưa chốt tháng chưa thu").
+  ── AN TOÀN GD THẬT (KHÔNG DELETE) ──────────────────────────────────────────
     Re-close idempotent (MERGE trên (SI, period)):
       • MATCHED + UNPAID + CHƯA gửi BO → refresh số + stamp C_CLOSED_AT.
       • MATCHED + PAID / đang thu (C_BO_EVENT_ID set) → GIỮ NGUYÊN (không đụng món đã/đang giao dịch BO).
-      • NOT MATCHED → insert kỳ (đóng luôn) — phòng trường hợp J15 chưa kịp tạo dòng.
+      • NOT MATCHED → insert kỳ (đóng luôn) — phòng trường hợp accrue chưa kịp tạo dòng.
 ============================================================================*/
 CREATE OR ALTER PROCEDURE SP_FEE_CLOSE_PERIOD @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON; SET @p_rows = 0;
-    DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DAY(@p_d);
-    -- @p_d phải là ngày GD ĐẦU TIÊN của tháng (phiên GD trước nó rơi vào tháng khác) → chốt kỳ của @prev.
-    IF YEAR(@prev)=YEAR(@p_d) AND MONTH(@prev)=MONTH(@p_d) RETURN;
-
-    DECLARE @period CHAR(6) = CONVERT(CHAR(6), @prev, 112);   -- kỳ THÁNG TRƯỚC (vừa được J15 accrue nốt đuôi)
+    DECLARE @curPeriod CHAR(6) = CONVERT(CHAR(6), @p_d, 112);
+    -- @p_d có phải NGÀY CUỐI THÁNG dương lịch không (ngày mai sang tháng khác)?
+    DECLARE @isLastDay BIT = CASE WHEN MONTH(DATEADD(DAY,1,@p_d)) <> MONTH(@p_d) THEN 1 ELSE 0 END;
 
     ;WITH agg AS (
-        SELECT C_SI_ACCOUNT, MAX(C_CUST_CODE) cust, MAX(C_MASTER_CODE) mc,
+        SELECT C_SI_ACCOUNT, C_PERIOD, MAX(C_CUST_CODE) cust, MAX(C_MASTER_CODE) mc,
                SUM(C_FEE_AMOUNT) total, MIN(C_FEE_DATE) pf, MAX(C_FEE_DATE) pt
-        FROM T_SI_FEE_BALANCE WHERE C_PERIOD=@period AND C_STATUS=1 GROUP BY C_SI_ACCOUNT   -- chỉ ngày hợp lệ
+        FROM T_SI_FEE_BALANCE b
+        WHERE b.C_STATUS=1                                   -- chỉ ngày hợp lệ
+          AND ( b.C_PERIOD < @curPeriod                      -- (b) BẮT-KỊP kỳ cũ chưa đóng sổ
+             OR (b.C_PERIOD = @curPeriod AND @isLastDay=1) ) -- (a) kỳ hiện tại, hôm nay là ngày cuối tháng
+          AND NOT EXISTS (SELECT 1 FROM T_SI_FEE_CHARGE c    -- bỏ kỳ ĐÃ đóng sổ rồi (khỏi quét lại mỗi ngày)
+                          WHERE c.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND c.C_PERIOD=b.C_PERIOD
+                            AND c.C_CLOSED_AT IS NOT NULL)
+        GROUP BY C_SI_ACCOUNT, C_PERIOD
         HAVING SUM(C_FEE_AMOUNT) > 0
     )
     MERGE T_SI_FEE_CHARGE AS tgt
-    USING agg AS src ON tgt.C_SI_ACCOUNT=src.C_SI_ACCOUNT AND tgt.C_PERIOD=@period
+    USING agg AS src ON tgt.C_SI_ACCOUNT=src.C_SI_ACCOUNT AND tgt.C_PERIOD=src.C_PERIOD
     WHEN MATCHED AND tgt.C_STATUS='UNPAID' AND tgt.C_BO_EVENT_ID IS NULL THEN   -- chưa thu & chưa gửi BO mới ghi đè
         UPDATE SET C_FEE_TOTAL=src.total, C_FEE_DUE=CAST(CEILING(src.total) AS DECIMAL(20,0)),   -- chốt kỳ làm tròn LÊN
                    C_PERIOD_FROM=src.pf, C_PERIOD_TO=src.pt, C_CLOSED_AT=GETDATE()   -- ĐÓNG SỔ ⇒ thu được
     WHEN NOT MATCHED BY TARGET THEN
         INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_PERIOD,C_PERIOD_FROM,C_PERIOD_TO,C_FEE_TOTAL,C_FEE_DUE,C_CLOSED_AT)
-        VALUES (src.C_SI_ACCOUNT,src.cust,src.mc,@period,src.pf,src.pt,src.total,CAST(CEILING(src.total) AS DECIMAL(20,0)),GETDATE());
+        VALUES (src.C_SI_ACCOUNT,src.cust,src.mc,src.C_PERIOD,src.pf,src.pt,src.total,CAST(CEILING(src.total) AS DECIMAL(20,0)),GETDATE());
     SET @p_rows = @@ROWCOUNT;
     -- (KHÔNG mark CLOSED trên balance: "đã chốt/đã thu" suy từ T_SI_FEE_CHARGE; accrue khóa theo charge PAID/đang thu.)
+END
+GO
+
+/*============================================================================
+  SP_FEE_RUN_DAILY @p_business_date — ★ ĐIỂM VÀO DUY NHẤT của phí. App gọi **MỖI NGÀY LỊCH** (365),
+    kể cả T7/CN/lễ, NGAY SAU KHI ingest Asset xong ngày đó (SP_INGEST_ASSET_NAV).
+      1) SP_EOD_FEE_ACCRUE   — phí của ĐÚNG ngày đó (AUM ngày đó × rate/365)
+      2) SP_FEE_CLOSE_PERIOD — đóng sổ kỳ nếu là ngày cuối tháng (+ bắt-kịp kỳ cũ chưa đóng)
+
+  ⚠️ KHÔNG nằm trong SP_EOD_RUN: pipeline EOD bị gate LỊCH (chỉ ngày GD — index/TE không được tính ngày
+    nghỉ), trong khi phí chạy theo NGÀY DƯƠNG LỊCH. Để phí trong EOD ⇒ ngày nghỉ MẤT PHÍ (~115 ngày/năm).
+  Idempotent (MERGE upsert) → gọi lại cùng ngày an toàn; kỳ ĐÃ/ĐANG THU thì bất biến.
+  err: 0 OK · 20 ngày NULL · -1 runtime. KHÔNG THROW.
+============================================================================*/
+CREATE OR ALTER PROCEDURE SP_FEE_RUN_DAILY
+    @p_business_date DATE,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT,
+    @p_rows          BIGINT        = NULL OUTPUT   -- #dòng-ngày phí ghi/cập nhật
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_rows=0;
+    IF @p_business_date IS NULL
+        BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_business_date NULL'; RETURN; END
+    BEGIN TRY
+        BEGIN TRAN;
+        DECLARE @rAcc BIGINT, @rClose BIGINT;
+        EXEC SP_EOD_FEE_ACCRUE   @p_business_date, @p_rows=@rAcc   OUTPUT;
+        EXEC SP_FEE_CLOSE_PERIOD @p_business_date, @p_rows=@rClose OUTPUT;
+        COMMIT;
+        SET @p_rows = @rAcc;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
+    END CATCH
 END
 GO
 
