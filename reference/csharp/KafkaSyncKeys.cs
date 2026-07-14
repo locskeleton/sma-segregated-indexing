@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -27,21 +29,27 @@ public static class KafkaSyncKeys
     public static string ActiveJobs(string redisKeyPrefix) => $"{redisKeyPrefix}:JOBS";
 
     /// <summary>
-    /// DANH TÍNH CỦA BATCH = băm phần DỮ LIỆU.
+    /// DANH TÍNH CỦA BATCH = băm TẬP si_account (đã sắp xếp) mà batch này mang theo.
     ///
-    /// ⚠️ VÌ SAO KHÔNG DÙNG (partition, offset):
-    ///   enable.idempotence=true chỉ chặn trùng khi retry trong CÙNG một phiên producer.
-    ///   Nó SỐNG SÓT qua leader-partition failover (producer state nằm trong log của partition),
-    ///   nhưng KHÔNG sống sót qua producer RESTART (redeploy / OOM / evict → PID mới, broker
-    ///   không nhận ra sequence cũ) ⇒ cùng nội dung nằm ở OFFSET KHÁC ⇒ dedup theo offset MÙ.
-    ///   Băm nội dung thì miễn nhiễm: cùng data → cùng khoá, bất kể offset nào.
+    /// ⚠️ KHÔNG băm chuỗi JSON thô: chỉ cần Asset đổi thứ tự field, đổi format số, hay nhét thêm
+    ///    timestamp/traceId vào payload là hash ĐỔI ⇒ dedup mù ⇒ cộng dồn 2 lần.
+    ///    Băm DANH TÍNH NGHIỆP VỤ thì bất biến với mọi thay đổi hình thức.
     ///
-    /// ⚠️ CHỈ băm phần `data`. KHÔNG băm requestId/timestamp/envelope — nếu Asset sinh lại
-    ///    những trường đó khi gửi lại thì hash sẽ đổi và dedup mất tác dụng.
+    /// ⚠️ KHÔNG dùng (partition, offset): đó là danh tính của CÁI PHONG BÌ.
+    ///    enable.idempotence=true (bên Asset — TA KHÔNG KIỂM SOÁT) chỉ chặn trùng trong CÙNG một
+    ///    phiên producer: sống sót qua leader failover, nhưng KHÔNG sống sót qua producer RESTART
+    ///    (redeploy/OOM/evict → PID mới) ⇒ cùng nội dung nằm ở OFFSET KHÁC ⇒ dedup theo offset mù.
+    ///
+    /// Vì sao tập si_account là danh tính đúng:
+    ///   • Asset gửi LẠI cùng batch (kể cả đã SỬA giá trị) → cùng tập tài khoản → cùng khoá
+    ///     → KHÔNG cộng dồn 2 lần.  (Dữ liệu SỬA vẫn được ghi: executeFunc chạy TRƯỚC dedup.)
+    ///   • Batch khác → tập tài khoản khác → khoá khác → cộng bình thường.
     /// </summary>
-    public static string BatchKey(string dataJson)
+    public static string BatchKey(IEnumerable<string> siAccounts)
     {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(dataJson));
+        var canonical = string.Join(",", siAccounts.Select(s => s.Trim().ToUpperInvariant())
+                                                   .OrderBy(s => s, StringComparer.Ordinal));
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
         return Convert.ToHexString(bytes);   // 64 ký tự
     }
 

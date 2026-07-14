@@ -74,7 +74,9 @@ public class SyncAssetDataService : ISyncAssetDataService
             tranDate:       tranDate,
             redisKeyPrefix: RedisKeyDefine.EOD_ASSET,
             bizType:        BizTypeDefine.JOB_EOD_ASSET,
-            dataJson:       assetJsonString,                    // băm CHỈ phần data
+            siAccounts:     assetResponseData.Select(x => x.si_account),   // DANH TÍNH nghiệp vụ để dedup —
+                                                                //    KHÔNG băm JSON thô (Asset đổi format/thứ tự
+                                                                //    field là hash đổi ⇒ dedup mù)
             totalRow:       model.totalRow,                     // GỢI Ý (Asset khai) — không phải cổng chặn
             rowsInBatch:    assetResponseData.Count,            // ⚠️ đếm từ PAYLOAD, KHÔNG dùng @p_rows (số dòng
                                                                 //    GHI ĐƯỢC — đã lọc acc lạ ⇒ không bao giờ khớp)

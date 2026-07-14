@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Serilog;
 using StackExchange.Redis;
@@ -64,7 +65,7 @@ public class BatchSyncService
     }
 
     /// <param name="requestId">★ Asset gửi, CHUNG cho mọi batch của job ⇒ dùng thẳng làm JOB_ID.</param>
-    /// <param name="dataJson">CHỈ phần `data` (bỏ requestId/timestamp) — để băm ra danh tính batch.</param>
+    /// <param name="siAccounts">Danh sách si_account trong batch — DANH TÍNH nghiệp vụ để dedup.</param>
     /// <param name="totalRow">Số dòng Asset KHAI cho cả ngày. GỢI Ý, không phải cổng chặn.</param>
     /// <param name="rowsInBatch">Số dòng trong batch này (đếm từ payload — KHÔNG phải số dòng ghi được).</param>
     /// <param name="executeFunc">Ghi DB. Trả false ⇒ NÉM ⇒ không commit offset ⇒ Kafka giao lại.</param>
@@ -73,7 +74,7 @@ public class BatchSyncService
         string tranDate,
         string redisKeyPrefix,
         string bizType,
-        string dataJson,
+        IEnumerable<string> siAccounts,
         long   totalRow,
         int    rowsInBatch,
         Func<Task<bool>> executeFunc)
@@ -93,7 +94,7 @@ public class BatchSyncService
         // ── 2) CỘNG DỒN CÓ DEDUP — nguyên tử, 1 round-trip ────────────────────────────────
         //    Đánh dấu SAU khi DB đã commit. Đánh dấu TRƯỚC mà pod chết giữa chừng ⇒ batch coi như
         //    xong dù chưa ghi ⇒ tổng không bao giờ đạt ⇒ treo. KHÔNG BAO GIỜ đánh dấu trước.
-        var batchKey = KafkaSyncKeys.BatchKey(dataJson);
+        var batchKey = KafkaSyncKeys.BatchKey(siAccounts);
         long rows = (long)await _redis.ScriptEvaluateAsync(
             KafkaSyncKeys.LuaSumOnce,
             new RedisKey[]   { KafkaSyncKeys.Msg(p), KafkaSyncKeys.Rows(p) },

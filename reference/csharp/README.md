@@ -32,18 +32,25 @@ services.AddSingleton<EodStepRunner>();
 services.AddHostedService<EodJobWatchdogService>();   // chạy trên MỌI pod — an toàn, idempotent
 ```
 
-## Cấu hình Kafka bắt buộc
+## Cấu hình Kafka
+
+### ✅ Của SDI — bắt buộc, và mày kiểm soát 100%
 
 ```properties
-# Producer
-enable.idempotence = true        # bịt trùng khi retry trong 1 phiên. KHÔNG bịt được producer restart
-                                 # → nên dedup theo NỘI DUNG (Sha256(data)), không theo offset
-
-# Consumer
-enable.auto.commit = false       # commit TAY, SAU KHI xử lý xong
+enable.auto.commit = false       # Consumer: commit TAY, SAU KHI xử lý xong
 ```
 
-**Commit offset SAU KHI `ProcessDataSyncAssetSdiCore` trả về không ném.** Ném ⇒ **không commit** ⇒ Kafka giao lại ⇒ đúng ý đồ (SP idempotent nên xử lý lại là vô hại).
+Commit offset **sau khi** `ProcessDataSyncAssetSdiCore` trả về không ném. Ném ⇒ **không commit** ⇒ Kafka giao lại ⇒ đúng ý đồ (SP idempotent nên xử lý lại là vô hại).
+
+### ⚠️ Của Asset — **KHÔNG phụ thuộc, không cần xin**
+
+```properties
+enable.idempotence = true        # Producer của ASSET. Có thì tốt. KHÔNG có cũng KHÔNG SAO.
+```
+
+**Thiết kế này không dựa vào nó.** Dedup theo **danh tính nghiệp vụ** (`Sha256(tập si_account đã sắp xếp)`) — Asset gửi lại từ PID nào, offset nào, broker nào, serialize kiểu gì, **nội dung vẫn thế** → cùng khoá → bắt được.
+
+> **Đừng bao giờ đặt tính đúng của hệ mình vào một cấu hình nằm trong tay hệ khác.**
 
 ---
 
@@ -72,8 +79,36 @@ enable.auto.commit = false       # commit TAY, SAU KHI xử lý xong
 
 ---
 
+---
+
+## ★ Tính đúng KHÔNG phụ thuộc Asset, Kafka, hay Redis
+
+Đây là điều quan trọng nhất. **Toàn bộ tính đúng nằm trong 2 thứ SDI kiểm soát 100%:**
+
+| # | Cơ chế | Nằm ở đâu |
+|---|---|---|
+| **①** | **Ghi idempotent** — `SP_INGEST_ASSET_NAV` `DELETE+INSERT` theo `(date, si)` | DB của SDI |
+| **②** | **Cửa khoá** — `SP_EOD_RUN` **err=12**: mọi SI ACTIVE của SDI phải có dòng `T_SI_BALANCE @d`, đọc từ registry của **chính SDI** | DB của SDI |
+
+Ném mọi kiểu lỗi của Asset/Kafka/Redis vào — **không có ô nào làm sai số liệu**:
+
+| Hỏng gì | Hậu quả | Sai số? |
+|---|---|---|
+| Asset **không bật** `enable.idempotence` | Dedup theo nội dung vẫn bắt được | ❌ |
+| Asset gửi **trùng** batch (PID mới, offset mới) | Cùng tập `si_account` → cùng khoá → **không cộng lại** | ❌ |
+| Asset khai `totalRow` **sai** | Cờ READY bật sớm/muộn → EOD thử → err=12 chặn nếu thiếu | ❌ |
+| Asset gửi **thiếu** tài khoản của SDI | **err=12 → CHẶN**, báo rõ thiếu bao nhiêu | ❌ (chặn đúng) |
+| Asset gửi **dư** acc không thuộc SDI | `INNER JOIN` registry lọc bỏ | ❌ |
+| Kafka rebalance → **zombie pod** ghi song song | `DELETE+INSERT` theo `(date, si)` → **vô hại** | ❌ |
+| **Redis mất sạch key** | Job treo → watchdog kêu → bật cờ tay | ❌ (chậm, không sai) |
+| Dedup **thủng hoàn toàn** | Cộng dồn 2 lần → READY sớm → EOD → **err=12 chặn** | ❌ |
+
+⇒ **Dedup và bộ đếm chỉ là TỐI ƯU TỐC ĐỘ.** Chúng quyết định *"khi nào thử chạy EOD"*, **không** quyết định *"dữ liệu có đúng không"*.
+
+---
+
 ## Ba nguyên tắc
 
 1. **Đừng ĐẾM LƯỢT GHÉ — hãy ĐÁNH DẤU DANH TÍNH rồi mới cộng.** Kafka chỉ hứa *"ít nhất một lần"*, không bao giờ hứa *"đúng một lần"*.
 2. **"Đủ chưa" là một PHÉP HỎI, không phải một SỰ KIỆN.** Ai hỏi lúc nào cũng ra đúng ⇒ chain không bao giờ bị bỏ lỡ.
-3. **Redis hỏng chỉ được phép làm CHẬM, không được phép làm SAI.** Tính đúng nằm ở idempotency của DB, không nằm ở lock.
+3. **Đừng để tính đúng của hệ mình phụ thuộc vào hệ khác.** Nhận gợi ý từ họ (nhanh), nhưng **quyết định bằng dữ liệu của mình** (đúng).
