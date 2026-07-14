@@ -1088,22 +1088,31 @@ BEGIN
     END
     ELSE IF @p_source='ASSET_NAV'
     BEGIN
-        -- [thin-layer] Asset gửi per-SI qua Kafka BATCH (≤100 item/msg) → SP_INGEST_ASSET_NAV ghi thẳng T_SI_BALANCE.
-        --   Completeness: @p_total_record = tổng SI Asset khai; RECEIVED = #SI distinct @ngày; READY khi đủ (else err=4).
+        -- [KAFKA 2026-07-14] ĐỔI THÀNH CỜ (như MKT_DATA) — SP KHÔNG còn tự quyết đủ/thiếu.
+        --
+        -- VÌ SAO BỎ ĐẾM Ở ĐÂY: cách cũ so RECEIVED = COUNT(DISTINCT si @ngày) [chỉ đếm SI **SDI NHẬN**, vì
+        --   SP_INGEST_ASSET_NAV INNER JOIN registry lọc bỏ acc lạ] với @p_total_record [số Asset **KHAI**, GỒM
+        --   acc lạ]. Hai vế đếm trên 2 tập KHÁC NHAU ⇒ chỉ cần Asset có 1 tài khoản không thuộc SDI là
+        --   RECEIVED < TOTAL VĨNH VIỄN ⇒ ASSET_NAV không bao giờ READY ⇒ EOD + chain job không bao giờ chạy.
+        --
+        -- AI QUYẾT ĐỦ/THIẾU BÂY GIỜ — 2 tầng, 2 CÂU HỎI KHÁC NHAU:
+        --   (1) "Asset đã gửi đủ cái nó KHAI chưa?"  → tầng Kafka/Redis: SADD si_account (danh tính, idempotent
+        --       với message giao lại) rồi so SCARD >= totalRow. Consumer CHỈ gọi proc này khi đã đủ.
+        --   (2) "SDI có đủ dữ liệu cho TÀI KHOẢN CỦA MÌNH chưa?" → POST-CHECK ở SP_EOD_RUN: mọi SI ACTIVE phải
+        --       có dòng T_SI_BALANCE @d, thiếu ⇒ err=12 CHẶN EOD. Đây mới là chốt chặn thật.
+        --   ⇒ Proc này chỉ GHI CỜ. TOTAL/RECEIVED vẫn lưu để AUDIT (RECEIVED có thể < TOTAL: acc lạ bị lọc —
+        --      BÌNH THƯỜNG, không phải lỗi). Xem docs/SDI-kafka-batch-sync-design.md.
         IF @p_total_record IS NULL
-            BEGIN SET @p_err_code=2; SET @p_err_msg=N'ASSET_NAV cần @p_total_record (tổng SI Asset gửi)'; RAISERROR(@p_err_msg, 16, 1); END
+            BEGIN SET @p_err_code=2; SET @p_err_msg=N'ASSET_NAV cần @p_total_record (tổng record Asset khai — để audit)'; RAISERROR(@p_err_msg, 16, 1); END
         DECLARE @anavRecv INT = (SELECT COUNT(DISTINCT C_SI_ACCOUNT) FROM T_SI_BALANCE
-                                 WHERE C_BUSINESS_DATE=@p_business_date);
-        DECLARE @anavOk BIT = CASE WHEN @anavRecv >= @p_total_record THEN 1 ELSE 0 END;
-        UPDATE T_EOD_PIPELINE SET C_ASSET_NAV_TOTAL=@p_total_record, C_ASSET_NAV_RECEIVED=@anavRecv,
-               C_ASSET_NAV_STATUS = CASE WHEN @anavOk=1 THEN 'READY' ELSE 'PENDING' END,
-               C_ASSET_NAV_AT     = CASE WHEN @anavOk=1 THEN GETDATE() ELSE C_ASSET_NAV_AT END,
-               C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user WHERE C_BUSINESS_DATE=@p_business_date;
-        IF @anavOk=0
-        BEGIN
-            SET @p_err_code=4;   -- chưa đủ batch → KHÔNG READY (không THROW; tình huống nghiệp vụ)
-            SET @p_err_msg=CONCAT(N'ASSET_NAV: received ', @anavRecv, '/', @p_total_record, N' SI — CHƯA đủ batch.');
-        END
+                                 WHERE C_BUSINESS_DATE=@p_business_date);   -- chỉ để AUDIT, KHÔNG gate
+        UPDATE T_EOD_PIPELINE SET
+               C_ASSET_NAV_TOTAL    = @p_total_record,   -- audit: Asset khai bao nhiêu
+               C_ASSET_NAV_RECEIVED = @anavRecv,         -- audit: SDI nhận được bao nhiêu (≤ total nếu có acc lạ)
+               C_ASSET_NAV_STATUS   = 'READY',
+               C_ASSET_NAV_AT       = GETDATE(),
+               C_UPDATED_AT=GETDATE(), C_UPDATED_BY=@p_user
+         WHERE C_BUSINESS_DATE=@p_business_date;
     END
     ELSE  -- FO_INGEST: completeness theo total cust_code
     BEGIN

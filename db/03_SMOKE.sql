@@ -168,15 +168,26 @@ IF @ecP=12 PRINT '  OK thiếu Asset NAV cho SUB002 → err=12 (chặn EOD, khô
 DELETE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT='SUB002';
 
 PRINT '';
-PRINT '======== ASSET_NAV batch gate (received/total — Kafka batch ≤100/msg) ========';
-DECLARE @ag1 INT, @ag2 INT, @ast1 VARCHAR(10), @ast2 VARCHAR(10);
-EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',2,NULL,@ag1 OUTPUT,@em OUTPUT;  -- received=1 (SUB001) / total=2 → CHƯA đủ
-SELECT @ast1=C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-06';
-EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',1,NULL,@ag2 OUTPUT,@em OUTPUT;  -- received=1 / total=1 → đủ
-SELECT @ast2=C_ASSET_NAV_STATUS FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-06';
-IF @ag1=4 AND @ast1='PENDING' AND @ag2=0 AND @ast2='READY'
-   PRINT '  OK batch gate: 1/2 → err=4 PENDING ; 1/1 → READY';
-ELSE PRINT CONCAT('  !!! batch gate: ag1=',@ag1,' st1=',@ast1,' ag2=',@ag2,' st2=',@ast2);
+PRINT '======== ASSET_NAV = CỜ (Kafka/Redis quyết đủ) + POST-CHECK err=12 mới là chốt chặn ========';
+-- [KAFKA 2026-07-14] Proc KHÔNG còn tự đếm đủ/thiếu. Consumer (Redis: SADD si_account vs totalRow) quyết,
+--   rồi gọi proc này để GHI CỜ. Đủ/thiếu so với REGISTRY SDI do SP_EOD_RUN lo (err=12 — test ngay trên).
+DECLARE @ag1 INT, @ast1 VARCHAR(10), @agTot INT, @agRecv INT;
+-- ★ Asset khai 999 record (gồm CẢ acc KHÔNG thuộc SDI) nhưng SDI chỉ nhận 1 SI → CŨ: kẹt PENDING vĩnh viễn
+--   (received 1 < total 999) ⇒ EOD + chain KHÔNG BAO GIỜ chạy. NAY: READY, và TOTAL/RECEIVED chỉ để audit.
+EXEC SP_EOD_SET_SOURCE_READY '2026-01-06','ASSET_NAV',999,NULL,@ag1 OUTPUT,@em OUTPUT;
+SELECT @ast1=C_ASSET_NAV_STATUS, @agTot=C_ASSET_NAV_TOTAL, @agRecv=C_ASSET_NAV_RECEIVED
+  FROM T_EOD_PIPELINE WHERE C_BUSINESS_DATE='2026-01-06';
+IF @ag1=0 AND @ast1='READY' AND @agTot=999 AND @agRecv=1
+   PRINT CONCAT('  OK ASSET_NAV = cờ: err=0 READY dù received(',@agRecv,') < total khai(',@agTot,') — acc lạ bị lọc là BÌNH THƯỜNG');
+ELSE PRINT CONCAT('  !!! ASSET_NAV flag sai: err=',@ag1,' status=',@ast1,' total=',@agTot,' recv=',@agRecv);
+-- ★★ Nhưng chốt chặn THẬT vẫn còn: thêm 1 SI ACTIVE chưa có dòng Asset → SP_EOD_RUN err=12 (post-check)
+INSERT T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS) VALUES ('SUB003','KH003','SDI01','2026-01-06','ACTIVE');
+DECLARE @agRun INT;
+EXEC SP_EOD_RUN '2026-01-06',@p_err_code=@agRun OUTPUT,@p_err_msg=@em OUTPUT;
+IF @agRun=12
+   PRINT '  OK POST-CHECK: ASSET_NAV=READY nhưng thiếu SI của SDI → SP_EOD_RUN err=12, VẪN CHẶN EOD';
+ELSE PRINT CONCAT('  !!! post-check KHÔNG chặn: err=',@agRun);
+DELETE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT='SUB003';
 
 PRINT '';
 PRINT '======== LỊCH GD: ngày nghỉ KHÔNG được cộng dồn vào index (T_TRADING_HOLIDAY + rule T7/CN) ========';
