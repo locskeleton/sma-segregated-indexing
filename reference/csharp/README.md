@@ -2,25 +2,47 @@
 
 > Code C# **không nằm trong repo này** (nó ở `sdi-core-messaging-process`). Đây là **bản tham chiếu** viết lại theo thiết kế ở [`docs/SDI-kafka-batch-sync-design.md`](../../docs/SDI-kafka-batch-sync-design.md), giữ nguyên tên class/method/interface để **drop vào là chạy**.
 
+## ⚠️ Hàm generic cũ KHÔNG mất — nó bị TÁCH LÀM HAI
+
+`SyncEodDataGeneric` đang gánh **hai bài toán khác hẳn nhau**, và chính việc trộn chúng vào một hàm là nguồn gốc của `COUNTER` + `LockTake` + retry-loop + double-check:
+
+| Bài toán | Ai dùng | Cần gì | Generic mới |
+|---|---|---|---|
+| **(a)** Gom **nhiều batch** thành một job | Job 01 — asset ingest | Đếm · dedup · biết khi nào đủ | **`BatchSyncService`** |
+| **(b)** Chạy **một job đơn lẻ** đúng một lần | Job 02, 03 — `msg:"{}"`, `executeFunc` trả `(true, 1, 1)` | Chỉ cần chạy + ghi log job | **`JobRunner`** |
+
+> Job 02/03 **không có batch nào cả** — code cũ phải nhét `totalRow=1`, `numProcessed=1` để **lừa cái máy đếm-batch** chạy qua. `JobRunner` giữ nguyên **log job + đo thời gian + khoá best-effort**, chỉ bỏ phần đếm mà chúng vốn không cần.
+
+**Cả hai đều vẫn generic** — thêm luồng batch mới (BO đẩy giá theo batch chẳng hạn) thì dùng lại `BatchSyncService`; thêm job đơn mới thì dùng lại `JobRunner`.
+
 ## File
 
 | File | Thay cho |
 |---|---|
-| `KafkaSyncKeys.cs` | (mới) khoá Redis + **script Lua cộng dồn nguyên tử** |
-| `BatchSyncService.cs` | **`BaseService.SyncEodDataGeneric`** |
-| `SyncAssetDataService.cs` | **`SyncAssetDataService.ProcessDataSyncAssetSdiCore`** |
-| `EodJobWatchdogService.cs` | (mới) timeout fallback + hết treo im lặng |
-| `EodStepRunner.cs` | (mới) chạy từng step tường minh — **thay chain nối trong handler** |
+| `KafkaSyncKeys.cs` | *(mới)* khoá Redis + **script Lua cộng dồn nguyên tử** |
+| **`BatchSyncService.cs`** | **`SyncEodDataGeneric`** — phần **(a)** nhiều-batch |
+| **`JobRunner.cs`** | **`SyncEodDataGeneric`** — phần **(b)** job-đơn *(giữ log job)* |
+| `SyncAssetDataService.cs` | `ProcessDataSyncAssetSdiCore` — **ngắt chain** |
+| `EodJobWatchdogService.cs` | *(mới)* timeout fallback + hết treo im lặng |
+| `EodStepRunner.cs` | *(mới)* chạy từng step tường minh — **thay chain nối trong handler** |
 
 ## Cần bổ sung (tự viết theo repo sẵn có)
 
 ```csharp
 public interface ISdiDbGateway
 {
-    Task<(int Err, string? Msg)> SetSourceReadyAsync(string tranDate, string source, long totalRecord);
-    Task<(int Err, string? Msg)> FeeRunDailyAsync(DateTime d);      // SP_FEE_RUN_DAILY
-    Task<(int Err, string? Msg)> EodRunIndexAsync(DateTime d);      // SP_EOD_RUN_INDEX
-    Task<(int Err, string? Msg)> EodRunAsync(DateTime d);           // SP_EOD_RUN
+    Task<(int Err, string? Msg)>            SetSourceReadyAsync(string tranDate, string source, long totalRecord);
+    Task<(int Err, string? Msg, long Rows)> FeeRunDailyAsync(DateTime d);    // SP_FEE_RUN_DAILY
+    Task<(int Err, string? Msg, long Rows)> EodRunIndexAsync(DateTime d);    // SP_EOD_RUN_INDEX
+    Task<(int Err, string? Msg, long Rows)> EodRunAsync(DateTime d);         // SP_EOD_RUN
+}
+
+// Map sang LogJobKafkaStarting / updateJob sẵn có
+public interface IJobLogWriter
+{
+    Task<string> StartAsync(string bizType, string tranDate);   // ⚠️ MERGE theo (bizType, tranDate) ⇒ idempotent
+    Task FinishAsync(string jobId, string bizType, long total, long success, long fail,
+                     long totalMs, bool ok, string? msg);
 }
 ```
 
@@ -28,6 +50,7 @@ public interface ISdiDbGateway
 
 ```csharp
 services.AddSingleton<BatchSyncService>();
+services.AddSingleton<JobRunner>();
 services.AddSingleton<EodStepRunner>();
 services.AddHostedService<EodJobWatchdogService>();   // chạy trên MỌI pod — an toàn, idempotent
 ```
