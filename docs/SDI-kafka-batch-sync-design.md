@@ -1,191 +1,203 @@
 # Thiết kế đồng bộ Asset qua Kafka — nhiều pod, Redis điều phối
 
-> **Ràng buộc:** không thêm bảng DB · nhiều pod để chia tải · Redis quản batch + trạng thái job · không so danh sách tài khoản giữa Asset và SDI ở tầng Kafka (post-check lo).
-> **Thay cho:** cơ chế `COUNTER` / `TOTAL_PROCESSED` / `counter==1` / retry-loop hiện tại.
+> **Ràng buộc:** không thêm bảng DB · nhiều pod chia tải · Redis quản batch + trạng thái job · **không** so danh sách tài khoản giữa Asset và SDI ở tầng Kafka (post-check lo) · **ngắt** consumer khỏi EOD/chain, chạy từng step tường minh.
+>
+> **Thay cho:** `COUNTER` / `TOTAL_PROCESSED` / `counter==1` / `INITIAL_LOCK` / `END_LOCK` / retry-loop 100s / `JobDone` trong RAM.
 
 ---
 
-## 0. Nguyên tắc nền — đọc kỹ, mọi thứ dưới đây dựa vào nó
+## 0. Ba nguyên tắc — mọi thứ dưới đây dựa vào chúng
 
-> ### Redis lo TỐC ĐỘ và ĐIỀU PHỐI. DB lo TÍNH ĐÚNG.
-> **Redis mất sạch key vẫn không được làm SAI một đồng nào** — chỉ được phép làm *chậm* hoặc *treo*.
-
-Đạt được bằng cách: **tính đúng nằm ở tính idempotent của DB**, Redis chỉ để **khỏi làm lại việc thừa** và **để biết khi nào đủ**.
-
-Hệ quả trực tiếp: **không bao giờ dùng Redis lock để bảo vệ tính đúng.** Lock có TTL, TTL sẽ hết vào lúc tệ nhất. Lock chỉ để tiết kiệm CPU.
+> ### ① Redis lo TỐC ĐỘ. DB lo TÍNH ĐÚNG.
+> Redis mất sạch key chỉ được phép làm **chậm/treo**, **không bao giờ** được làm **sai số**.
+>
+> ### ② Đừng để hệ mình chết vì hệ người khác lỗi.
+> `totalRow` là số **Asset khai** — không kiểm soát được. Nó chỉ là **gợi ý**, không phải **cổng chặn**.
+>
+> ### ③ Đã xây trên nền at-least-once thì phép cộng phải có DEDUP.
+> Kafka chỉ hứa *"ít nhất một lần"*. Nó **không bao giờ** hứa *"đúng một lần"*.
 
 ---
 
-## 1. Hai câu hỏi khác nhau — đừng trộn
+## 1. Hai câu hỏi — hai tầng — đừng trộn
 
-| Tầng | Câu hỏi | Trả lời bằng | Nếu thiếu |
+| Tầng | Câu hỏi | Trả lời bằng | Sai thì sao |
 |---|---|---|---|
-| **Kafka + Redis** | *"Asset đã gửi đủ những gì nó **KHAI** chưa?"* | `SCARD(si đã nhận)` ≥ `totalRow` | Job chưa READY → chờ |
-| **DB (post-check)** | *"SDI có đủ dữ liệu cho **tài khoản của mình** chưa?"* | `SP_EOD_RUN` → **err=12** | Chặn EOD, báo rõ số SI thiếu |
+| **Kafka + Redis** | *"Asset gửi đủ cái nó **KHAI** chưa?"* | `rows >= totalRow` (có dedup) **hoặc** timeout | Chỉ tốn một lần thử — **vô hại** |
+| **DB (post-check)** | *"SDI đủ dữ liệu cho **tài khoản CỦA MÌNH** chưa?"* | `SP_EOD_RUN` → **err=12** | **Không thể sai** — đọc dữ liệu thật, tính từ registry thật |
 
-⇒ **Tầng Kafka KHÔNG cần biết registry SDI.** Asset gửi dư tài khoản lạ → `SP_INGEST_ASSET_NAV` tự lọc. Asset gửi thiếu tài khoản của SDI → `err=12` bắt được ở tầng sau.
+⇒ Tầng Kafka **không đụng registry SDI**. Cờ `READY` bật sớm/muộn đều **vô hại**, vì cửa khoá thật nằm ở DB.
 
 ---
 
-## 2. Danh tính để chống trùng — **có sẵn, không cần producer sửa**
+## 2. Hai khoá định danh — hai vai trò khác nhau
 
-Producer hiện **chỉ gửi `totalRow`** (giống nhau mọi batch), **không có `batch_index`**. Vậy lấy gì làm danh tính?
+| Khoá | Nguồn | Trả lời | Dùng để |
+|---|---|---|---|
+| **`requestId`** | **Asset gửi sẵn** — chung cho MỌI batch của job | *"Đây là JOB nào?"* | `jobId` · scope Redis · MERGE job log |
+| **`Sha256(data)`** | Consumer tự tính từ payload | *"Batch này xử lý chưa?"* | Dedup · cộng dồn an toàn |
 
-**`si_account`.** Nó nằm sẵn trong payload, và `totalRow` chính là **tổng số bản ghi (= số tài khoản) cả ngày**.
+### Vì sao dedup theo **nội dung**, không theo `(partition, offset)`
 
-```
-Đếm theo si_account (SADD)  ⇒  trùng bao nhiêu lần cũng chỉ tính 1
-So với totalRow             ⇒  biết đã đủ chưa
-KHÔNG cần biết có bao nhiêu batch
-```
+`offset` là danh tính của **cái phong bì**. `enable.idempotence=true` chỉ bảo vệ được **một phần**:
 
-> ⚠️ **Giả định:** 1 bản ghi = 1 `si_account` cho một ngày (khớp `UQ (C_BUSINESS_DATE, C_SI_ACCOUNT)` của `T_SI_BALANCE`). Nếu Asset gửi trùng `si_account` trong cùng ngày thì `totalRow` (đếm dòng) sẽ **lớn hơn** số tài khoản phân biệt → `SCARD` không bao giờ đạt → treo. **Cần Asset xác nhận `totalRow` = số tài khoản phân biệt.** Có guard cảnh báo ở §6.
+| Tình huống | `enable.idempotence` chặn được? |
+|---|---|
+| Retry vì timeout / ack rớt | ✅ |
+| **Leader partition đổi broker** (failover) | ✅ — producer state nằm trong log của partition |
+| **Producer process RESTART** (redeploy, OOM, evict) | ❌ **KHÔNG** — PID mới, broker không nhận ra sequence cũ |
+
+⇒ Producer restart → cùng nội dung nằm ở **offset khác** → dedup theo offset **mù**.
+`Sha256(data)` là danh tính của **nội dung bên trong** → **miễn nhiễm**.
+
+> Vẫn bật `enable.idempotence = true` (rẻ, bịt các lỗ khác). Nhưng **đừng xây tính đúng dựa trên nó**.
 
 ---
 
 ## 3. Bản đồ Redis key
 
-`P = SDI:{bizType}:{yyyyMMdd}` — TTL toàn bộ **48h**.
+`P = SDI:{bizType}:{requestId}` — TTL **48h** toàn bộ.
 
 | Key | Kiểu | Dùng để |
 |---|---|---|
-| `{P}:SI` | **SET** | `si_account` đã nhận (từ **payload**, kể cả acc SDI không nhận). `SADD` → idempotent |
-| `{P}:TOTAL` | STRING | `totalRow` Asset khai (ghi lần đầu bằng `SET NX`) |
-| `{P}:READY` | STRING | `"1"` khi `SCARD ≥ TOTAL` — chống gọi `SP_EOD_SET_SOURCE_READY` lặp |
-| `{P}:LAST_AT` | STRING | Timestamp message cuối → **watchdog** |
-| `{P}:JOB_ID` | STRING | Id log job (`SET NX`) — **chỉ để log, KHÔNG chặn xử lý** |
-| `SDI:CHAIN:{yyyyMMdd}` | STRING | Quyền chạy chain (`SET NX EX 60`, có gia hạn) |
+| `{P}:MSG` | **SET** | `Sha256(data)` của các batch đã xử lý → dedup. ~500 phần tử ≈ **35 KB** |
+| `{P}:ROWS` | STRING | Tổng số dòng đã nhận (cộng dồn **có dedup**) |
+| `{P}:TOTAL` | STRING | `totalRow` Asset khai (audit + so sánh) |
+| `{P}:READY` | STRING | `"1"` — chống gọi `SP_EOD_SET_SOURCE_READY` lặp |
+| `{P}:LAST_AT` | STRING | Timestamp message cuối → **timeout fallback + watchdog** |
 
-**Không còn:** `COUNTER`, `COUNTER_SUCCESS`, `COUNTER_FAIL`, `TOTAL_PROCESSED`, `INITIAL_LOCK`, `END_LOCK`, `LAST_TRY_DEQUEUE`.
+**Đã xoá:** `COUNTER`, `COUNTER_SUCCESS`, `COUNTER_FAIL`, `TOTAL_PROCESSED`, `JOB_ID`, `INITIAL_LOCK`, `END_LOCK`, `LAST_TRY_DEQUEUE`, `EOD_DATE`.
 
 ---
 
-## 4. Consumer — mọi pod giống hệt nhau
+## 4. Lua — cộng dồn NGUYÊN TỬ, một round-trip
 
-**Không có "message đầu tiên đặc biệt". Không lock. Không chờ. Không chain.**
+Vấn đề nếu tách 2 lệnh:
+
+```
+SADD {P}:MSG <hash>      → đánh dấu đã xử lý
+⚡ pod chết ĐÚNG ở đây
+INCRBY {P}:ROWS 100      → KHÔNG BAO GIỜ CHẠY
+⇒ message coi như xong nhưng 100 dòng không được cộng ⇒ TREO VĨNH VIỄN
+```
+
+Redis chạy Lua **nguyên tử** → không có cửa sổ ghi-dở:
+
+```lua
+-- KEYS[1] = {P}:MSG    KEYS[2] = {P}:ROWS
+-- ARGV[1] = batchKey (sha256 của data)
+-- ARGV[2] = số dòng trong batch
+-- ARGV[3] = TTL giây
+if redis.call('SADD', KEYS[1], ARGV[1]) == 1 then
+    local n = redis.call('INCRBY', KEYS[2], ARGV[2])
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+    return n                                              -- batch MỚI → đã cộng
+else
+    return tonumber(redis.call('GET', KEYS[2]) or '0')    -- batch TRÙNG → KHÔNG cộng
+end
+```
+
+Giao lại 10 lần → `SADD` trả 0 → **không cộng lần nào nữa**.
+
+---
+
+## 5. Consumer — chỉ làm ĐÚNG MỘT VIỆC
+
+**Không chain. Không EOD. Không phí. Không lock. Không chờ.**
 
 ```csharp
-async Task HandleAsync(ConsumeResult<string,string> r)
+private async Task ProcessDataSyncAssetSdiCore(string rawJson, ConsumeResult<string,string> r)
 {
-    var model  = JsonConvert.DeserializeObject<AssetKafkaModel>(r.Message.Value);
-    var d      = model.Date;                 // tranDate
-    var total  = model.TotalRow;             // Asset khai, giống nhau mọi batch
-    var siList = model.Data.Select(x => (RedisValue)x.si_account).ToArray();
-    var P      = $"SDI:{bizType}:{d:yyyyMMdd}";
+    var model    = JsonConvert.DeserializeObject<AssetSdiCoreKafkaModel>(rawJson);
+    var tranDate = model.data.Select(m => m.date).FirstOrDefault();
+    var jobId    = model.requestId;                      // ★ JOB_ID có sẵn — không cần tạo, không cần chờ
+    var P        = $"SDI:{bizType}:{jobId}";
 
-    // ── 1) GHI DB TRƯỚC ────────────────────────────────────────────────
-    //    SP_INGEST_ASSET_NAV: all-or-nothing + idempotent (DELETE+INSERT theo (date,si))
-    //    Xử lý lại bao nhiêu lần cũng ra cùng kết quả.
-    var (err, _) = await _sp.IngestAssetNavAsync(r.Message.Value, d);
+    if (!Utils.IsValidDate(tranDate)) { Log.Error(...); return; }
+
+    // ── 1) GHI DB TRƯỚC — idempotent (DELETE+INSERT theo (date,si)), all-or-nothing
+    var (err, _) = await _sp.IngestAssetNavAsync(rawJson, tranDate);
     if (err != 0)
-        throw new SyncException($"ingest fail err={err}");   // KHÔNG commit offset → Kafka giao lại
+        throw new SyncException($"ingest err={err}");     // KHÔNG commit offset → Kafka giao lại
 
-    // ── 2) ĐÁNH DẤU SAU KHI DB ĐÃ COMMIT ──────────────────────────────
-    //    Đánh dấu TRƯỚC mà pod chết giữa chừng ⇒ message coi như xong dù chưa ghi. KHÔNG BAO GIỜ.
-    var batch = _redis.CreateBatch();
-    var tAdd  = batch.SetAddAsync($"{P}:SI", siList);                                  // SADD nhiều phần tử, 1 lệnh
-    _         = batch.StringSetAsync($"{P}:TOTAL",   total, _ttl48h, When.NotExists);
-    _         = batch.StringSetAsync($"{P}:LAST_AT", DateTime.UtcNow.Ticks, _ttl48h);
-    _         = batch.KeyExpireAsync($"{P}:SI", _ttl48h);
-    batch.Execute();
-    await tAdd;
+    // ── 2) CỘNG DỒN AN TOÀN — dedup theo NỘI DUNG, nguyên tử (Lua)
+    var batchKey = Sha256(JsonConvert.SerializeObject(model.data));   // ⚠️ chỉ data, BỎ requestId/timestamp
+    long rows = (long)await _redis.ScriptEvaluateAsync(LuaSumOnce,
+        new RedisKey[]   { $"{P}:MSG", $"{P}:ROWS" },
+        new RedisValue[] { batchKey, model.data.Count, 172800 });
 
-    // ── 3) "ĐỦ CHƯA?" LÀ MỘT PHÉP HỎI, KHÔNG PHẢI MỘT SỰ KIỆN ─────────
-    long got = await _redis.SetLengthAsync($"{P}:SI");        // SCARD — O(1)
-    if (got >= total)
-    {
-        // SET NX ⇒ chỉ đúng 1 pod gọi SP, dù cả hai cùng thấy đủ
-        if (await _redis.StringSetAsync($"{P}:READY", "1", _ttl48h, When.NotExists))
-        {
-            await _sp.SetSourceReadyAsync(d, "ASSET_NAV", total);   // ghi cờ vào T_EOD_PIPELINE
-            _log.Information("[{Biz}] ASSET_NAV READY {Date}: {Got}/{Total}", bizType, d, got, total);
-        }
-    }
+    await _redis.StringSetAsync($"{P}:TOTAL",   model.totalRow, _ttl48h, When.NotExists);
+    await _redis.StringSetAsync($"{P}:LAST_AT", DateTime.UtcNow.Ticks, _ttl48h);
 
-    // XONG → commit offset. Vài chục ms. Không bao giờ bị Kafka đá.
+    // ── 3) ĐỦ CHƯA → BẬT CỜ. HẾT.
+    if (rows >= model.totalRow)
+        await TrySetReadyAsync(P, tranDate, model.totalRow, rows, byTimeout: false);
+
+    // ❌ KHÔNG gọi ProcessJobAumFeeAcccrue
+    // ❌ KHÔNG gọi ProcessJobAumFeeCharge
+    // ❌ KHÔNG gọi SP_EOD_RUN
+    // → commit offset. Vài chục ms. KHÔNG BAO GIỜ bị Kafka đá.
 }
-```
 
-### Điều gì đã bị xoá bỏ, và vì sao
-
-| Bỏ | Vì |
-|---|---|
-| `counter == 1` để tạo `JOB_ID` | **Điểm chết đơn**: pod chết sau `INCR` → không ai còn thấy `counter==1` → job chết vĩnh viễn |
-| Vòng retry `1000 × 100ms` chờ `JOB_ID` | Block consumer 100s → vượt `max.poll.interval` → **bị đá → zombie → duplicate** |
-| Bắt buộc có `JOB_ID` mới được xử lý | `JOB_ID` **chỉ để log**. Không được để nó chặn dữ liệu |
-| `TOTAL_PROCESSED >= totalRow` (cộng số dòng) | `numProcessed` = số dòng **ghi được** (đã lọc acc lạ) ≠ `totalRow` = số dòng **gửi đi** ⇒ **không bao giờ đạt → treo** |
-| `COUNTER` làm điều kiện chốt | `INCR` **trước** khi xử lý ⇒ batch **FAIL vẫn được tính là xong** ⇒ chốt job trên data thiếu |
-| `INITIAL_LOCK` / `END_LOCK` | Không cần khoá khi mọi thao tác đã idempotent theo danh tính |
-
----
-
-## 5. Chain job — chạy ở mọi pod, chỉ một pod thắng
-
-**Không chạy trong handler Kafka.** Chạy trong `BackgroundService` của **cùng pod đó** (không cần deployment riêng).
-
-```csharp
-protected override async Task ExecuteAsync(CancellationToken ct)
+private async Task TrySetReadyAsync(string P, string d, long total, long rows, bool byTimeout)
 {
-    while (!ct.IsCancellationRequested)
-    {
-        await Task.Delay(15_000, ct);
+    // SET NX ⇒ chỉ 1 pod gọi SP, dù nhiều pod cùng thấy đủ
+    if (!await _redis.StringSetAsync($"{P}:READY", "1", _ttl48h, When.NotExists)) return;
 
-        // T_EOD_PIPELINE: C_ASSET_NAV_STATUS='READY' AND C_EOD_STATUS <> 'DONE'
-        foreach (var d in await _sp.GetDatesNeedingChainAsync())
-        {
-            var key = $"SDI:CHAIN:{d:yyyyMMdd}";
+    if (byTimeout)
+        Log.Warning("[{Biz}] {Date} chốt theo TIMEOUT: {Rows}/{Total} dòng. Asset có thể gửi thiếu " +
+                    "hoặc totalRow sai. Đủ/thiếu THẬT do SP_EOD_RUN quyết (err=12).", bizType, d, rows, total);
 
-            // Giành quyền: SET NX EX 60. Thua thì bỏ qua, không chờ.
-            if (!await _redis.StringSetAsync(key, _podId, TimeSpan.FromSeconds(60), When.NotExists))
-                continue;
-
-            using var keepAlive = RenewEvery(TimeSpan.FromSeconds(20), key, _podId);  // gia hạn TTL
-            try
-            {
-                await _sp.FeeRunDailyAsync(d);   // SP_FEE_RUN_DAILY  — MERGE, idempotent
-                await _sp.EodRunAsync(d);        // SP_EOD_RUN        — step-gate, idempotent
-                                                 //   err=12 nếu Asset thiếu SI ⇒ POST-CHECK ở đây
-            }
-            catch (Exception ex) { _log.Error(ex, "chain {Date}", d); }
-            finally { await ReleaseIfMineAsync(key, _podId); }   // Lua: GET==podId thì DEL
-        }
-    }
+    await _sp.SetSourceReadyAsync(d, "ASSET_NAV", total);   // ghi cờ C_ASSET_NAV_STATUS='READY'
+    Log.Information("[{Biz}] {Date} ASSET_NAV READY: {Rows}/{Total}", bizType, d, rows, total);
 }
 ```
 
-### Vì sao TTL lock hết giữa chừng **không** gây sai
+### `totalRow` là GỢI Ý — timeout là lưới an toàn
 
-Vì công việc bên dưới **idempotent sẵn**:
+Chạy trong `BackgroundService` (quét 15s), **không** phụ thuộc message mới tới — vì lúc treo thì **đúng là không còn message nào tới nữa**:
 
-- `SP_EOD_RUN` → `SP_EOD_STEP` có **resume-gate**: job đã `DONE` thì **bỏ qua**, không chạy lại.
-- `SP_FEE_RUN_DAILY` → **MERGE upsert**, khoá kỳ đã/đang thu.
+```csharp
+foreach (var P in await ScanActiveJobsAsync())          // các job chưa READY
+{
+    long rows  = await _redis.StringGetAsync($"{P}:ROWS");
+    long total = await _redis.StringGetAsync($"{P}:TOTAL");
+    var  last  = await _redis.StringGetAsync($"{P}:LAST_AT");
 
-Hai pod cùng chạy = **lãng phí CPU, không sai số**. Lock chỉ để **tiết kiệm**, không để **bảo vệ**.
+    if (rows > 0 && DateTime.UtcNow - last > TimeSpan.FromMinutes(5))
+        await TrySetReadyAsync(P, date, total, rows, byTimeout: true);
+}
+```
 
-> Đây là điểm quan trọng nhất của cả thiết kế: **không có đường nào mà "Redis hỏng ⇒ tiền sai"**.
+### Ném lỗi của Asset vào — không có ô nào chết
 
-### Chain không bao giờ bị bỏ nữa
-
-Hiện tại: `JobDone` là **bool trong RAM** của **đúng một message may mắn**. Message đó lỗi/trùng/pod chết → **sự kiện mất luôn**, không ai dựng lại → chain bị bỏ. *(Đúng triệu chứng đang gặp.)*
-
-Bây giờ: chain được kích bởi **trạng thái trong `T_EOD_PIPELINE`**. Pod chết? Vòng quét sau 15 giây của **pod bất kỳ** vẫn thấy `READY` và chạy tiếp. **Không còn khái niệm "bỏ lỡ".**
+| Asset lỗi kiểu gì | Điều gì xảy ra |
+|---|---|
+| `totalRow` khai **thừa** | `rows` không bao giờ đạt → **timeout 5 phút → READY** → `SP_EOD_RUN` kiểm tra thật → chạy hoặc err=12. **Không treo** |
+| `totalRow` khai **thiếu** | `READY` sớm → `SP_EOD_RUN` → **err=12** nếu thiếu SI của SDI → chặn → batch còn lại tới → chạy lại. **Không sai** |
+| Gửi **trùng** `si_account` | Dòng trùng vẫn được cộng (đúng theo định nghĩa `totalRow` = số dòng gửi) → không ảnh hưởng |
+| Gửi **dư** acc không thuộc SDI | `SP_INGEST_ASSET_NAV` lọc. `rows` vẫn cộng đủ theo payload → READY đúng |
+| **Thiếu hẳn** tài khoản của SDI | → **err=12** → **CHẶN**. Đúng, vì đây mới là lỗi nguy hiểm |
+| Producer restart → gửi lại batch | `Sha256(data)` trùng → **không cộng lại** |
+| Kafka rebalance → zombie pod ghi song song | DB `DELETE+INSERT` theo `(date,si)` + `SADD` hash → **vô hại** |
 
 ---
 
-## 6. Watchdog — hết treo im lặng
+## 6. NGẮT khỏi EOD — chạy từng step tường minh
 
-Cùng vòng lặp 15s, mỗi pod:
+Consumer **chỉ** ingest + bật cờ. Các bước sau gọi **riêng**, nhìn `err` là biết kẹt ở đâu:
 
-```csharp
-// Chưa READY mà đã lâu không có message mới → kêu
-if (!ready && (now - lastAt) > TimeSpan.FromMinutes(10))
-    _log.Warning("[{Biz}] {Date} TREO: nhận {Got}/{Total} tài khoản, {Min} phút không có message mới",
-                 bizType, d, scard, total, minutes);
+| Step | Gọi | Chưa đủ tiền đề → | Chạy lại |
+|---|---|---|---|
+| 1. Asset ingest | Kafka consumer | — | idempotent |
+| 2. **Phí** | `SP_FEE_RUN_DAILY @d` | — (chỉ cần AUM ngày đó). **Chạy MỌI ngày lịch**, độc lập | MERGE → an toàn |
+| 3. **Index** | `SP_EOD_RUN_INDEX @d` | `10` MKT chưa READY · `11` thiếu giá mã rổ · `13` ngày nghỉ | idempotent |
+| 4. **EOD** | `SP_EOD_RUN @d` | `10` precondition · **`12` thiếu SI của SDI** · `13` ngày nghỉ | step-gate → an toàn |
 
-// Nhận VƯỢT số Asset khai → Asset gửi trùng si_account, hoặc totalRow sai
-if (scard > total)
-    _log.Error("[{Biz}] {Date} nhận {Got} > khai {Total} — kiểm tra định nghĩa totalRow của Asset", ...);
-```
+Sau khi từng step chạy ổn định và tin được rồi, muốn tự động hoá thì cho **scheduler quét `T_EOD_PIPELINE`** — **không bao giờ** nối lại vào trong Kafka handler.
+
+> **Vì sao không bao giờ:** chain chạy trong handler → block consumer → vượt `max.poll.interval` → Kafka **đá pod** (nhưng **không giết thread** — nó vẫn ghi DB!) → **zombie ghi song song** → rebalance → giao lại → duplicate → vòng xoáy tự khuếch đại.
 
 ---
 
@@ -193,65 +205,38 @@ if (scard > total)
 
 | Mất | Hậu quả | **Sai số liệu?** |
 |---|---|---|
-| `{P}:SI` | `SCARD` tụt → không bao giờ đạt `TOTAL` → job **treo** | ❌ **Không.** Dữ liệu trong DB **vẫn đủ**, chỉ là cờ không bật. Watchdog kêu → ops bật `READY` thủ công (hoặc Asset gửi lại — SP idempotent) |
+| `{P}:MSG` | Batch giao lại **được cộng lại** → `rows` phình → READY sớm | ❌ **Không** — `SP_EOD_RUN` err=12 vẫn chặn nếu thiếu |
+| `{P}:ROWS` | `rows` tụt → không đạt `totalRow` → **timeout 5 phút → READY** | ❌ Không |
 | `{P}:READY` | Gọi lại `SP_EOD_SET_SOURCE_READY` | ❌ Không (idempotent) |
-| `SDI:CHAIN:*` | 2 pod cùng chạy chain | ❌ Không (chain idempotent) |
-| `{P}:JOB_ID` | Sinh thêm 1 dòng log job | ❌ Không (chỉ trùng log) |
-| **Toàn bộ Redis** | Job treo, cần can thiệp tay | ❌ **Không bao giờ sai số** |
+| **Toàn bộ Redis** | Chậm/thử lại, có thể trùng công | ❌ **Không bao giờ sai số** |
 
-**Không có ô nào là ✅.** Đó chính là tiêu chí thiết kế ở §0.
+**Không có ô nào ✅.** Đúng nguyên tắc ①.
 
 ---
 
-## 8. Chia tải nhiều pod — giờ đã tự do
+## 8. Chia tải nhiều pod — tự do
 
-Vì mọi thao tác đều **idempotent theo danh tính**, không còn ràng buộc gì về partition:
+Vì mọi thao tác đã idempotent:
 
-- Partition tuỳ ý (round-robin, hoặc key = `si_account` để trải đều).
-- **Không cần** ép `key = job_key` để dồn một job về một pod.
-- 2 pod (hay 10 pod) cùng ăn batch của **cùng một job** → **an toàn tuyệt đối**.
-- Zombie pod sau rebalance ghi song song → `DELETE+INSERT` theo `(date, si)` + `SADD` → **vô hại**.
-
-> Chỉ khi hệ thống **không** idempotent thì mới phải hy sinh khả năng scale để đổi lấy an toàn. Ở đây thì không phải đánh đổi gì.
+- Partition **tuỳ ý** (round-robin cũng được) — **không cần** ép `key = job_key`.
+- 2 pod (hay 10) cùng ăn batch của **cùng một job** → an toàn.
+- Zombie sau rebalance ghi song song → vô hại.
 
 ---
 
-## 9. Thay đổi phía DB — **không thêm bảng nào**
+## 9. Phía DB — **đã xong**, không thêm bảng/cột
 
-Chỉ sửa **một chỗ** trong `SP_EOD_SET_SOURCE_READY`, nhánh `ASSET_NAV`:
+`SP_EOD_SET_SOURCE_READY` nhánh `ASSET_NAV` **đã đổi thành CỜ** (commit `65cf008`):
 
-**Hiện tại** — SP **tự quyết** đủ/thiếu bằng cách so với số Asset khai:
-```sql
-DECLARE @anavRecv INT = (SELECT COUNT(DISTINCT C_SI_ACCOUNT) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_business_date);
-C_ASSET_NAV_STATUS = CASE WHEN @anavRecv >= @p_total_record THEN 'READY' ELSE 'PENDING' END
-IF @anavOk=0 → err=4
-```
-⚠️ Sai vì `@anavRecv` chỉ đếm SI **SDI nhận** (acc lạ bị `INNER JOIN` lọc), còn `@p_total_record` là số Asset **khai** (gồm acc lạ) ⇒ **không bao giờ bằng nhau** ⇒ luôn `PENDING`.
-
-**Đổi thành** — tầng Kafka đã quyết (Redis `SCARD ≥ totalRow`), SP chỉ **ghi cờ** (giống `MKT_DATA`):
-```sql
--- Consumer chỉ gọi khi Redis xác nhận đã nhận đủ si_account so với totalRow Asset khai.
--- Đủ/thiếu so với REGISTRY SDI ⇒ post-check ở SP_EOD_RUN (err=12), KHÔNG check ở đây.
-UPDATE T_EOD_PIPELINE
-   SET C_ASSET_NAV_STATUS = 'READY',
-       C_ASSET_NAV_TOTAL  = @p_total_record,                        -- lưu để audit
-       C_ASSET_NAV_RECEIVED = (SELECT COUNT(DISTINCT C_SI_ACCOUNT)  -- lưu để audit (có thể < total: acc lạ)
-                               FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_business_date),
-       C_ASSET_NAV_AT     = GETDATE(),
-       C_UPDATED_AT = GETDATE(), C_UPDATED_BY = @p_user
- WHERE C_BUSINESS_DATE = @p_business_date;
-```
-
-**Giữ nguyên** chốt chặn thật ở `SP_EOD_RUN` — đây chính là *"post check phía sau"*:
-```sql
--- MỌI tiểu khoản ACTIVE phải có dòng T_SI_BALANCE @d
-IF @missSI > 0 → err=12  "Thiếu Asset NAV cho N tiểu khoản ACTIVE @d — chặn EOD"
-```
+- **Trước:** so `RECEIVED = COUNT(DISTINCT si)` *(chỉ SI SDI nhận — acc lạ bị `INNER JOIN` lọc)* với `@p_total_record` *(số Asset khai — GỒM acc lạ)*. **Hai tập khác nhau** ⇒ chỉ cần 1 acc lạ là `PENDING` **vĩnh viễn** ⇒ EOD + chain **không bao giờ chạy**.
+- **Nay:** chỉ ghi cờ `READY`. `TOTAL`/`RECEIVED` lưu để **audit** (`RECEIVED < TOTAL` khi có acc lạ là **BÌNH THƯỜNG**).
+- **Cửa khoá thật giữ nguyên:** `SP_EOD_RUN` → `err=12` nếu SI ACTIVE nào thiếu dòng `T_SI_BALANCE @d`.
 
 ---
 
-## 10. Tóm tắt — 3 câu
+## 10. Tóm tắt — 4 câu
 
-1. **Đừng ĐẾM. Hãy ĐÁNH DẤU** — `SADD si_account`, không `INCR`. Trùng bao nhiêu lần cũng vô hại.
-2. **"Đủ chưa" là một PHÉP HỎI, không phải một SỰ KIỆN** — ai hỏi lúc nào cũng ra đúng ⇒ chain không bao giờ bị bỏ lỡ.
-3. **Redis hỏng chỉ được phép làm CHẬM, không được phép làm SAI** — vì tính đúng nằm ở idempotency của DB, không nằm ở lock.
+1. **`requestId` = JOB_ID** → xoá sổ `counter==1`, `INITIAL_LOCK`, retry-loop 100s. Không còn "message đầu tiên đặc biệt", không còn điểm chết đơn.
+2. **Dedup theo NỘI DUNG** (`Sha256(data)`), không theo `offset` → bịt được lỗ producer restart mà `enable.idempotence` không bịt nổi.
+3. **Cộng dồn bằng Lua** (SADD + INCRBY nguyên tử) → không có cửa sổ ghi-dở.
+4. **`totalRow` là gợi ý, `err=12` là cửa khoá.** Asset lỗi → chậm 5 phút, **không chết**. SDI thiếu dữ liệu → **chặn**, báo rõ.
