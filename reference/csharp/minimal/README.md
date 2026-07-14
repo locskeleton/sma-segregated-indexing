@@ -6,7 +6,17 @@
 ## Ghép vào: 1 file + 2 chỗ ở call-site
 
 ### ① Thay method `SyncEodDataGeneric` trong `BaseService<T>`
-Copy `SyncEodDataGeneric.cs`. **Giữ nguyên chữ ký, nguyên `JobResult`.**
+Copy `SyncEodDataGeneric.cs`. Giữ nguyên `JobResult`, **chỉ thêm 1 tham số optional `jobId`**.
+
+```diff
+  var job01 = await SyncEodDataGeneric(rawJson, tranDate, RedisKeyDefine.EOD_ASSET,
+-                                      BizTypeDefine.JOB_EOD_ASSET, BulkInsertAssetToSdiCore);
++                                      BizTypeDefine.JOB_EOD_ASSET, BulkInsertAssetToSdiCore,
++                                      jobId: model.requestId);     // ★ Asset gửi sẵn — không phải đi tạo
+```
+
+> `requestId` **chung cho mọi batch của job** ⇒ nó **chính là** `JOB_ID`. Có sẵn thì truyền vào, không cần `counter==1` + `LockTake` + vòng chờ 100 giây để "tạo" ra nó.
+> Job fee (02/03) **không truyền** → hàm dùng **ngày** làm định danh → chạy y như cũ.
 
 ### ② `BulkInsertAssetToSdiCore` — đổi giá trị thứ 3 trả về
 
