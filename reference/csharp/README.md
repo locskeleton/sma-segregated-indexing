@@ -2,6 +2,30 @@
 
 > Code C# **không nằm trong repo này** (nó ở `sdi-core-messaging-process`). Đây là **bản tham chiếu** viết lại theo thiết kế ở [`docs/SDI-kafka-batch-sync-design.md`](../../docs/SDI-kafka-batch-sync-design.md), giữ nguyên tên class/method/interface để **drop vào là chạy**.
 
+## 🗑️ Dọn dẹp Redis: **TTL, KHÔNG `KeyDelete`**
+
+Code cũ xoá key khi job xong:
+
+```csharp
+var keysToDelete = new RedisKey[] { JOB_ID, COUNTER_SUCCESS, COUNTER_FAIL,
+                                    TOTAL_PROCESSED, EOD_DATE, LAST_TRY_DEQUEUE };
+await db.KeyDeleteAsync(keysToDelete);
+```
+
+⇒ Batch **tới muộn** (rebalance / retry chậm) vào hàm → không tìm thấy `JOB_ID` → spin 100s → `return BatchDone=false` → **`executeFunc` KHÔNG được gọi** → **dữ liệu batch đó không bao giờ vào DB**. Job vẫn báo `DONE`.
+
+> **Việc "dọn dẹp" đã giết dữ liệu.**
+
+| | Bản mới |
+|---|---|
+| Cách dọn | **TTL 48h** — mọi key tự hết hạn |
+| Giữ `{P}:MSG` để làm gì | Batch trùng tới muộn **không bị đếm lại** (dedup còn hiệu lực) |
+| Giữ `{P}:ROWS`/`{P}:TOTAL` | **Bằng chứng debug** — job hỏng thì cần đúng lúc đó. Xoá ngay = phá bằng chứng |
+| Chi phí | `MSG` set ≈ **35 KB/job** (500 batch × 64B). Vài job/ngày × 48h = **vài MB** |
+| Thứ **duy nhất** dọn ngay | Tư cách thành viên trong `{prefix}:JOBS` (`SREM` khi `READY` / khi job chết) — nếu không watchdog quét mãi job đã xong, và **spam log mỗi 15 giây** |
+
+---
+
 ## ⚠️ Hàm generic cũ KHÔNG mất — nó bị TÁCH LÀM HAI
 
 `SyncEodDataGeneric` đang gánh **hai bài toán khác hẳn nhau**, và chính việc trộn chúng vào một hàm là nguồn gốc của `COUNTER` + `LockTake` + retry-loop + double-check:

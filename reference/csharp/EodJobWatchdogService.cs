@@ -96,12 +96,19 @@ public class EodJobWatchdogService : BackgroundService
 
                 if (rows <= 0)
                 {
+                    // Job chết hẳn: Asset không gửi được dòng nào. KÊU ĐÚNG MỘT LẦN rồi gỡ khỏi danh sách canh.
+                    // ⚠️ Nếu để nguyên trong JOBS thì watchdog log ERROR mỗi 15 GIÂY suốt 48h (TTL) →
+                    //    SPAM LOG → người trực nhờn → đến lúc lỗi thật thì không ai để ý.
+                    //    Gỡ ra KHÔNG mất gì: message mới tới sẽ SADD requestId vào JOBS lại (xem BatchSyncService).
                     Log.Error("[Watchdog][{Biz}] {Date} req={Req} — {Min:F0} phút KHÔNG nhận được dòng nào. " +
-                              "Kiểm tra producer/Asset.", biz, (string)dateVal!, reqId, quiet.TotalMinutes);
+                              "Kiểm tra producer/Asset. (Gỡ khỏi danh sách canh; tự quay lại nếu có message mới.)",
+                              biz, (string)dateVal!, reqId, quiet.TotalMinutes);
+                    await _redis.SetRemoveAsync(KafkaSyncKeys.ActiveJobs(prefix), reqId);
                     continue;
                 }
 
-                // ★ CHỐT THEO TIMEOUT — không để Asset lỗi làm treo hệ mình
+                // ★ CHỐT THEO TIMEOUT — không để Asset lỗi làm treo hệ mình.
+                //   TrySetReadyAsync tự SREM khỏi JOBS sau khi bật cờ.
                 await _sync.TrySetReadyAsync(prefix, reqId!, (string)dateVal!, biz, total, rows, byTimeout: true);
             }
         }

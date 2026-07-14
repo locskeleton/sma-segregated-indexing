@@ -56,7 +56,27 @@ public class BatchSyncService
 {
     private readonly IDatabase      _redis;
     private readonly ISdiDbGateway  _db;         // wrapper gọi SP (Dapper/ADO — dùng repo sẵn có)
-    private readonly TimeSpan       _ttl = TimeSpan.FromHours(48);
+
+    /// <summary>
+    /// ★ CHÍNH SÁCH DỌN DẸP: TTL — TUYỆT ĐỐI KHÔNG KeyDelete SAU KHI JOB XONG.
+    ///
+    /// Code cũ xoá key khi job kết thúc:
+    ///     var keysToDelete = new RedisKey[] { JOB_ID, COUNTER_SUCCESS, COUNTER_FAIL,
+    ///                                         TOTAL_PROCESSED, EOD_DATE, LAST_TRY_DEQUEUE };
+    ///     await db.KeyDeleteAsync(keysToDelete);
+    /// ⇒ Batch TỚI MUỘN (rebalance / retry chậm) vào hàm, không tìm thấy JOB_ID → spin 100s →
+    ///   return BatchDone=false → executeFunc KHÔNG ĐƯỢC GỌI → DỮ LIỆU BATCH ĐÓ KHÔNG BAO GIỜ VÀO DB.
+    ///   Việc "dọn dẹp" đã GIẾT DỮ LIỆU, mà job vẫn báo DONE.
+    ///
+    /// Vì sao TTL an toàn hơn:
+    ///   • Giữ {P}:MSG ⇒ batch trùng tới muộn KHÔNG bị đếm lại (dedup còn hiệu lực).
+    ///   • Giữ {P}:ROWS/{P}:TOTAL ⇒ còn BẰNG CHỨNG để debug đúng lúc cần nhất (job hỏng).
+    ///   • Chi phí ~35 KB/job (MSG set 500 batch × 64B). Vài job/ngày × 48h = vài MB. Không đáng đánh đổi.
+    ///
+    /// Thứ DUY NHẤT được dọn ngay: tư cách thành viên trong SET {prefix}:JOBS (SREM khi READY) —
+    /// nếu không watchdog sẽ quét mãi job đã xong.
+    /// </summary>
+    private readonly TimeSpan _ttl = TimeSpan.FromHours(48);
 
     public BatchSyncService(IDatabase redis, ISdiDbGateway db)
     {
