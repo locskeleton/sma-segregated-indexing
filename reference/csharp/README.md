@@ -20,8 +20,9 @@ await db.KeyDeleteAsync(keysToDelete);
 |---|---|
 | Cách dọn | **TTL 48h** — mọi key tự hết hạn |
 | Giữ `{P}:MSG` để làm gì | Batch trùng tới muộn **không bị đếm lại** (dedup còn hiệu lực) |
-| Giữ `{P}:ROWS`/`{P}:TOTAL` | **Bằng chứng debug** — job hỏng thì cần đúng lúc đó. Xoá ngay = phá bằng chứng |
-| Chi phí | `MSG` set ≈ **35 KB/job** (500 batch × 64B). Vài job/ngày × 48h = **vài MB** |
+| Giữ `{P}:ROWS`/`{P}:AUM`/`{P}:TOTAL` | **Bằng chứng debug** — job hỏng thì cần đúng lúc đó: *đủ dòng chưa* **và** *tổng tiền có khớp DB không*. Xoá ngay = phá bằng chứng |
+| Giữ `{P}:BATCH_AUM` | AUM từng batch — batch gửi lại **đã sửa** thì cộng đúng phần **chênh**, không cộng lại từ đầu |
+| Chi phí | ≈ **75 KB/job** (`MSG` set 500×64B ≈ 35 KB + `BATCH_AUM` hash 500×76B ≈ 40 KB). Vài job/ngày × 48h = **vài MB** |
 | Thứ **duy nhất** dọn ngay | Tư cách thành viên trong `{prefix}:JOBS` (`SREM` khi `READY` / khi job chết) — nếu không watchdog quét mãi job đã xong, và **spam log mỗi 15 giây** |
 
 ---
@@ -119,6 +120,7 @@ enable.idempotence = true        # Producer của ASSET. Có thì tốt. KHÔNG 
 |---|---|
 | Tạo `JOB_ID` | `requestId` — Asset gửi sẵn, **chung cho mọi batch**. Không tạo, không lock, không chờ |
 | Đếm hoàn thành | **Lua nguyên tử**: `SADD Sha256(data)` → nếu mới thì `INCRBY rows`. Trùng ⇒ **không cộng** |
+| Biết *"đủ dòng nhưng lệch tiền"* | **Cùng script** cộng luôn `{P}:AUM` (tổng AUM đã nhận). So với `SUM(C_AUM) FROM T_SI_BALANCE @d`. **Chỉ để nhìn — không vào điều kiện chốt job** |
 | Dedup | Theo **NỘI DUNG** (`Sha256(data)`), **không** theo `(partition, offset)` — vì `enable.idempotence` **không sống sót qua producer restart** |
 | `totalRow` sai / Asset lỗi | **Timeout 5 phút** trong watchdog → vẫn bật cờ + log WARNING. **Không treo** |
 | Cửa khoá thật | **`SP_EOD_RUN` err=12** — mọi SI ACTIVE của SDI phải có dòng `T_SI_BALANCE @d`. Đọc registry của **chính SDI**, không phụ thuộc con số nào của Asset |
