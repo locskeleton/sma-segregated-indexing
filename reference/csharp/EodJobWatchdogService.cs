@@ -76,7 +76,6 @@ public class EodJobWatchdogService : BackgroundService
                 var totalVal = await _redis.StringGetAsync(KafkaSyncKeys.Total(p));
                 var lastVal  = await _redis.StringGetAsync(KafkaSyncKeys.LastAt(p));
                 var dateVal  = await _redis.StringGetAsync(KafkaSyncKeys.Date(p));
-                var aumVal   = await _redis.StringGetAsync(KafkaSyncKeys.Aum(p));   // ★ chỉ để LOG
 
                 // Redis mất key giữa chừng (evict/restart) → không đủ dữ liệu để quyết → gỡ ra, kêu.
                 if (!rowsVal.HasValue || !totalVal.HasValue || !lastVal.HasValue || !dateVal.HasValue)
@@ -88,11 +87,8 @@ public class EodJobWatchdogService : BackgroundService
                     continue;
                 }
 
-                // ⚠️ AUM CỐ TÌNH KHÔNG nằm trong guard "mất key" ở trên: nó là số QUAN SÁT.
-                //    Thiếu nó thì log xấu một chút, KHÔNG được phép làm đổi quyết định chốt job.
                 long rows  = (long)rowsVal;
                 long total = (long)totalVal;
-                long aum   = aumVal.HasValue ? (long)aumVal : 0;
                 var  last  = new DateTime((long)lastVal, DateTimeKind.Utc);
                 var  quiet = DateTime.UtcNow - last;
 
@@ -112,11 +108,7 @@ public class EodJobWatchdogService : BackgroundService
                 }
 
                 // ★ CHỐT THEO TIMEOUT — không để Asset lỗi làm treo hệ mình.
-                //   TrySetReadyAsync tự SREM khỏi JOBS sau khi bật cờ (và tự log tổng AUM).
-                Log.Information("[Watchdog][{Biz}] {Date} req={Req} im lặng {Min:F0} phút — chốt với " +
-                                "{Rows}/{Total} dòng, tổng AUM {Aum}",
-                                biz, (string)dateVal!, reqId, quiet.TotalMinutes, rows, total, aum);
-
+                //   TrySetReadyAsync tự SREM khỏi JOBS sau khi bật cờ.
                 await _sync.TrySetReadyAsync(prefix, reqId!, (string)dateVal!, biz, total, rows, byTimeout: true);
             }
         }

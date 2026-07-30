@@ -12,16 +12,8 @@ public sealed class BatchSyncResult
     public string JobId    { get; init; } = "";   // = requestId
     public bool   BatchDone { get; init; }        // batch này đã ghi DB xong
     public bool   JobDone   { get; init; }        // job đã đủ dòng ⇒ ASSET_NAV = READY
-    public long   Rows      { get; init; }        // ★ TỔNG DÒNG đã nhận (lũy kế cả job, sau batch này)
+    public long   Rows      { get; init; }        // tổng dòng đã nhận
     public long   Total     { get; init; }        // totalRow Asset khai
-
-    /// <summary>★ TỔNG AUM (VND) đã nhận — lũy kế cả job, sau batch này. Chỉ có nghĩa khi <see cref="AumTracked"/>.</summary>
-    public long   Aum        { get; init; }
-    /// <summary>false ⇒ batch này không đóng góp AUM (tổng batch vượt tầm int64 — xem log ERROR).</summary>
-    public bool   AumTracked { get; init; }
-
-    /// <summary>Tổng AUM của RIÊNG batch này (phần đóng góp mới, chưa tính phần sửa lại của batch cũ).</summary>
-    public long   AumInBatch { get; init; }
 }
 
 /// <summary>Ném ra khi ghi DB lỗi ⇒ consumer KHÔNG commit offset ⇒ Kafka giao lại.</summary>
@@ -78,11 +70,8 @@ public class BatchSyncService
     ///
     /// Vì sao TTL an toàn hơn:
     ///   • Giữ {P}:MSG ⇒ batch trùng tới muộn KHÔNG bị đếm lại (dedup còn hiệu lực).
-    ///   • Giữ {P}:ROWS/{P}:AUM/{P}:TOTAL ⇒ còn BẰNG CHỨNG để debug đúng lúc cần nhất (job hỏng):
-    ///     "nhận đủ dòng chưa" VÀ "tổng tiền có khớp DB không".
-    ///   • Giữ {P}:BATCH_AUM ⇒ batch gửi lại (đã SỬA giá trị) vẫn cộng đúng phần CHÊNH, không cộng lại từ đầu.
-    ///   • Chi phí ~75 KB/job (MSG set 500×64B ≈ 35 KB + BATCH_AUM hash 500×(64B+~12B) ≈ 40 KB).
-    ///     Vài job/ngày × 48h = vài MB. Không đáng đánh đổi.
+    ///   • Giữ {P}:ROWS/{P}:TOTAL ⇒ còn BẰNG CHỨNG để debug đúng lúc cần nhất (job hỏng).
+    ///   • Chi phí ~35 KB/job (MSG set 500 batch × 64B). Vài job/ngày × 48h = vài MB. Không đáng đánh đổi.
     ///
     /// Thứ DUY NHẤT được dọn ngay: tư cách thành viên trong SET {prefix}:JOBS (SREM khi READY) —
     /// nếu không watchdog sẽ quét mãi job đã xong.
@@ -99,14 +88,6 @@ public class BatchSyncService
     /// <param name="siAccounts">Danh sách si_account trong batch — DANH TÍNH nghiệp vụ để dedup.</param>
     /// <param name="totalRow">Số dòng Asset KHAI cho cả ngày. GỢI Ý, không phải cổng chặn.</param>
     /// <param name="rowsInBatch">Số dòng trong batch này (đếm từ payload — KHÔNG phải số dòng ghi được).</param>
-    /// <param name="aumInBatch">
-    ///   ★ Tổng AUM (VND) của batch này — tính bằng <see cref="KafkaSyncKeys.SumAum"/> tại call-site
-    ///   (làm tròn TỪNG DÒNG y như <c>DECIMAL(20,0)</c> của DB).
-    ///   <c>null</c> = không theo dõi AUM (job không có khái niệm AUM, hoặc tổng vượt tầm int64).
-    ///
-    ///   ⚠️ Đây là số để QUAN SÁT/ĐỐI SOÁT, TUYỆT ĐỐI không phải cổng chặn — đúng nguyên tắc
-    ///   "Redis lo TỐC ĐỘ, DB lo TÍNH ĐÚNG". Sự thật về AUM là <c>SUM(C_AUM) FROM T_SI_BALANCE @d</c>.
-    /// </param>
     /// <param name="executeFunc">Ghi DB. Trả false ⇒ NÉM ⇒ không commit offset ⇒ Kafka giao lại.</param>
     public async Task<BatchSyncResult> SyncBatchAsync(
         string requestId,
@@ -116,7 +97,6 @@ public class BatchSyncService
         IEnumerable<string> siAccounts,
         long   totalRow,
         int    rowsInBatch,
-        long?  aumInBatch,
         Func<Task<bool>> executeFunc)
     {
         if (string.IsNullOrEmpty(requestId))
@@ -134,22 +114,11 @@ public class BatchSyncService
         // ── 2) CỘNG DỒN CÓ DEDUP — nguyên tử, 1 round-trip ────────────────────────────────
         //    Đánh dấu SAU khi DB đã commit. Đánh dấu TRƯỚC mà pod chết giữa chừng ⇒ batch coi như
         //    xong dù chưa ghi ⇒ tổng không bao giờ đạt ⇒ treo. KHÔNG BAO GIỜ đánh dấu trước.
-        //    ★ Một script Lua cộng CẢ HAI: số dòng (cổng chặn, dedup thuần) và tổng AUM (số quan sát,
-        //      cộng theo delta để batch gửi lại-đã-sửa vẫn ra số đúng). Cùng 1 round-trip, cùng 1
-        //      lát cắt nguyên tử ⇒ ROWS và AUM KHÔNG BAO GIỜ lệch pha nhau.
         var batchKey = KafkaSyncKeys.BatchKey(siAccounts);
-        var res = (RedisValue[])await _redis.ScriptEvaluateAsync(
+        long rows = (long)await _redis.ScriptEvaluateAsync(
             KafkaSyncKeys.LuaSumOnce,
-            new RedisKey[]   { KafkaSyncKeys.Msg(p),  KafkaSyncKeys.Rows(p),
-                               KafkaSyncKeys.Aum(p),  KafkaSyncKeys.BatchAum(p) },
-            new RedisValue[] { batchKey, rowsInBatch,
-                               // ⚠️ ĐỪNG dùng long.ToString(): phụ thuộc CurrentCulture (dấu âm/nhóm số).
-                               //    Ép sang RedisValue để thư viện format bất biến. '' = không theo dõi AUM.
-                               aumInBatch.HasValue ? (RedisValue)aumInBatch.Value : RedisValue.EmptyString,
-                               (long)_ttl.TotalSeconds });
-
-        long rows = (long)res[0];
-        long aum  = (long)res[1];
+            new RedisKey[]   { KafkaSyncKeys.Msg(p), KafkaSyncKeys.Rows(p) },
+            new RedisValue[] { batchKey, rowsInBatch, (long)_ttl.TotalSeconds });
 
         // metadata cho watchdog
         var batch = _redis.CreateBatch();
@@ -160,21 +129,14 @@ public class BatchSyncService
         _ = batch.KeyExpireAsync(KafkaSyncKeys.ActiveJobs(redisKeyPrefix), _ttl);
         batch.Execute();
 
-        // ── 3) SỔ LŨY KẾ SAU MỖI BATCH — dòng log này là thứ trực ban nhìn để biết job đang chảy tới đâu
-        Log.Information("[{Biz}] {Date} req={Req} +{N} dòng / +{AumN} AUM → LŨY KẾ {Rows}/{Total} dòng, AUM {Aum}",
-                        bizType, tranDate, requestId, rowsInBatch, aumInBatch, rows, totalRow, aum);
-
-        // ── 4) ĐỦ CHƯA → BẬT CỜ. HẾT. ─────────────────────────────────────────────────────
+        // ── 3) ĐỦ CHƯA → BẬT CỜ. HẾT. ─────────────────────────────────────────────────────
         bool jobDone = rows >= totalRow;
         if (jobDone)
             await TrySetReadyAsync(redisKeyPrefix, requestId, tranDate, bizType, totalRow, rows, byTimeout: false);
 
         return new BatchSyncResult
         {
-            JobId      = requestId, BatchDone = true, JobDone = jobDone, Rows = rows, Total = totalRow,
-            Aum        = aum,
-            AumTracked = aumInBatch.HasValue,
-            AumInBatch = aumInBatch ?? 0
+            JobId = requestId, BatchDone = true, JobDone = jobDone, Rows = rows, Total = totalRow
         };
     }
 
@@ -191,9 +153,6 @@ public class BatchSyncService
         if (!await _redis.StringSetAsync(KafkaSyncKeys.Ready(p), "1", _ttl, When.NotExists))
             return;   // pod khác đã bật rồi
 
-        // Đọc SAU khi thắng SET NX ⇒ đúng 1 lần/job, không thêm round-trip vào đường nóng của batch.
-        var aumVal = await _redis.StringGetAsync(KafkaSyncKeys.Aum(p));
-
         if (byTimeout)
             Log.Warning("[{Biz}] {Date} req={Req} chốt theo TIMEOUT: {Rows}/{Total} dòng. " +
                         "Asset có thể gửi thiếu hoặc totalRow sai. ĐỦ/THIẾU THẬT do SP_EOD_RUN quyết (err=12).",
@@ -206,10 +165,7 @@ public class BatchSyncService
         // job xong → gỡ khỏi danh sách watchdog phải canh
         await _redis.SetRemoveAsync(KafkaSyncKeys.ActiveJobs(redisKeyPrefix), requestId);
 
-        // ★ Chốt sổ: dòng + AUM. So AUM này với SUM(C_AUM) FROM T_SI_BALANCE @d là phát hiện ngay
-        //   "Asset gửi đủ dòng nhưng lệch tiền" — thứ mà đếm dòng KHÔNG BAO GIỜ thấy được.
-        Log.Information("[{Biz}] {Date} req={Req} ASSET_NAV READY: {Rows}/{Total} dòng, tổng AUM {Aum}",
-                        bizType, tranDate, requestId, rows, total,
-                        aumVal.HasValue ? (long)aumVal : 0);
+        Log.Information("[{Biz}] {Date} req={Req} ASSET_NAV READY: {Rows}/{Total}",
+                        bizType, tranDate, requestId, rows, total);
     }
 }

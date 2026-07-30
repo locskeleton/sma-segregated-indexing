@@ -31,12 +31,14 @@ namespace SdiCoreMessagingProcess.Services.Implement;
 /// </summary>
 public class SyncAssetDataService : ISyncAssetDataService
 {
-    private readonly BatchSyncService _sync;
-    private readonly IBoServices      _bo;
+    private readonly BatchSyncService    _sync;
+    private readonly BatchStatAggregator _stat;   // ★ sổ lũy kế: tổng bản ghi + tổng AUM
+    private readonly IBoServices         _bo;
 
-    public SyncAssetDataService(BatchSyncService sync, IBoServices bo)
+    public SyncAssetDataService(BatchSyncService sync, BatchStatAggregator stat, IBoServices bo)
     {
         _sync = sync;
+        _stat = stat;
         _bo   = bo;
     }
 
@@ -68,19 +70,22 @@ public class SyncAssetDataService : ISyncAssetDataService
 
         var rawJson = JsonConvert.SerializeObject(model);
 
-        // ── Tổng AUM của batch — làm tròn TỪNG DÒNG y như DECIMAL(20,0) của T_SI_BALANCE.C_AUM ────
-        //    null = tổng vượt tầm int64 ⇒ dữ liệu Asset bất thường. KÊU rồi đi tiếp: AUM là số để
-        //    QUAN SÁT, không được phép làm treo ingest (nguyên tắc ①: Redis lo tốc độ, DB lo tính đúng).
-        //    ⚠️ ép (decimal?) chứ KHÔNG để Select trả decimal thô: IEnumerable<decimal> KHÔNG tự
-        //       chuyển sang IEnumerable<decimal?> (kiểu giá trị không có covariance) ⇒ lỗi biên dịch
-        //       nếu IndexingDataSyncModel.aum khai là decimal. Ép thế này thì decimal hay decimal? đều chạy.
-        var aumInBatch = KafkaSyncKeys.SumAum(assetResponseData.Select(x => (decimal?)x.aum));
+        // ── Chuẩn bị cho SỔ LŨY KẾ (tổng bản ghi + tổng AUM) ──────────────────────────────
+        //    ⚠️ PHẢI dùng ĐÚNG batchKey mà BatchSyncService dùng (băm tập si_account). Khoá khác
+        //       thì batch "gửi lại đã sửa" không nhận ra nhau ⇒ cộng chồng thay vì cộng phần chênh.
+        //       Tính lại ở đây = 1 lần SHA256 trên chuỗi ngắn — rẻ hơn nhiều so với việc kéo thêm
+        //       tham số ra/vào cái generic chỉ để chuyền một chuỗi.
+        var batchKey = KafkaSyncKeys.BatchKey(assetResponseData.Select(x => x.si_account));
+
+        //    ⚠️ ép (decimal?): IEnumerable<decimal> KHÔNG tự chuyển sang IEnumerable<decimal?>
+        //       (kiểu giá trị không có covariance) ⇒ ép thế này thì aum khai decimal hay decimal? đều chạy.
+        var aumInBatch = BatchStatAggregator.SumAum(assetResponseData.Select(x => (decimal?)x.aum));
         if (aumInBatch is null)
             Log.Error("[ProcessDataSyncAssetSdiCore] {Date} req={ReqId} — tổng AUM batch VƯỢT TẦM int64 " +
-                      "({N} dòng). Batch VẪN được ghi DB + đếm dòng bình thường, chỉ BỎ cộng AUM. " +
+                      "({N} dòng). Batch VẪN ghi DB + đếm dòng bình thường, chỉ BỎ cộng AUM. " +
                       "Kiểm tra dữ liệu Asset gửi.", tranDate, model.requestId, assetResponseData.Count);
 
-        // ── Ghi DB + cộng dồn (dòng + AUM) + bật cờ. KHÔNG CHAIN. ─────────────────────────
+        // ── Ghi DB + cộng dồn + bật cờ. KHÔNG CHAIN. ──────────────────────────────────────
         var result = await _sync.SyncBatchAsync(
             requestId:      model.requestId,                    // ★ JOB_ID — không cần tạo, không cần chờ
             tranDate:       tranDate,
@@ -92,14 +97,40 @@ public class SyncAssetDataService : ISyncAssetDataService
             totalRow:       model.totalRow,                     // GỢI Ý (Asset khai) — không phải cổng chặn
             rowsInBatch:    assetResponseData.Count,            // ⚠️ đếm từ PAYLOAD, KHÔNG dùng @p_rows (số dòng
                                                                 //    GHI ĐƯỢC — đã lọc acc lạ ⇒ không bao giờ khớp)
-            aumInBatch:     aumInBatch,                         // ★ tổng AUM batch → Redis cộng dồn (quan sát/đối soát)
-            executeFunc:    () => _bo.BulkInsertAssetToSdiCore(rawJson));
+            // ★ SỔ LŨY KẾ NẰM Ở ĐÂY — trong hàm nghiệp vụ, KHÔNG trong script Lua của cái generic.
+            //   BatchSyncService dùng chung cho mọi luồng batch, phần lớn KHÔNG có khái niệm AUM.
+            //   Luồng nào có số để cộng thì tự cộng, ngay sau khi ghi DB xong. Xem BatchStatAggregator.
+            executeFunc: async () =>
+            {
+                if (!await _bo.BulkInsertAssetToSdiCore(rawJson))
+                    return false;   // BatchSyncService sẽ NÉM ⇒ không commit offset ⇒ Kafka giao lại
+
+                // Cộng SAU KHI DB đã commit. Cộng trước mà pod chết giữa chừng ⇒ sổ có, dữ liệu không.
+                // Lỗi Redis ở đây trả null + log WARNING, KHÔNG ném — mất sổ ≠ mất dữ liệu.
+                var stat = await _stat.AccumulateAsync(
+                    RedisKeyDefine.EOD_ASSET, model.requestId, batchKey,
+                    rows: assetResponseData.Count, aum: aumInBatch);
+
+                if (stat is not null)
+                    Log.Information("[{Biz}] {Date} req={Req} +{N} dòng / +{AumN} AUM → " +
+                                    "LŨY KẾ {Rows} dòng, AUM {Aum}",
+                                    BizTypeDefine.JOB_EOD_ASSET, tranDate, model.requestId,
+                                    assetResponseData.Count, aumInBatch, stat.Rows, stat.Aum);
+                return true;
+            });
 
         if (result.JobDone)
-            Log.Information("[{Biz}] {Date} req={Req} — nhận đủ {Rows}/{Total} dòng, tổng AUM {Aum}. " +
+        {
+            var final = await _stat.ReadAsync(RedisKeyDefine.EOD_ASSET, model.requestId);
+            // ★ Chốt sổ: so với SELECT COUNT(*), SUM(C_AUM) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@d
+            //   là bắt được ngay "đủ dòng nhưng lệch tiền" — thứ mà đếm dòng KHÔNG BAO GIỜ thấy.
+            //   Hiệu số phải ĐÚNG BẰNG phần của các acc không thuộc SDI (INNER JOIN registry lọc).
+            Log.Information("[{Biz}] {Date} req={Req} — nhận đủ {Rows}/{Total} dòng, " +
+                            "sổ lũy kế {StatRows} dòng / AUM {Aum}. " +
                             "Chạy tiếp bằng EodStepRunner (KHÔNG chain trong handler).",
                             BizTypeDefine.JOB_EOD_ASSET, tranDate, model.requestId,
-                            result.Rows, result.Total, result.Aum);
+                            result.Rows, result.Total, final.Rows, final.Aum);
+        }
 
         // ❌ KHÔNG: ProcessJobAumFeeAcccrue(tranDate)
         // ❌ KHÔNG: ProcessJobAumFeeCharge(tranDate)

@@ -20,9 +20,8 @@ await db.KeyDeleteAsync(keysToDelete);
 |---|---|
 | Cách dọn | **TTL 48h** — mọi key tự hết hạn |
 | Giữ `{P}:MSG` để làm gì | Batch trùng tới muộn **không bị đếm lại** (dedup còn hiệu lực) |
-| Giữ `{P}:ROWS`/`{P}:AUM`/`{P}:TOTAL` | **Bằng chứng debug** — job hỏng thì cần đúng lúc đó: *đủ dòng chưa* **và** *tổng tiền có khớp DB không*. Xoá ngay = phá bằng chứng |
-| Giữ `{P}:BATCH_AUM` | AUM từng batch — batch gửi lại **đã sửa** thì cộng đúng phần **chênh**, không cộng lại từ đầu |
-| Chi phí | ≈ **75 KB/job** (`MSG` set 500×64B ≈ 35 KB + `BATCH_AUM` hash 500×76B ≈ 40 KB). Vài job/ngày × 48h = **vài MB** |
+| Giữ `{P}:ROWS`/`{P}:TOTAL` | **Bằng chứng debug** — job hỏng thì cần đúng lúc đó. Xoá ngay = phá bằng chứng |
+| Chi phí | `MSG` set ≈ **35 KB/job** (500 batch × 64B) + `STAT_BATCH` hash ≈ **42 KB/job** ⇒ **~77 KB/job**. Vài job/ngày × 48h = **vài MB** |
 | Thứ **duy nhất** dọn ngay | Tư cách thành viên trong `{prefix}:JOBS` (`SREM` khi `READY` / khi job chết) — nếu không watchdog quét mãi job đã xong, và **spam log mỗi 15 giây** |
 
 ---
@@ -45,6 +44,7 @@ await db.KeyDeleteAsync(keysToDelete);
 | File | Thay cho |
 |---|---|
 | `KafkaSyncKeys.cs` | *(mới)* khoá Redis + **script Lua cộng dồn nguyên tử** |
+| `BatchStatAggregator.cs` | *(mới)* **sổ lũy kế nghiệp vụ**: tổng bản ghi + tổng AUM. **Gọi từ trong `executeFunc`, KHÔNG nằm trong tầng generic** |
 | **`BatchSyncService.cs`** | **`SyncEodDataGeneric`** — phần **(a)** nhiều-batch |
 | **`JobRunner.cs`** | **`SyncEodDataGeneric`** — phần **(b)** job-đơn *(giữ log job)* |
 | `SyncAssetDataService.cs` | `ProcessDataSyncAssetSdiCore` — **ngắt chain** |
@@ -75,6 +75,7 @@ public interface IJobLogWriter
 
 ```csharp
 services.AddSingleton<BatchSyncService>();
+services.AddSingleton<BatchStatAggregator>();        // sổ lũy kế — luồng nào có số để cộng thì inject
 services.AddSingleton<JobRunner>();
 services.AddSingleton<EodStepRunner>();
 services.AddHostedService<EodJobWatchdogService>();   // chạy trên MỌI pod — an toàn, idempotent
@@ -120,8 +121,8 @@ enable.idempotence = true        # Producer của ASSET. Có thì tốt. KHÔNG 
 |---|---|
 | Tạo `JOB_ID` | `requestId` — Asset gửi sẵn, **chung cho mọi batch**. Không tạo, không lock, không chờ |
 | Đếm hoàn thành | **Lua nguyên tử**: `SADD Sha256(data)` → nếu mới thì `INCRBY rows`. Trùng ⇒ **không cộng** |
-| Biết *"đủ dòng nhưng lệch tiền"* | **Cùng script** cộng luôn `{P}:AUM` (tổng AUM đã nhận). So với `SUM(C_AUM) FROM T_SI_BALANCE @d`. **Chỉ để nhìn — không vào điều kiện chốt job** |
 | Dedup | Theo **NỘI DUNG** (`Sha256(data)`), **không** theo `(partition, offset)` — vì `enable.idempotence` **không sống sót qua producer restart** |
+| Biết *"đủ dòng nhưng lệch tiền"* | `BatchStatAggregator` cộng `{P}:STAT_ROWS` + `{P}:STAT_AUM` **trong `executeFunc`**. So với `SELECT COUNT(*), SUM(C_AUM) ... @d`. **Chỉ để nhìn — không vào điều kiện chốt job, và KHÔNG đụng vào tầng generic** |
 | `totalRow` sai / Asset lỗi | **Timeout 5 phút** trong watchdog → vẫn bật cờ + log WARNING. **Không treo** |
 | Cửa khoá thật | **`SP_EOD_RUN` err=12** — mọi SI ACTIVE của SDI phải có dòng `T_SI_BALANCE @d`. Đọc registry của **chính SDI**, không phụ thuộc con số nào của Asset |
 | Chain | `EodStepRunner` — gọi tường minh từng step, **ngoài** Kafka handler |

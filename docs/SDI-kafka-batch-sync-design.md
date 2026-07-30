@@ -61,51 +61,15 @@
 | Key | Kiểu | Dùng để |
 |---|---|---|
 | `{P}:MSG` | **SET** | `Sha256(data)` của các batch đã xử lý → dedup. ~500 phần tử ≈ **35 KB** |
-| `{P}:ROWS` | STRING | **Tổng số bản ghi** đã nhận (cộng dồn **có dedup**) — ★ **cổng chặn** |
-| `{P}:AUM` | STRING | **Tổng AUM (VND)** đã nhận (cộng dồn **có dedup + có SỬA**) — ★ **số quan sát, KHÔNG chặn** |
-| `{P}:BATCH_AUM` | **HASH** | `batchKey` → AUM của batch đó. Để batch gửi lại-đã-sửa cộng phần **chênh**. ~500 × 76B ≈ **40 KB** |
+| `{P}:ROWS` | STRING | Tổng số dòng đã nhận (cộng dồn **có dedup**) |
 | `{P}:TOTAL` | STRING | `totalRow` Asset khai (audit + so sánh) |
 | `{P}:READY` | STRING | `"1"` — chống gọi `SP_EOD_SET_SOURCE_READY` lặp |
 | `{P}:LAST_AT` | STRING | Timestamp message cuối → **timeout fallback + watchdog** |
 
 **Đã xoá:** `COUNTER`, `COUNTER_SUCCESS`, `COUNTER_FAIL`, `TOTAL_PROCESSED`, `JOB_ID`, `INITIAL_LOCK`, `END_LOCK`, `LAST_TRY_DEQUEUE`, `EOD_DATE`.
 
-### Vì sao cộng thêm **tổng AUM**, và vì sao nó **không được** làm cổng chặn
-
-Đếm dòng chỉ trả lời *"Asset gửi đủ số lượng chưa"*. Nó **mù hoàn toàn** với *"đủ dòng nhưng lệch tiền"* — kiểu lỗi
-đắt nhất và im lặng nhất (Asset gửi đúng 250.000 dòng, nhưng một lô `aum` bị 0 hoặc lệch dấu). Có `{P}:AUM`
-thì chỉ cần một phép so:
-
-```sql
--- Redis:  GET {P}:ROWS   /   GET {P}:AUM
-SELECT COUNT(*), SUM(C_AUM) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE = @d;
-```
-
-`ROWS ≥ COUNT(*)` là **bình thường**, và `AUM − SUM(C_AUM)` **đúng bằng tổng `aum` của các tài khoản không thuộc SDI**
-bị `INNER JOIN` registry lọc ở `SP_INGEST_ASSET_NAV` *(hiệu này có thể âm nếu acc lạ có `aum < 0` — dấu không nói lên
-điều gì, chỉ ĐỘ LỚN mới nói)*. Chênh **khác** con số đó ⇒ có chuyện.
-
-Làm tròn khớp DB là có chủ đích: `SP_INGEST_ASSET_NAV` đọc payload bằng
-`OPENJSON(...) WITH (aum DECIMAL(20,0) '$.aum')` ⇒ SQL Server **làm tròn TỪNG DÒNG** (half away from zero).
-`SumAum` ở C# làm y hệt — không cộng thập phân rồi mới tròn một lần.
-
-Nhưng nó **tuyệt đối không** được vào điều kiện chốt job — đúng **nguyên tắc ①**: Redis lo tốc độ, DB lo tính đúng.
-Sự thật về tiền nằm ở `T_SI_BALANCE`. Cửa khoá vẫn là `SP_EOD_RUN` **err=12**.
-
-**Hai phép cộng, hai luật khác nhau — đừng trộn:**
-
-| | `{P}:ROWS` | `{P}:AUM` |
-|---|---|---|
-| Vai trò | **Cổng chặn** (`rows >= totalRow`) | **Số quan sát / đối soát** |
-| Batch gửi lại **y nguyên** | không cộng (dedup thuần) | delta = 0 → không đổi |
-| Batch gửi lại **đã SỬA giá trị** | không cộng — *số dòng có đổi đâu* | **cộng phần chênh** → ra số mới, khớp DB |
-| Mất key | rows tụt → timeout 5' → READY | log xấu một chút. **Hết.** |
-
-Vì sao `AUM` phải theo delta: `batchKey` = băm **tập `si_account`**, nên batch gửi lại với `aum` **đã sửa** rơi vào
-**cùng** một khoá. `SP_INGEST_ASSET_NAV` `DELETE+INSERT` theo `(date, si)` nên **DB ra số mới** — đây là luồng
-re-ingest chính thức để sửa dữ liệu quá khứ. Nếu `AUM` dedup thuần như `ROWS` thì nó đứng ở **số cũ**, tức là
-sai **đúng vào lúc người ta cần nó nhất**: vừa sửa dữ liệu xong, đang ngồi đối soát.
-`{P}:BATCH_AUM` giữ AUM từng batch chính là để cộng được phần chênh đó.
+**Sổ lũy kế nghiệp vụ** (§5b) dùng thêm 3 khoá cùng scope — do **hàm nghiệp vụ** quản, **không** thuộc tầng này:
+`{P}:STAT_ROWS`, `{P}:STAT_AUM`, `{P}:STAT_BATCH`.
 
 ---
 
@@ -120,49 +84,24 @@ INCRBY {P}:ROWS 100      → KHÔNG BAO GIỜ CHẠY
 ⇒ message coi như xong nhưng 100 dòng không được cộng ⇒ TREO VĨNH VIỄN
 ```
 
-Redis chạy Lua **nguyên tử** → không có cửa sổ ghi-dở. Một script cộng **cả số bản ghi lẫn tổng AUM**,
-cùng một lát cắt ⇒ hai con số **không bao giờ lệch pha** nhau:
+Redis chạy Lua **nguyên tử** → không có cửa sổ ghi-dở:
 
 ```lua
--- KEYS[1] = {P}:MSG (set)   KEYS[2] = {P}:ROWS
--- KEYS[3] = {P}:AUM         KEYS[4] = {P}:BATCH_AUM (hash)
--- ARGV[1] = batchKey        ARGV[2] = số dòng trong batch
--- ARGV[3] = tổng AUM batch ('' = job không có AUM, vd job phí)
--- ARGV[4] = TTL giây
-local isNew = redis.call('SADD', KEYS[1], ARGV[1])
-if isNew == 1 then
-    redis.call('INCRBY', KEYS[2], ARGV[2])              -- ROWS: dedup THUẦN (cổng chặn)
+-- KEYS[1] = {P}:MSG    KEYS[2] = {P}:ROWS
+-- ARGV[1] = batchKey (sha256 của data)
+-- ARGV[2] = số dòng trong batch
+-- ARGV[3] = TTL giây
+if redis.call('SADD', KEYS[1], ARGV[1]) == 1 then
+    local n = redis.call('INCRBY', KEYS[2], ARGV[2])
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+    return n                                              -- batch MỚI → đã cộng
+else
+    return tonumber(redis.call('GET', KEYS[2]) or '0')    -- batch TRÙNG → KHÔNG cộng
 end
-
-if ARGV[3] ~= '' then                                   -- AUM: cộng theo DELTA (chịu được sửa số)
-    local prev = redis.call('HGET', KEYS[4], ARGV[1]) or '0'
-    redis.call('INCRBY', KEYS[3], string.format('%d', tonumber(ARGV[3]) - tonumber(prev)))
-    redis.call('HSET',   KEYS[4], ARGV[1], ARGV[3])
-end
-
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-redis.call('EXPIRE', KEYS[2], ARGV[4])
-redis.call('EXPIRE', KEYS[3], ARGV[4])
-redis.call('EXPIRE', KEYS[4], ARGV[4])
-
-return { redis.call('GET', KEYS[2]) or '0', redis.call('GET', KEYS[3]) or '0' }
 ```
 
-Giao lại 10 lần → `SADD` trả 0 → `ROWS` **không cộng lần nào nữa**; `AUM` delta = 0 → **không đổi**.
-
-**Trả về chuỗi (`GET`), không trả số.** Số trong Lua là `double` — chính xác tới `2^53 ≈ 9,0e15`.
-Tổng AUM tính bằng **đồng** có thể tới `1e14`–`1e15`: chưa vỡ, nhưng biên an toàn mỏng và khi vỡ thì **im lặng**.
-Đi qua `GET` thì tổng do `INCRBY` tính bằng **int64 trong Redis**, C# parse lại từ chuỗi ⇒ chính xác tuyệt đối.
-Chỉ **delta** (≤ AUM của *một* batch) đi qua `double` — nhỏ hơn `2^53` rất xa.
-
-**Làm tròn ở C#, tròn TỪNG DÒNG.** `T_SI_BALANCE.C_AUM` là `DECIMAL(20,0)` ⇒ SQL Server tròn từng dòng khi ghi.
-Cộng thập phân rồi mới tròn một lần sẽ lệch DB vài đồng — đúng loại chênh vô nghĩa mà lúc đối soát tốn cả buổi để truy.
-Tổng batch vượt tầm `int64` ⇒ trả `null` → **log ERROR, bỏ cộng AUM batch đó, ingest chạy tiếp**. Không bao giờ ném:
-một con số để **nhìn** không được phép làm treo đường ghi dữ liệu.
-
-> **Redis Cluster:** 4 khoá này đi chung một script ⇒ phải cùng slot. Bản hiện tại chạy standalone/sentinel nên
-> không cần hash-tag. Nếu chuyển sang cluster: đổi scope thành `{prefix:requestId}` (có ngoặc nhọn) —
-> **không** được tách script thành nhiều lệnh rời (mất tính nguyên tử, quay lại đúng cái bug ở trên).
+Giao lại 10 lần → `SADD` trả 0 → **không cộng lần nào nữa**.
 
 ---
 
@@ -185,26 +124,16 @@ private async Task ProcessDataSyncAssetSdiCore(string rawJson, ConsumeResult<str
     if (err != 0)
         throw new SyncException($"ingest err={err}");     // KHÔNG commit offset → Kafka giao lại
 
-    // ── 2) CỘNG DỒN AN TOÀN — dedup theo NỘI DUNG, nguyên tử (Lua). Cộng CẢ dòng LẪN AUM.
-    var batchKey   = Sha256(JsonConvert.SerializeObject(model.data));   // ⚠️ chỉ data, BỎ requestId/timestamp
-    var aumInBatch = SumAum(model.data.Select(x => x.aum));             // tròn TỪNG DÒNG; null = vượt int64
-
-    var res = (RedisValue[])await _redis.ScriptEvaluateAsync(LuaSumOnce,
-        new RedisKey[]   { $"{P}:MSG", $"{P}:ROWS", $"{P}:AUM", $"{P}:BATCH_AUM" },
-        new RedisValue[] { batchKey, model.data.Count,
-                           aumInBatch.HasValue ? aumInBatch.Value.ToString() : "", 172800 });
-
-    long rows = (long)res[0];
-    long aum  = (long)res[1];      // ★ tổng AUM lũy kế của job, ngay sau batch này
+    // ── 2) CỘNG DỒN AN TOÀN — dedup theo NỘI DUNG, nguyên tử (Lua)
+    var batchKey = Sha256(JsonConvert.SerializeObject(model.data));   // ⚠️ chỉ data, BỎ requestId/timestamp
+    long rows = (long)await _redis.ScriptEvaluateAsync(LuaSumOnce,
+        new RedisKey[]   { $"{P}:MSG", $"{P}:ROWS" },
+        new RedisValue[] { batchKey, model.data.Count, 172800 });
 
     await _redis.StringSetAsync($"{P}:TOTAL",   model.totalRow, _ttl48h, When.NotExists);
     await _redis.StringSetAsync($"{P}:LAST_AT", DateTime.UtcNow.Ticks, _ttl48h);
 
-    // Sổ lũy kế SAU MỖI BATCH — một dòng log là biết job chảy tới đâu, cả dòng lẫn tiền
-    Log.Information("[{Biz}] {Date} +{N} dòng / +{AumN} AUM → LŨY KẾ {Rows}/{Total} dòng, AUM {Aum}",
-                    bizType, tranDate, model.data.Count, aumInBatch, rows, model.totalRow, aum);
-
-    // ── 3) ĐỦ CHƯA → BẬT CỜ. HẾT.  ⚠️ Điều kiện CHỈ dựa vào rows — AUM KHÔNG BAO GIỜ tham gia
+    // ── 3) ĐỦ CHƯA → BẬT CỜ. HẾT.
     if (rows >= model.totalRow)
         await TrySetReadyAsync(P, tranDate, model.totalRow, rows, byTimeout: false);
 
@@ -258,6 +187,91 @@ foreach (var P in await ScanActiveJobsAsync())          // các job chưa READY
 
 ---
 
+## 5b. Sổ lũy kế: **tổng bản ghi + tổng AUM** — nằm ở HÀM NGHIỆP VỤ, không ở tầng generic
+
+Đếm dòng chỉ trả lời *"Asset gửi đủ **số lượng** chưa"*. Nó **mù hoàn toàn** với *"đủ dòng nhưng **lệch tiền**"* —
+kiểu lỗi đắt nhất và im lặng nhất (đúng 250.000 dòng, nhưng một lô `aum` bị 0 hoặc sai dấu). Nên sau mỗi batch,
+**hàm nghiệp vụ** cộng thêm hai con số vào Redis:
+
+| Key | Kiểu | Dùng để |
+|---|---|---|
+| `{P}:STAT_ROWS` | STRING | Tổng **số bản ghi** đã nhận |
+| `{P}:STAT_AUM` | STRING | Tổng **AUM (VND)** đã nhận |
+| `{P}:STAT_BATCH` | **HASH** | `batchKey` → `"rows\|aum"` của batch đó — để cộng theo **delta** |
+
+### Vì sao KHÔNG nhét vào script Lua của `BatchSyncService`
+
+`BatchSyncService` là hạ tầng **dùng chung** cho mọi luồng batch — Asset NAV hôm nay, giá BO / holdings / bất cứ
+thứ gì mai mốt — và **phần lớn trong số đó không có khái niệm "AUM"**. Nhét vào thì:
+
+- Mọi luồng phải mang theo một tham số vô nghĩa với nó (`aum = null / '' / 0`).
+- Script Lua — thứ giữ **tính đúng của cổng chặn READY** — phải mọc nhánh `if` cho một con số **chỉ để ngắm**.
+  Sửa phần thống kê hoá ra là động vào code quyết định *"job xong chưa"*. Không đáng.
+- Thêm luồng thứ ba có *"tổng khối lượng"* thay vì *"tổng tiền"* là lại sửa Lua lần nữa.
+
+⇒ Tách hẳn ra `BatchStatAggregator`. Hàm nghiệp vụ (`BulkInsertAssetToSdiCore`) **tự gọi** nó sau khi ghi DB xong.
+Ai có số để cộng thì gọi; ai không có thì không biết lớp này tồn tại. **`BatchSyncService` và script Lua của nó
+không đổi một dòng.**
+
+```csharp
+executeFunc: async () =>
+{
+    if (!await _bo.BulkInsertAssetToSdiCore(rawJson)) return false;   // ném ở tầng trên → Kafka giao lại
+
+    // Cộng SAU KHI DB commit. Lỗi Redis → trả null + log WARNING, KHÔNG ném: mất sổ ≠ mất dữ liệu.
+    var stat = await _stat.AccumulateAsync(RedisKeyDefine.EOD_ASSET, model.requestId,
+                                           batchKey, rows: data.Count,
+                                           aum: BatchStatAggregator.SumAum(data.Select(x => (decimal?)x.aum)));
+    return true;
+}
+```
+
+### Cộng theo **delta**, không phải cộng dồn
+
+Lớp này chạy **bên trong** `executeFunc`, tức là **trước** khi script Lua của cổng chặn chạy ⇒ nó **không thấy**
+kết quả dedup của `{P}:MSG`, phải **tự** idempotent. Cách làm: nhớ số của từng batch trong `{P}:STAT_BATCH`,
+gặp lại chính `batchKey` đó thì cộng phần **chênh**.
+
+| Tình huống | Kết quả |
+|---|---|
+| Kafka giao lại **y nguyên** | delta = 0 → không đổi gì *(bằng dedup thuần)* |
+| Asset gửi lại **đã SỬA số** | delta = chênh → tổng ra **số mới, khớp DB** *(dedup thuần thì **đứng ở số cũ**)* |
+
+Cái vế thứ hai mới là lý do phải dùng delta: `SP_INGEST_ASSET_NAV` ghi `DELETE+INSERT` theo `(date, si)` —
+gửi lại cùng tập tài khoản là **ghi đè**, không phải cộng thêm. Sổ phải phản ánh đúng phép ghi đó, nếu không
+nó sai **đúng vào lúc người ta cần nó nhất**: vừa re-ingest sửa dữ liệu xong, đang ngồi đối soát.
+
+⚠️ `batchKey` phải là **đúng khoá** tầng cổng chặn dùng (`Sha256(tập si_account đã sắp xếp)`). Dùng khoá khác
+thì hai lần gửi của cùng một batch không nhận ra nhau ⇒ cộng chồng.
+
+Chi phí: `STAT_BATCH` ≈ **42 KB/job** (500 batch × ~84B), TTL 48h — cùng cỡ với `{P}:MSG`. Mất nó (evict) thì
+batch gửi lại bị **cộng chồng** → sổ phình; sổ phình **không** làm sai dữ liệu, chỉ làm xấu số đối soát.
+
+### Đối chiếu — và giới hạn
+
+```sql
+-- Redis:  GET {P}:STAT_ROWS   /   GET {P}:STAT_AUM
+SELECT COUNT(*), SUM(C_AUM) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE = @d;
+```
+
+`STAT_ROWS ≥ COUNT(*)` là **bình thường**, và `STAT_AUM − SUM(C_AUM)` **đúng bằng tổng `aum` của các tài khoản
+không thuộc SDI** bị `INNER JOIN` registry lọc *(hiệu có thể âm nếu acc lạ có `aum < 0` — dấu không nói lên gì,
+chỉ **độ lớn** mới nói)*. Lệch **khác** con số đó ⇒ có chuyện.
+
+Làm tròn khớp DB là có chủ đích: SP đọc payload bằng `OPENJSON(...) WITH (aum DECIMAL(20,0) '$.aum')` ⇒ SQL Server
+làm tròn **từng dòng** (half away from zero). `SumAum` ở C# làm y hệt — không cộng thập phân rồi mới tròn một lần.
+Tổng batch vượt tầm `int64` ⇒ trả `null` → **log ERROR, bỏ cộng AUM, ingest chạy tiếp**.
+
+> **Hai con số này để NHÌN, không để CHẶN** — nguyên tắc ①. Không có nhánh code nào được rẽ theo chúng.
+> Cổng chặn vẫn là `rows >= totalRow`; cửa khoá thật vẫn là `SP_EOD_RUN` **err=12**.
+> Vì thế `BatchStatAggregator` **không bao giờ ném**: Redis hỏng thì mất sổ, không được phép làm hỏng ingest.
+
+**Lua trả về chuỗi (`GET`), không trả số.** Số trong Lua là `double` — chính xác tới `2^53 ≈ 9,0e15`, mà tổng AUM
+tính bằng **đồng** có thể tới `1e14`–`1e15`. Đi qua `GET` thì tổng do `INCRBY` tính bằng **int64 trong Redis**,
+C# parse lại từ chuỗi ⇒ chính xác tuyệt đối. Chỉ **delta** (≤ một batch) đi qua `double`.
+
+---
+
 ## 6. NGẮT khỏi EOD — chạy từng step tường minh
 
 Consumer **chỉ** ingest + bật cờ. Các bước sau gọi **riêng**, nhìn `err` là biết kẹt ở đâu:
@@ -281,9 +295,8 @@ Sau khi từng step chạy ổn định và tin được rồi, muốn tự đ�
 |---|---|---|
 | `{P}:MSG` | Batch giao lại **được cộng lại** → `rows` phình → READY sớm | ❌ **Không** — `SP_EOD_RUN` err=12 vẫn chặn nếu thiếu |
 | `{P}:ROWS` | `rows` tụt → không đạt `totalRow` → **timeout 5 phút → READY** | ❌ Không |
-| `{P}:AUM` | Con số đối soát tụt/mất → **log xấu**. Không vào điều kiện nào cả | ❌ Không |
-| `{P}:BATCH_AUM` | Batch gửi lại-đã-sửa bị cộng **cả** số mới (không trừ số cũ) → `AUM` phình | ❌ Không — số để nhìn, sự thật là `SUM(C_AUM)` trong DB |
 | `{P}:READY` | Gọi lại `SP_EOD_SET_SOURCE_READY` | ❌ Không (idempotent) |
+| `{P}:STAT_*` | Sổ lũy kế tụt/mất → **log xấu**. Không vào điều kiện nào cả | ❌ Không |
 | **Toàn bộ Redis** | Chậm/thử lại, có thể trùng công | ❌ **Không bao giờ sai số** |
 
 **Không có ô nào ✅.** Đúng nguyên tắc ①.
@@ -314,6 +327,6 @@ Vì mọi thao tác đã idempotent:
 
 1. **`requestId` = JOB_ID** → xoá sổ `counter==1`, `INITIAL_LOCK`, retry-loop 100s. Không còn "message đầu tiên đặc biệt", không còn điểm chết đơn.
 2. **Dedup theo NỘI DUNG** (`Sha256(data)`), không theo `offset` → bịt được lỗ producer restart mà `enable.idempotence` không bịt nổi.
-3. **Cộng dồn bằng Lua** (SADD + INCRBY nguyên tử) → không có cửa sổ ghi-dở. Cùng script cộng **cả số bản ghi lẫn tổng AUM** ⇒ hai số không lệch pha.
+3. **Cộng dồn bằng Lua** (SADD + INCRBY nguyên tử) → không có cửa sổ ghi-dở.
 4. **`totalRow` là gợi ý, `err=12` là cửa khoá.** Asset lỗi → chậm 5 phút, **không chết**. SDI thiếu dữ liệu → **chặn**, báo rõ.
-5. **`{P}:AUM` để NHÌN, không để CHẶN.** Đếm dòng mù với lỗi "đủ dòng nhưng lệch tiền"; tổng AUM bắt được ngay. Nhưng sự thật vẫn là `SUM(C_AUM) FROM T_SI_BALANCE` — Redis lo tốc độ, DB lo tính đúng.
+5. **Sổ lũy kế (bản ghi + AUM) nằm ở HÀM NGHIỆP VỤ, không ở tầng generic.** Tầng generic dùng chung cho nhiều luồng, phần lớn không có "AUM" — không bắt chúng mang tham số vô nghĩa, và không động vào script Lua đang giữ tính đúng của cổng chặn chỉ vì một con số để ngắm.

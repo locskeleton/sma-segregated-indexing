@@ -1,6 +1,4 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
@@ -11,8 +9,7 @@ namespace SdiCoreMessagingProcess.Services;
 
 /// <summary>
 /// ★ BẢN DROP-IN — thay THẲNG method cũ trong BaseService&lt;T&gt;.
-///   Giữ NGUYÊN kiểu trả về JobResult. Chỉ THÊM 2 tham số optional: jobId, aumInBatch.
-///   Job không truyền gì thêm (fee accrue/charge) chạy y như cũ — cả 2 đều có default.
+///   Giữ NGUYÊN kiểu trả về JobResult. Chỉ THÊM 1 tham số optional: jobId.
 /// </summary>
 public partial class BaseService<T>
 {
@@ -43,23 +40,13 @@ public partial class BaseService<T>
     ///   ⇒ Σ(@p_rows) KHÔNG BAO GIỜ ĐẠT totalRow ⇒ JobDone luôn false ⇒ CHAIN LUÔN BỊ BỎ.
     ///   Chỉ cần Asset có MỘT tài khoản lạ là job treo vĩnh viễn. Đây chính là bug đang gặp.
     /// </param>
-    /// <param name="aumInBatch">
-    ///   ★ Tổng AUM (VND) của batch này — tính tại call-site bằng <c>SumAum(model.data.Select(x =&gt; x.aum))</c>.
-    ///   Redis cộng dồn để lúc nào cũng có sẵn "tổng dòng + tổng tiền" đã nhận của job.
-    ///   <c>null</c> (mặc định) = job không có khái niệm AUM (fee accrue/charge) ⇒ KHÔNG tạo key AUM.
-    ///
-    ///   ⚠️ SỐ ĐỂ QUAN SÁT/ĐỐI SOÁT, KHÔNG phải cổng chặn. Cổng chặn vẫn chỉ là số DÒNG
-    ///   (<c>rows &gt;= totalRow</c>) và cửa khoá thật vẫn là <c>SP_EOD_RUN</c> err=12.
-    ///   Sự thật về tiền là <c>SUM(C_AUM) FROM T_SI_BALANCE @d</c>.
-    /// </param>
     public async Task<JobResult> SyncEodDataGeneric(
         string msg,
         string tranDate,
         string redisKeyPrefix,
         string bizType,
         Func<string, Task<(bool IsSuccess, long TotalRow, int RowsInBatch)>> executeFunc,
-        string jobId = null,
-        long?  aumInBatch = null)
+        string jobId = null)
     {
         var db          = _cachingService.GetCurrentDbActive();
         var timeExpired = _cachingService.GetTimeOutKeyRedis(redisKeyPrefix);
@@ -95,7 +82,7 @@ public partial class BaseService<T>
             if (totalRow <= 0)   // không có dữ liệu cần đồng bộ
             {
                 Log.Information("[{Biz}] {Date} job={Job} totalRow=0 → coi như XONG", bizType, tranDate, jobId);
-                await FinishJobAsync(db, p, jobId, bizType, tranDate, 0, 0, 0);
+                await FinishJobAsync(db, p, jobId, bizType, tranDate, 0, 0);
                 return new JobResult { JobId = jobId, BatchDone = true, JobDone = true };
             }
 
@@ -104,24 +91,14 @@ public partial class BaseService<T>
             //       Kafka chỉ hứa "ÍT NHẤT một lần" ⇒ giao lại ⇒ cộng 2 lần ⇒ đủ SỚM
             //       ⇒ chốt job khi batch cuối CHƯA HỀ TỚI ⇒ chain chạy trên data thiếu.
             //   MỚI: đánh dấu DANH TÍNH batch rồi mới cộng. Trùng ⇒ SADD trả 0 ⇒ KHÔNG cộng.
-            //   ★ CÙNG script này cộng luôn TỔNG AUM (nếu job có AUM) — 1 round-trip, 1 lát cắt
-            //     nguyên tử ⇒ "tổng dòng" và "tổng tiền" của job KHÔNG BAO GIỜ lệch pha nhau.
             string batchKey = Sha256(msg);   // danh tính NỘI DUNG — cùng batch gửi lại (offset/PID khác) → cùng khoá
 
-            var res = (RedisValue[])await db.ScriptEvaluateAsync(LuaSumOnce,
-                new RedisKey[]   { $"{p}:MSG", $"{p}:ROWS", $"{p}:AUM", $"{p}:BATCH_AUM" },
-                new RedisValue[] { batchKey, rowsInBatch,
-                                   // ⚠️ ĐỪNG dùng long.ToString(): phụ thuộc CurrentCulture. Ép sang
-                                   //    RedisValue để thư viện format bất biến. '' = không theo dõi AUM.
-                                   aumInBatch.HasValue ? (RedisValue)aumInBatch.Value : RedisValue.EmptyString,
-                                   (long)timeExpired.TotalSeconds });
+            long rows = (long)await db.ScriptEvaluateAsync(LuaSumOnce,
+                new RedisKey[]   { $"{p}:MSG", $"{p}:ROWS" },
+                new RedisValue[] { batchKey, rowsInBatch, (long)timeExpired.TotalSeconds });
 
-            long rows = (long)res[0];
-            long aum  = (long)res[1];
-
-            // Sổ lũy kế SAU MỖI BATCH — nhìn 1 dòng log là biết job đang chảy tới đâu, cả dòng lẫn tiền.
-            Log.Information("[{Biz}] {Date} job={Job} +{N} dòng / +{AumN} AUM → LŨY KẾ {Rows}/{Total} dòng, AUM {Aum}",
-                            bizType, tranDate, jobId, rowsInBatch, aumInBatch, rows, totalRow, aum);
+            Log.Information("[{Biz}] {Date} job={Job} +{N} dòng → {Rows}/{Total}",
+                            bizType, tranDate, jobId, rowsInBatch, rows, totalRow);
 
             if (rows < totalRow)
                 return new JobResult { JobId = jobId, BatchDone = true, JobDone = false };
@@ -129,7 +106,7 @@ public partial class BaseService<T>
             // ═══ 4. CHỐT JOB — SET NX, ai chạm mốc trước thì người đó chốt ══════════════════
             //   CŨ: END_LOCK + double-check. Không cần khoá khi mọi thao tác đã idempotent theo danh tính.
             if (await db.StringSetAsync($"{p}:DONE", "1", timeExpired, When.NotExists))
-                await FinishJobAsync(db, p, jobId, bizType, tranDate, rows, totalRow, aum);
+                await FinishJobAsync(db, p, jobId, bizType, tranDate, rows, totalRow);
 
             return new JobResult { JobId = jobId, BatchDone = true, JobDone = true };
         }
@@ -141,7 +118,7 @@ public partial class BaseService<T>
     }
 
     private async Task FinishJobAsync(IDatabase db, string p, string jobId,
-                                      string bizType, string tranDate, long rows, long totalRow, long aum)
+                                      string bizType, string tranDate, long rows, long totalRow)
     {
         var startTicks = await db.StringGetAsync($"{p}:START_AT");
         long totalTime = startTicks.HasValue
@@ -150,10 +127,8 @@ public partial class BaseService<T>
 
         updateJob(jobId, bizType, totalRow, rows, 0, totalTime, jobId);
 
-        // ★ Chốt sổ có TIỀN: so tổng AUM này với SUM(C_AUM) FROM T_SI_BALANCE @d là bắt được ngay
-        //   "đủ dòng nhưng lệch tiền" — thứ mà đếm dòng KHÔNG BAO GIỜ thấy.
-        Log.Information("[{Biz}] {Date} job={Job} HOÀN THÀNH — {Rows}/{Total} dòng, tổng AUM {Aum}, {Ms}ms",
-                        bizType, tranDate, jobId, rows, totalRow, aum, totalTime);
+        Log.Information("[{Biz}] {Date} job={Job} HOÀN THÀNH — {Rows}/{Total} dòng, {Ms}ms",
+                        bizType, tranDate, jobId, rows, totalRow, totalTime);
 
         // ⚠️⚠️ TUYỆT ĐỐI KHÔNG KeyDeleteAsync Ở ĐÂY.
         //   CŨ: xoá JOB_ID / COUNTER_* / TOTAL_PROCESSED / EOD_DATE khi job xong
@@ -162,105 +137,55 @@ public partial class BaseService<T>
         //     ⇒ DỮ LIỆU BATCH ĐÓ KHÔNG BAO GIỜ VÀO DB, mà job vẫn báo DONE.
         //   ⇒ VIỆC "DỌN DẸP" ĐÃ GIẾT DỮ LIỆU.
         //
-        //   Cách dọn ĐÚNG: TTL tự hết hạn. Giữ {p}:MSG ⇒ batch trùng tới muộn KHÔNG bị đếm lại;
-        //   giữ {p}:ROWS + {p}:AUM ⇒ còn BẰNG CHỨNG (đủ dòng chưa VÀ khớp tiền không) đúng lúc cần nhất.
-        //   ~75KB/job (MSG set ≈35KB + BATCH_AUM hash ≈40KB).
+        //   Cách dọn ĐÚNG: TTL tự hết hạn. Giữ {p}:MSG ⇒ batch trùng tới muộn KHÔNG bị đếm lại,
+        //   và còn BẰNG CHỨNG để debug đúng lúc cần nhất. ~35KB/job.
     }
 
     private static string Sha256(string s) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
 
     /// <summary>
-    /// TỔNG AUM CỦA MỘT BATCH — làm tròn ĐÚNG NHƯ DB (<c>DECIMAL(20,0)</c> ⇒ tròn TỪNG DÒNG,
-    /// half away from zero). Cộng thập phân rồi mới tròn một lần sẽ lệch DB vài đồng — đúng loại
-    /// chênh vô nghĩa mà lúc đối soát tốn cả buổi để truy.
-    /// Trả <c>null</c> nếu vượt tầm int64 ⇒ caller log ERROR, BỎ theo dõi AUM (KHÔNG làm treo ingest).
-    /// </summary>
-    public static long? SumAum(IEnumerable<decimal?> aums)
-    {
-        decimal sum = 0m;
-        foreach (var a in aums)
-        {
-            if (a is null) continue;
-            sum += Math.Round(a.Value, 0, MidpointRounding.AwayFromZero);
-        }
-        return sum > long.MaxValue || sum < long.MinValue ? null : (long)sum;
-    }
-
-    /// <summary>
-    /// CỘNG DỒN NGUYÊN TỬ — cộng CẢ số dòng LẪN tổng AUM trong một lát cắt.
-    /// KEYS[1]=MSG(set) KEYS[2]=ROWS KEYS[3]=AUM KEYS[4]=BATCH_AUM(hash)
-    /// ARGV[1]=batchKey ARGV[2]=rows ARGV[3]=aum ('' = job không có AUM) ARGV[4]=ttl(giây)
+    /// CỘNG DỒN NGUYÊN TỬ. KEYS[1]=MSG(set) KEYS[2]=ROWS · ARGV[1]=batchKey ARGV[2]=rows ARGV[3]=ttl(giây)
+    ///   Batch MỚI   → SADD trả 1 → INCRBY → trả tổng mới
+    ///   Batch TRÙNG → SADD trả 0 → KHÔNG cộng → trả tổng hiện tại
     ///
-    /// PHẢI là Lua (không tách nhiều lệnh): SADD → ⚡pod chết → INCRBY không chạy
+    /// PHẢI là Lua (không tách 2 lệnh): SADD → ⚡pod chết → INCRBY không chạy
     /// ⇒ batch coi như xong mà dòng không được cộng ⇒ tổng KHÔNG BAO GIỜ đạt ⇒ TREO VĨNH VIỄN.
-    ///
-    /// ── HAI PHÉP CỘNG, HAI LUẬT — ĐỪNG TRỘN ──────────────────────────────────────────────
-    /// • ROWS (cổng chặn): dedup THUẦN. Batch MỚI → SADD trả 1 → cộng. TRÙNG → trả 0 → KHÔNG cộng.
-    ///   Giữ NGUYÊN như cũ vì toàn bộ lập luận "rows >= totalRow" dựa vào nó.
-    /// • AUM (số quan sát): cộng theo DELTA — nhớ AUM của từng batchKey trong HASH {BATCH_AUM},
-    ///   gặp lại chính batchKey đó thì cộng phần CHÊNH (mới − cũ).
-    ///   ⇒ Asset gửi lại batch ĐÃ SỬA giá trị (luồng re-ingest chính thức, SP idempotent DELETE+INSERT)
-    ///     → DB ra số mới → AUM Redis CŨNG ra số mới. Dedup thuần thì AUM đứng ở số CŨ, tức là sai
-    ///     đúng vào lúc người ta cần nó nhất: vừa sửa dữ liệu xong, đang ngồi đối soát.
-    ///   Gửi lại y nguyên → delta = 0 → vô hại.
-    ///
-    /// ⚠️ RIÊNG BẢN DROP-IN NÀY: batchKey = Sha256(TOÀN BỘ msg), không phải băm tập si_account.
-    ///    Batch gửi lại ĐÃ SỬA ⇒ msg khác ⇒ khoá KHÁC ⇒ SADD trả 1 ⇒ cả ROWS lẫn AUM đều cộng THÊM
-    ///    (không trừ số cũ). Đây là hạn chế SẴN CÓ của bản drop-in (đổi 1 ký tự trong payload là dedup mù),
-    ///    KHÔNG phải do phần AUM sinh ra — AUM chỉ đi theo đúng luật mà ROWS đang chạy.
-    ///    Muốn có tính chất "sửa số ra đúng số mới" thì dùng BatchSyncService (băm tập si_account).
-    ///
-    /// TTL được gia hạn ở MỌI lượt gọi (kể cả batch trùng), không chỉ lượt đầu: job còn message chảy vào
-    /// thì bằng chứng còn sống. Trước đây chỉ gia hạn khi batch mới — không sai, nhưng chặt hơn mức cần.
-    ///
-    /// TRẢ VỀ CHUỖI (GET) chứ không trả số: số trong Lua là double (chỉ chính xác tới 2^53 ≈ 9,0e15),
-    /// mà tổng AUM tính bằng ĐỒNG có thể tới 1e14–1e15. Đi qua GET thì tổng do INCRBY tính bằng int64
-    /// trong Redis, C# parse lại từ chuỗi ⇒ chính xác tuyệt đối. Chỉ DELTA (≤ AUM 1 batch) qua double.
     /// </summary>
     private const string LuaSumOnce = @"
-local isNew = redis.call('SADD', KEYS[1], ARGV[1])
-if isNew == 1 then
-    redis.call('INCRBY', KEYS[2], ARGV[2])
-end
-
-if ARGV[3] ~= '' then
-    local prev = redis.call('HGET', KEYS[4], ARGV[1]) or '0'
-    redis.call('INCRBY', KEYS[3], string.format('%d', tonumber(ARGV[3]) - tonumber(prev)))
-    redis.call('HSET',   KEYS[4], ARGV[1], ARGV[3])
-end
-
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-redis.call('EXPIRE', KEYS[2], ARGV[4])
-redis.call('EXPIRE', KEYS[3], ARGV[4])
-redis.call('EXPIRE', KEYS[4], ARGV[4])
-
-return { redis.call('GET', KEYS[2]) or '0', redis.call('GET', KEYS[3]) or '0' }";
+if redis.call('SADD', KEYS[1], ARGV[1]) == 1 then
+    local n = redis.call('INCRBY', KEYS[2], ARGV[2])
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+    return n
+else
+    return tonumber(redis.call('GET', KEYS[2]) or '0')
+end";
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════════════════
    CALL-SITE SỬA 3 CHỖ:
 
-   ① Job 01 — TRUYỀN jobId TỪ NGOÀI (requestId của Asset) + TỔNG AUM CỦA BATCH:
-        // ⚠️ ép (decimal?): IEnumerable<decimal> KHÔNG tự chuyển sang IEnumerable<decimal?> (kiểu giá trị
-        //    không có covariance). Ép thế này thì aum khai decimal hay decimal? đều biên dịch được.
-        var aumInBatch = SumAum(model.data.Select(x => (decimal?)x.aum));   // ★ THÊM — tròn TỪNG DÒNG như DECIMAL(20,0)
-        if (aumInBatch is null)
-            Log.Error("[{Biz}] {Date} req={Req} — tổng AUM batch VƯỢT TẦM int64 ({N} dòng). " +
-                      "Batch VẪN ghi DB + đếm dòng bình thường, chỉ BỎ cộng AUM.",
-                      BizTypeDefine.JOB_EOD_ASSET, tranDate, model.requestId, model.data.Count);
-
+   ① Job 01 — TRUYỀN jobId TỪ NGOÀI (requestId của Asset):
         var job01 = await SyncEodDataGeneric(
             msg:            rawJson,
             tranDate:       tranDate,
             redisKeyPrefix: RedisKeyDefine.EOD_ASSET,
             bizType:        BizTypeDefine.JOB_EOD_ASSET,
             executeFunc:    BulkInsertAssetToSdiCore,
-            jobId:          model.requestId,             // ★ THÊM
-            aumInBatch:     aumInBatch);                 // ★ THÊM
+            jobId:          model.requestId);            // ★ THÊM
 
-   ② BulkInsertAssetToSdiCore — đổi giá trị thứ 3:
+   ② BulkInsertAssetToSdiCore — đổi giá trị thứ 3 + CỘNG SỔ LŨY KẾ NGAY TẠI ĐÂY:
         - return (true, totalRow, rowsWritten);        // ❌ @p_rows — số dòng GHI ĐƯỢC
+        + // ★ Tổng số bản ghi + tổng AUM cộng Ở ĐÂY, trong hàm nghiệp vụ — KHÔNG nhét vào
+        + //   script Lua của SyncEodDataGeneric: hàm đó dùng chung cho job phí (job 02/03) và
+        + //   mọi luồng batch sau này, phần lớn KHÔNG có khái niệm AUM. Xem BatchStatAggregator.
+        + var stat = await _stat.AccumulateAsync(
+        +     RedisKeyDefine.EOD_ASSET, model.requestId,
+        +     batchKey: Sha256(msg),                    // ⚠️ ĐÚNG khoá mà generic dùng để dedup
+        +     rows:     model.data.Count,
+        +     aum:      BatchStatAggregator.SumAum(model.data.Select(x => (decimal?)x.aum)));
+        +
         + return (true, totalRow, model.data.Count);   // ✅ số dòng TRONG PAYLOAD
 
    ③ ProcessDataSyncAssetSdiCore — JobDone thì BẬT CỜ rồi DỪNG:
@@ -274,15 +199,16 @@ return { redis.call('GET', KEYS[2]) or '0', redis.call('GET', KEYS[3]) or '0' }"
 
    JOB 02/03 (fee) — KHÔNG SỬA GÌ:
         Không truyền jobId → dùng ngày làm định danh.
-        Không truyền aumInBatch → null → KHÔNG tạo key {p}:AUM / {p}:BATCH_AUM (job phí không có AUM batch).
-        executeFunc trả (true, 1, 1) → 1>=1 → JobDone=true. Chạy y như cũ.
+        Không gọi BatchStatAggregator → không có khoá STAT_* nào được tạo. Chạy y như cũ.
+        ★ ĐÂY LÀ LÝ DO sổ lũy kế nằm ở hàm nghiệp vụ chứ không nằm trong SyncEodDataGeneric:
+          hàm generic KHÔNG được biết đến "AUM", và job không có AUM KHÔNG phải mang theo
+          tham số vô nghĩa với nó.
 
-   ĐỌC SỐ LŨY KẾ TỪ NGOÀI (dashboard / lệnh kiểm tra thủ công):
-        GET {redisKeyPrefix}:{requestId}:ROWS     → tổng số bản ghi đã nhận
-        GET {redisKeyPrefix}:{requestId}:AUM      → tổng AUM đã nhận (VND)
-        GET {redisKeyPrefix}:{requestId}:TOTAL    → totalRow Asset khai
-   Đối chiếu:  SELECT COUNT(*), SUM(C_AUM) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE = @d
-        ROWS >= COUNT(*) là BÌNH THƯỜNG (acc không thuộc SDI bị INNER JOIN registry lọc).
-        AUM − SUM(C_AUM) = ĐÚNG tổng aum của đám acc lạ đó (có thể ÂM nếu acc lạ có aum<0 —
-        dấu không nói lên gì, chỉ ĐỘ LỚN mới nói). Lệch khác con số đó ⇒ có chuyện.
+   ĐỌC SỔ TỪ NGOÀI (dashboard / kiểm tra tay):
+        GET {redisKeyPrefix}:{requestId}:STAT_ROWS   → tổng số bản ghi đã nhận
+        GET {redisKeyPrefix}:{requestId}:STAT_AUM    → tổng AUM đã nhận (VND)
+   Đối chiếu: SELECT COUNT(*), SUM(C_AUM) FROM T_SI_BALANCE WHERE C_BUSINESS_DATE = @d
+        STAT_ROWS >= COUNT(*) là BÌNH THƯỜNG (acc không thuộc SDI bị INNER JOIN registry lọc).
+        STAT_AUM − SUM(C_AUM) = ĐÚNG tổng aum của đám acc lạ đó (có thể ÂM nếu acc lạ có aum<0
+        — dấu không nói lên gì, chỉ ĐỘ LỚN mới nói). Lệch khác con số đó ⇒ có chuyện.
    ══════════════════════════════════════════════════════════════════════════════════════════ */
