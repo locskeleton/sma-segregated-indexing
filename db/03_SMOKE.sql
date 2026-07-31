@@ -247,6 +247,109 @@ DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MGATE';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE';
 DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE='MGATE';
+
+PRINT '';
+PRINT '======== RỔ ĐỔI GIỮA DẢI: THÊM mã + GỠ mã → recompute range phải KHỚP TỪNG PHIÊN ========';
+-- Chuỗi index là NHÂN DỒN nên sai một phiên là lệch vĩnh viễn. Ca này ép đủ 3 chuyện xảy ra
+--   TRONG cùng một dải recompute: thêm mã mới, gỡ mã cũ, và mã bị gỡ KHÔNG CÒN GIÁ (huỷ niêm yết).
+-- Trọng số + tỷ lệ giá đều chọn NHỊ PHÂN CHÍNH XÁC (1/2, 1/4, 5/4, 3/2) để số kỳ vọng tính tay
+--   khớp tuyệt đối, không phải "xấp xỉ" — sai 1 đồng là test đỏ.
+--
+--   Phiên   Rổ hiệu lực              FACTOR                                index (publish)
+--   D1 01/6 RA .5  RB .5             .5(1.25)+.5(1.00)          = 1.125    1000    → 1125.00
+--   D2 02/6 RA .5  RB .5             .5(1.00)+.5(1.50)          = 1.25     1125    → 1406.25
+--   D3 03/6 RA .5  RB .25 RC .25 ★+  .5(1.00)+.25(1.00)+.25(1.5)= 1.125    1406.25 → 1582.03
+--   D4 04/6 RA .5  RB .25 RC .25     .5(1.50)+.25(1.00)+.25(1.0)= 1.25     1582.03125 → 1977.54
+--   D5 05/6 RA .5  RC .5        ★−   .5(1.00)+.5(1.25)          = 1.125    1977.5390625 → 2224.73
+--   D6 08/6 RA .5  RC .5             .5(1.00)+.5(1.00)          = 1.0      → 2224.73
+--   ★+ RC vào rổ từ D3 — CỐ Ý không có giá D1/D2 (chưa niêm yết): mã chưa vào rổ KHÔNG được đòi giá.
+--   ★− RB gỡ khỏi rổ từ D5 — CỐ Ý không có giá D5/D6 (huỷ niêm yết): mã đã gỡ KHÔNG được đòi giá.
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE)
+VALUES ('MRB',N'Rebalance',  'ACTIVE','2026-06-01','VNINDEX');
+
+-- ⚠️ RA giữ nguyên .5 suốt cả 3 mốc ⇒ CỐ Ý KHÔNG có dòng HIST ở 06-03 và 06-05 (đúng ngữ nghĩa log delta).
+--    Đây là điều làm test BIẾT CẮN: nếu ai đó đổi iTVF sang PARTITION chỉ theo master (lỗi kinh điển với
+--    log delta) thì RA sẽ BIẾN MẤT khỏi rổ từ D3 trở đi, Σw tụt còn .5 và index lệch ngay.
+--    Seed mà mốc nào cũng ghi lại ĐỦ mọi mã thì hai cách cài đặt cho ra kết quả GIỐNG HỆT ⇒ test vô dụng.
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('MRB','RA',0.50,'2026-06-01 00:00:00'),('MRB','RB',0.50,'2026-06-01 00:00:00'),
+                                         ('MRB','RB',0.25,'2026-06-03 00:00:00'),('MRB','RC',0.25,'2026-06-03 00:00:00'),
+                                         ('MRB','RB',0.00,'2026-06-05 00:00:00'),('MRB','RC',0.50,'2026-06-05 00:00:00');
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MRB','RA',0.50),('MRB','RC',0.50);
+
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
+ ('RA','2026-06-01',100.0000,125.0000),('RA','2026-06-02',125.0000,125.0000),('RA','2026-06-03',125.0000,125.0000),
+ ('RA','2026-06-04',125.0000,187.5000),('RA','2026-06-05',187.5000,187.5000),('RA','2026-06-08',187.5000,187.5000),
+ ('RB','2026-06-01',100.0000,100.0000),('RB','2026-06-02',100.0000,150.0000),('RB','2026-06-03',150.0000,150.0000),
+ ('RB','2026-06-04',150.0000,150.0000),   -- HẾT: RB huỷ niêm yết sau khi bị gỡ
+ ('RC','2026-06-03',100.0000,150.0000),   -- RC bắt đầu có giá ĐÚNG phiên nó vào rổ
+ ('RC','2026-06-04',150.0000,150.0000),('RC','2026-06-05',150.0000,187.5000),('RC','2026-06-08',187.5000,187.5000);
+
+DECLARE @ecR INT, @emR NVARCHAR(400);
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-06-01', @p_to_date='2026-06-08',
+     @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+
+DECLARE @r1 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-01');
+DECLARE @r2 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-02');
+DECLARE @r3 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-03');
+DECLARE @r4 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-04');
+DECLARE @r5 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-05');
+DECLARE @r6 DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB' AND C_BUSINESS_DATE='2026-06-08');
+DECLARE @rN INT=(SELECT COUNT(*) FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB');
+IF @ecR=0 AND @rN=6 AND @r1=1125.00 AND @r2=1406.25 AND @r3=1582.03 AND @r4=1977.54 AND @r5=2224.73 AND @r6=2224.73
+   PRINT '  OK thêm/gỡ mã giữa dải: 6 phiên khớp TỪNG SỐ (1125.00 1406.25 1582.03 1977.54 2224.73 2224.73)';
+ELSE PRINT CONCAT('  !!! index sai: err=',@ecR,' #dong=',@rN,' | ',@r1,' ',@r2,' ',@r3,' ',@r4,' ',@r5,' ',@r6,' ',ISNULL(@emR,''));
+
+-- (b) mã CHƯA vào rổ / ĐÃ gỡ khỏi rổ đều KHÔNG được có mặt trong rổ as-of
+DECLARE @bD2 INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-06-02') WHERE C_MASTER_CODE='MRB' AND C_TARGET_WEIGHT<>0);
+DECLARE @bD4 INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-06-04') WHERE C_MASTER_CODE='MRB' AND C_TARGET_WEIGHT<>0);
+DECLARE @bD6 INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-06-08') WHERE C_MASTER_CODE='MRB' AND C_TARGET_WEIGHT<>0);
+DECLARE @bRB INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-06-08') WHERE C_MASTER_CODE='MRB' AND C_TICKER='RB' AND C_TARGET_WEIGHT<>0);
+IF @bD2=2 AND @bD4=3 AND @bD6=2 AND @bRB=0
+   PRINT '  OK rổ as-of theo phiên: D2=2 mã · D4=3 mã (RC vào) · D6=2 mã (RB ra, không đòi giá)';
+ELSE PRINT CONCAT('  !!! rổ as-of sai: D2=',@bD2,' D4=',@bD4,' D6=',@bD6,' RB_con_trong_ro=',@bRB);
+
+-- (c) ★ CHẠY LẠI CẢ DẢI phải ra Y HỆT (idempotent — recompute không được cộng dồn thêm lần nữa)
+SELECT C_BUSINESS_DATE, C_INDEX_VALUE_RAW, C_INDEX_VALUE, C_DAILY_RETURN
+INTO #rb_lan1 FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB';
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-06-01', @p_to_date='2026-06-08',
+     @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+DECLARE @dif1 INT=(SELECT COUNT(*) FROM (
+    SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN FROM #rb_lan1
+    EXCEPT SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN
+           FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB') x);
+IF @ecR=0 AND @dif1=0 PRINT '  OK chạy lại CẢ DẢI lần 2 → giống hệt lần 1 (raw 12dp + publish + daily_return)';
+ELSE PRINT CONCAT('  !!! chạy lại dải bị lệch: err=',@ecR,' #dong_khac=',@dif1);
+
+-- (d) ★ CHẠY TỪNG NGÀY phải bằng CHẠY CẢ DẢI — bắt lỗi anchor/thứ tự trong vòng lặp range
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB';
+EXEC SP_EOD_SI_INDEX '2026-06-01'; EXEC SP_EOD_SI_INDEX '2026-06-02'; EXEC SP_EOD_SI_INDEX '2026-06-03';
+EXEC SP_EOD_SI_INDEX '2026-06-04'; EXEC SP_EOD_SI_INDEX '2026-06-05'; EXEC SP_EOD_SI_INDEX '2026-06-08';
+DECLARE @dif2 INT=(SELECT COUNT(*) FROM (
+    SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN FROM #rb_lan1
+    EXCEPT SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN
+           FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB') x);
+IF @dif2=0 PRINT '  OK chạy TỪNG NGÀY = chạy CẢ DẢI (không lệch anchor/thứ tự)';
+ELSE PRINT CONCAT('  !!! từng ngày khác cả dải: #dong_khac=',@dif2);
+
+-- (e) ★ CHẠY LẠI MỘT ĐOẠN GIỮA (D4..D6, đúng đoạn có sự kiện GỠ mã) phải không đổi số
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-06-04', @p_to_date='2026-06-08',
+     @p_err_code=@ecR OUTPUT, @p_err_msg=@emR OUTPUT;
+DECLARE @dif3 INT=(SELECT COUNT(*) FROM (
+    SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN FROM #rb_lan1
+    EXCEPT SELECT C_BUSINESS_DATE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN
+           FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB') x);
+IF @ecR=0 AND @dif3=0 PRINT '  OK chạy lại ĐOẠN GIỮA (D4..D6, có sự kiện gỡ mã) → số không đổi';
+ELSE PRINT CONCAT('  !!! chạy lại đoạn giữa bị lệch: err=',@ecR,' #dong_khac=',@dif3);
+
+DROP TABLE #rb_lan1;
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MRB';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MRB';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MRB';
+DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE='MRB';
+DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('RA','RB','RC');
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
 DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('GA','GB');
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
 
