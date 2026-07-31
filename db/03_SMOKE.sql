@@ -161,6 +161,83 @@ DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('PXM1','PXM2','ZWA','ZWB');
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
 
 PRINT '';
+PRINT '======== RỔ: cổng nạp SP_INGEST_MASTER_PORTFOLIO_TICKER + gỡ mã bằng weight 0 ========';
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE)
+VALUES ('MGATE',N'Gate','ACTIVE','2026-04-01','VNINDEX');
+DECLARE @ecG INT, @emG NVARCHAR(400);
+
+-- (a) nạp rổ đầu: GA 0.6 + GB 0.4
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-01',
+     N'[{"ticker":"GA","weight":0.6},{"ticker":"GB","weight":0.4}]','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=0 AND (SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE')=2
+   PRINT '  OK nạp rổ đầu qua cổng (2 mã)'; ELSE PRINT CONCAT('  !!! nạp rổ đầu: ec=',@ecG,' ',ISNULL(@emG,''));
+
+-- (b) ★ GHI SÓT MÃ (chỉ đẩy GA, quên GB) → PHẢI bị chặn. Đây là ca sinh ra index 1200 thay vì 1040.
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
+     N'[{"ticker":"GA","weight":1.0}]','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=24 AND NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE' AND C_EFFECTIVE_DATE='2026-04-02')
+   PRINT '  OK GHI SÓT MÃ → err=24, KHÔNG ghi dòng nào'; ELSE PRINT CONCAT('  !!! sót mã phải bị chặn: ec=',@ecG,' ',ISNULL(@emG,''));
+
+-- (c) Σweight sai thang (0.6+0.3=0.9) → chặn
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
+     N'[{"ticker":"GA","weight":0.6},{"ticker":"GB","weight":0.3}]','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=23 PRINT '  OK Σweight=0.9 → err=23'; ELSE PRINT CONCAT('  !!! Σweight guard: ec=',@ecG);
+
+-- (d) mã TRÙNG trong batch → chặn
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
+     N'[{"ticker":"GA","weight":0.5},{"ticker":"GA","weight":0.5}]','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=22 PRINT '  OK mã trùng trong batch → err=22'; ELSE PRINT CONCAT('  !!! dup guard: ec=',@ecG);
+
+-- (e) ★ GỠ GB ĐÚNG CÁCH: weight 0. GB huỷ niêm yết (KHÔNG có giá) mà index vẫn phải tính được.
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
+     N'[{"ticker":"GA","weight":1.0},{"ticker":"GB","weight":0}]','ops',@ecG OUTPUT,@emG OUTPUT;
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('GA','2026-04-03',100,110);
+DECLARE @ecGi INT=0, @nGi BIGINT;
+BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-04-03', @nGi OUTPUT; END TRY BEGIN CATCH SET @ecGi=ERROR_NUMBER(); END CATCH
+DECLARE @vG DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MGATE' AND C_BUSINESS_DATE='2026-04-03');
+IF @ecG=0 AND @ecGi=0 AND @vG=1100.00
+   PRINT '  OK gỡ mã bằng weight 0: GB không bị đòi giá, index = 1100.00 (chỉ theo GA)';
+ELSE PRINT CONCAT('  !!! gỡ bằng weight 0: ec_ingest=',@ecG,' ec_index=',@ecGi,' index=',ISNULL(CONVERT(VARCHAR(20),@vG),'(null)'));
+
+-- (f) version SAU KHI gỡ không cần mang lại GB (rổ không phình) — chỉ GA là hợp lệ
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-06',
+     N'[{"ticker":"GA","weight":1.0}]','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=0 PRINT '  OK version sau khi gỡ KHÔNG phải mang lại mã weight 0 (rổ không phình)';
+ELSE PRINT CONCAT('  !!! version sau khi gỡ: ec=',@ecG,' ',ISNULL(@emG,''));
+
+-- (g) gỡ SẠCH mã (toàn weight 0) → Σ=0 → THROW 51012, không sinh index câm
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT)
+VALUES ('MGATE','2026-04-07','GA',0);   -- ghi thẳng: cổng chặn Σ=0 nên phải bypass để test guard J12
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('GA','2026-04-08',110,110);
+DECLARE @ecGz INT=0;
+BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-04-08', @nGi OUTPUT; END TRY BEGIN CATCH SET @ecGz=ERROR_NUMBER(); END CATCH
+IF @ecGz=51012 PRINT '  OK rổ gỡ SẠCH mã (Σ=0) → THROW 51012, KHÔNG im lặng bỏ qua';
+ELSE PRINT CONCAT('  !!! rổ gỡ sạch phải THROW 51012: ec=',@ecGz);
+
+-- (h) HIST có vết: 3 lần nạp THÀNH CÔNG (a,e,f) — 3 batch riêng, mỗi batch 1 mốc DUY NHẤT cho mọi dòng.
+--     ⚠️ Đếm theo C_BATCH_SEQ, KHÔNG theo C_CONFIRM_TIME: 2 lần nạp liên tiếp có thể cùng mili giây
+--        (chính assertion này bắt được lỗi đó lần chạy đầu → phải thêm SEQUENCE).
+DECLARE @hLan INT=(SELECT COUNT(DISTINCT C_BATCH_SEQ) FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE');
+DECLARE @hXe  INT=(SELECT COUNT(*) FROM (SELECT C_BATCH_SEQ FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                                         WHERE C_MASTER_CODE='MGATE'
+                                         GROUP BY C_BATCH_SEQ
+                                         HAVING COUNT(DISTINCT C_CONFIRM_TIME) > 1
+                                             OR COUNT(DISTINCT C_EFFECTIVE_DATE) > 1) q);
+DECLARE @hFail INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                    WHERE C_MASTER_CODE='MGATE' AND C_EFFECTIVE_DATE='2026-04-02' AND C_TICKER='GB' AND C_TARGET_WEIGHT=0);
+IF @hLan=3 AND @hXe=0 AND @hFail=1
+   PRINT CONCAT('  OK HIST: ',@hLan,' batch (đúng số lần nạp THÀNH CÔNG), không batch nào bị xẻ, có vết gỡ GB weight 0');
+ELSE PRINT CONCAT('  !!! HIST: so_batch=',@hLan,' batch_bi_xe=',@hXe,' vet_go_GB=',@hFail);
+
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MGATE';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE';
+DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE='MGATE';
+DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('GA','GB');
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
+
+PRINT '';
 PRINT '======== INDEX scope as-of: master PHÁT SINH SAU + rổ BACKDATE không được kéo về quá khứ ========';
 -- Ca thật khi CHẠY LẠI LỊCH SỬ: FO lập master mới (inception 06/2026) nhưng khai weight hiệu lực từ 03/2026
 --   (backdate — đầu quý/đầu chiến lược), và trong rổ có mã NIÊM YẾT SAU nên không thể có giá tháng 3.

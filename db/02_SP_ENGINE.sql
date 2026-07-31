@@ -576,6 +576,138 @@ BEGIN
 END
 GO
 
+/*===========================================================================
+  SP_INGEST_MASTER_PORTFOLIO_TICKER — CỔNG DUY NHẤT nạp rổ danh mục mẫu (FO → SDI).
+
+  VÌ SAO PHẢI CÓ: trước đây rổ là feed DUY NHẤT không có cổng — app ghi thẳng vào bảng, trong khi Asset NAV /
+    FO holdings / giá / lịch nghỉ đều đi qua SP có validate + all-or-nothing. Mà rổ lại là thứ quyết định
+    TOÀN BỘ index. Ghi SÓT một mã (ví dụ chỉ đẩy phần thay đổi) cho ra index "hợp lệ" mà SAI, và SAI IM LẶNG:
+    FACTOR chuẩn hoá bằng /Σw nên mất mã không làm vỡ thang, nó chỉ lặng lẽ chuyển sang theo dõi rổ khác.
+    Đo thật: rổ (RA 0.6, RB 0.4), ghi sót RB ⇒ index 1200.00 thay vì 1040.00, err=0, không guard nào bật.
+
+  JSON: [{"ticker":"AAA","weight":0.6},{"ticker":"BBB","weight":0.4},{"ticker":"CCC","weight":0}]
+    ★ MỘT lần nạp = TOÀN BỘ rổ tại @p_effective_date, KHÔNG phải phần thay đổi.
+    ★ GỠ mã = weight 0 (KHÔNG bỏ trống) — nhờ vậy "sót mã" mới phân biệt được với "gỡ mã" (err=24).
+
+  Ghi: DELETE+INSERT theo (master, eff_date) → sửa tại chỗ được (chốt nghiệp vụ), + append
+    T_MASTER_PORTFOLIO_TICKER_HIST với MỘT C_CONFIRM_TIME chung cho cả batch để còn vết audit.
+
+  err: 0 OK · 20 tham số/JSON sai · 21 master không tồn tại/CLOSED · 22 validate dòng (rỗng/trùng/âm)
+       · 23 Σweight sai thang · 24 SÓT MÃ so với version trước · -1 runtime. KHÔNG THROW.
+
+  ⚠️ Sửa rổ của mốc ĐÃ TÍNH INDEX ⇒ chuỗi index cũ VẪN SAI cho tới khi chạy lại
+     SP_EOD_RECOMPUTE_INDEX_RANGE từ mốc đó (index là chuỗi nhân dồn).
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_INGEST_MASTER_PORTFOLIO_TICKER
+    @p_master_code    VARCHAR(20),
+    @p_effective_date DATE,
+    @p_json           NVARCHAR(MAX),
+    @p_user           VARCHAR(64)   = NULL,
+    @p_err_code       INT           OUTPUT,
+    @p_err_msg        NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+        IF @p_master_code IS NULL OR @p_effective_date IS NULL
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_master_code / @p_effective_date NULL'; RETURN; END
+        IF @p_json IS NULL OR ISJSON(@p_json) <> 1
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không phải JSON hợp lệ'; RETURN; END
+        IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO
+                       WHERE C_MASTER_CODE=@p_master_code AND C_STATUS='ACTIVE')
+            BEGIN SET @p_err_code=21;
+                  SET @p_err_msg=CONCAT(N'Master ', @p_master_code, N' không tồn tại hoặc đã CLOSED');
+                  RETURN; END
+
+        -- Đọc weight dạng CHUỖI rồi TRY_CONVERT: ép DECIMAL trong OPENJSON WITH sẽ THROW conversion error
+        --   khó hiểu (→ err=-1) thay vì báo rõ mã nào sai.
+        DECLARE @src TABLE (C_TICKER VARCHAR(20), C_RAW_W NVARCHAR(40), C_TARGET_WEIGHT DECIMAL(12,8), rn INT);
+        INSERT @src (C_TICKER, C_RAW_W, C_TARGET_WEIGHT, rn)
+        SELECT UPPER(LTRIM(RTRIM(j.ticker))), j.weight, TRY_CONVERT(DECIMAL(12,8), j.weight),
+               ROW_NUMBER() OVER (PARTITION BY UPPER(LTRIM(RTRIM(j.ticker))) ORDER BY (SELECT NULL))
+        FROM OPENJSON(@p_json) WITH (ticker VARCHAR(20) '$.ticker', weight NVARCHAR(40) '$.weight') j;
+
+        IF NOT EXISTS (SELECT 1 FROM @src)
+            BEGIN SET @p_err_code=22;
+                  SET @p_err_msg=N'Batch rỗng — TỪ CHỐI. Muốn dừng master thì set C_STATUS=''CLOSED'', '
+                                 + N'không phải nạp rổ rỗng.';
+                  RETURN; END
+
+        DECLARE @bad NVARCHAR(300) = (
+            SELECT TOP 1 CASE
+                WHEN C_TICKER IS NULL OR C_TICKER = '' THEN N'ticker rỗng/NULL'
+                WHEN C_TARGET_WEIGHT IS NULL           THEN CONCAT(N'weight sai định dạng @', C_TICKER, N': ', ISNULL(C_RAW_W,N'(null)'))
+                WHEN C_TARGET_WEIGHT < 0               THEN CONCAT(N'weight ÂM @', C_TICKER, N' (rổ 100% cổ phiếu, không short)')
+                WHEN rn > 1                            THEN CONCAT(N'ticker TRÙNG trong batch: ', C_TICKER)
+                END
+            FROM @src
+            WHERE C_TICKER IS NULL OR C_TICKER = '' OR C_TARGET_WEIGHT IS NULL
+               OR C_TARGET_WEIGHT < 0 OR rn > 1);
+        IF @bad IS NOT NULL
+            BEGIN SET @p_err_code=22;
+                  SET @p_err_msg=CONCAT(N'Validate FAIL — batch BỊ TỪ CHỐI (không ghi dòng nào): ', @bad);
+                  RETURN; END
+
+        -- Σweight phải khớp THANG CHUẨN. Đây là lưới thứ hai bắt "ghi sót mã".
+        -- ⚠️ Chấp nhận CẢ HAI thang (Σ=1 phân số, Σ=100 phần trăm) vì FACTOR chia /Σw nên cả hai đều cho ra
+        --    index đúng, và dữ liệu hiện có đang dùng cả hai. Muốn siết về DUY NHẤT Σ=1.0 thì bỏ vế 100 —
+        --    chặt hơn (sót mã mà Σ tình cờ rơi gần 100 sẽ không lọt), nhưng phải chuẩn hoá feed trước.
+        DECLARE @sumw FLOAT = (SELECT SUM(CAST(C_TARGET_WEIGHT AS FLOAT)) FROM @src);
+        IF NOT (ABS(@sumw - 1.0) <= 1e-6 OR ABS(@sumw - 100.0) <= 1e-4)
+            BEGIN SET @p_err_code=23;
+                  SET @p_err_msg=CONCAT(N'Σweight = ', CONVERT(NVARCHAR(30), CAST(@sumw AS DECIMAL(20,8))),
+                        N' — phải = 1.0 (phân số) hoặc 100 (phần trăm). Nguyên nhân thường gặp nhất: GHI SÓT MÃ ',
+                        N'(một lần nạp = TOÀN BỘ rổ, không phải phần thay đổi).');
+                  RETURN; END
+
+        -- ★ KHÔNG ĐƯỢC SÓT MÃ so với version LIỀN TRƯỚC. Đây là guard chính, và nó CHỈ khả thi nhờ quy ước
+        --   "gỡ mã = weight 0": nếu gỡ bằng cách bỏ trống thì "gỡ" và "sót" trông y hệt nhau, không phân biệt nổi.
+        --   So với các mã weight>0 của version trước (mã đã ghi 0 ở đó thì thôi, không cần mang tiếp ⇒ rổ không phình).
+        DECLARE @prev DATE = (SELECT MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
+                              WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE < @p_effective_date);
+        IF @prev IS NOT NULL
+        BEGIN
+            DECLARE @miss NVARCHAR(MAX) = (
+                SELECT STRING_AGG(CONVERT(NVARCHAR(20), p.C_TICKER), N', ') WITHIN GROUP (ORDER BY p.C_TICKER)
+                FROM T_MASTER_PORTFOLIO_TICKER p
+                WHERE p.C_MASTER_CODE=@p_master_code AND p.C_EFFECTIVE_DATE=@prev AND p.C_TARGET_WEIGHT <> 0
+                  AND NOT EXISTS (SELECT 1 FROM @src s WHERE s.C_TICKER = p.C_TICKER));
+            IF @miss IS NOT NULL
+                BEGIN SET @p_err_code=24;
+                      SET @p_err_msg=CONCAT(N'SÓT MÃ so với rổ ', CONVERT(VARCHAR(10),@prev,23), N': ',
+                            LEFT(@miss,200), N'. Gỡ mã PHẢI ghi weight = 0, KHÔNG được bỏ trống ',
+                            N'(bỏ trống thì không phân biệt được GỠ với SÓT).');
+                      RETURN; END
+        END
+
+        -- ★ MỘT định danh + MỘT mốc cho CẢ batch. KHÔNG lấy từng dòng: mọi truy vấn "rổ tại thời điểm T"
+        --   xếp hạng theo C_BATCH_SEQ, lệch giữa các dòng cùng batch ⇒ rổ bị XẺ, chỉ còn 1 mã.
+        -- ⚠️ Thứ tự dùng SEQUENCE chứ KHÔNG dùng SYSDATETIME(): độ mịn ~1ms nên hai lần nạp liên tiếp rơi
+        --   cùng mili giây là bình thường (smoke bắt được ngay lần chạy đầu) ⇒ "bản ghi mới nhất" hoà nhau,
+        --   thành không xác định. C_CONFIRM_TIME chỉ để người đọc.
+        DECLARE @batch BIGINT = NEXT VALUE FOR SEQ_MASTER_PORTFOLIO_TICKER_HIST_BATCH;
+        DECLARE @now   DATETIME2(3) = SYSDATETIME();
+
+        BEGIN TRAN;
+        DELETE FROM T_MASTER_PORTFOLIO_TICKER
+        WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@p_effective_date;
+
+        INSERT INTO T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT)
+        SELECT @p_master_code, @p_effective_date, C_TICKER, C_TARGET_WEIGHT FROM @src;
+
+        INSERT INTO T_MASTER_PORTFOLIO_TICKER_HIST
+            (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT,C_BATCH_SEQ,C_CONFIRM_TIME,C_UPDATER)
+        SELECT @p_master_code, @p_effective_date, C_TICKER, C_TARGET_WEIGHT, @batch, @now, @p_user FROM @src;
+        COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END
+    END CATCH
+END
+GO
+
 /*---------------------------------------------------- iTVF: RỔ TÍNH INDEX AS-OF @d (+ giá cùng ngày)
   ★ ĐỊNH NGHĨA DUY NHẤT của "những gì được đưa vào tính index ngày @d". Trước 2026-07-31 vị từ scope bị CHÉP
     4 LẦN (completeness / weight-guard / CTE W / gate SP_EOD_RUN_INDEX) và comment phải hét "PHẢI GIỐNG HỆT
@@ -601,7 +733,16 @@ GO
   LEFT JOIN giá (KHÔNG INNER): thiếu giá phải NHÌN THẤY ĐƯỢC (C_CLOSE_PRICE IS NULL) để completeness báo tên
   mã thiếu. INNER JOIN sẽ làm mã thiếu giá BIẾN MẤT — đúng kiểu "bỏ ngầm" mà thiết kế này cấm.
   Không thể fan-out: UQ(master,eff_date,ticker) + RK=1 chốt 1 eff_date/master ⇒ (master,ticker) duy nhất;
-  PK T_PRICE_DAILY (business_date,ticker) ⇒ join giá 1-1. */
+  PK T_PRICE_DAILY (business_date,ticker) ⇒ join giá 1-1.
+
+  ★ TRẢ VỀ CẢ DÒNG C_TARGET_WEIGHT = 0 (bản ghi GỠ mã) — CÓ CHỦ ĐÍCH, đừng lọc ở đây.
+    Hàm này trả lời "bản ghi rổ hiệu lực tại @d", còn "thành phần rổ THỰC TẾ" = những dòng weight <> 0.
+    Người gọi PHẢI tự lọc <> 0 khi ĐÒI GIÁ và khi TÍNH:
+      • đòi giá cho mã vừa gỡ (rất có thể đã HUỶ NIÊM YẾT ⇒ không đời nào có giá) sẽ THROW 51011 mỗi ngày
+        và vì all-or-nothing, chặn luôn index của MỌI master — vĩnh viễn.
+      • ngược lại, giữ dòng 0 lại thì guard Σweight=0 mới phát hiện được "rổ đã gỡ sạch mã"; lọc ở đây
+        sẽ làm master đó biến mất khỏi mọi phép kiểm ⇒ im lặng không có index, không err nào bật.
+    (Dòng 0 KHÔNG làm lệch FACTOR — nó cộng 0 vào cả tử lẫn mẫu. Đo rồi: 1.1 vs 1.1.) */
 CREATE OR ALTER FUNCTION UDF_INDEX_BASKET_ASOF (@d DATE)
 RETURNS TABLE
 AS
@@ -693,10 +834,12 @@ BEGIN
     --   THROW trước mọi DML ⇒ atomic: index ngày đó GIỮ NGUYÊN (không xoá) nếu fail. (Forward còn gate err=11 ở
     --   SP_EOD_RUN_INDEX báo sớm/sạch — DÙNG CHUNG UDF_INDEX_BASKET_ASOF nên KHÔNG THỂ lệch scope.)
     --   Scope (ACTIVE + inception ≤ @p_d + rổ hiệu lực) nằm gọn trong UDF_INDEX_BASKET_ASOF — xem giải thích ở đó.
+    --   ⚠️ CHỈ đòi giá cho mã CÒN TRONG RỔ (weight <> 0). Mã có dòng weight 0 là BẢN GHI GỠ — nó rất có thể
+    --      đã huỷ niêm yết nên không đời nào có giá; đòi giá nó = THROW mỗi ngày = chặn index MỌI master.
     DECLARE @missing NVARCHAR(MAX) = (
         SELECT STRING_AGG(CONCAT(b.C_MASTER_CODE, N':', b.C_TICKER), N', ')
                WITHIN GROUP (ORDER BY b.C_MASTER_CODE, b.C_TICKER)
-        FROM @basket b WHERE b.C_CLOSE_PRICE IS NULL);
+        FROM @basket b WHERE b.C_CLOSE_PRICE IS NULL AND b.C_TARGET_WEIGHT <> 0);
     IF @missing IS NOT NULL
     BEGIN
         DECLARE @emsg NVARCHAR(2000) = CONCAT(N'INDEX completeness FAIL @', CONVERT(VARCHAR(10),@p_d,23),
@@ -705,9 +848,12 @@ BEGIN
         THROW 51011, @emsg, 1;
     END
 
-    -- VALIDATE WEIGHT (TRƯỚC mọi DML): master ACTIVE có Σtarget_weight = 0 (cấu hình rổ sai) ⇒ FACTOR =
+    -- VALIDATE WEIGHT (TRƯỚC mọi DML): master ACTIVE có Σtarget_weight = 0 ⇒ FACTOR =
     --   numerator/NULLIF(0,0) = NULL ⇒ nếu để chạy tới INSERT sẽ vỡ ràng buộc NOT NULL của C_INDEX_VALUE.
     --   Raise NGAY tại đây (báo rõ master), KHÔNG để lỗi NOT NULL khó hiểu ở tầng insert.
+    -- ★ Từ khi weight 0 = bản ghi GỠ mã, Σ=0 còn mang nghĩa thứ hai: RỔ ĐÃ GỠ SẠCH MÃ. Đây chính là lý do
+    --   @basket phải GIỮ dòng 0 — lọc chúng ở iTVF thì master gỡ sạch sẽ không còn dòng nào, không vào được
+    --   nhóm nào, guard này KHÔNG fire, và ngày đó master lặng lẽ không có index mà không err nào bật.
     DECLARE @badw NVARCHAR(MAX) = (
         SELECT STRING_AGG(CONVERT(NVARCHAR(20), z.C_MASTER_CODE), N', ') WITHIN GROUP (ORDER BY z.C_MASTER_CODE)
         FROM (
@@ -718,7 +864,7 @@ BEGIN
     IF @badw IS NOT NULL
     BEGIN
         DECLARE @wmsg NVARCHAR(2000) = CONCAT(N'INDEX weight INVALID @', CONVERT(VARCHAR(10),@p_d,23),
-            N': Σtarget_weight = 0 (cấu hình rổ sai) — master ', LEFT(@badw,1800),
+            N': Σtarget_weight = 0 (cấu hình rổ sai, HOẶC rổ đã gỡ sạch mã) — master ', LEFT(@badw,1800),
             N' — KHÔNG tính index (FACTOR không xác định).');
         THROW 51012, @wmsg, 1;
     END
@@ -743,10 +889,14 @@ BEGIN
         -- ★ Tính THẲNG trên @basket — ĐÚNG bộ dữ liệu mà completeness + weight-guard vừa soi. Không dựng lại
         --   scope, không join lại giá ⇒ không còn cửa cho "kiểm một đằng, tính một nẻo".
         --   C_CLOSE_PRICE/C_REF_PRICE chắc chắn NOT NULL tại đây vì completeness đã THROW nếu thiếu.
+        -- ⚠️ LỌC weight <> 0 TƯỜNG MINH. Về số học dòng 0 vô hại (cộng 0 vào cả tử lẫn mẫu), nhưng nếu mã
+        --    đã gỡ KHÔNG có giá thì biểu thức thành 0*NULL/NULL = NULL và chỉ "đúng" nhờ SUM bỏ qua NULL —
+        --    đúng do tai nạn, không phải do thiết kế. Lọc thẳng cho khỏi phụ thuộc vào hành vi đó.
         SELECT b.C_MASTER_CODE,
                SUM( CAST(b.C_TARGET_WEIGHT AS FLOAT) * b.C_CLOSE_PRICE / b.C_REF_PRICE )
                  / NULLIF(SUM( CAST(b.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR  -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
         FROM @basket b
+        WHERE b.C_TARGET_WEIGHT <> 0
         GROUP BY b.C_MASTER_CODE
     )
     -- [Cách A] CHAIN ở raw precision cao (COALESCE prev.raw, nếu legacy thiếu raw thì fallback prev 2dp, else 1000)
@@ -1086,9 +1236,11 @@ BEGIN
     -- ★ DÙNG CHUNG UDF_INDEX_BASKET_ASOF với SP_EOD_SI_INDEX ⇒ gate và phép tính KHÔNG THỂ lệch scope.
     --   Trước đây đây là bản CHÉP TAY của cùng vị từ; lệch một chữ là gate cho qua nhưng SP_EOD_SI_INDEX THROW
     --   (hoặc ngược lại) — err trả về mất tin cậy. Nay chỉ còn một định nghĩa.
+    --   weight <> 0: mã có dòng weight 0 là bản ghi GỠ, KHÔNG đòi giá (xem chú thích ở SP_EOD_SI_INDEX).
     DECLARE @missing NVARCHAR(400) = (
         SELECT STRING_AGG(req.C_TICKER, ',') WITHIN GROUP (ORDER BY req.C_TICKER)
-        FROM (SELECT DISTINCT C_TICKER FROM dbo.UDF_INDEX_BASKET_ASOF(@d) WHERE C_CLOSE_PRICE IS NULL) req);
+        FROM (SELECT DISTINCT C_TICKER FROM dbo.UDF_INDEX_BASKET_ASOF(@d)
+              WHERE C_CLOSE_PRICE IS NULL AND C_TARGET_WEIGHT <> 0) req);
     IF @missing IS NOT NULL
     BEGIN
         SET @p_err_code=11;
