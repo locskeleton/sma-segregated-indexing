@@ -1,4 +1,4 @@
-SET QUOTED_IDENTIFIER ON;  -- procs ghi/đọc bảng có filtered index → cần QI ON lúc CREATE PROC
+﻿SET QUOTED_IDENTIFIER ON;  -- procs ghi/đọc bảng có filtered index → cần QI ON lúc CREATE PROC
 SET ANSI_NULLS ON;
 GO
 /*==============================================================================
@@ -577,41 +577,45 @@ END
 GO
 
 /*===========================================================================
-  SP_INGEST_MASTER_PORTFOLIO_TICKER — CỔNG DUY NHẤT nạp rổ danh mục mẫu (FO → SDI).
+  SP_INGEST_MASTER_PORTFOLIO_TICKER — CỔNG DUY NHẤT ghi thay đổi tỷ trọng danh mục mẫu (FO → SDI).
 
-  VÌ SAO PHẢI CÓ: trước đây rổ là feed DUY NHẤT không có cổng — app ghi thẳng vào bảng, trong khi Asset NAV /
-    FO holdings / giá / lịch nghỉ đều đi qua SP có validate + all-or-nothing. Mà rổ lại là thứ quyết định
-    TOÀN BỘ index. Ghi SÓT một mã (ví dụ chỉ đẩy phần thay đổi) cho ra index "hợp lệ" mà SAI, và SAI IM LẶNG:
-    FACTOR chuẩn hoá bằng /Σw nên mất mã không làm vỡ thang, nó chỉ lặng lẽ chuyển sang theo dõi rổ khác.
-    Đo thật: rổ (RA 0.6, RB 0.4), ghi sót RB ⇒ index 1200.00 thay vì 1040.00, err=0, không guard nào bật.
+  MÔ HÌNH: HIST là log DELTA (chỉ mã ĐỔI tỷ trọng + thời điểm duyệt); T_MASTER_PORTFOLIO_TICKER là
+    TRẠNG THÁI HIỆN TẠI (không có chiều thời gian). SP nhận PHẦN THAY ĐỔI rồi trong CÙNG MỘT giao dịch:
+    append HIST (vết audit + nguồn DUY NHẤT để dựng rổ as-of) và cập nhật rổ hiện tại.
+    Một đường ghi ⇒ hai nơi không bao giờ lệch. Ghi thẳng vào bảng là phá đúng tính chất đó.
 
-  JSON: [{"ticker":"AAA","weight":0.6},{"ticker":"BBB","weight":0.4},{"ticker":"CCC","weight":0}]
-    ★ MỘT lần nạp = TOÀN BỘ rổ tại @p_effective_date, KHÔNG phải phần thay đổi.
-    ★ GỠ mã = weight 0 (KHÔNG bỏ trống) — nhờ vậy "sót mã" mới phân biệt được với "gỡ mã" (err=24).
+  JSON: [{"ticker":"AAA","weight":0.55},{"ticker":"CCC","weight":0}]   -- CHỈ mã THAY ĐỔI
+    ★ GỠ MÃ = weight 0, BẮT BUỘC. HIST là log delta: gỡ mà không ghi gì thì dòng cuối (weight dương) của
+      mã đó SỐNG MÃI ⇒ mọi lần dựng rổ quá khứ về sau đều thừa mã đã gỡ, Σw phình, index sai IM LẶNG.
+      Đây không phải tuỳ chọn — nó là điều kiện để mô hình delta dựng lại được lịch sử.
 
-  Ghi: DELETE+INSERT theo (master, eff_date) → sửa tại chỗ được (chốt nghiệp vụ), + append
-    T_MASTER_PORTFOLIO_TICKER_HIST với MỘT C_CONFIRM_TIME chung cho cả batch để còn vết audit.
+  VÌ SAO PHẢI CÓ CỔNG: rổ là feed DUY NHẤT không có cổng, trong khi Asset NAV / FO holdings / giá / lịch
+    nghỉ đều qua SP có validate + all-or-nothing. Mà rổ quyết định TOÀN BỘ index, và rổ hụt tỷ trọng thì
+    SAI IM LẶNG: FACTOR chuẩn hoá bằng /Σw nên thiếu mã KHÔNG làm vỡ thang, nó chỉ lặng lẽ chuyển sang
+    theo dõi một rổ khác. Đo thật: rổ (RA 0.6, RB 0.4) mà mất RB ⇒ index 1200.00 thay vì 1040.00,
+    daily_return 20% thay vì 4%, err=0, không guard nào bật.
 
-  err: 0 OK · 20 tham số/JSON sai · 21 master không tồn tại/CLOSED · 22 validate dòng (rỗng/trùng/âm)
-       · 23 Σweight sai thang · 24 SÓT MÃ so với version trước · -1 runtime. KHÔNG THROW.
+  err: 0 OK · 20 tham số/JSON sai · 21 master không tồn tại/CLOSED · 22 validate dòng (rỗng/trùng/âm/sai
+       định dạng) · 23 Σweight SAU KHI ÁP sai thang · 24 gỡ mã KHÔNG có trong rổ · 25 confirm_time không
+       hợp lệ (tương lai, hoặc không mới hơn thay đổi gần nhất) · -1 runtime. KHÔNG THROW.
 
-  ⚠️ Sửa rổ của mốc ĐÃ TÍNH INDEX ⇒ chuỗi index cũ VẪN SAI cho tới khi chạy lại
-     SP_EOD_RECOMPUTE_INDEX_RANGE từ mốc đó (index là chuỗi nhân dồn).
+  ⚠️ Thay đổi có confirm_time rơi vào ngày ĐÃ TÍNH INDEX ⇒ chuỗi index cũ VẪN SAI cho tới khi chạy lại
+     SP_EOD_RECOMPUTE_INDEX_RANGE từ ngày đó (index là chuỗi nhân dồn).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_INGEST_MASTER_PORTFOLIO_TICKER
-    @p_master_code    VARCHAR(20),
-    @p_effective_date DATE,
-    @p_json           NVARCHAR(MAX),
-    @p_user           VARCHAR(64)   = NULL,
-    @p_err_code       INT           OUTPUT,
-    @p_err_msg        NVARCHAR(400) OUTPUT
+    @p_master_code   VARCHAR(20),
+    @p_json          NVARCHAR(MAX),
+    @p_confirm_time  DATETIME2(3)  = NULL,   -- thời điểm DUYỆT thật; NULL = bây giờ
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
-        IF @p_master_code IS NULL OR @p_effective_date IS NULL
-            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_master_code / @p_effective_date NULL'; RETURN; END
+        IF @p_master_code IS NULL
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_master_code NULL'; RETURN; END
         IF @p_json IS NULL OR ISJSON(@p_json) <> 1
             BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không phải JSON hợp lệ'; RETURN; END
         IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO
@@ -629,10 +633,7 @@ BEGIN
         FROM OPENJSON(@p_json) WITH (ticker VARCHAR(20) '$.ticker', weight NVARCHAR(40) '$.weight') j;
 
         IF NOT EXISTS (SELECT 1 FROM @src)
-            BEGIN SET @p_err_code=22;
-                  SET @p_err_msg=N'Batch rỗng — TỪ CHỐI. Muốn dừng master thì set C_STATUS=''CLOSED'', '
-                                 + N'không phải nạp rổ rỗng.';
-                  RETURN; END
+            BEGIN SET @p_err_code=22; SET @p_err_msg=N'Batch rỗng — TỪ CHỐI'; RETURN; END
 
         DECLARE @bad NVARCHAR(300) = (
             SELECT TOP 1 CASE
@@ -649,56 +650,81 @@ BEGIN
                   SET @p_err_msg=CONCAT(N'Validate FAIL — batch BỊ TỪ CHỐI (không ghi dòng nào): ', @bad);
                   RETURN; END
 
-        -- Σweight phải khớp THANG CHUẨN. Đây là lưới thứ hai bắt "ghi sót mã".
-        -- ⚠️ Chấp nhận CẢ HAI thang (Σ=1 phân số, Σ=100 phần trăm) vì FACTOR chia /Σw nên cả hai đều cho ra
-        --    index đúng, và dữ liệu hiện có đang dùng cả hai. Muốn siết về DUY NHẤT Σ=1.0 thì bỏ vế 100 —
-        --    chặt hơn (sót mã mà Σ tình cờ rơi gần 100 sẽ không lọt), nhưng phải chuẩn hoá feed trước.
-        DECLARE @sumw FLOAT = (SELECT SUM(CAST(C_TARGET_WEIGHT AS FLOAT)) FROM @src);
-        IF NOT (ABS(@sumw - 1.0) <= 1e-6 OR ABS(@sumw - 100.0) <= 1e-4)
-            BEGIN SET @p_err_code=23;
-                  SET @p_err_msg=CONCAT(N'Σweight = ', CONVERT(NVARCHAR(30), CAST(@sumw AS DECIMAL(20,8))),
-                        N' — phải = 1.0 (phân số) hoặc 100 (phần trăm). Nguyên nhân thường gặp nhất: GHI SÓT MÃ ',
-                        N'(một lần nạp = TOÀN BỘ rổ, không phải phần thay đổi).');
+        -- ★ MỘT mốc duyệt cho CẢ batch (không lấy SYSDATETIME() từng dòng: rổ as-of xếp hạng theo cột này).
+        DECLARE @ct DATETIME2(3) = ISNULL(@p_confirm_time, SYSDATETIME());
+        IF @ct > SYSDATETIME()
+            BEGIN SET @p_err_code=25;
+                  SET @p_err_msg=N'confirm_time ở TƯƠNG LAI — rổ hiện tại sẽ đổi ngay mà rổ as-of hôm nay '
+                                 + N'lại chưa thấy thay đổi ⇒ hai nguồn lệch nhau.';
+                  RETURN; END
+        -- Không cho ghi LÙI/TRÙNG mốc: HIST phải đơn điệu tăng theo master thì "rổ hiện tại" mới đúng bằng
+        --   "rổ as-of bây giờ". Ghi lùi = bảng rổ phản ánh một thay đổi CŨ hơn trạng thái đang có.
+        --   Điều này cũng khử luôn khả năng đụng UNIQUE(master,ticker,confirm_time).
+        IF EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                   WHERE C_MASTER_CODE=@p_master_code AND C_CONFIRM_TIME >= @ct)
+            BEGIN SET @p_err_code=25;
+                  SET @p_err_msg=CONCAT(N'confirm_time ', CONVERT(NVARCHAR(30),@ct,121),
+                        N' KHÔNG mới hơn thay đổi gần nhất của master (',
+                        CONVERT(NVARCHAR(30), (SELECT MAX(C_CONFIRM_TIME) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                                               WHERE C_MASTER_CODE=@p_master_code), 121),
+                        N'). Nhập bù phải theo đúng thứ tự thời gian.');
                   RETURN; END
 
-        -- ★ KHÔNG ĐƯỢC SÓT MÃ so với version LIỀN TRƯỚC. Đây là guard chính, và nó CHỈ khả thi nhờ quy ước
-        --   "gỡ mã = weight 0": nếu gỡ bằng cách bỏ trống thì "gỡ" và "sót" trông y hệt nhau, không phân biệt nổi.
-        --   So với các mã weight>0 của version trước (mã đã ghi 0 ở đó thì thôi, không cần mang tiếp ⇒ rổ không phình).
-        DECLARE @prev DATE = (SELECT MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-                              WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE < @p_effective_date);
-        IF @prev IS NOT NULL
-        BEGIN
-            DECLARE @miss NVARCHAR(MAX) = (
-                SELECT STRING_AGG(CONVERT(NVARCHAR(20), p.C_TICKER), N', ') WITHIN GROUP (ORDER BY p.C_TICKER)
-                FROM T_MASTER_PORTFOLIO_TICKER p
-                WHERE p.C_MASTER_CODE=@p_master_code AND p.C_EFFECTIVE_DATE=@prev AND p.C_TARGET_WEIGHT <> 0
-                  AND NOT EXISTS (SELECT 1 FROM @src s WHERE s.C_TICKER = p.C_TICKER));
-            IF @miss IS NOT NULL
-                BEGIN SET @p_err_code=24;
-                      SET @p_err_msg=CONCAT(N'SÓT MÃ so với rổ ', CONVERT(VARCHAR(10),@prev,23), N': ',
-                            LEFT(@miss,200), N'. Gỡ mã PHẢI ghi weight = 0, KHÔNG được bỏ trống ',
-                            N'(bỏ trống thì không phân biệt được GỠ với SÓT).');
-                      RETURN; END
-        END
+        -- Gỡ mã KHÔNG có trong rổ hiện tại = vô nghĩa (gõ nhầm mã, hoặc gỡ hai lần). Báo thay vì ghi
+        --   tombstone rác — tombstone rác không sai số nhưng làm bẩn HIST và che lỗi nhập liệu.
+        DECLARE @ghost NVARCHAR(MAX) = (
+            SELECT STRING_AGG(CONVERT(NVARCHAR(20), s.C_TICKER), N', ') WITHIN GROUP (ORDER BY s.C_TICKER)
+            FROM @src s
+            WHERE s.C_TARGET_WEIGHT = 0
+              AND NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER t
+                              WHERE t.C_MASTER_CODE=@p_master_code AND t.C_TICKER=s.C_TICKER));
+        IF @ghost IS NOT NULL
+            BEGIN SET @p_err_code=24;
+                  SET @p_err_msg=CONCAT(N'Gỡ mã KHÔNG có trong rổ hiện tại: ', LEFT(@ghost,250));
+                  RETURN; END
 
-        -- ★ MỘT định danh + MỘT mốc cho CẢ batch. KHÔNG lấy từng dòng: mọi truy vấn "rổ tại thời điểm T"
-        --   xếp hạng theo C_BATCH_SEQ, lệch giữa các dòng cùng batch ⇒ rổ bị XẺ, chỉ còn 1 mã.
-        -- ⚠️ Thứ tự dùng SEQUENCE chứ KHÔNG dùng SYSDATETIME(): độ mịn ~1ms nên hai lần nạp liên tiếp rơi
-        --   cùng mili giây là bình thường (smoke bắt được ngay lần chạy đầu) ⇒ "bản ghi mới nhất" hoà nhau,
-        --   thành không xác định. C_CONFIRM_TIME chỉ để người đọc.
-        DECLARE @batch BIGINT = NEXT VALUE FOR SEQ_MASTER_PORTFOLIO_TICKER_HIST_BATCH;
-        DECLARE @now   DATETIME2(3) = SYSDATETIME();
+        -- ★ Σweight SAU KHI ÁP DELTA phải khớp thang chuẩn. Đây là lưới bắt "rổ hụt tỷ trọng" —
+        --   thay cho phép kiểm "sót mã" của mô hình snapshot (delta thì partial là chuyện bình thường).
+        -- ⚠️ Chấp nhận CẢ HAI thang (Σ=1 phân số, Σ=100 phần trăm) vì FACTOR chia /Σw nên cả hai đều ra
+        --    index đúng, và dữ liệu hiện có đang dùng cả hai. Muốn siết về DUY NHẤT Σ=1.0 thì bỏ vế 100.
+        DECLARE @sumw FLOAT = (
+            SELECT ISNULL(SUM(CAST(z.w AS FLOAT)), 0) FROM (
+                SELECT s.C_TARGET_WEIGHT AS w FROM @src s WHERE s.C_TARGET_WEIGHT > 0
+                UNION ALL
+                SELECT t.C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER t
+                WHERE t.C_MASTER_CODE = @p_master_code
+                  AND NOT EXISTS (SELECT 1 FROM @src s2 WHERE s2.C_TICKER = t.C_TICKER)
+            ) z);
+        IF NOT (ABS(@sumw - 1.0) <= 1e-6 OR ABS(@sumw - 100.0) <= 1e-4)
+            BEGIN SET @p_err_code=23;
+                  SET @p_err_msg=CONCAT(N'Σweight SAU KHI ÁP = ',
+                        CONVERT(NVARCHAR(30), CAST(@sumw AS DECIMAL(20,8))),
+                        N' — phải = 1.0 (phân số) hoặc 100 (phần trăm). Rổ hụt/thừa tỷ trọng cho ra index ',
+                        N'SAI IM LẶNG vì FACTOR chuẩn hoá bằng /Σw.');
+                  RETURN; END
 
         BEGIN TRAN;
-        DELETE FROM T_MASTER_PORTFOLIO_TICKER
-        WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@p_effective_date;
-
-        INSERT INTO T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT)
-        SELECT @p_master_code, @p_effective_date, C_TICKER, C_TARGET_WEIGHT FROM @src;
-
+        -- HIST chỉ nhận dòng THỰC SỰ đổi giá trị — giữ đúng ngữ nghĩa "log mã thay đổi tỷ trọng".
+        --   Mã mới (chưa có trong rổ) ⇒ ISNULL(...,-1) <> w ⇒ luôn được ghi.
         INSERT INTO T_MASTER_PORTFOLIO_TICKER_HIST
-            (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT,C_BATCH_SEQ,C_CONFIRM_TIME,C_UPDATER)
-        SELECT @p_master_code, @p_effective_date, C_TICKER, C_TARGET_WEIGHT, @batch, @now, @p_user FROM @src;
+            (C_MASTER_CODE, C_TICKER, C_TARGET_WEIGHT, C_CONFIRM_TIME, C_UPDATER)
+        SELECT @p_master_code, s.C_TICKER, s.C_TARGET_WEIGHT, @ct, @p_user
+        FROM @src s
+        LEFT JOIN T_MASTER_PORTFOLIO_TICKER t
+               ON t.C_MASTER_CODE=@p_master_code AND t.C_TICKER=s.C_TICKER
+        WHERE ISNULL(t.C_TARGET_WEIGHT, -1) <> s.C_TARGET_WEIGHT;
+
+        -- Rổ hiện tại: weight 0 ⇒ GỠ khỏi bảng (dấu vết đã nằm ở HIST).
+        DELETE t FROM T_MASTER_PORTFOLIO_TICKER t
+        INNER JOIN @src s ON s.C_TICKER = t.C_TICKER
+        WHERE t.C_MASTER_CODE=@p_master_code AND s.C_TARGET_WEIGHT = 0;
+
+        MERGE T_MASTER_PORTFOLIO_TICKER AS t
+        USING (SELECT C_TICKER, C_TARGET_WEIGHT FROM @src WHERE C_TARGET_WEIGHT > 0) s
+           ON t.C_MASTER_CODE=@p_master_code AND t.C_TICKER=s.C_TICKER
+        WHEN MATCHED THEN UPDATE SET t.C_TARGET_WEIGHT = s.C_TARGET_WEIGHT
+        WHEN NOT MATCHED THEN INSERT (C_MASTER_CODE, C_TICKER, C_TARGET_WEIGHT)
+                               VALUES (@p_master_code, s.C_TICKER, s.C_TARGET_WEIGHT);
         COMMIT;
     END TRY
     BEGIN CATCH
@@ -714,29 +740,31 @@ GO
     NHAU" — đó chính là class bug đã dính: thiếu C_INCEPTION_DATE ở scope làm master phát sinh sau bị kéo về
     quá khứ. Gom về 1 hàm ⇒ KHÔNG THỂ lệch scope nữa, kể cả giữa 2 stored proc khác nhau.
 
-  Ba tầng lọc, mỗi tầng trả lời một câu khác nhau — đừng gộp nhầm:
-    ① mp.C_STATUS='ACTIVE'          → master còn được tính không (CLOSED = đóng băng lịch sử, không tính lại)
-    ② mp.C_INCEPTION_DATE<=@d       → master ĐÃ RA ĐỜI tại @d chưa (rổ backdate KHÔNG trả lời được câu này)
-    ③ LD: eff_date lớn nhất ≤ @d    → phiên bản RỔ nào có hiệu lực tại @d
+  ★★ ĐỌC TỪ T_MASTER_PORTFOLIO_TICKER_HIST, KHÔNG ĐỌC BẢNG RỔ HIỆN TẠI.
+    T_MASTER_PORTFOLIO_TICKER không có chiều thời gian — nó chỉ biết "rổ ĐANG là gì". Dùng nó để tính index
+    ngày quá khứ = tính lịch sử bằng rổ HÔM NAY: mọi lần rebalance sau đó bị áp ngược về quá khứ, và
+    recompute-từ-inception sẽ cho ra chuỗi index khác hẳn chuỗi đã publish. Lịch sử CHỈ nằm ở HIST.
 
-  ③ dùng RANK() — CHẠM T_MASTER_PORTFOLIO_TICKER ĐÚNG MỘT LẦN. Bản trước tự join lại chính bảng này để lấy
-    MAX(eff_date) rồi lọc ngược ⇒ 2 lần quét cho một câu hỏi. Rổ là bảng VERSIONED (mỗi rebalance insert
-    nguyên một bộ dòng eff_date mới, bộ cũ GIỮ NGUYÊN, không có end-date/cờ is-current) nên chỉ
-    `WHERE eff_date <= @d` là ra CHỒNG TẤT CẢ phiên bản — phải chốt lấy đúng phiên bản mới nhất.
-    ⚠️ PHẢI là RANK (hoặc DENSE_RANK), TUYỆT ĐỐI KHÔNG ROW_NUMBER: một phiên bản rổ có NHIỀU dòng mã;
-       ROW_NUMBER đánh số DÒNG chứ không đánh số PHIÊN BẢN ⇒ giữ đúng 1 mã, vứt phần còn lại, ra index
-       trông vẫn hợp lý mà sai bét. (Đo thật trên rổ 2 phiên bản × 3 mã: WHERE trần = 6 dòng/Σw 200;
-       RANK=1 → 3 dòng/Σw 100 ĐÚNG; ROW_NUMBER=1 → 1 dòng/Σw 20 SAI.)
-    Lọc mp (ACTIVE + inception) đặt BÊN TRONG: nó loại nguyên master chứ không loại lẻ eff_date nên KHÔNG
-    đổi thứ hạng của master còn lại, mà lại giảm số dòng phải xếp hạng.
+  Ba tầng lọc, mỗi tầng trả lời một câu khác nhau — đừng gộp nhầm:
+    ① mp.C_STATUS='ACTIVE'     → master còn được tính không (CLOSED = đóng băng lịch sử, không tính lại)
+    ② mp.C_INCEPTION_DATE<=@d  → master ĐÃ RA ĐỜI tại @d chưa
+    ③ RN=1 theo (master,TICKER) → tỷ trọng MỚI NHẤT của TỪNG MÃ còn hiệu lực đến hết ngày @d
+
+  ③ ⚠️ PARTITION PHẢI CÓ C_TICKER. HIST là log DELTA (chỉ ghi mã ĐỔI tỷ trọng), không phải snapshot cả rổ:
+    một lần duyệt chỉ đẻ ra dòng cho vài mã, các mã khác giữ nguyên giá trị ở dòng cũ CỦA CHÍNH NÓ.
+    Partition chỉ theo master ⇒ chỉ giữ mấy mã đổi ở lần duyệt cuối, VỨT toàn bộ phần còn lại của rổ.
+    Với partition theo (master,ticker) thì ROW_NUMBER là ĐÚNG loại hàm (mỗi mã đúng 1 dòng); và nhờ
+    UNIQUE(master,ticker,confirm_time) nên không bao giờ HOÀ ⇒ kết quả xác định, không phụ thuộc plan.
+
+  CẬN TRÊN MỞ `< @d+1` chứ không phải `<= 23:59:59`: C_CONFIRM_TIME là DATETIME2(3), duyệt lúc
+    23:59:59.500 sẽ bị cận `<= 23:59:59` LOẠI IM LẶNG ⇒ rổ ngày đó thiếu đúng thay đổi cuối cùng.
 
   LEFT JOIN giá (KHÔNG INNER): thiếu giá phải NHÌN THẤY ĐƯỢC (C_CLOSE_PRICE IS NULL) để completeness báo tên
   mã thiếu. INNER JOIN sẽ làm mã thiếu giá BIẾN MẤT — đúng kiểu "bỏ ngầm" mà thiết kế này cấm.
-  Không thể fan-out: UQ(master,eff_date,ticker) + RK=1 chốt 1 eff_date/master ⇒ (master,ticker) duy nhất;
-  PK T_PRICE_DAILY (business_date,ticker) ⇒ join giá 1-1.
+  Không thể fan-out: RN=1 chốt 1 dòng/(master,ticker); PK T_PRICE_DAILY (business_date,ticker) ⇒ giá 1-1.
 
   ★ TRẢ VỀ CẢ DÒNG C_TARGET_WEIGHT = 0 (bản ghi GỠ mã) — CÓ CHỦ ĐÍCH, đừng lọc ở đây.
-    Hàm này trả lời "bản ghi rổ hiệu lực tại @d", còn "thành phần rổ THỰC TẾ" = những dòng weight <> 0.
+    Hàm này trả lời "bản ghi tỷ trọng còn hiệu lực tại @d", còn "thành phần rổ THỰC TẾ" = dòng weight <> 0.
     Người gọi PHẢI tự lọc <> 0 khi ĐÒI GIÁ và khi TÍNH:
       • đòi giá cho mã vừa gỡ (rất có thể đã HUỶ NIÊM YẾT ⇒ không đời nào có giá) sẽ THROW 51011 mỗi ngày
         và vì all-or-nothing, chặn luôn index của MỌI master — vĩnh viễn.
@@ -750,16 +778,17 @@ RETURN
     SELECT x.C_MASTER_CODE, x.C_TICKER, x.C_TARGET_WEIGHT,
            p.C_CLOSE_PRICE, p.C_REF_PRICE
     FROM (
-        SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT,
-               RANK() OVER (PARTITION BY mw.C_MASTER_CODE ORDER BY mw.C_EFFECTIVE_DATE DESC) AS RK
-        FROM T_MASTER_PORTFOLIO_TICKER mw
-        INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = mw.C_MASTER_CODE
+        SELECT h.C_MASTER_CODE, h.C_TICKER, h.C_TARGET_WEIGHT,
+               ROW_NUMBER() OVER (PARTITION BY h.C_MASTER_CODE, h.C_TICKER
+                                  ORDER BY h.C_CONFIRM_TIME DESC) AS RN
+        FROM T_MASTER_PORTFOLIO_TICKER_HIST h
+        INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = h.C_MASTER_CODE
                                         AND mp.C_STATUS = 'ACTIVE'
                                         AND mp.C_INCEPTION_DATE <= @d
-        WHERE mw.C_EFFECTIVE_DATE <= @d
+        WHERE h.C_CONFIRM_TIME < DATEADD(DAY, 1, CAST(@d AS DATE))
     ) x
     LEFT JOIN T_PRICE_DAILY p ON p.C_TICKER = x.C_TICKER AND p.C_BUSINESS_DATE = @d
-    WHERE x.RK = 1;
+    WHERE x.RN = 1;
 GO
 
 /*===========================================================================

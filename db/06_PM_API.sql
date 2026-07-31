@@ -316,10 +316,13 @@ BEGIN
     LEFT JOIN T_BENCHMARK_DAILY    bm  ON bm.C_BENCHMARK_CODE=@bench AND bm.C_BUSINESS_DATE=s.d
     ORDER BY s.d;
 
-    -- RS2 mốc rebalance trong kỳ
-    SELECT DISTINCT C_EFFECTIVE_DATE
-    FROM T_MASTER_PORTFOLIO_TICKER
-    WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE BETWEEN @base AND @end
+    -- RS2 mốc rebalance trong kỳ — lấy từ HIST (log thay đổi tỷ trọng), KHÔNG từ bảng rổ hiện tại:
+    --   bảng rổ hiện tại không còn chiều thời gian, nó không biết đã rebalance ngày nào.
+    SELECT DISTINCT CAST(C_CONFIRM_TIME AS DATE) AS C_EFFECTIVE_DATE
+    FROM T_MASTER_PORTFOLIO_TICKER_HIST
+    WHERE C_MASTER_CODE=@p_master_code
+      AND C_CONFIRM_TIME >= CAST(@base AS DATETIME2(3))
+      AND C_CONFIRM_TIME <  DATEADD(DAY, 1, CAST(@end AS DATE))   -- cận trên MỞ: duyệt lúc 23:59:59.5 vẫn tính
     ORDER BY C_EFFECTIVE_DATE;
     END TRY
     BEGIN CATCH
@@ -345,30 +348,36 @@ BEGIN
     SET @p_err_code = 0; SET @p_err_msg = NULL;
     BEGIN TRY
 
-    -- DATE GUARD (err=5): master phải có rebalance/holdings ≤ @p_date (chặn ngày trước inception / master chưa có data).
-    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE<=@p_date)
+    -- DATE GUARD (err=5): master phải có thay đổi tỷ trọng/holdings ≤ @p_date (chặn ngày trước inception).
+    --   ⚠️ Hỏi HIST, KHÔNG hỏi bảng rổ hiện tại: bảng đó không có chiều thời gian nên luôn "có dữ liệu",
+    --      guard sẽ mất tác dụng và mọi ngày quá khứ đều lọt.
+    IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                   WHERE C_MASTER_CODE=@p_master_code AND C_CONFIRM_TIME < DATEADD(DAY,1,CAST(@p_date AS DATE)))
        AND NOT EXISTS (SELECT 1 FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@p_date)
     BEGIN SET @p_err_code=5;
         SET @p_err_msg = CONCAT(N'Không có dữ liệu rebalance/holdings cho master ', @p_master_code, N' ≤ ',
             CONVERT(VARCHAR(10),@p_date,23), N' (ngày trước inception / master không tồn tại).');
         RAISERROR(@p_err_msg, 16, 1); END
 
-    -- effective_date hiệu lực = lớn nhất ≤ @p_date ; kỳ trước = lớn nhất < eff
+    -- Mốc duyệt hiệu lực = ngày duyệt lớn nhất ≤ @p_date; kỳ trước = ngày duyệt lớn nhất < eff.
     DECLARE @eff DATE, @prevEff DATE;
-    SELECT @eff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE <= @p_date;
-    SELECT @prevEff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE < @eff;
+    SELECT @eff = MAX(CAST(C_CONFIRM_TIME AS DATE)) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+     WHERE C_MASTER_CODE=@p_master_code AND C_CONFIRM_TIME < DATEADD(DAY,1,CAST(@p_date AS DATE));
+    SELECT @prevEff = MAX(CAST(C_CONFIRM_TIME AS DATE)) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+     WHERE C_MASTER_CODE=@p_master_code AND CAST(C_CONFIRM_TIME AS DATE) < @eff;
 
-    -- RS1: weight cũ → mới (full outer: mã ra/vào danh mục)
+    -- RS1: weight cũ → mới (full outer: mã ra/vào danh mục).
+    --   ⚠️ So RỔ ĐẦY ĐỦ as-of hai mốc, KHÔNG so hai tập delta: HIST chỉ ghi mã ĐỔI, nên lấy trực tiếp
+    --      dòng của từng mốc sẽ bỏ sót mọi mã giữ nguyên tỷ trọng ⇒ RS1 khuyết mã, delta nhìn như mã mới.
+    --   Bỏ dòng weight 0 ở cả hai phía: mã đã gỡ không thuộc rổ (nhưng vẫn hiện ở phía "cũ" nếu lúc đó còn).
     SELECT  COALESCE(n.C_TICKER, o.C_TICKER) AS C_TICKER,
             o.C_TARGET_WEIGHT AS C_WEIGHT_OLD,
             n.C_TARGET_WEIGHT AS C_WEIGHT_NEW,
             COALESCE(n.C_TARGET_WEIGHT,0) - COALESCE(o.C_TARGET_WEIGHT,0) AS C_WEIGHT_DELTA
-    FROM        (SELECT C_TICKER,C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
-                 WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@eff) n
-    FULL OUTER JOIN (SELECT C_TICKER,C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
-                 WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@prevEff) o
+    FROM        (SELECT C_TICKER,C_TARGET_WEIGHT FROM dbo.UDF_INDEX_BASKET_ASOF(@eff)
+                 WHERE C_MASTER_CODE=@p_master_code AND C_TARGET_WEIGHT <> 0) n
+    FULL OUTER JOIN (SELECT C_TICKER,C_TARGET_WEIGHT FROM dbo.UDF_INDEX_BASKET_ASOF(@prevEff)
+                 WHERE C_MASTER_CODE=@p_master_code AND C_TARGET_WEIGHT <> 0) o
       ON o.C_TICKER=n.C_TICKER
     ORDER BY ABS(COALESCE(n.C_TARGET_WEIGHT,0)-COALESCE(o.C_TARGET_WEIGHT,0)) DESC;
 
@@ -740,10 +749,13 @@ BEGIN
     SELECT @drift=C_DRIFT_THRESHOLD, @symW=C_SYMBOL_WEIGHT_ALERT, @indW=C_INDUSTRY_WEIGHT_ALERT
     FROM dbo.UDF_PM_CONFIG(@p_master_code);
 
-    -- target weight hiệu lực (eff mới nhất ≤ @p_date)
+    -- target weight hiệu lực AS-OF @p_date — dựng lại từ HIST qua UDF_INDEX_BASKET_ASOF.
+    --   ⚠️ KHÔNG đọc T_MASTER_PORTFOLIO_TICKER: bảng đó là rổ HIỆN TẠI, không có chiều thời gian ⇒ so
+    --      holdings ngày quá khứ với target HÔM NAY sẽ ra drift ảo ở mọi mã đã rebalance sau ngày đó.
+    --   @eff = ngày rebalance gần nhất ≤ @p_date (để RS1 báo "target đang so là của mốc nào").
     DECLARE @eff DATE;
-    SELECT @eff = MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER
-     WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE <= @p_date;
+    SELECT @eff = MAX(CAST(C_CONFIRM_TIME AS DATE)) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+     WHERE C_MASTER_CODE=@p_master_code AND C_CONFIRM_TIME < DATEADD(DAY, 1, CAST(@p_date AS DATE));
 
     -- per-mã: actual vs target + drift + cờ (FULL OUTER: mã chỉ có ở 1 phía vẫn ra)
     SELECT COALESCE(a.C_TICKER, t.C_TICKER) AS C_TICKER,
@@ -755,8 +767,8 @@ BEGIN
     INTO #pt
     FROM       (SELECT C_TICKER, C_WEIGHT FROM T_MASTER_HOLDING_BALANCE
                 WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE=@p_date) a
-    FULL OUTER JOIN (SELECT C_TICKER, C_TARGET_WEIGHT FROM T_MASTER_PORTFOLIO_TICKER
-                WHERE C_MASTER_CODE=@p_master_code AND C_EFFECTIVE_DATE=@eff) t
+    FULL OUTER JOIN (SELECT C_TICKER, C_TARGET_WEIGHT FROM dbo.UDF_INDEX_BASKET_ASOF(@p_date)
+                WHERE C_MASTER_CODE=@p_master_code AND C_TARGET_WEIGHT <> 0) t   -- <>0: bỏ bản ghi GỠ mã
       ON t.C_TICKER = a.C_TICKER;
 
     -- per-ngành: Σ tỷ trọng thực tế theo ngành (mã chưa map → 'UNKNOWN')

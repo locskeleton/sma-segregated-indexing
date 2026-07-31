@@ -1,4 +1,4 @@
-/*==============================================================================
+﻿/*==============================================================================
   SDI SMOKE — thin-layer (chạy sau 01+02+05+06).
   Asset gửi per-SI per-ngày: AUM + daily_return (TWR) → SDI ingest (SP_INGEST_ASSET_NAV) → LƯU (KHÔNG derive)
   → agg master (AUM + AUM-weighted return) → reconcile. FO chỉ gửi holdings. Cashflow SDI vẫn nhập (đối soát).
@@ -12,11 +12,14 @@ DELETE FROM T_MASTER_BALANCE; DELETE FROM T_MASTER_INDEX_DAILY; DELETE FROM T_MA
 DELETE FROM T_EOD_RUN; DELETE FROM T_MASTER_CURRENT;
 DELETE FROM T_SI_PORTFOLIO_HOLDING; DELETE FROM T_SI_CURRENT; DELETE FROM T_SI_HOLDING_HIST;
 DELETE FROM T_SI_CASHFLOW_EVENT; DELETE FROM T_EOD_RECON_BREAK; DELETE FROM T_EOD_PIPELINE;
-DELETE FROM T_PRICE_DAILY; DELETE FROM T_MASTER_PORTFOLIO_TICKER; DELETE FROM T_SI_PORTFOLIO; DELETE FROM T_MASTER_PORTFOLIO;
+DELETE FROM T_PRICE_DAILY; DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST; DELETE FROM T_MASTER_PORTFOLIO_TICKER; DELETE FROM T_SI_PORTFOLIO; DELETE FROM T_MASTER_PORTFOLIO;
 
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES ('SDI01',N'Demo','ACTIVE','2026-01-02','VNINDEX');
 INSERT T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS) VALUES ('SUB001','KH001','SDI01','2026-01-02','ACTIVE');
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES ('SDI01','2026-01-02','AAA',0.6),('SDI01','2026-01-02','BBB',0.4);
+-- Rổ = HIST (nguồn as-of, J12 đọc từ đây) + bảng rổ hiện tại. Mốc duyệt TRƯỚC ngày tính index đầu tiên.
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('SDI01','AAA',0.6,'2026-01-01 09:00:00'),('SDI01','BBB',0.4,'2026-01-01 09:00:00');
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES ('SDI01','AAA',0.6),('SDI01','BBB',0.4);
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
  ('AAA','2026-01-02',100,100),('BBB','2026-01-02',50,50),
  ('AAA','2026-01-05',100,110),('BBB','2026-01-05',50,48),
@@ -143,92 +146,102 @@ PRINT '';
 PRINT '======== INDEX completeness HARD-FAIL + weight guard (engine giữ nguyên) ========';
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES ('MMISS',N'MissPx','ACTIVE','2026-03-01','VNINDEX');
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MMISS','2026-03-01','PXM1',50),('MMISS','2026-03-01','PXM2',50);
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('MMISS','PXM1',50,'2026-03-01 09:00:00'),('MMISS','PXM2',50,'2026-03-01 09:00:00');
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('PXM1','2026-03-02',100,110);  -- thiếu PXM2
 DECLARE @ecMM INT=0;
 BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-03-02'; END TRY BEGIN CATCH SET @ecMM=ERROR_NUMBER(); END CATCH
 IF @ecMM=51011 AND NOT EXISTS(SELECT 1 FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MMISS') PRINT '  OK completeness HARD-FAIL: THROW 51011, không ghi';
 ELSE PRINT CONCAT('  !!! completeness: ec=',@ecMM);
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES ('MZW',N'ZeroW','ACTIVE','2026-03-01','VNINDEX');
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MZW','2026-03-01','ZWA',0),('MZW','2026-03-01','ZWB',0);
+-- MZW: mọi mã đã bị GỠ (weight 0 trong HIST) ⇒ rổ as-of rỗng ⇒ Σ=0 ⇒ phải THROW 51012, không im lặng
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('MZW','ZWA',0,'2026-03-01 09:00:00'),('MZW','ZWB',0,'2026-03-01 09:00:00');
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('ZWA','2026-03-03',100,100),('ZWB','2026-03-03',50,50),('PXM1','2026-03-03',100,110),('PXM2','2026-03-03',100,100);  -- MMISS đủ giá @03-03 để weight-guard fire (không vướng completeness)
 DECLARE @ecZW INT=0;
 BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-03-03'; END TRY BEGIN CATCH SET @ecZW=ERROR_NUMBER(); END CATCH
 IF @ecZW=51012 PRINT '  OK weight Σ=0 → THROW 51012'; ELSE PRINT CONCAT('  !!! weight guard: ec=',@ecZW);
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE IN ('MMISS','MZW');
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE IN ('MMISS','MZW');
 DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE IN ('MMISS','MZW');
 DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('PXM1','PXM2','ZWA','ZWB');
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
 
 PRINT '';
-PRINT '======== RỔ: cổng nạp SP_INGEST_MASTER_PORTFOLIO_TICKER + gỡ mã bằng weight 0 ========';
+PRINT '======== RỔ: cổng nạp SP_INGEST_MASTER_PORTFOLIO_TICKER (delta) + gỡ mã bằng weight 0 ========';
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE)
 VALUES ('MGATE',N'Gate','ACTIVE','2026-04-01','VNINDEX');
 DECLARE @ecG INT, @emG NVARCHAR(400);
 
--- (a) nạp rổ đầu: GA 0.6 + GB 0.4
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-01',
-     N'[{"ticker":"GA","weight":0.6},{"ticker":"GB","weight":0.4}]','ops',@ecG OUTPUT,@emG OUTPUT;
+-- (a) nạp rổ đầu (rổ trống → delta = cả rổ): GA 0.6 + GB 0.4
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GA","weight":0.6},{"ticker":"GB","weight":0.4}]','2026-04-01 09:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
 IF @ecG=0 AND (SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE')=2
    PRINT '  OK nạp rổ đầu qua cổng (2 mã)'; ELSE PRINT CONCAT('  !!! nạp rổ đầu: ec=',@ecG,' ',ISNULL(@emG,''));
 
--- (b) ★ GHI SÓT MÃ (chỉ đẩy GA, quên GB) → PHẢI bị chặn. Đây là ca sinh ra index 1200 thay vì 1040.
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
-     N'[{"ticker":"GA","weight":1.0}]','ops',@ecG OUTPUT,@emG OUTPUT;
-IF @ecG=24 AND NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE' AND C_EFFECTIVE_DATE='2026-04-02')
-   PRINT '  OK GHI SÓT MÃ → err=24, KHÔNG ghi dòng nào'; ELSE PRINT CONCAT('  !!! sót mã phải bị chặn: ec=',@ecG,' ',ISNULL(@emG,''));
+-- (b) ★ ĐỔI TỶ TRỌNG LÀM HỤT Σ (GA 0.6→1.0 mà quên hạ GB) → Σ=1.4 → chặn.
+--     Đây là ca sinh ra index sai im lặng ở mô hình cũ.
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GA","weight":1.0}]','2026-04-02 09:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=23 AND NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                           WHERE C_MASTER_CODE='MGATE' AND C_CONFIRM_TIME='2026-04-02 09:00:00')
+   PRINT '  OK delta làm Σ=1.4 → err=23, KHÔNG ghi dòng nào';
+ELSE PRINT CONCAT('  !!! Σ sau khi áp phải bị chặn: ec=',@ecG,' ',ISNULL(@emG,''));
 
--- (c) Σweight sai thang (0.6+0.3=0.9) → chặn
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
-     N'[{"ticker":"GA","weight":0.6},{"ticker":"GB","weight":0.3}]','ops',@ecG OUTPUT,@emG OUTPUT;
-IF @ecG=23 PRINT '  OK Σweight=0.9 → err=23'; ELSE PRINT CONCAT('  !!! Σweight guard: ec=',@ecG);
-
--- (d) mã TRÙNG trong batch → chặn
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
-     N'[{"ticker":"GA","weight":0.5},{"ticker":"GA","weight":0.5}]','ops',@ecG OUTPUT,@emG OUTPUT;
+-- (c) mã TRÙNG trong batch → chặn
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GA","weight":0.5},{"ticker":"GA","weight":0.5}]','2026-04-02 09:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
 IF @ecG=22 PRINT '  OK mã trùng trong batch → err=22'; ELSE PRINT CONCAT('  !!! dup guard: ec=',@ecG);
 
--- (e) ★ GỠ GB ĐÚNG CÁCH: weight 0. GB huỷ niêm yết (KHÔNG có giá) mà index vẫn phải tính được.
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-02',
-     N'[{"ticker":"GA","weight":1.0},{"ticker":"GB","weight":0}]','ops',@ecG OUTPUT,@emG OUTPUT;
+-- (d) gỡ mã KHÔNG có trong rổ → chặn (gõ nhầm mã / gỡ hai lần)
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GZZ","weight":0}]','2026-04-02 09:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=24 PRINT '  OK gỡ mã không có trong rổ → err=24'; ELSE PRINT CONCAT('  !!! ghost guard: ec=',@ecG);
+
+-- (e) confirm_time KHÔNG mới hơn thay đổi gần nhất → chặn (ghi lùi làm rổ hiện tại lệch rổ as-of)
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GA","weight":1.0},{"ticker":"GB","weight":0}]','2026-04-01 08:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
+IF @ecG=25 PRINT '  OK confirm_time ghi lùi → err=25'; ELSE PRINT CONCAT('  !!! time guard: ec=',@ecG);
+
+-- (f) ★ GỠ GB ĐÚNG CÁCH: weight 0 kèm nâng GA lên 1.0 (Σ vẫn = 1).
+--     GB huỷ niêm yết (KHÔNG có giá) mà index vẫn phải tính được.
+EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE',
+     N'[{"ticker":"GA","weight":1.0},{"ticker":"GB","weight":0}]','2026-04-02 09:00:00','ops',@ecG OUTPUT,@emG OUTPUT;
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('GA','2026-04-03',100,110);
 DECLARE @ecGi INT=0, @nGi BIGINT;
 BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-04-03', @nGi OUTPUT; END TRY BEGIN CATCH SET @ecGi=ERROR_NUMBER(); END CATCH
 DECLARE @vG DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MGATE' AND C_BUSINESS_DATE='2026-04-03');
-IF @ecG=0 AND @ecGi=0 AND @vG=1100.00
-   PRINT '  OK gỡ mã bằng weight 0: GB không bị đòi giá, index = 1100.00 (chỉ theo GA)';
-ELSE PRINT CONCAT('  !!! gỡ bằng weight 0: ec_ingest=',@ecG,' ec_index=',@ecGi,' index=',ISNULL(CONVERT(VARCHAR(20),@vG),'(null)'));
+DECLARE @nCur INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MGATE');
+IF @ecG=0 AND @ecGi=0 AND @vG=1100.00 AND @nCur=1
+   PRINT '  OK gỡ mã bằng weight 0: GB rời rổ hiện tại, KHÔNG bị đòi giá, index = 1100.00 (chỉ theo GA)';
+ELSE PRINT CONCAT('  !!! gỡ bằng weight 0: ec_ingest=',@ecG,' ec_index=',@ecGi,' index=',ISNULL(CONVERT(VARCHAR(20),@vG),'(null)'),' #ro=',@nCur);
 
--- (f) version SAU KHI gỡ không cần mang lại GB (rổ không phình) — chỉ GA là hợp lệ
-EXEC SP_INGEST_MASTER_PORTFOLIO_TICKER 'MGATE','2026-04-06',
-     N'[{"ticker":"GA","weight":1.0}]','ops',@ecG OUTPUT,@emG OUTPUT;
-IF @ecG=0 PRINT '  OK version sau khi gỡ KHÔNG phải mang lại mã weight 0 (rổ không phình)';
-ELSE PRINT CONCAT('  !!! version sau khi gỡ: ec=',@ecG,' ',ISNULL(@emG,''));
+-- (g) ★ RỔ AS-OF TRƯỚC KHI GỠ vẫn phải thấy GB — đây là toàn bộ lý do HIST tồn tại
+DECLARE @bTruoc INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-04-01') WHERE C_MASTER_CODE='MGATE' AND C_TARGET_WEIGHT<>0);
+DECLARE @bSau   INT=(SELECT COUNT(*) FROM dbo.UDF_INDEX_BASKET_ASOF('2026-04-03') WHERE C_MASTER_CODE='MGATE' AND C_TARGET_WEIGHT<>0);
+IF @bTruoc=2 AND @bSau=1
+   PRINT '  OK rổ as-of: 01/04 = 2 mã (trước khi gỡ), 03/04 = 1 mã — lịch sử KHÔNG bị rổ hiện tại đè lên';
+ELSE PRINT CONCAT('  !!! rổ as-of sai: 01/04=',@bTruoc,' 03/04=',@bSau);
 
--- (g) gỡ SẠCH mã (toàn weight 0) → Σ=0 → THROW 51012, không sinh index câm
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT)
-VALUES ('MGATE','2026-04-07','GA',0);   -- ghi thẳng: cổng chặn Σ=0 nên phải bypass để test guard J12
+-- (h) gỡ SẠCH mã (mọi mã weight 0 trong HIST) → Σ=0 → THROW 51012, không sinh index câm
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME)
+VALUES ('MGATE','GA',0,'2026-04-07 09:00:00');   -- ghi thẳng: cổng chặn Σ=0 nên phải bypass để test guard J12
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES ('GA','2026-04-08',110,110);
 DECLARE @ecGz INT=0;
 BEGIN TRY EXEC SP_EOD_SI_INDEX '2026-04-08', @nGi OUTPUT; END TRY BEGIN CATCH SET @ecGz=ERROR_NUMBER(); END CATCH
 IF @ecGz=51012 PRINT '  OK rổ gỡ SẠCH mã (Σ=0) → THROW 51012, KHÔNG im lặng bỏ qua';
 ELSE PRINT CONCAT('  !!! rổ gỡ sạch phải THROW 51012: ec=',@ecGz);
 
--- (h) HIST có vết: 3 lần nạp THÀNH CÔNG (a,e,f) — 3 batch riêng, mỗi batch 1 mốc DUY NHẤT cho mọi dòng.
---     ⚠️ Đếm theo C_BATCH_SEQ, KHÔNG theo C_CONFIRM_TIME: 2 lần nạp liên tiếp có thể cùng mili giây
---        (chính assertion này bắt được lỗi đó lần chạy đầu → phải thêm SEQUENCE).
-DECLARE @hLan INT=(SELECT COUNT(DISTINCT C_BATCH_SEQ) FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE');
-DECLARE @hXe  INT=(SELECT COUNT(*) FROM (SELECT C_BATCH_SEQ FROM T_MASTER_PORTFOLIO_TICKER_HIST
-                                         WHERE C_MASTER_CODE='MGATE'
-                                         GROUP BY C_BATCH_SEQ
-                                         HAVING COUNT(DISTINCT C_CONFIRM_TIME) > 1
-                                             OR COUNT(DISTINCT C_EFFECTIVE_DATE) > 1) q);
-DECLARE @hFail INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER_HIST
-                    WHERE C_MASTER_CODE='MGATE' AND C_EFFECTIVE_DATE='2026-04-02' AND C_TICKER='GB' AND C_TARGET_WEIGHT=0);
-IF @hLan=3 AND @hXe=0 AND @hFail=1
-   PRINT CONCAT('  OK HIST: ',@hLan,' batch (đúng số lần nạp THÀNH CÔNG), không batch nào bị xẻ, có vết gỡ GB weight 0');
-ELSE PRINT CONCAT('  !!! HIST: so_batch=',@hLan,' batch_bi_xe=',@hXe,' vet_go_GB=',@hFail);
+-- (i) HIST là log DELTA: chỉ ghi mã THỰC SỰ đổi. Lần (f) chỉ đổi GA và GB ⇒ đúng 2 dòng ở mốc đó.
+DECLARE @hF INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                 WHERE C_MASTER_CODE='MGATE' AND C_CONFIRM_TIME='2026-04-02 09:00:00');
+DECLARE @hGo INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER_HIST
+                  WHERE C_MASTER_CODE='MGATE' AND C_TICKER='GB' AND C_TARGET_WEIGHT=0);
+DECLARE @hTong INT=(SELECT COUNT(*) FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE');
+IF @hF=2 AND @hGo=1 AND @hTong=5
+   PRINT '  OK HIST delta: mốc gỡ có đúng 2 dòng (GA đổi + GB gỡ), tổng 5 dòng, có vết gỡ GB';
+ELSE PRINT CONCAT('  !!! HIST delta: dong_moc_go=',@hF,' vet_go_GB=',@hGo,' tong=',@hTong);
 
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MGATE';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MGATE';
@@ -247,9 +260,11 @@ UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES
  ('MOLD',N'OldMaster','ACTIVE','2026-03-01','VNINDEX'),
  ('MNEW',N'NewMaster','ACTIVE','2026-06-01','VNINDEX');   -- ★ ra đời SAU dải recompute
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES
- ('MOLD','2026-03-01','OLDA',1.0),
- ('MNEW','2026-03-01','NEWX',1.0);                        -- ★ rổ BACKDATE về trước inception
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('MOLD','OLDA',1.0,'2026-03-01 09:00:00'),
+ ('MNEW','NEWX',1.0,'2026-03-01 09:00:00');               -- ★ duyệt tỷ trọng TRƯỚC ngày master ra đời (backdate)
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES
+ ('MOLD','OLDA',1.0),('MNEW','NEWX',1.0);
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
  ('OLDA','2026-03-02',100,110),('OLDA','2026-03-03',110,110);
  -- NEWX CỐ Ý không có giá tháng 3 (niêm yết sau)
@@ -277,6 +292,7 @@ IF @ecIN=0 AND @vNew=1050.00 PRINT '  OK từ ngày inception trở đi master M
 ELSE PRINT CONCAT('  !!! master mới không vào scope sau inception: err=',@ecIN,' MNEW@06-01=',
                   ISNULL(CONVERT(VARCHAR(20),@vNew),'(null)'),' ',ISNULL(@emIN,''));
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE IN ('MOLD','MNEW');
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE IN ('MOLD','MNEW');
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE IN ('MOLD','MNEW');
 DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE IN ('MOLD','MNEW');
 DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('OLDA','NEWX');
@@ -367,7 +383,8 @@ DELETE FROM T_PRICE_DAILY WHERE C_TICKER='HX2';
 --     Không lịch: nhân thêm 1.1 hai lần → 1464.10 (sai +21%). Có lịch: dừng ở 1210.
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES ('MHOL',N'HolidayGuard','ACTIVE','2026-07-01','VNINDEX');
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MHOL','2026-07-01','HAA',1.0);
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES ('MHOL','HAA',1.0,'2026-07-01 08:00:00');
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES ('MHOL','HAA',1.0);
 INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
  ('HAA','2026-07-01',100,100),('HAA','2026-07-02',100,110),('HAA','2026-07-03',110,121),
  ('HAA','2026-07-04',110,121),   -- T7 RÁC
@@ -408,6 +425,7 @@ IF @ecRdy=13 AND @ecRix=13 AND @ecH=13 AND NOT EXISTS (SELECT 1 FROM T_EOD_PIPEL
 ELSE PRINT CONCAT('  !!! EOD ngày nghỉ không chặn: ready=',@ecRdy,' run_index=',@ecRix,' run=',@ecH);
 
 DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MHOL';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='MHOL';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='MHOL';
 DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE='MHOL';
 DELETE FROM T_PRICE_DAILY WHERE C_TICKER='HAA';

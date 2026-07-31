@@ -1,4 +1,4 @@
-# SDI — Engine core (SQL Server)
+﻿# SDI — Engine core (SQL Server)
 
 Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `EXEC` proc.
 
@@ -115,16 +115,44 @@ EXEC SP_EOD_SI_AGG    '2026-01-06';   -- master agg (AUM/unit price)
 EXEC SP_EOD_TE_ACCUM  '2026-01-06';   -- lũy kế active return (TE prefix-sum)
 ```
 - **Index master** sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception) — GIỮ (index do SDI tính từ giá×weight, không phụ thuộc Asset NAV).
-  - **Nạp rổ CHỈ qua `SP_INGEST_MASTER_PORTFOLIO_TICKER`** (thêm 2026-08-01). Một lần nạp = **TOÀN BỘ rổ** tại `@p_effective_date`, không phải phần thay đổi. **Gỡ mã = ghi `weight = 0`**, không được bỏ trống. Ghi thẳng vào bảng là bỏ qua cổng: rổ sót mã vẫn cho ra index "hợp lệ" mà **sai im lặng** (đo thật: rổ `RA 0.6 + RB 0.4`, sót `RB` ⇒ index **1200.00** thay vì 1040.00, `err=0`) — vì `FACTOR` chuẩn hoá bằng `/Σw` nên mất mã không làm vỡ thang, chỉ lặng lẽ đổi sang theo dõi rổ khác.
-    - `err`: `20` tham số/JSON · `21` master không tồn tại/CLOSED · `22` dòng sai (rỗng/trùng/âm) · `23` Σweight sai thang · `24` **SÓT MÃ** so với version trước.
-    - Vì sao "gỡ = weight 0" mới chặn được sót mã: với cơ chế **vắng mặt**, *"gỡ mã"* và *"sót mã"* trông **y hệt nhau**, không phân biệt nổi. Có dòng 0 thì hợp đồng thành *"version mới phải liệt kê mọi mã weight>0 của version liền trước"* ⇒ kiểm được.
-    - Dòng `0` chỉ cần mang **một lần** ở version ngay sau khi gỡ ⇒ rổ không phình.
+  - **Mô hình lưu rổ (đúng thực tế dự án):**
+    - `T_MASTER_PORTFOLIO_TICKER` = **rổ HIỆN TẠI**, 1 dòng/(master,ticker), **KHÔNG có chiều thời gian**. Chỉ trả lời *"rổ đang là gì"*. Serve layer.
+    - `T_MASTER_PORTFOLIO_TICKER_HIST` = **log DELTA**: mỗi dòng = một lần **đổi tỷ trọng của một mã** tại một `C_CONFIRM_TIME` (thời điểm duyệt). Mã không đổi thì **không có dòng mới**.
+    - ⇒ **Mọi phép tính as-of PHẢI dựng lại rổ từ HIST.** Đọc bảng rổ hiện tại rồi coi là rổ ngày quá khứ = tính lịch sử bằng rổ **hôm nay**.
+  - **Nạp rổ CHỈ qua `SP_INGEST_MASTER_PORTFOLIO_TICKER`** — nhận **PHẦN THAY ĐỔI**, rồi trong **cùng một giao dịch** append HIST + cập nhật rổ hiện tại (một đường ghi ⇒ hai nơi không lệch).
+    - `err`: `20` tham số/JSON · `21` master không tồn tại/CLOSED · `22` dòng sai (rỗng/trùng/âm) · `23` **Σweight SAU KHI ÁP** sai thang · `24` gỡ mã không có trong rổ · `25` `confirm_time` tương lai / không mới hơn thay đổi gần nhất.
+    - Ghi thẳng vào bảng là bỏ qua cổng: (a) HIST không có vết ⇒ rổ as-of quá khứ **sai vĩnh viễn**; (b) Σweight không ai kiểm ⇒ rổ hụt tỷ trọng vẫn cho ra index "hợp lệ" mà **sai im lặng** — đo thật: rổ `RA 0.6 + RB 0.4` mà mất `RB` ⇒ index **1200.00** thay vì 1040.00, `err=0`, vì `FACTOR` chuẩn hoá bằng `/Σw` nên thiếu mã **không làm vỡ thang**.
+  - **GỠ MÃ = ghi `weight = 0` vào HIST — BẮT BUỘC**, không được bỏ trống. HIST là log delta: gỡ mà không ghi gì thì dòng cuối (weight dương) của mã đó **sống mãi** ⇒ mọi lần dựng rổ quá khứ đều thừa mã đã gỡ. Bảng rổ hiện tại thì **xoá** dòng đó.
     - J12 lọc `weight <> 0` khi **đòi giá** và khi **tính** — nếu không, mã vừa gỡ (thường đã huỷ niêm yết) bị completeness đòi giá ⇒ `THROW 51011` chặn index **mọi master**, vĩnh viễn.
-  - **`T_MASTER_PORTFOLIO_TICKER_HIST`** — vết audit mọi lần nạp (version đã tính index **vẫn được sửa tại chỗ**, nên bảng chính chỉ giữ trạng thái hiện tại). ⚠️ Xếp hạng "rổ tại thời điểm T" phải dùng **`C_BATCH_SEQ`**, không dùng `C_CONFIRM_TIME`: `SYSDATETIME()` mịn ~1ms nên hai lần nạp liên tiếp trùng mốc là bình thường (smoke bắt được ngay lần chạy đầu). Và phải **`RANK`/`DENSE_RANK`**, không `ROW_NUMBER` — một batch có nhiều dòng cùng `C_BATCH_SEQ`, `ROW_NUMBER` đánh số *dòng* nên chỉ giữ 1 mã.
-  - **Scope as-of** (sửa 2026-07-31): định nghĩa DUY NHẤT ở iTVF **`UDF_INDEX_BASKET_ASOF(@d)`** — `C_STATUS='ACTIVE'` + `C_INCEPTION_DATE <= @d` + rổ hiệu lực (`MAX(eff_date) ≤ @d`), `LEFT JOIN` giá cùng ngày. `SP_EOD_SI_INDEX` đổ nó vào `@basket` **một lần** rồi validate *và* tính trên chính bộ đó; `SP_EOD_RUN_INDEX` gate gọi thẳng iTVF ⇒ **không thể lệch scope**. Trước đó vị từ bị chép 4 lần — đúng class bug đã dính. `C_INCEPTION_DATE` **NOT NULL** — nó là **vị từ tính toán**, không phải metadata hiển thị. Thiếu nó thì rổ **backdate** kéo master mới ngược về ngày chưa tồn tại: mã trong rổ niêm yết sau ⇒ completeness (**all-or-nothing xuyên master**) `THROW 51011` mỗi ngày ⇒ **chặn luôn việc tính lại của mọi master hợp lệ khác**.
+    - Nhưng iTVF **vẫn trả về** dòng 0: lọc ở đó thì master gỡ sạch mã không còn dòng nào, guard `Σ=0` (51012) không fire ⇒ im lặng không có index.
+  - **Đọc as-of PHẢI `PARTITION BY (master, TICKER) ORDER BY C_CONFIRM_TIME DESC`.** Partition chỉ theo master sẽ chỉ giữ mấy mã đổi ở lần duyệt cuối và **vứt toàn bộ phần còn lại của rổ**. Với partition có ticker thì `ROW_NUMBER` là đúng loại hàm, và `UNIQUE(master,ticker,confirm_time)` khử hẳn khả năng hoà ⇒ kết quả xác định.
+  - **Cận trên MỞ** `C_CONFIRM_TIME < @d+1`, **không** `<= 23:59:59`: `DATETIME2(3)` nên duyệt lúc `23:59:59.500` sẽ bị loại im lặng.
+  - **So hai mốc rebalance phải so RỔ ĐẦY ĐỦ as-of**, không so hai tập delta — mã giữ nguyên tỷ trọng sẽ biến mất khỏi kết quả (`SP_GET_MASTER_REBALANCE_DETAIL` RS1).
+  - **Scope as-of** (2026-07-31): định nghĩa DUY NHẤT ở iTVF **`UDF_INDEX_BASKET_ASOF(@d)`** — `C_STATUS='ACTIVE'` + `C_INCEPTION_DATE <= @d` + rổ dựng từ HIST + `LEFT JOIN` giá cùng ngày. `SP_EOD_SI_INDEX` đổ vào `@basket` **một lần** rồi validate *và* tính trên chính bộ đó; `SP_EOD_RUN_INDEX` gate gọi thẳng iTVF ⇒ **không thể lệch scope**. `C_INCEPTION_DATE` **NOT NULL** — nó là **vị từ tính toán**, không phải metadata: thiếu nó thì rổ duyệt **backdate** kéo master mới ngược về ngày chưa tồn tại, mã niêm yết sau ⇒ completeness (**all-or-nothing xuyên master**) `THROW 51011` mỗi ngày ⇒ **chặn luôn việc tính lại của mọi master hợp lệ khác**.
   - Master **CLOSED**: không tính lại (đóng băng lịch sử).
   - `DELETE` trong `SP_EOD_SI_INDEX` **cố ý rộng hơn** `INSERT` (không lọc inception) ⇒ recompute **tự dọn** index ma mà bản cũ đã ghi ở ngày trước inception.
 
+> ### ⚠️ Nâng cấp DB đã chạy — HIST là nguồn DUY NHẤT của rổ as-of
+>
+> J12 và PM API **không còn đọc** `T_MASTER_PORTFOLIO_TICKER` cho ngày quá khứ. DB đang chạy mà HIST **thiếu trạng thái khởi tạo** thì rổ as-of ra **rỗng** ⇒ index không tính được. Backfill trước:
+> ```sql
+> -- Nạp trạng thái hiện tại thành mốc gốc (chọn mốc SỚM HƠN ngày index đầu tiên cần tính lại)
+> INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME,C_UPDATER)
+> SELECT t.C_MASTER_CODE, t.C_TICKER, t.C_TARGET_WEIGHT, '<mốc gốc>', 'backfill'
+> FROM   T_MASTER_PORTFOLIO_TICKER t
+> WHERE  NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO_TICKER_HIST h
+>                    WHERE h.C_MASTER_CODE=t.C_MASTER_CODE AND h.C_TICKER=t.C_TICKER);
+> ```
+> ⚠️ Backfill này gán rổ **hôm nay** cho quá khứ — chỉ đúng nếu chưa từng rebalance, hoặc mọi lần rebalance đã có trong HIST. Nếu HIST thiếu quãng giữa thì chuỗi index tính lại sẽ **khác** chuỗi đã publish.
+>
+> Soát hai nguồn có khớp nhau không (phải rỗng):
+> ```sql
+> SELECT * FROM T_MASTER_PORTFOLIO_TICKER t
+> FULL OUTER JOIN (SELECT C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT
+>                  FROM dbo.UDF_INDEX_BASKET_ASOF(CAST(GETDATE() AS DATE)) WHERE C_TARGET_WEIGHT<>0) b
+>   ON b.C_MASTER_CODE=t.C_MASTER_CODE AND b.C_TICKER=t.C_TICKER
+> WHERE t.C_TICKER IS NULL OR b.C_TICKER IS NULL OR t.C_TARGET_WEIGHT<>b.C_TARGET_WEIGHT;
+> ```
 > ### ⚠️ Nâng cấp DB đã chạy — `C_INCEPTION_DATE` từ nay là **VỊ TỪ TÍNH TOÁN**, không còn là metadata
 >
 > **Trước khi chạy recompute lịch sử**, soi những master có index SỚM HƠN inception:

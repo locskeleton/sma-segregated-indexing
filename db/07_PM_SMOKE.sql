@@ -1,4 +1,4 @@
-/*==============================================================================
+﻿/*==============================================================================
   PM TOOL SMOKE — dataset 1 master × 3 KH × 3 phiên, số TÍNH TAY ĐƯỢC.
   Seed THẲNG state/daily tables (không qua EOD) để verify công thức serve-layer:
     AUM-weighted return/TE, deviation, cash drag, histogram, top-N, rebalance detail.
@@ -30,6 +30,8 @@ DELETE FROM T_MASTER_BALANCE     WHERE C_MASTER_CODE='M1';
 DELETE FROM T_MASTER_CURRENT     WHERE C_MASTER_CODE='M1';
 DELETE FROM T_MASTER_INDEX_DAILY     WHERE C_MASTER_CODE='M1';
 DELETE FROM T_MASTER_HOLDING_BALANCE WHERE C_MASTER_CODE='M1';
+DELETE FROM T_EOD_WORK WHERE C_MASTER_CODE='M1';   -- để file CHẠY LẠI ĐƯỢC (không vỡ PK_EOD_WORK)
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='M1';
 DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE='M1';
 DELETE FROM T_BENCHMARK_DAILY        WHERE C_BENCHMARK_CODE='BM';
 DELETE FROM T_PRICE_DAILY            WHERE C_TICKER='AAA';
@@ -41,10 +43,14 @@ DECLARE @D1 DATE='2026-01-05', @D2 DATE='2026-01-06', @D3 DATE='2026-01-07';
 INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE)
 VALUES ('M1',N'PM Smoke Master','ACTIVE',@D1,'BM');   -- KHÔNG khai fee config → không accrue
 
--- target weights: 2 mốc rebalance (D1, D3)
-INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES
- ('M1',@D1,'AAA',0.60),('M1',@D1,'BBB',0.40),
- ('M1',@D3,'AAA',0.50),('M1',@D3,'BBB',0.30),('M1',@D3,'CCC',0.20);
+-- target weights: 2 mốc DUYỆT (D1, D3). HIST là log delta ⇒ mốc D3 chỉ ghi mã ĐỔI (cả 3 đều đổi/thêm mới).
+DECLARE @T1 DATETIME2(3)=CAST(@D1 AS DATETIME2(3)), @T3 DATETIME2(3)=CAST(@D3 AS DATETIME2(3));
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('M1','AAA',0.60,@T1),('M1','BBB',0.40,@T1),
+ ('M1','AAA',0.50,@T3),('M1','BBB',0.30,@T3),('M1','CCC',0.20,@T3);
+-- rổ HIỆN TẠI = trạng thái sau mốc mới nhất
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES
+ ('M1','AAA',0.50),('M1','BBB',0.30),('M1','CCC',0.20);
 
 -- master holdings balance quanh rebalance D3 (phiên trước=D2)
 INSERT T_MASTER_HOLDING_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_TICKER,C_QUANTITY,C_MARKET_PRICE,C_MARKET_VALUE,C_WEIGHT) VALUES
@@ -178,4 +184,32 @@ PRINT '-- override A=500/B=-200 → #>A=0 #<B=0 (deviation value khong doi) --';
 EXEC SP_GET_MASTER_DEVIATION_DIST @p_master_code='M1', @p_range='INCEPTION',
      @p_dev_threshold_high=500, @p_dev_threshold_low=-200,
      @p_err_code=@ec2 OUTPUT, @p_err_msg=@em2 OUTPUT;
+GO
+
+PRINT '';
+PRINT '======== RS1 rebalance detail: mã GIỮ NGUYÊN tỷ trọng vẫn PHẢI hiện ra ========';
+-- HIST là log DELTA (chỉ ghi mã ĐỔI). Nếu RS1 so hai TẬP DELTA của hai mốc thay vì so hai RỔ ĐẦY ĐỦ
+--   as-of, thì mã không đổi ở mốc sau sẽ BIẾN MẤT khỏi kết quả — và mã đổi sẽ nhìn như "mã mới vào rổ".
+--   Seed M1 ở trên có MỌI mã đều đổi ở D3 nên KHÔNG phân biệt được hai cách làm ⇒ phải có ca riêng.
+-- KỲ VỌNG RS1 (3 dòng): XA .5→.6 (+.1) · XB .3→.2 (−.1) · XC .2→.2 (delta 0, KHÔNG được biến mất)
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='M2';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER      WHERE C_MASTER_CODE='M2';
+DELETE FROM T_MASTER_PORTFOLIO             WHERE C_MASTER_CODE='M2';
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE)
+VALUES ('M2',N'Keep Smoke','ACTIVE','2026-01-05','BM');
+-- mốc 1: XA .5 · XB .3 · XC .2   →   mốc 2: CHỈ XA/XB đổi (XC giữ nguyên .2, KHÔNG có dòng HIST mới)
+INSERT T_MASTER_PORTFOLIO_TICKER_HIST (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT,C_CONFIRM_TIME) VALUES
+ ('M2','XA',0.5,'2026-01-05 09:00:00'),('M2','XB',0.3,'2026-01-05 09:00:00'),('M2','XC',0.2,'2026-01-05 09:00:00'),
+ ('M2','XA',0.6,'2026-01-07 09:00:00'),('M2','XB',0.2,'2026-01-07 09:00:00');
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_TICKER,C_TARGET_WEIGHT) VALUES
+ ('M2','XA',0.6),('M2','XB',0.2),('M2','XC',0.2);
+
+DECLARE @ecK INT, @emK NVARCHAR(400);
+EXEC SP_GET_MASTER_REBALANCE_DETAIL @p_master_code='M2', @p_date='2026-01-07',
+     @p_err_code=@ecK OUTPUT, @p_err_msg=@emK OUTPUT;
+PRINT '  err_code='+CAST(@ecK AS VARCHAR(10))+' (kỳ vọng 0)';
+
+DELETE FROM T_MASTER_PORTFOLIO_TICKER_HIST WHERE C_MASTER_CODE='M2';
+DELETE FROM T_MASTER_PORTFOLIO_TICKER      WHERE C_MASTER_CODE='M2';
+DELETE FROM T_MASTER_PORTFOLIO             WHERE C_MASTER_CODE='M2';
 GO

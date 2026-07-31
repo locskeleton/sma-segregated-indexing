@@ -37,63 +37,61 @@ CREATE TABLE T_MASTER_PORTFOLIO (
 -- [BRD asset-sync] ĐÃ BỎ T_FEE_CONFIG: SDI KHÔNG còn accrue phí. Phí QL do Asset tính → gửi kèm sync
 --   (số tổng lũy kế per-SI). Xem docs/SDI-asset-handover.md.
 
--- Danh mục mẫu (FO tính & feed). Σ C_TARGET_WEIGHT theo (C_MASTER_CODE, C_EFFECTIVE_DATE) = 1.0
+-- Danh mục mẫu — RỔ HIỆN TẠI (FO tính & feed). 1 dòng / (master, ticker). Σ C_TARGET_WEIGHT = 1.0
 --
--- ★ MỘT C_EFFECTIVE_DATE = TOÀN BỘ RỔ tại mốc rebalance đó, KHÔNG phải "phần thay đổi".
---   Nạp CHỈ QUA SP_INGEST_MASTER_PORTFOLIO_TICKER (validate + all-or-nothing). Ghi thẳng vào bảng này là
---   BỎ QUA CỔNG: rổ ghi sót mã vẫn cho ra index "hợp lệ" mà SAI, vì FACTOR chuẩn hoá bằng /Σw nên mất mã
---   không làm vỡ thang — chỉ lặng lẽ đổi sang theo dõi một rổ khác.
+-- ★ KHÔNG CÓ CHIỀU THỜI GIAN. Bảng này chỉ trả lời "rổ ĐANG là gì", KHÔNG trả lời "rổ ngày 15/03 là gì".
+--   Lịch sử nằm ở T_MASTER_PORTFOLIO_TICKER_HIST và CHỈ ở đó ⇒ mọi phép tính as-of (index J12, PM API)
+--   PHẢI dựng lại rổ từ HIST, TUYỆT ĐỐI không đọc bảng này rồi coi là rổ của ngày quá khứ.
+--   Bảng này là SERVE LAYER (UI/FO xem rổ hiện hành) + nguồn để cổng nạp tính DELTA.
 --
--- ★ GỠ MÃ KHỎI RỔ = ghi dòng C_TARGET_WEIGHT = 0 (KHÔNG phải bỏ trống). Lý do:
---   "vắng mặt" không phân biệt được GỠ CÓ CHỦ ĐÍCH với GHI SÓT. Có dòng 0 thì hợp đồng thành
---   "version mới phải liệt kê mọi mã weight>0 của version liền trước" ⇒ sót mã là CHẶN ĐƯỢC (err=24),
---   và thời điểm gỡ được ghi lại thay vì phải diff 2 snapshot mới suy ra.
---   Dòng 0 chỉ cần mang MỘT LẦN ở version ngay sau khi gỡ; version sau đó bỏ hẳn mã (rổ không phình).
---   J12 lọc weight <> 0 khi tính VÀ khi đòi giá — nếu không, mã vừa gỡ (có thể đã huỷ niêm yết) sẽ bị
---   completeness đòi giá và chặn index của MỌI master, vĩnh viễn.
+-- ★ Chỉ chứa mã CÒN TRONG RỔ (weight > 0). Gỡ mã ⇒ XOÁ dòng ở đây, và ghi dòng weight = 0 vào HIST
+--   (xem giải thích ở HIST — không có bản ghi gỡ thì không dựng lại được rổ quá khứ).
+--
+-- ★ Nạp CHỈ QUA SP_INGEST_MASTER_PORTFOLIO_TICKER. Ghi thẳng vào bảng này là bỏ qua cổng ⇒ (a) HIST
+--   không có vết ⇒ rổ as-of quá khứ sai vĩnh viễn, (b) Σweight không ai kiểm ⇒ rổ hụt tỷ trọng vẫn cho ra
+--   index "hợp lệ" mà SAI IM LẶNG, vì FACTOR chuẩn hoá bằng /Σw nên thiếu mã không làm vỡ thang, nó chỉ
+--   lặng lẽ chuyển sang theo dõi một rổ khác.
 CREATE TABLE T_MASTER_PORTFOLIO_TICKER (
     PK_MASTER_PORTFOLIO_TICKER UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_TICKER_PKID DEFAULT NEWID(),
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_EFFECTIVE_DATE DATE            NOT NULL,   -- ngày hiệu lực trọng số = mốc REBALANCE (J12 dùng latest eff_date ≤ @d)
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,   -- trọng số mục tiêu; Σ theo (master,eff_date)=1.0. ★ 0 = BẢN GHI GỠ mã khỏi rổ (không phải thành phần rổ). Vào công thức index J12 (Σ wᵢ·Pᵢ,t/P_ref)
+    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,   -- trọng số mục tiêu HIỆN TẠI; Σ theo master = 1.0 (hoặc 100 nếu feed dùng thang %)
     CONSTRAINT PK_MASTER_PORTFOLIO_TICKER PRIMARY KEY CLUSTERED (PK_MASTER_PORTFOLIO_TICKER),
-    CONSTRAINT UQ_MASTER_PORTFOLIO_TICKER_NK UNIQUE (C_MASTER_CODE, C_EFFECTIVE_DATE, C_TICKER),
-    CONSTRAINT CK_MASTER_PORTFOLIO_TICKER_W CHECK (C_TARGET_WEIGHT >= 0)   -- weight ÂM là vô nghĩa (rổ 100% cổ phiếu, không short)
+    CONSTRAINT UQ_MASTER_PORTFOLIO_TICKER_NK UNIQUE (C_MASTER_CODE, C_TICKER),
+    CONSTRAINT CK_MASTER_PORTFOLIO_TICKER_W CHECK (C_TARGET_WEIGHT > 0)   -- rổ hiện tại chỉ chứa mã CÒN trong rổ; 0 = đã gỡ ⇒ xoá dòng, dấu vết nằm ở HIST
 );
 
--- LOG GHI của rổ danh mục mẫu — vết audit cho mọi lần nạp.
--- Vì version ĐÃ TÍNH INDEX vẫn được phép SỬA TẠI CHỖ (chốt nghiệp vụ), bảng chính chỉ giữ trạng thái HIỆN
---   TẠI của từng mốc rebalance ⇒ không có bảng này thì không ai biết rổ đã bị sửa gì, lúc nào, bởi ai —
---   trong khi chuỗi index cũ đã tính trên nội dung CŨ.
+-- LỊCH SỬ TỶ TRỌNG — LOG THAY ĐỔI (delta), KHÔNG phải snapshot.
+--   Mỗi dòng = MỘT lần đổi tỷ trọng của MỘT mã, tại MỘT thời điểm DUYỆT (C_CONFIRM_TIME).
+--   Mã không đổi tỷ trọng thì KHÔNG có dòng mới — nó vẫn giữ giá trị ở dòng gần nhất của chính nó.
 --
--- ⚠️⚠️ C_CONFIRM_TIME PHẢI ĐỒNG NHẤT TRONG MỘT LẦN GHI (SP set 1 biến, TUYỆT ĐỐI không gọi SYSDATETIME()
---   từng dòng). Mọi truy vấn "rổ trông thế nào tại thời điểm T" đều xếp hạng theo cột này: lệch vài mili
---   giây giữa các dòng cùng batch ⇒ rổ bị XẺ, chỉ còn đúng 1 mã, mà không một lỗi nào bật.
--- ⚠️ Đọc lại theo thời điểm PHẢI dùng RANK/DENSE_RANK theo (master, C_BATCH_SEQ DESC), KHÔNG ROW_NUMBER:
---   một batch có NHIỀU dòng cùng mốc; ROW_NUMBER đánh số DÒNG nên chỉ giữ 1 mã, vứt cả rổ còn lại.
+-- ★ ĐÂY LÀ NGUỒN DUY NHẤT dựng lại rổ AS-OF. Rổ cuối ngày @d = với TỪNG MÃ lấy dòng có C_CONFIRM_TIME
+--   LỚN NHẤT còn < @d+1, rồi BỎ những mã có weight = 0.
 --
--- ⚠️⚠️ THỨ TỰ XẾP HẠNG PHẢI DÙNG C_BATCH_SEQ, KHÔNG PHẢI C_CONFIRM_TIME.
---   SYSDATETIME() có độ mịn ~1ms: hai lần nạp liên tiếp CÙNG RƠI VÀO MỘT MILI GIÂY là chuyện bình thường
---   (smoke bắt được ngay lần chạy đầu: 3 lần nạp chỉ ra 2 giá trị C_CONFIRM_TIME phân biệt). Xếp hạng theo
---   thời gian khi đó là HOÀ, và "bản ghi mới nhất" trở thành thứ không xác định. C_BATCH_SEQ lấy từ
---   SEQ_MASTER_PORTFOLIO_TICKER_HIST_BATCH nên đơn điệu tăng, duy nhất mỗi lần nạp, CHUNG cho cả batch.
---   C_CONFIRM_TIME giữ lại để CON NGƯỜI đọc, KHÔNG dùng làm khoá thứ tự.
--- Clustered theo khoá tự nhiên (append-only, luôn quét theo master+mốc); GUID để nonclustered.
-CREATE SEQUENCE SEQ_MASTER_PORTFOLIO_TICKER_HIST_BATCH AS BIGINT START WITH 1 INCREMENT BY 1;
-
+-- ★ GỠ MÃ = ghi dòng C_TARGET_WEIGHT = 0 (BẮT BUỘC). Vì đây là log DELTA: nếu gỡ mã mà không ghi gì thì
+--   dòng cuối cùng của mã đó (weight dương) SỐNG MÃI ⇒ mọi lần dựng rổ quá khứ về sau đều thừa mã đã gỡ,
+--   Σw phình, index sai — và sai IM LẶNG. Đây không phải tuỳ chọn, nó là điều kiện để mô hình delta đúng.
+--
+-- ★ ĐỌC AS-OF PHẢI dùng ROW_NUMBER/RANK OVER (PARTITION BY C_MASTER_CODE, C_TICKER ORDER BY C_CONFIRM_TIME DESC).
+--   PARTITION PHẢI CÓ C_TICKER — đây là log per-mã, không phải snapshot cả rổ. Partition chỉ theo master sẽ
+--   chỉ giữ những mã đổi ở lần duyệt cuối cùng và vứt toàn bộ phần còn lại của rổ.
+--
+-- ⚠️ UNIQUE (master, ticker, confirm_time) không phải để tra nhanh: nó KHỬ HẲN khả năng HOÀ khi xếp hạng.
+--   Một mã KHÔNG THỂ có hai tỷ trọng khác nhau tại cùng một thời điểm duyệt — đó là mâu thuẫn nghiệp vụ.
+--   Thiếu ràng buộc này thì hai dòng trùng mốc làm "dòng mới nhất" thành KHÔNG XÁC ĐỊNH: cùng input, khác
+--   output giữa các lần chạy (phụ thuộc plan/parallelism), không một lỗi nào bật.
+-- Clustered theo khoá tự nhiên: append-only, và luôn đọc theo (master, ticker) + quét theo thời gian.
 CREATE TABLE T_MASTER_PORTFOLIO_TICKER_HIST (
     PK_MASTER_PORTFOLIO_TICKER_HIST UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_TICKER_HIST_PKID DEFAULT NEWID(),
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
-    C_EFFECTIVE_DATE DATE            NOT NULL,   -- mốc rebalance mà lần ghi này nhắm tới
     C_TICKER         VARCHAR(20)     NOT NULL,
-    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,   -- 0 = bản ghi GỠ mã
-    C_BATCH_SEQ      BIGINT          NOT NULL,   -- ★ ĐỊNH DANH + THỨ TỰ của LẦN NẠP. CHUNG cho mọi dòng cùng batch
-    C_CONFIRM_TIME   DATETIME2(3)    NOT NULL,   -- thời điểm ghi (để đọc); CHUNG cho cả batch nhưng CÓ THỂ TRÙNG giữa 2 batch
+    C_TARGET_WEIGHT  DECIMAL(12,8)   NOT NULL,   -- tỷ trọng MỚI của mã sau lần duyệt này. ★ 0 = GỠ mã khỏi rổ
+    C_CONFIRM_TIME   DATETIME2(3)    NOT NULL,   -- ★ thời điểm DUYỆT thay đổi — khoá thứ tự để dựng rổ as-of
     C_UPDATER        VARCHAR(64)     NULL,
     CONSTRAINT PK_MASTER_PORTFOLIO_TICKER_HIST PRIMARY KEY CLUSTERED
-        (C_MASTER_CODE, C_EFFECTIVE_DATE, C_BATCH_SEQ, C_TICKER),
-    CONSTRAINT UQ_MASTER_PORTFOLIO_TICKER_HIST_PKID UNIQUE NONCLUSTERED (PK_MASTER_PORTFOLIO_TICKER_HIST)
+        (C_MASTER_CODE, C_TICKER, C_CONFIRM_TIME),
+    CONSTRAINT UQ_MASTER_PORTFOLIO_TICKER_HIST_PKID UNIQUE NONCLUSTERED (PK_MASTER_PORTFOLIO_TICKER_HIST),
+    CONSTRAINT CK_MASTER_PORTFOLIO_TICKER_HIST_W CHECK (C_TARGET_WEIGHT >= 0)
 );
 
 -- SUB-ACCOUNT (tiểu khoản): 1 dòng/sub-account. C_SI_ACCOUNT = mã sub-account (CUST_CODE+đuôi), UNIQUE.
