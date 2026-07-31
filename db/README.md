@@ -115,7 +115,7 @@ EXEC SP_EOD_SI_AGG    '2026-01-06';   -- master agg (AUM/unit price)
 EXEC SP_EOD_TE_ACCUM  '2026-01-06';   -- lũy kế active return (TE prefix-sum)
 ```
 - **Index master** sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception) — GIỮ (index do SDI tính từ giá×weight, không phụ thuộc Asset NAV).
-  - **Scope as-of** (sửa 2026-07-31): `C_STATUS='ACTIVE' AND C_INCEPTION_DATE <= @d`. `C_INCEPTION_DATE` **NOT NULL** — nó là **vị từ tính toán**, không phải metadata hiển thị. Thiếu nó thì rổ **backdate** kéo master mới ngược về ngày chưa tồn tại: mã trong rổ niêm yết sau ⇒ completeness (**all-or-nothing xuyên master**) `THROW 51011` mỗi ngày ⇒ **chặn luôn việc tính lại của mọi master hợp lệ khác**.
+  - **Scope as-of** (sửa 2026-07-31): định nghĩa DUY NHẤT ở iTVF **`UDF_INDEX_BASKET_ASOF(@d)`** — `C_STATUS='ACTIVE'` + `C_INCEPTION_DATE <= @d` + rổ hiệu lực (`MAX(eff_date) ≤ @d`), `LEFT JOIN` giá cùng ngày. `SP_EOD_SI_INDEX` đổ nó vào `@basket` **một lần** rồi validate *và* tính trên chính bộ đó; `SP_EOD_RUN_INDEX` gate gọi thẳng iTVF ⇒ **không thể lệch scope**. Trước đó vị từ bị chép 4 lần — đúng class bug đã dính. `C_INCEPTION_DATE` **NOT NULL** — nó là **vị từ tính toán**, không phải metadata hiển thị. Thiếu nó thì rổ **backdate** kéo master mới ngược về ngày chưa tồn tại: mã trong rổ niêm yết sau ⇒ completeness (**all-or-nothing xuyên master**) `THROW 51011` mỗi ngày ⇒ **chặn luôn việc tính lại của mọi master hợp lệ khác**.
   - Master **CLOSED**: không tính lại (đóng băng lịch sử).
   - `DELETE` trong `SP_EOD_SI_INDEX` **cố ý rộng hơn** `INSERT` (không lọc inception) ⇒ recompute **tự dọn** index ma mà bản cũ đã ghi ở ngày trước inception.
 

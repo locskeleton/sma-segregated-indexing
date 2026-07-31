@@ -576,12 +576,51 @@ BEGIN
 END
 GO
 
+/*---------------------------------------------------- iTVF: RỔ TÍNH INDEX AS-OF @d (+ giá cùng ngày)
+  ★ ĐỊNH NGHĨA DUY NHẤT của "những gì được đưa vào tính index ngày @d". Trước 2026-07-31 vị từ scope bị CHÉP
+    4 LẦN (completeness / weight-guard / CTE W / gate SP_EOD_RUN_INDEX) và comment phải hét "PHẢI GIỐNG HỆT
+    NHAU" — đó chính là class bug đã dính: thiếu C_INCEPTION_DATE ở scope làm master phát sinh sau bị kéo về
+    quá khứ. Gom về 1 hàm ⇒ KHÔNG THỂ lệch scope nữa, kể cả giữa 2 stored proc khác nhau.
+
+  Ba tầng lọc, mỗi tầng trả lời một câu khác nhau — đừng gộp nhầm:
+    ① mp.C_STATUS='ACTIVE'          → master còn được tính không (CLOSED = đóng băng lịch sử, không tính lại)
+    ② mp.C_INCEPTION_DATE<=@d       → master ĐÃ RA ĐỜI tại @d chưa (rổ backdate KHÔNG trả lời được câu này)
+    ③ LD: eff_date lớn nhất ≤ @d    → phiên bản RỔ nào có hiệu lực tại @d
+
+  LEFT JOIN giá (KHÔNG INNER): thiếu giá phải NHÌN THẤY ĐƯỢC (C_CLOSE_PRICE IS NULL) để completeness báo tên
+  mã thiếu. INNER JOIN sẽ làm mã thiếu giá BIẾN MẤT — đúng kiểu "bỏ ngầm" mà thiết kế này cấm.
+  Không thể fan-out: UQ(master,eff_date,ticker) + LD chốt 1 eff_date/master ⇒ (master,ticker) duy nhất;
+  PK T_PRICE_DAILY (business_date,ticker) ⇒ join giá 1-1. */
+CREATE OR ALTER FUNCTION UDF_INDEX_BASKET_ASOF (@d DATE)
+RETURNS TABLE
+AS
+RETURN
+    SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT,
+           p.C_CLOSE_PRICE, p.C_REF_PRICE
+    FROM T_MASTER_PORTFOLIO_TICKER mw
+    INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = mw.C_MASTER_CODE
+                                    AND mp.C_STATUS = 'ACTIVE'
+                                    AND mp.C_INCEPTION_DATE <= @d
+    INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
+                FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE <= @d GROUP BY C_MASTER_CODE) LD
+      ON LD.C_MASTER_CODE = mw.C_MASTER_CODE AND LD.ED = mw.C_EFFECTIVE_DATE
+    LEFT JOIN T_PRICE_DAILY p ON p.C_TICKER = mw.C_TICKER AND p.C_BUSINESS_DATE = @d;
+GO
+
 /*===========================================================================
   J12 — SI INDEX (danh mục mẫu, 100% cổ phiếu) → T_MASTER_INDEX_DAILY
         FACTOR   = Σ w^(t) × P_t / P_ref ; w^(t)=eff_date≤@d mới nhất
         [Cách A] Index_raw_t = Index_raw_(t-1) × FACTOR (chain PRECISION CAO — chống trôi)
                  Index_publish = ROUND(Index_raw_t, 2)                        -- con số 2dp user thấy
                  daily_return  = Index_publish_t / Index_publish_(t-1) − 1     -- TỪ 2dp → user suy ra KHỚP (hết lệch)
+
+  ★ MỘT LẦN ĐỔ @basket ← UDF_INDEX_BASKET_ASOF(@p_d), rồi validate VÀ tính ĐỀU TRÊN CÙNG BỘ DỮ LIỆU ĐÓ.
+    Trước đây 3 truy vấn (completeness / weight / W) mỗi cái TỰ DỰNG LẠI scope từ 3 bảng ⇒ có thể lệch nhau
+    mà không ai biết. Nay guard soi ĐÚNG những dòng sẽ đi vào INSERT — "kiểm cái gì thì tính cái đó".
+    ⚠️ Lý do là TÍNH ĐÚNG, KHÔNG phải tốc độ: đo trên dải 38 phiên × 3 master thì chênh lệch nằm trong nhiễu
+      (334ms vs 418ms rồi 457ms vs 327ms) — vật hoá cũng có giá của nó, đừng bịa ra khoản lãi chưa đo được.
+    Dùng TABLE VARIABLE chứ không #temp: tránh churn tempdb + recompile khi SP_EOD_RECOMPUTE_INDEX_RANGE
+    gọi hàng nghìn lượt trong một vòng lặp.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_SI_INDEX @p_d DATE, @p_rows BIGINT = NULL OUTPUT
 AS
@@ -603,8 +642,8 @@ BEGIN
     END
 
     -- INCEPTION NOT NULL HARD-FAIL. Cột đã NOT NULL ở 01_TABLES.sql, guard này là cho DB dựng từ schema CŨ
-    --   (cột còn NULLable) chưa chạy ALTER. Vì sao không bỏ qua: vị từ mp.C_INCEPTION_DATE<=@p_d với NULL cho ra
-    --   UNKNOWN ⇒ master bị loại IM LẶNG khỏi CẢ 4 scope (completeness/weight/W/gate) ⇒ index của nó ngừng được
+    --   (cột còn NULLable) chưa chạy ALTER. Vì sao không bỏ qua: vị từ mp.C_INCEPTION_DATE<=@d trong
+    --   UDF_INDEX_BASKET_ASOF với NULL cho ra UNKNOWN ⇒ master rơi khỏi rổ IM LẶNG ⇒ index của nó ngừng được
     --   tính mà KHÔNG một err nào bật — đúng loại hỏng tệ nhất. Thà THROW. Bảng vài chục dòng, chi phí ~0.
     IF EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_STATUS='ACTIVE' AND C_INCEPTION_DATE IS NULL)
     BEGIN
@@ -617,38 +656,33 @@ BEGIN
         THROW 51014, @nmsg, 1;
     END
 
+    -- ═══ ĐỔ RỔ MỘT LẦN — mọi guard VÀ phép tính bên dưới đều soi CHÍNH BỘ DỮ LIỆU NÀY ═══════════════
+    --   PK (master,ticker) không chỉ để tra nhanh: nó KHẲNG ĐỊNH bất biến "1 mã xuất hiện đúng 1 lần trong
+    --   rổ của 1 master tại @p_d". Nếu LD/UQ nào đó hỏng làm sinh dòng trùng → INSERT vỡ PK ngay tại đây,
+    --   thay vì âm thầm nhân đôi trọng số của mã đó rồi ra FACTOR sai mà không ai biết.
+    DECLARE @basket TABLE (
+        C_MASTER_CODE   VARCHAR(20)   NOT NULL,
+        C_TICKER        VARCHAR(20)   NOT NULL,
+        C_TARGET_WEIGHT DECIMAL(12,8) NOT NULL,
+        C_CLOSE_PRICE   DECIMAL(18,4) NULL,     -- NULL = KHÔNG có dòng giá @p_d (completeness bắt ngay dưới)
+        C_REF_PRICE     DECIMAL(18,4) NULL,
+        PRIMARY KEY (C_MASTER_CODE, C_TICKER)
+    );
+    INSERT @basket (C_MASTER_CODE, C_TICKER, C_TARGET_WEIGHT, C_CLOSE_PRICE, C_REF_PRICE)
+    SELECT C_MASTER_CODE, C_TICKER, C_TARGET_WEIGHT, C_CLOSE_PRICE, C_REF_PRICE
+    FROM dbo.UDF_INDEX_BASKET_ASOF(@p_d);
+
     -- COMPLETENESS HARD-FAIL (mọi đường gọi: forward/direct/recompute): MỌI mã trong rổ hiệu lực @p_d của MỌI
     --   master ACTIVE ĐÃ RA ĐỜI ≤ @p_d PHẢI có giá @p_d. Thiếu DÙ 1 mã (của BẤT KỲ master nào) → THROW, KHÔNG ghi
     --   index master nào ngày đó (all-or-nothing) → nghiệp vụ CONTROL được (báo rõ master:mã thiếu), KHÔNG silent
     --   skip. Chốt 2026-06-24: bỏ per-master skip cũ vì danh mục thiếu bị bỏ ngầm, nghiệp vụ không kiểm soát được.
     --   THROW trước mọi DML ⇒ atomic: index ngày đó GIỮ NGUYÊN (không xoá) nếu fail. (Forward còn gate err=11 ở
-    --   SP_EOD_RUN_INDEX báo sớm/sạch — CÙNG SCOPE — trước khi tới đây; throw này phủ direct/recompute.)
-    --
-    -- ★ SCOPE = ACTIVE **VÀ** C_INCEPTION_DATE <= @p_d (thêm 2026-07-31). "Có bản ghi rổ hiệu lực ≤ @p_d" KHÔNG
-    --   đồng nghĩa "master đã tồn tại tại @p_d": rổ hay bị BACKDATE (FO khai weight hiệu lực từ đầu quý/đầu chiến
-    --   lược rồi mới đẩy sang SDI; migration gán chung một mốc lịch sử). Thiếu vị từ inception thì khi RECOMPUTE
-    --   LỊCH SỬ, master mới bị kéo ngược về ngày nó chưa ra đời ⇒
-    --     ① mã trong rổ nó NIÊM YẾT SAU @p_d → không đời nào có giá → THROW 51011 mỗi ngày → vì all-or-nothing,
-    --        MỌI master hợp lệ khác cũng không được tính lại ⇒ recompute-từ-inception (đường sửa chuỗi DUY NHẤT)
-    --        BẤT KHẢ THI;
-    --     ② nếu giá tình cờ đủ → sinh chuỗi index MA cho master ở những ngày nó chưa tồn tại, khởi từ base 1000.
-    --   C_INCEPTION_DATE là NOT NULL (validate ngay lúc khai báo master) ⇒ vị từ này không bao giờ ra UNKNOWN.
-    --   ⚠️ 4 chỗ dùng scope này (completeness / weight-guard / CTE W / gate SP_EOD_RUN_INDEX) PHẢI GIỐNG HỆT NHAU —
-    --      lệch một chỗ là guard và phép tính nói hai chuyện khác nhau. DELETE cố ý KHÔNG có (xem chú thích ở đó).
+    --   SP_EOD_RUN_INDEX báo sớm/sạch — DÙNG CHUNG UDF_INDEX_BASKET_ASOF nên KHÔNG THỂ lệch scope.)
+    --   Scope (ACTIVE + inception ≤ @p_d + rổ hiệu lực) nằm gọn trong UDF_INDEX_BASKET_ASOF — xem giải thích ở đó.
     DECLARE @missing NVARCHAR(MAX) = (
-        SELECT STRING_AGG(CONCAT(x.C_MASTER_CODE, N':', x.C_TICKER), N', ')
-               WITHIN GROUP (ORDER BY x.C_MASTER_CODE, x.C_TICKER)
-        FROM (
-            SELECT mw.C_MASTER_CODE, mw.C_TICKER
-            FROM T_MASTER_PORTFOLIO_TICKER mw
-            INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
-                                            AND mp.C_INCEPTION_DATE<=@p_d
-            INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
-                        FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE) LD
-              ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
-            WHERE NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY p
-                              WHERE p.C_TICKER=mw.C_TICKER AND p.C_BUSINESS_DATE=@p_d)
-        ) x);
+        SELECT STRING_AGG(CONCAT(b.C_MASTER_CODE, N':', b.C_TICKER), N', ')
+               WITHIN GROUP (ORDER BY b.C_MASTER_CODE, b.C_TICKER)
+        FROM @basket b WHERE b.C_CLOSE_PRICE IS NULL);
     IF @missing IS NOT NULL
     BEGIN
         DECLARE @emsg NVARCHAR(2000) = CONCAT(N'INDEX completeness FAIL @', CONVERT(VARCHAR(10),@p_d,23),
@@ -663,15 +697,9 @@ BEGIN
     DECLARE @badw NVARCHAR(MAX) = (
         SELECT STRING_AGG(CONVERT(NVARCHAR(20), z.C_MASTER_CODE), N', ') WITHIN GROUP (ORDER BY z.C_MASTER_CODE)
         FROM (
-            SELECT mw.C_MASTER_CODE
-            FROM T_MASTER_PORTFOLIO_TICKER mw
-            INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
-                                            AND mp.C_INCEPTION_DATE<=@p_d          -- ★ cùng scope completeness
-            INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
-                        FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE) LD
-              ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
-            GROUP BY mw.C_MASTER_CODE
-            HAVING SUM(CAST(mw.C_TARGET_WEIGHT AS FLOAT)) = 0
+            SELECT b.C_MASTER_CODE FROM @basket b        -- ★ CÙNG bộ dữ liệu completeness vừa soi
+            GROUP BY b.C_MASTER_CODE
+            HAVING SUM(CAST(b.C_TARGET_WEIGHT AS FLOAT)) = 0
         ) z);
     IF @badw IS NOT NULL
     BEGIN
@@ -694,28 +722,18 @@ BEGIN
     INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=idx.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
     WHERE idx.C_BUSINESS_DATE=@p_d;
 
-    ;WITH LD AS (
-        SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
-        FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE
-    ),
-    W AS (   -- rổ hiệu lực @p_d của master ACTIVE ĐÃ RA ĐỜI ≤ @p_d (CÙNG SCOPE với guard hard-fail + forward gate)
-        SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT
-        FROM T_MASTER_PORTFOLIO_TICKER mw
-        INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
-                                        AND mp.C_INCEPTION_DATE<=@p_d          -- ★ cùng scope completeness
-        INNER JOIN LD ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
-    ),
-    FACT AS (
+    ;WITH FACT AS (
         -- FACTOR = BÌNH QUÂN GIA QUYỀN price-relative = Σ(w × close/ref) / Σ(w). CHIA Σw để BẤT BIẾN với thang
         --   trọng số: dù FO gửi w dạng phân số (Σ=1) hay phần trăm (Σ=100) đều ra ~1.0x/ngày (KHÔNG còn ×100 nổ
         --   cấp số nhân). close/ref = giá đóng / giá tham chiếu đầu phiên (self-contained, cùng dòng @p_d).
-        --   ĐỦ giá mọi mã đã được guard hard-fail ở trên đảm bảo ⇒ INNER JOIN price KHÔNG drop mã nào.
-        SELECT W.C_MASTER_CODE,
-               SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) * p.C_CLOSE_PRICE / p.C_REF_PRICE )
-                 / NULLIF(SUM( CAST(W.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR  -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
-        FROM W
-        INNER JOIN T_PRICE_DAILY p ON p.C_TICKER=W.C_TICKER AND p.C_BUSINESS_DATE=@p_d
-        GROUP BY W.C_MASTER_CODE
+        -- ★ Tính THẲNG trên @basket — ĐÚNG bộ dữ liệu mà completeness + weight-guard vừa soi. Không dựng lại
+        --   scope, không join lại giá ⇒ không còn cửa cho "kiểm một đằng, tính một nẻo".
+        --   C_CLOSE_PRICE/C_REF_PRICE chắc chắn NOT NULL tại đây vì completeness đã THROW nếu thiếu.
+        SELECT b.C_MASTER_CODE,
+               SUM( CAST(b.C_TARGET_WEIGHT AS FLOAT) * b.C_CLOSE_PRICE / b.C_REF_PRICE )
+                 / NULLIF(SUM( CAST(b.C_TARGET_WEIGHT AS FLOAT) ), 0)        AS FACTOR  -- FLOAT: tránh cắt scale do chia decimal (cap 38) → index đúng 6 chữ số
+        FROM @basket b
+        GROUP BY b.C_MASTER_CODE
     )
     -- [Cách A] CHAIN ở raw precision cao (COALESCE prev.raw, nếu legacy thiếu raw thì fallback prev 2dp, else 1000)
     --   → publish = ROUND(raw,2). daily_return = publish_t / publish_(t-1) − 1 (TỪ 2dp đã publish, FLOAT tránh crush scale).
@@ -1051,19 +1069,12 @@ BEGIN
     -- COMPLETENESS GATE (chốt chặn index SAI): MỌI mã thành phần danh mục mẫu (rổ hiệu lực ≤ @d, master ACTIVE
     --   ĐÃ RA ĐỜI ≤ @d) PHẢI có giá @d trong T_PRICE_DAILY. Thiếu DÙ 1 mã → KHÔNG tính index (tránh factor lệch
     --   do nạp giá thiếu).
-    -- ★ PHẢI CÙNG SCOPE với guard trong SP_EOD_SI_INDEX (gồm cả vị từ C_INCEPTION_DATE — xem giải thích dài ở đó).
-    --   Lệch scope = gate cho qua nhưng SP_EOD_SI_INDEX lại THROW (hoặc ngược lại), err trả về không còn tin được.
+    -- ★ DÙNG CHUNG UDF_INDEX_BASKET_ASOF với SP_EOD_SI_INDEX ⇒ gate và phép tính KHÔNG THỂ lệch scope.
+    --   Trước đây đây là bản CHÉP TAY của cùng vị từ; lệch một chữ là gate cho qua nhưng SP_EOD_SI_INDEX THROW
+    --   (hoặc ngược lại) — err trả về mất tin cậy. Nay chỉ còn một định nghĩa.
     DECLARE @missing NVARCHAR(400) = (
         SELECT STRING_AGG(req.C_TICKER, ',') WITHIN GROUP (ORDER BY req.C_TICKER)
-        FROM (
-            SELECT DISTINCT t.C_TICKER
-            FROM T_MASTER_PORTFOLIO_TICKER t
-            INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=t.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
-                                            AND mp.C_INCEPTION_DATE<=@d
-            WHERE t.C_EFFECTIVE_DATE = (SELECT MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER t2
-                                        WHERE t2.C_MASTER_CODE=t.C_MASTER_CODE AND t2.C_EFFECTIVE_DATE<=@d)
-        ) req
-        WHERE NOT EXISTS (SELECT 1 FROM T_PRICE_DAILY p WHERE p.C_TICKER=req.C_TICKER AND p.C_BUSINESS_DATE=@d));
+        FROM (SELECT DISTINCT C_TICKER FROM dbo.UDF_INDEX_BASKET_ASOF(@d) WHERE C_CLOSE_PRICE IS NULL) req);
     IF @missing IS NOT NULL
     BEGIN
         SET @p_err_code=11;
