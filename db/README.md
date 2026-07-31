@@ -115,6 +115,30 @@ EXEC SP_EOD_SI_AGG    '2026-01-06';   -- master agg (AUM/unit price)
 EXEC SP_EOD_TE_ACCUM  '2026-01-06';   -- lũy kế active return (TE prefix-sum)
 ```
 - **Index master** sửa riêng: `SP_EOD_RECOMPUTE_INDEX_RANGE(@from,@to)` (loop từ inception) — GIỮ (index do SDI tính từ giá×weight, không phụ thuộc Asset NAV).
+  - **Scope as-of** (sửa 2026-07-31): `C_STATUS='ACTIVE' AND C_INCEPTION_DATE <= @d`. `C_INCEPTION_DATE` **NOT NULL** — nó là **vị từ tính toán**, không phải metadata hiển thị. Thiếu nó thì rổ **backdate** kéo master mới ngược về ngày chưa tồn tại: mã trong rổ niêm yết sau ⇒ completeness (**all-or-nothing xuyên master**) `THROW 51011` mỗi ngày ⇒ **chặn luôn việc tính lại của mọi master hợp lệ khác**.
+  - Master **CLOSED**: không tính lại (đóng băng lịch sử).
+  - `DELETE` trong `SP_EOD_SI_INDEX` **cố ý rộng hơn** `INSERT` (không lọc inception) ⇒ recompute **tự dọn** index ma mà bản cũ đã ghi ở ngày trước inception.
+
+> ### ⚠️ Nâng cấp DB đã chạy — `C_INCEPTION_DATE` từ nay là **VỊ TỪ TÍNH TOÁN**, không còn là metadata
+>
+> **Trước khi chạy recompute lịch sử**, soi những master có index SỚM HƠN inception:
+> ```sql
+> SELECT mp.C_MASTER_CODE, mp.C_INCEPTION_DATE, MIN(idx.C_BUSINESS_DATE) AS first_index_date
+> FROM T_MASTER_PORTFOLIO mp
+> INNER JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE = mp.C_MASTER_CODE
+> GROUP BY mp.C_MASTER_CODE, mp.C_INCEPTION_DATE
+> HAVING MIN(idx.C_BUSINESS_DATE) < mp.C_INCEPTION_DATE;
+> ```
+> Mỗi dòng trả về là **một trong hai**, và ops phải phân biệt trước khi chạy:
+> - **index MA** do bản cũ sinh ra ở ngày master chưa tồn tại → recompute dọn giúp, đúng ý.
+> - **inception KHAI SAI** (điền muộn hơn thực tế) → recompute sẽ **XOÁ lịch sử index THẬT** và không ghi lại. Sửa `C_INCEPTION_DATE` cho đúng **trước**.
+>
+> Schema đã đổi sang `NOT NULL`. DB dựng từ script cũ phải chạy:
+> ```sql
+> UPDATE T_MASTER_PORTFOLIO SET C_INCEPTION_DATE = '<ngày thật>' WHERE C_INCEPTION_DATE IS NULL;
+> ALTER TABLE T_MASTER_PORTFOLIO ALTER COLUMN C_INCEPTION_DATE DATE NOT NULL;
+> ```
+> Chưa chạy mà còn NULL → `SP_EOD_SI_INDEX` **THROW 51014** (recompute → `err=14`) thay vì loại master im lặng.
 - **Composition** (`T_MASTER_HOLDING_BALANCE`) as-of: FO gửi lại holdings ngày đó (qua `SP_INGEST_CUSTOMER`) nếu cần sửa.
 - **Idempotent**: re-ingest cùng ngày → DELETE+INSERT, chạy lại compute = ghi đè sạch (`T_SI_BALANCE` UQ theo (date,si)).
 

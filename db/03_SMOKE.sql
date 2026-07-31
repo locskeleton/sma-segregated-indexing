@@ -161,6 +161,51 @@ DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('PXM1','PXM2','ZWA','ZWB');
 UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
 
 PRINT '';
+PRINT '======== INDEX scope as-of: master PHÁT SINH SAU + rổ BACKDATE không được kéo về quá khứ ========';
+-- Ca thật khi CHẠY LẠI LỊCH SỬ: FO lập master mới (inception 06/2026) nhưng khai weight hiệu lực từ 03/2026
+--   (backdate — đầu quý/đầu chiến lược), và trong rổ có mã NIÊM YẾT SAU nên không thể có giá tháng 3.
+--   Thiếu vị từ C_INCEPTION_DATE<=@d thì master mới lọt scope ngày 03/2026 → completeness THROW 51011 → vì
+--   all-or-nothing, master CŨ hợp lệ cũng KHÔNG được tính lại ⇒ recompute-từ-inception bất khả thi.
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='CLOSED' WHERE C_MASTER_CODE='SDI01';   -- cô lập (all-or-nothing)
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_BENCHMARK_CODE) VALUES
+ ('MOLD',N'OldMaster','ACTIVE','2026-03-01','VNINDEX'),
+ ('MNEW',N'NewMaster','ACTIVE','2026-06-01','VNINDEX');   -- ★ ra đời SAU dải recompute
+INSERT T_MASTER_PORTFOLIO_TICKER (C_MASTER_CODE,C_EFFECTIVE_DATE,C_TICKER,C_TARGET_WEIGHT) VALUES
+ ('MOLD','2026-03-01','OLDA',1.0),
+ ('MNEW','2026-03-01','NEWX',1.0);                        -- ★ rổ BACKDATE về trước inception
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
+ ('OLDA','2026-03-02',100,110),('OLDA','2026-03-03',110,110);
+ -- NEWX CỐ Ý không có giá tháng 3 (niêm yết sau)
+-- Rác từ bản CŨ: index ma của MNEW ở ngày nó chưa tồn tại → recompute phải DỌN (DELETE rộng hơn INSERT)
+INSERT T_MASTER_INDEX_DAILY (C_BUSINESS_DATE,C_MASTER_CODE,C_INDEX_VALUE_RAW,C_INDEX_VALUE,C_DAILY_RETURN)
+VALUES ('2026-03-02','MNEW',999.000000000000,999.00,NULL);
+DECLARE @ecIN INT, @emIN NVARCHAR(400);
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-03-02', @p_to_date='2026-03-03',
+     @p_err_code=@ecIN OUTPUT, @p_err_msg=@emIN OUTPUT;
+DECLARE @nOld INT=(SELECT COUNT(*) FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MOLD');
+DECLARE @nNew INT=(SELECT COUNT(*) FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MNEW');
+DECLARE @vOld DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MOLD' AND C_BUSINESS_DATE='2026-03-02');
+IF @ecIN=0 AND @nOld=2 AND @nNew=0 AND @vOld=1100.00
+   PRINT '  OK scope as-of inception: master CŨ tính đủ 2 phiên (1100.00), master MỚI 0 dòng, index MA đã bị dọn';
+ELSE PRINT CONCAT('  !!! scope as-of inception SAI: err=',@ecIN,' #MOLD=',@nOld,' #MNEW=',@nNew,
+                  ' MOLD@03-02=',ISNULL(CONVERT(VARCHAR(20),@vOld),'(null)'),' ',ISNULL(@emIN,''));
+-- Ngày MNEW đã ra đời thì PHẢI vào scope trở lại (đủ giá) — guard không được biến thành "loại vĩnh viễn"
+--   (OLDA cũng phải có giá @06-01: MOLD vẫn trong scope, mà completeness là all-or-nothing xuyên master)
+INSERT T_PRICE_DAILY (C_TICKER,C_BUSINESS_DATE,C_REF_PRICE,C_CLOSE_PRICE) VALUES
+ ('NEWX','2026-06-01',100,105),('OLDA','2026-06-01',110,110);
+EXEC SP_EOD_RECOMPUTE_INDEX_RANGE @p_from_date='2026-06-01', @p_to_date='2026-06-01',
+     @p_err_code=@ecIN OUTPUT, @p_err_msg=@emIN OUTPUT;
+DECLARE @vNew DECIMAL(18,2)=(SELECT C_INDEX_VALUE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE='MNEW' AND C_BUSINESS_DATE='2026-06-01');
+IF @ecIN=0 AND @vNew=1050.00 PRINT '  OK từ ngày inception trở đi master MỚI vào scope bình thường (1050.00)';
+ELSE PRINT CONCAT('  !!! master mới không vào scope sau inception: err=',@ecIN,' MNEW@06-01=',
+                  ISNULL(CONVERT(VARCHAR(20),@vNew),'(null)'),' ',ISNULL(@emIN,''));
+DELETE FROM T_MASTER_INDEX_DAILY WHERE C_MASTER_CODE IN ('MOLD','MNEW');
+DELETE FROM T_MASTER_PORTFOLIO_TICKER WHERE C_MASTER_CODE IN ('MOLD','MNEW');
+DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE IN ('MOLD','MNEW');
+DELETE FROM T_PRICE_DAILY WHERE C_TICKER IN ('OLDA','NEWX');
+UPDATE T_MASTER_PORTFOLIO SET C_STATUS='ACTIVE' WHERE C_MASTER_CODE='SDI01';
+
+PRINT '';
 PRINT '======== ASSET_NAV completeness: thiếu SI → SP_EOD_RUN err=12 ========';
 INSERT T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS) VALUES ('SUB002','KH002','SDI01','2026-01-06','ACTIVE');
 EXEC SP_EOD_RUN '2026-01-06',@p_err_code=@ecP OUTPUT,@p_err_msg=@emP OUTPUT;   -- SUB002 chưa có asset_daily @06

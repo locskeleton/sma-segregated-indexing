@@ -24,7 +24,11 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     C_MASTER_CODE    VARCHAR(20)     NOT NULL,
     C_MASTER_NAME        NVARCHAR(200)   NULL,
     C_STATUS         VARCHAR(10)     NOT NULL CONSTRAINT DF_MASTER_PORTFOLIO_STATUS DEFAULT 'ACTIVE', -- ACTIVE|CLOSED
-    C_INCEPTION_DATE DATE            NULL,
+    -- Ngày master RA ĐỜI. KHÔNG chỉ là metadata hiển thị: J12 dùng làm VỊ TỪ SCOPE (mp.C_INCEPTION_DATE<=@d)
+    --   để recompute lịch sử không kéo master mới ngược về ngày nó chưa tồn tại. NOT NULL là BẮT BUỘC —
+    --   NULL sẽ làm vị từ ra UNKNOWN ⇒ master bị loại IM LẶNG khỏi cả 4 scope của J12 (completeness, weight-guard,
+    --   CTE W, gate SP_EOD_RUN_INDEX) ⇒ index ngừng được tính mà không một err nào bật.
+    C_INCEPTION_DATE DATE            NOT NULL,
     -- (phí QL KHÔNG còn cột rate ở đây: chính sách phí cấu hình ở T_FEE_CONFIG global theo fee_type.)
     C_BENCHMARK_CODE VARCHAR(20)     NULL,   -- benchmark đối chiếu (vd 'VNINDEX','VN30') → T_BENCHMARK_DAILY
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)

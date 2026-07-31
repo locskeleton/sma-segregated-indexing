@@ -602,12 +602,39 @@ BEGIN
         THROW 51013, @cmsg, 1;
     END
 
+    -- INCEPTION NOT NULL HARD-FAIL. Cột đã NOT NULL ở 01_TABLES.sql, guard này là cho DB dựng từ schema CŨ
+    --   (cột còn NULLable) chưa chạy ALTER. Vì sao không bỏ qua: vị từ mp.C_INCEPTION_DATE<=@p_d với NULL cho ra
+    --   UNKNOWN ⇒ master bị loại IM LẶNG khỏi CẢ 4 scope (completeness/weight/W/gate) ⇒ index của nó ngừng được
+    --   tính mà KHÔNG một err nào bật — đúng loại hỏng tệ nhất. Thà THROW. Bảng vài chục dòng, chi phí ~0.
+    IF EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_STATUS='ACTIVE' AND C_INCEPTION_DATE IS NULL)
+    BEGIN
+        DECLARE @nmsg NVARCHAR(2000) = CONCAT(N'INDEX @', CONVERT(VARCHAR(10),@p_d,23),
+            N': master ACTIVE có C_INCEPTION_DATE = NULL — ',
+            LEFT((SELECT STRING_AGG(CONVERT(NVARCHAR(20),C_MASTER_CODE), N', ') WITHIN GROUP (ORDER BY C_MASTER_CODE)
+                  FROM T_MASTER_PORTFOLIO WHERE C_STATUS='ACTIVE' AND C_INCEPTION_DATE IS NULL), 1500),
+            N'. Inception là VỊ TỪ SCOPE của J12, NULL sẽ loại master khỏi mọi phép tính mà không báo lỗi. ',
+            N'Điền inception rồi chạy lại (schema mới đã NOT NULL).');
+        THROW 51014, @nmsg, 1;
+    END
+
     -- COMPLETENESS HARD-FAIL (mọi đường gọi: forward/direct/recompute): MỌI mã trong rổ hiệu lực @p_d của MỌI
-    --   master ACTIVE PHẢI có giá @p_d. Thiếu DÙ 1 mã (của BẤT KỲ master nào) → THROW, KHÔNG ghi index master nào
-    --   ngày đó (all-or-nothing) → nghiệp vụ CONTROL được (báo rõ master:mã thiếu), KHÔNG silent skip. Chốt
-    --   2026-06-24: bỏ per-master skip cũ vì danh mục thiếu bị bỏ ngầm, nghiệp vụ không kiểm soát được.
+    --   master ACTIVE ĐÃ RA ĐỜI ≤ @p_d PHẢI có giá @p_d. Thiếu DÙ 1 mã (của BẤT KỲ master nào) → THROW, KHÔNG ghi
+    --   index master nào ngày đó (all-or-nothing) → nghiệp vụ CONTROL được (báo rõ master:mã thiếu), KHÔNG silent
+    --   skip. Chốt 2026-06-24: bỏ per-master skip cũ vì danh mục thiếu bị bỏ ngầm, nghiệp vụ không kiểm soát được.
     --   THROW trước mọi DML ⇒ atomic: index ngày đó GIỮ NGUYÊN (không xoá) nếu fail. (Forward còn gate err=11 ở
-    --   SP_EOD_RUN_INDEX báo sớm/sạch — cùng scope ACTIVE — trước khi tới đây; throw này phủ direct/recompute.)
+    --   SP_EOD_RUN_INDEX báo sớm/sạch — CÙNG SCOPE — trước khi tới đây; throw này phủ direct/recompute.)
+    --
+    -- ★ SCOPE = ACTIVE **VÀ** C_INCEPTION_DATE <= @p_d (thêm 2026-07-31). "Có bản ghi rổ hiệu lực ≤ @p_d" KHÔNG
+    --   đồng nghĩa "master đã tồn tại tại @p_d": rổ hay bị BACKDATE (FO khai weight hiệu lực từ đầu quý/đầu chiến
+    --   lược rồi mới đẩy sang SDI; migration gán chung một mốc lịch sử). Thiếu vị từ inception thì khi RECOMPUTE
+    --   LỊCH SỬ, master mới bị kéo ngược về ngày nó chưa ra đời ⇒
+    --     ① mã trong rổ nó NIÊM YẾT SAU @p_d → không đời nào có giá → THROW 51011 mỗi ngày → vì all-or-nothing,
+    --        MỌI master hợp lệ khác cũng không được tính lại ⇒ recompute-từ-inception (đường sửa chuỗi DUY NHẤT)
+    --        BẤT KHẢ THI;
+    --     ② nếu giá tình cờ đủ → sinh chuỗi index MA cho master ở những ngày nó chưa tồn tại, khởi từ base 1000.
+    --   C_INCEPTION_DATE là NOT NULL (validate ngay lúc khai báo master) ⇒ vị từ này không bao giờ ra UNKNOWN.
+    --   ⚠️ 4 chỗ dùng scope này (completeness / weight-guard / CTE W / gate SP_EOD_RUN_INDEX) PHẢI GIỐNG HỆT NHAU —
+    --      lệch một chỗ là guard và phép tính nói hai chuyện khác nhau. DELETE cố ý KHÔNG có (xem chú thích ở đó).
     DECLARE @missing NVARCHAR(MAX) = (
         SELECT STRING_AGG(CONCAT(x.C_MASTER_CODE, N':', x.C_TICKER), N', ')
                WITHIN GROUP (ORDER BY x.C_MASTER_CODE, x.C_TICKER)
@@ -615,6 +642,7 @@ BEGIN
             SELECT mw.C_MASTER_CODE, mw.C_TICKER
             FROM T_MASTER_PORTFOLIO_TICKER mw
             INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+                                            AND mp.C_INCEPTION_DATE<=@p_d
             INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
                         FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE) LD
               ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
@@ -638,6 +666,7 @@ BEGIN
             SELECT mw.C_MASTER_CODE
             FROM T_MASTER_PORTFOLIO_TICKER mw
             INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+                                            AND mp.C_INCEPTION_DATE<=@p_d          -- ★ cùng scope completeness
             INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
                         FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE) LD
               ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
@@ -654,6 +683,13 @@ BEGIN
 
     -- DELETE scoped theo master ACTIVE (đúng tập sẽ INSERT lại). KHÔNG xoá index của master ĐÃ CLOSED
     --   → lịch sử index master đã đóng được GIỮ NGUYÊN (đóng băng) khi re-run/recompute ngày quá khứ.
+    --
+    -- ★ CỐ Ý KHÔNG có vị từ C_INCEPTION_DATE ở đây — ĐÂY LÀ ĐƯỜNG DỌN RÁC, không phải guard.
+    --   Bản cũ (trước 2026-07-31) thiếu vị từ inception nên có thể đã ghi index MA cho master ở những ngày nó
+    --   chưa ra đời. Nếu DELETE cũng lọc inception thì đám rác đó VĨNH VIỄN không ai xoá (INSERT mới không phủ
+    --   tới, DELETE không đụng tới) — recompute chạy xong vẫn để lại chuỗi ma, mà lại báo err=0.
+    --   Để DELETE rộng hơn INSERT ⇒ recompute TỰ LÀNH: xoá sạch dòng @p_d của master ACTIVE rồi chỉ ghi lại
+    --   những master thật sự trong scope. Master inception > @p_d mà không có rác thì đây là no-op.
     DELETE idx FROM T_MASTER_INDEX_DAILY idx
     INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=idx.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
     WHERE idx.C_BUSINESS_DATE=@p_d;
@@ -662,10 +698,11 @@ BEGIN
         SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
         FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE<=@p_d GROUP BY C_MASTER_CODE
     ),
-    W AS (   -- rổ hiệu lực @p_d của master ACTIVE (cùng scope với guard hard-fail + forward gate)
+    W AS (   -- rổ hiệu lực @p_d của master ACTIVE ĐÃ RA ĐỜI ≤ @p_d (CÙNG SCOPE với guard hard-fail + forward gate)
         SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT
         FROM T_MASTER_PORTFOLIO_TICKER mw
         INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=mw.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+                                        AND mp.C_INCEPTION_DATE<=@p_d          -- ★ cùng scope completeness
         INNER JOIN LD ON LD.C_MASTER_CODE=mw.C_MASTER_CODE AND LD.ED=mw.C_EFFECTIVE_DATE
     ),
     FACT AS (
@@ -1011,14 +1048,18 @@ BEGIN
         RETURN;
     END
 
-    -- COMPLETENESS GATE (chốt chặn index SAI): MỌI mã thành phần danh mục mẫu (rổ hiệu lực ≤ @d, master ACTIVE)
-    --   PHẢI có giá @d trong T_PRICE_DAILY. Thiếu DÙ 1 mã → KHÔNG tính index (tránh factor lệch do nạp giá thiếu).
+    -- COMPLETENESS GATE (chốt chặn index SAI): MỌI mã thành phần danh mục mẫu (rổ hiệu lực ≤ @d, master ACTIVE
+    --   ĐÃ RA ĐỜI ≤ @d) PHẢI có giá @d trong T_PRICE_DAILY. Thiếu DÙ 1 mã → KHÔNG tính index (tránh factor lệch
+    --   do nạp giá thiếu).
+    -- ★ PHẢI CÙNG SCOPE với guard trong SP_EOD_SI_INDEX (gồm cả vị từ C_INCEPTION_DATE — xem giải thích dài ở đó).
+    --   Lệch scope = gate cho qua nhưng SP_EOD_SI_INDEX lại THROW (hoặc ngược lại), err trả về không còn tin được.
     DECLARE @missing NVARCHAR(400) = (
         SELECT STRING_AGG(req.C_TICKER, ',') WITHIN GROUP (ORDER BY req.C_TICKER)
         FROM (
             SELECT DISTINCT t.C_TICKER
             FROM T_MASTER_PORTFOLIO_TICKER t
             INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE=t.C_MASTER_CODE AND mp.C_STATUS='ACTIVE'
+                                            AND mp.C_INCEPTION_DATE<=@d
             WHERE t.C_EFFECTIVE_DATE = (SELECT MAX(C_EFFECTIVE_DATE) FROM T_MASTER_PORTFOLIO_TICKER t2
                                         WHERE t2.C_MASTER_CODE=t.C_MASTER_CODE AND t2.C_EFFECTIVE_DATE<=@d)
         ) req
@@ -1193,8 +1234,14 @@ GO
     ⚠️ Để sửa chuỗi hỏng phải chạy TỪ INCEPTION (prev ngày đầu = base 1000); chạy từ giữa → prev vẫn số cũ.
     ⚠️ KHÔNG xoá index rác đã ghi ở ngày nghỉ (từ trước khi có lịch): chỉ không tạo thêm. Dọn = xoá
        T_MASTER_INDEX_DAILY ở ngày UDF_IS_BUSINESS_DATE=0 rồi chạy lại từ inception.
-    Index là MASTER-level (giá×weight), KHÔNG theo KH → luôn tính mọi master có weight+giá @d.
+    Index là MASTER-level (giá×weight), KHÔNG theo KH → tính mọi master ACTIVE có weight+giá @d
+    ⚠️ VÀ đã RA ĐỜI: scope as-of = C_STATUS='ACTIVE' AND C_INCEPTION_DATE <= @d (sửa 2026-07-31). Trước đó scope
+      chỉ suy từ "có bản ghi rổ hiệu lực ≤ @d" — mà rổ hay BACKDATE ⇒ master mới bị kéo ngược về ngày chưa tồn
+      tại; nếu rổ nó có mã NIÊM YẾT SAU thì completeness (all-or-nothing) THROW mỗi ngày ⇒ CHẶN LUÔN việc tính
+      lại của mọi master hợp lệ khác ⇒ chính cái "chạy từ inception" bên dưới thành bất khả thi. Xem SP_EOD_SI_INDEX.
+    ⚠️ Master ĐÃ CLOSED: KHÔNG tính lại (đóng băng lịch sử) — chốt nghiệp vụ, không phải giới hạn kỹ thuật.
     err: 0 OK · 11 thiếu giá mã rổ (completeness) · 12 Σweight=0 (cấu hình rổ sai) · 13 ngày không GD
+         · 14 master ACTIVE thiếu C_INCEPTION_DATE (DB schema cũ — điền rồi chạy lại)
          · 20 range không hợp lệ · -1 runtime.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_EOD_RECOMPUTE_INDEX_RANGE
@@ -1225,10 +1272,11 @@ BEGIN
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT>0 ROLLBACK;
-        -- map lỗi hard-fail từ SP_EOD_SI_INDEX: 51011 completeness→11, 51012 weight Σ=0→12; còn lại runtime -1.
-        -- 51011 completeness→11, 51012 weight Σ=0→12, 51013 ngày không GD→13 (loop đã skip ngày nghỉ nên chỉ
-        --   xảy ra nếu lịch bị sửa giữa chừng); còn lại runtime -1.
-        SET @p_err_code = CASE ERROR_NUMBER() WHEN 51011 THEN 11 WHEN 51012 THEN 12 WHEN 51013 THEN 13 ELSE -1 END;
+        -- map lỗi hard-fail từ SP_EOD_SI_INDEX: 51011 completeness→11, 51012 weight Σ=0→12, 51013 ngày không GD→13
+        --   (loop đã skip ngày nghỉ nên chỉ xảy ra nếu lịch bị sửa giữa chừng), 51014 inception NULL→14;
+        --   còn lại runtime -1.
+        SET @p_err_code = CASE ERROR_NUMBER() WHEN 51011 THEN 11 WHEN 51012 THEN 12 WHEN 51013 THEN 13
+                                              WHEN 51014 THEN 14 ELSE -1 END;
         SET @p_err_msg = ERROR_MESSAGE();
     END CATCH
 END
