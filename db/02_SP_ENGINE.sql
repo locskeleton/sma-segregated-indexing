@@ -587,24 +587,38 @@ GO
     ② mp.C_INCEPTION_DATE<=@d       → master ĐÃ RA ĐỜI tại @d chưa (rổ backdate KHÔNG trả lời được câu này)
     ③ LD: eff_date lớn nhất ≤ @d    → phiên bản RỔ nào có hiệu lực tại @d
 
+  ③ dùng RANK() — CHẠM T_MASTER_PORTFOLIO_TICKER ĐÚNG MỘT LẦN. Bản trước tự join lại chính bảng này để lấy
+    MAX(eff_date) rồi lọc ngược ⇒ 2 lần quét cho một câu hỏi. Rổ là bảng VERSIONED (mỗi rebalance insert
+    nguyên một bộ dòng eff_date mới, bộ cũ GIỮ NGUYÊN, không có end-date/cờ is-current) nên chỉ
+    `WHERE eff_date <= @d` là ra CHỒNG TẤT CẢ phiên bản — phải chốt lấy đúng phiên bản mới nhất.
+    ⚠️ PHẢI là RANK (hoặc DENSE_RANK), TUYỆT ĐỐI KHÔNG ROW_NUMBER: một phiên bản rổ có NHIỀU dòng mã;
+       ROW_NUMBER đánh số DÒNG chứ không đánh số PHIÊN BẢN ⇒ giữ đúng 1 mã, vứt phần còn lại, ra index
+       trông vẫn hợp lý mà sai bét. (Đo thật trên rổ 2 phiên bản × 3 mã: WHERE trần = 6 dòng/Σw 200;
+       RANK=1 → 3 dòng/Σw 100 ĐÚNG; ROW_NUMBER=1 → 1 dòng/Σw 20 SAI.)
+    Lọc mp (ACTIVE + inception) đặt BÊN TRONG: nó loại nguyên master chứ không loại lẻ eff_date nên KHÔNG
+    đổi thứ hạng của master còn lại, mà lại giảm số dòng phải xếp hạng.
+
   LEFT JOIN giá (KHÔNG INNER): thiếu giá phải NHÌN THẤY ĐƯỢC (C_CLOSE_PRICE IS NULL) để completeness báo tên
   mã thiếu. INNER JOIN sẽ làm mã thiếu giá BIẾN MẤT — đúng kiểu "bỏ ngầm" mà thiết kế này cấm.
-  Không thể fan-out: UQ(master,eff_date,ticker) + LD chốt 1 eff_date/master ⇒ (master,ticker) duy nhất;
+  Không thể fan-out: UQ(master,eff_date,ticker) + RK=1 chốt 1 eff_date/master ⇒ (master,ticker) duy nhất;
   PK T_PRICE_DAILY (business_date,ticker) ⇒ join giá 1-1. */
 CREATE OR ALTER FUNCTION UDF_INDEX_BASKET_ASOF (@d DATE)
 RETURNS TABLE
 AS
 RETURN
-    SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT,
+    SELECT x.C_MASTER_CODE, x.C_TICKER, x.C_TARGET_WEIGHT,
            p.C_CLOSE_PRICE, p.C_REF_PRICE
-    FROM T_MASTER_PORTFOLIO_TICKER mw
-    INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = mw.C_MASTER_CODE
-                                    AND mp.C_STATUS = 'ACTIVE'
-                                    AND mp.C_INCEPTION_DATE <= @d
-    INNER JOIN (SELECT C_MASTER_CODE, MAX(C_EFFECTIVE_DATE) AS ED
-                FROM T_MASTER_PORTFOLIO_TICKER WHERE C_EFFECTIVE_DATE <= @d GROUP BY C_MASTER_CODE) LD
-      ON LD.C_MASTER_CODE = mw.C_MASTER_CODE AND LD.ED = mw.C_EFFECTIVE_DATE
-    LEFT JOIN T_PRICE_DAILY p ON p.C_TICKER = mw.C_TICKER AND p.C_BUSINESS_DATE = @d;
+    FROM (
+        SELECT mw.C_MASTER_CODE, mw.C_TICKER, mw.C_TARGET_WEIGHT,
+               RANK() OVER (PARTITION BY mw.C_MASTER_CODE ORDER BY mw.C_EFFECTIVE_DATE DESC) AS RK
+        FROM T_MASTER_PORTFOLIO_TICKER mw
+        INNER JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE = mw.C_MASTER_CODE
+                                        AND mp.C_STATUS = 'ACTIVE'
+                                        AND mp.C_INCEPTION_DATE <= @d
+        WHERE mw.C_EFFECTIVE_DATE <= @d
+    ) x
+    LEFT JOIN T_PRICE_DAILY p ON p.C_TICKER = x.C_TICKER AND p.C_BUSINESS_DATE = @d
+    WHERE x.RK = 1;
 GO
 
 /*===========================================================================
