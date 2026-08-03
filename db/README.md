@@ -257,7 +257,19 @@ Công thức (spec §2): AUM = `C_LAST_AUM` (per KH; phí QL đã trừ trong NA
 
 > ### ⚠️ Ba thứ SDI KHÔNG có, phải xử lý trước khi báo cáo dùng được thật
 >
-> 1. **`T_CUSTOMER_INFO` chưa có nguồn.** Họ tên KH · TKCK · MKT_ID giới thiệu/quản lý · phòng ban · đơn vị KD · khối — SDI **không phải nguồn** của những dữ liệu này (chúng ở hệ tài khoản `T_DM_ACCOUNT` + CRM). Bảng này là **bản sao được đẩy sang**. Chưa đấu nguồn ⇒ các cột đó `NULL` và **5 filter tổ chức không khớp dòng nào** — đúng hành vi, nhưng báo cáo chưa dùng được.
+> 1. **Đấu `V_CUSTOMER_INFO` vào bảng thật.** Họ tên KH · TKCK · MKT_ID giới thiệu/quản lý · phòng ban · đơn vị KD · khối — SDI **không phải nguồn**; dữ liệu này đã có sẵn ở hệ tài khoản + CRM. Báo cáo đọc **view `V_CUSTOMER_INFO`**, không đọc thẳng bảng ⇒ **đổi nguồn chỉ sửa một chỗ**:
+>    ```sql
+>    CREATE OR ALTER VIEW V_CUSTOMER_INFO AS
+>    SELECT C_CUST_CODE = a.<cot_ma_kh>, C_TKCK = a.<cot_tkck>, C_FULL_NAME = a.<cot_ho_ten>,
+>           C_MKT_ID_REFERRER = a.<...>, C_MKT_ID_MANAGER = a.<...>,
+>           C_DEPARTMENT_CODE = a.<...>, C_DEPARTMENT_NAME = a.<...>,
+>           C_BUSINESS_UNIT_CODE = a.<...>, C_BUSINESS_UNIT_NAME = a.<...>,
+>           C_DIVISION_CODE = a.<...>, C_DIVISION_NAME = a.<...>
+>    FROM <db>.<schema>.<bang_that> a;
+>    ```
+>    ⚠️ **View PHẢI duy nhất theo `C_CUST_CODE`.** Trả trùng ⇒ báo cáo **nhân đôi dòng** và Σ AUM phình mà không lỗi nào bật. Nguồn có nhiều dòng/KH (lịch sử quy kết, nhiều TK) thì phải chốt lấy 1 dòng **trong view**.
+>    ⚠️ Nguồn ở **hệ khác (Oracle…)** thì view không với tới — phải qua linked server hoặc job đồng bộ về `T_CUSTOMER_INFO` (thân view mặc định đang trỏ vào bảng này).
+>    Chưa đấu ⇒ các cột đó `NULL` và **5 filter tổ chức không khớp dòng nào** — đúng hành vi, nhưng báo cáo chưa dùng được.
 > 2. **Tên JSON key của 2 khoản chờ về cần Asset xác nhận.** Ingest đang đọc `dividend_pending` / `sell_pending`. **Sai tên ⇒ `OPENJSON` trả NULL ⇒ `ISNULL(...,0)` biến thành 0**, và báo cáo hiện "cổ tức chờ về = 0" trông y như thật. Đổi tên = sửa đúng 2 dòng trong `SP_INGEST_ASSET_NAV`. Kiểm nhanh sau khi Asset đẩy lô đầu:
 >    ```sql
 >    SELECT COUNT(*) AS n, SUM(C_DIVIDEND_PENDING) AS div_, SUM(C_SELL_PENDING) AS sell_

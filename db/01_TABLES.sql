@@ -154,6 +154,37 @@ CREATE TABLE T_CUSTOMER_INFO (
 CREATE INDEX IX_CUSTOMER_INFO_ORG ON T_CUSTOMER_INFO
     (C_DIVISION_CODE, C_BUSINESS_UNIT_CODE, C_DEPARTMENT_CODE)
     INCLUDE (C_CUST_CODE, C_MKT_ID_REFERRER, C_MKT_ID_MANAGER);
+GO
+
+/*==============================================================================================
+  V_CUSTOMER_INFO — ★ ĐIỂM NỐI DUY NHẤT giữa báo cáo và nguồn thông tin KH + tổ chức.
+
+  SP_GET_REPORT_AUM_TOTAL đọc VIEW này, KHÔNG đọc thẳng bảng. Lý do: dữ liệu khối/phòng ban/sale
+  KHÔNG thuộc SDI — nó nằm ở hệ tài khoản + CRM, và mỗi môi trường có thể để ở một chỗ khác nhau.
+  Đưa nó vào view ⇒ đổi nguồn chỉ sửa ĐÚNG MỘT CHỖ, không phải sửa SP báo cáo.
+
+  ⚠️ HỢP ĐỒNG CỘT (đổi thân view thì phải giữ nguyên đúng 11 tên cột này):
+      C_CUST_CODE · C_TKCK · C_FULL_NAME · C_MKT_ID_REFERRER · C_MKT_ID_MANAGER
+      C_DEPARTMENT_CODE · C_DEPARTMENT_NAME · C_BUSINESS_UNIT_CODE · C_BUSINESS_UNIT_NAME
+      C_DIVISION_CODE · C_DIVISION_NAME
+  ⚠️ PHẢI DUY NHẤT THEO C_CUST_CODE. View trả trùng cust_code ⇒ báo cáo NHÂN ĐÔI dòng và Σ AUM
+      phình lên mà không có lỗi nào bật. Nguồn có nhiều dòng/KH (lịch sử quy kết, nhiều TK) thì
+      phải chốt lấy 1 dòng TRONG view (bản ghi mới nhất / bản ghi đang hiệu lực).
+
+  Thân mặc định trỏ vào T_CUSTOMER_INFO (bảng SDI tự giữ, cần job đẩy sang).
+  ĐÃ CÓ SẴN BẢNG Ở NƠI KHÁC thì thay thân view, ví dụ:
+      CREATE OR ALTER VIEW V_CUSTOMER_INFO AS
+      SELECT C_CUST_CODE = a.customer_code, C_TKCK = a.account_no, C_FULL_NAME = a.full_name, ...
+      FROM   <db_khac>.dbo.<bang_that> a;
+  ⚠️ Nguồn nằm ở HỆ KHÁC (Oracle…) thì view KHÔNG với tới được — phải qua linked server hoặc job
+     đồng bộ về T_CUSTOMER_INFO. Đây là quyết định hạ tầng, không phải chuyện sửa SQL.
+==============================================================================================*/
+CREATE OR ALTER VIEW V_CUSTOMER_INFO AS
+SELECT C_CUST_CODE, C_TKCK, C_FULL_NAME, C_MKT_ID_REFERRER, C_MKT_ID_MANAGER,
+       C_DEPARTMENT_CODE, C_DEPARTMENT_NAME, C_BUSINESS_UNIT_CODE, C_BUSINESS_UNIT_NAME,
+       C_DIVISION_CODE, C_DIVISION_NAME
+FROM   T_CUSTOMER_INFO;
+GO
 
 /*-------------------------------------------------------------- MARKET DATA ---*/
 -- LỊCH NGHỈ — CORE (trước ở 09_FEE.sql, kéo lên đây 2026-07-11 vì ENGINE cũng phải dùng, không chỉ phí).

@@ -1,4 +1,4 @@
-SET QUOTED_IDENTIFIER ON;  -- procs đọc bảng có filtered index (hist) → cần QI ON lúc CREATE PROC
+﻿SET QUOTED_IDENTIFIER ON;  -- procs đọc bảng có filtered index (hist) → cần QI ON lúc CREATE PROC
 SET ANSI_NULLS ON;
 GO
 /*==============================================================================
@@ -617,7 +617,7 @@ BEGIN
         FROM       T_SI_BALANCE       b
         INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
         LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
-        LEFT  JOIN T_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE
+        LEFT  JOIN V_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE   -- ★ VIEW, không phải bảng: đổi nguồn sửa 1 chỗ
         WHERE b.C_BUSINESS_DATE = @p_to_date
           -- "Từ ngày": tiểu khoản phải đã mở trước/trong kỳ và chưa đóng TRƯỚC kỳ
           AND (@p_from_date IS NULL
@@ -677,7 +677,7 @@ BEGIN
     FROM       T_SI_BALANCE       b
     INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
     LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
-    LEFT  JOIN T_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE
+    LEFT  JOIN V_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE   -- ★ VIEW, không phải bảng: đổi nguồn sửa 1 chỗ
     WHERE b.C_BUSINESS_DATE = @p_to_date
       AND (@p_from_date IS NULL
            OR (p.C_JOIN_DATE <= @p_to_date
