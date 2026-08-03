@@ -29,10 +29,11 @@ Tài liệu **tổng hợp** mọi thuật ngữ (tiếng Việt / tiếng Anh) 
 
 | Tiếng Việt | English | Ký hiệu / cột | Giải thích | BRD tham chiếu |
 |---|---|---|---|---|
-| Tiền mặt | Cash | `C_CASH` | Tiền khả dụng (FO sync). **Đã NET** phí giao dịch + thuế (FO trừ khi khớp lệnh). | spec §3 |
-| Tiền bán chờ về | Pending settlement cash | `C_PENDING_CASH` | Tiền bán cổ phiếu chưa về tài khoản (chu kỳ T+2, tổng T0+T1+T2). Là **khoản phải thu (receivable)** — vẫn tính vào tài sản → NAV không hụt giả khi bán. | spec §3 |
-| Cổ tức tiền chờ về | Dividend receivable | `C_DIV_CASH` | Tiền cổ tức đã chia nhưng chưa về. Receivable. | spec §3 |
-| Tiền | Cash (tổng) | — | `Tiền = C_CASH + C_PENDING_CASH + C_DIV_CASH` (tiền mặt + 2 khoản chờ về). | spec §3 |
+| Tiền (tổng) | Cash (total) | `C_CASH` | **[thin-layer] Asset gửi — là TỔNG, ĐÃ GỘP 2 khoản chờ về.** `C_CASH = tiền mặt + C_DIVIDEND_PENDING + C_SELL_PENDING`. Đây là số dùng cho cash drag. ⚠️ Đừng đọc `C_CASH` là "tiền mặt" — quan hệ NGƯỢC với bản cũ (trước 2026-08-03 `C_CASH` là tiền mặt và tổng phải CỘNG thêm 2 khoản chờ). | spec §3 |
+| Tiền mặt | Cash on hand | — (suy ra) | **KHÔNG có cột riêng** — Asset không gửi. `Tiền mặt = C_CASH − C_DIVIDEND_PENDING − C_SELL_PENDING` (phần CÒN LẠI). Nhờ vậy 4 cột tiền của báo cáo AUM luôn cộng khớp theo định nghĩa. Ingest chặn `div+sell > cash` (err=22) nên không ra âm. | spec §3 ; `SP_GET_REPORT_AUM_TOTAL` |
+| Tiền khả dụng | Available cash | `C_CASH_AVAILABLE` | Asset gửi. Số **thật sự rút/cắt được** — loại thêm cả tiền PHONG TOẢ / CHỜ KHỚP, nên `C_CASH − C_CASH_AVAILABLE ≥ C_DIVIDEND_PENDING + C_SELL_PENDING`. ⚠️ **KHÁC "tiền mặt"** — đừng dùng thay nhau (lấy khả dụng làm tiền mặt ⇒ 4 cột báo cáo lệch). Là nguồn thu phí. | spec §3 ; fee |
+| Tiền bán chờ về | Pending settlement cash | `C_SELL_PENDING` | Tiền bán cổ phiếu chưa về tài khoản (chu kỳ T+2). **Khoản phải thu (receivable)** — vẫn tính vào tài sản → NAV không hụt giả khi bán. Asset gửi (`sell_pending`), **đã gộp trong `C_CASH`**. | spec §3 |
+| Cổ tức tiền chờ về | Dividend receivable | `C_DIVIDEND_PENDING` | Tiền cổ tức đã chia nhưng chưa về. Receivable. Asset gửi (`dividend_pending`), **đã gộp trong `C_CASH`**. | spec §3 |
 | ~~Giá trị cổ phiếu~~ **[thin-layer] ĐÃ GỠ** | ~~Stock value (MTM)~~ | ~~`C_STOCK_VALUE`~~ | **ĐÃ GỠ khỏi feed Asset** — thin-layer Asset gửi `aum` (NAV ròng) + `cash` (tổng) + `daily_return`, KHÔNG gửi `stock_value`. Composition per-mã vẫn có từ FO holdings (`T_MASTER_HOLDING_BALANCE`), nhưng định giá tổng cổ phiếu không còn là trường feed riêng. | — |
 | AUM (= NAV ròng) | AUM / Net Asset Value | `C_AUM`, `C_LAST_AUM` | **[thin-layer] Asset gửi trực tiếp** (NAV ròng per-KH, đã trừ phí QL). SDI lưu, KHÔNG tự cộng từ stock+cash. Ở cấp master = Σ AUM tiểu khoản (Assets Under Management). | spec §3 ; eod (4) |
 | ~~Phí phải trả~~ **[thin-layer] ĐÃ GỠ** | ~~Payable (accrued) fee~~ | ~~`C_PAYABLE_FEE`~~ | **ĐÃ GỠ** — SDI không accrue phí; Asset gửi NAV ròng (đã trừ phí QL sẵn). | — |

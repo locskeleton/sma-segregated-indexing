@@ -39,7 +39,7 @@ Asset ─(4) [thin-layer] aum (NAV ròng) + daily_return (TWR) + cash(tổng) + 
 SDI ──(6) cashflow nạp/rút/SIP (SDI là originator) ─────────────────── (đối soát Asset)
 Mkt ──(7) giá EOD + corporate action + benchmark ──────────────────▶ SDI
         │
-        │  INGEST-NAV (Asset, per-SI/ngày GD): SP_INGEST_ASSET_NAV → T_SI_ASSET_DAILY + LƯU aum+daily_return
+        │  INGEST-NAV (Asset, per-SI/ngày GD): SP_INGEST_ASSET_NAV → GHI THẲNG T_SI_BALANCE (aum+daily_return+tiền)
         │  FO holdings ingest (Kafka per-KH): SP_INGEST_CUSTOMER → holdings + interval hist (composition)
         │  SDI EOD (SP_EOD_RUN): J0 GATE → INGEST-NAV (LƯU aum+daily_return, KHÔNG derive)
         │       → J11 master agg → J12 Index → J12B TE accum → J13 RECONCILE (cổng publish nội bộ) → J14 build snapshot (nội bộ)
@@ -88,7 +88,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 ### E. Asset → SDI (feed EOD) — **[BRD asset-sync] MỚI**
 
-> **Cơ chế:** Asset gửi 1 batch JSON per-SI → `SP_INGEST_ASSET_NAV` (idempotent DELETE+INSERT `T_SI_BALANCE` theo date,si) rồi SDI **LƯU thẳng** `aum` + `cash` + `cash_available` + `daily_return` (KHÔNG derive).
+> **Cơ chế:** Asset gửi 1 batch JSON per-SI → `SP_INGEST_ASSET_NAV` (idempotent DELETE+INSERT `T_SI_BALANCE` theo date,si) rồi SDI **LƯU thẳng** `aum` + `cash` + `cash_available` + `dividend_pending` + `sell_pending` + `daily_return` (KHÔNG derive).
 >
 > ⚠️ **CẬP NHẬT 2026-07-11 — Asset gửi MỌI NGÀY LỊCH (365), kể cả T7/CN/lễ** (trước: chỉ ngày GD + SDI carry-forward). Lý do: **nạp/rút cuối tuần vẫn đổi AUM** ⇒ đổi base **phí QL** ngày đó (phí tính theo ngày dương lịch, `SP_EOD_FEE_ACCRUE` lấy **AUM của chính ngày đó**). Hệ quả:
 > - `SP_INGEST_ASSET_NAV` **KHÔNG gate lịch** — nhận ngày nghỉ bình thường. Nhưng **EOD/index/TE CHỈ chạy ngày GD** (`SP_EOD_RUN`/`SP_EOD_RUN_INDEX`/`SP_EOD_SET_SOURCE_READY` → err=13 nếu gọi vào ngày nghỉ).
@@ -97,7 +97,7 @@ Thứ tự: **(1) trong ngày** (SDI kích FO rebalance) → **(2,3,7) FO/Market
 
 | # | Luồng | Bảng/payload | Trường | Tính chất |
 |---|---|---|---|---|
-| 4 | **AUM + daily_return** Asset→SDI | `T_SI_ASSET_DAILY` → LƯU `T_SI_BALANCE`/`_CURRENT` | si_account, **aum** (NAV RÒNG, đã trừ phí QL), **daily_return** (TWR, khử dòng tiền; NULL ngày đầu), **cash** (TỔNG tiền 1 số), cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = NAV`. **KHÔNG `stock_value`/`fee_accum`** (Asset gửi NAV ròng + return; phí QL model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). |
+| 4 | **AUM + daily_return** Asset→SDI | GHI THẲNG `T_SI_BALANCE` + MERGE `T_SI_CURRENT` *(landing-table `T_SI_ASSET_DAILY` đã GỠ)* | si_account, **aum** (NAV RÒNG, đã trừ phí QL), **daily_return** (TWR, khử dòng tiền; NULL ngày đầu), **cash** (TỔNG tiền, ĐÃ GỘP 2 khoản chờ về), **cash_available**, **dividend_pending**, **sell_pending**, cash_in, cash_out | **DENSE** per-SI/ngày GD. `AUM = NAV`. **KHÔNG `stock_value`/`fee_accum`** (Asset gửi NAV ròng + return; phí QL model realized). `cash_in/out` để đối soát cashflow SDI tự nhập (mục 6). **Tiền mặt = cash − dividend_pending − sell_pending** (không có field riêng); ingest **từ chối cả batch (err=22)** nếu `div/sell < 0` hoặc `div+sell > cash`. |
 
 ### D. SDI → Asset — chỉ còn Master Index (BRD 2026-06-22)
 

@@ -61,14 +61,16 @@ SDI: [thin-layer] LƯU aum + daily_return (Asset gửi) + holdings (FO, composit
 
 ```
 AUM = NAV     = Asset GỬI TRỰC TIẾP per-KH (đã trừ phí QL — tài sản RÒNG)   [thin-layer]
-Tiền (cash)   = TỔNG tiền dư (1 số: gộp tiền mặt + bán chờ về + cổ tức tiền) — Asset gửi kèm
+Tiền (cash)   = TỔNG tiền dư — Asset gửi kèm; ĐÃ GỘP tiền mặt + bán chờ về + cổ tức tiền
+                Asset gửi THÊM tách khoản: cash_available, dividend_pending, sell_pending
+                ⇒ Tiền mặt = cash − dividend_pending − sell_pending  (KHÔNG có cột riêng)
 daily_return  = Asset GỬI (TWR ngày, đã khử dòng tiền) — SDI compound on-read
 Tổng vốn đầu tư = Σ cash_in − Σ cash_out             (net cashflow lũy kế)
 ```
 
-> **[thin-layer]** SDI **KHÔNG còn tự định giá / accrue phí QL / derive unit-UP-PnL**. **Asset gửi per-KH/ngày GD**: `aum` (NAV ròng — model REALIZED, phí QL đã trừ) + `daily_return` (TWR) + `cash` (tổng) + `cash_in/cash_out`. SDI **ingest thẳng** (`SP_INGEST_ASSET_NAV` → `T_SI_ASSET_DAILY`) rồi **LƯU** `aum`+`daily_return` vào `T_SI_BALANCE` (KHÔNG tính thêm gì).
+> **[thin-layer]** SDI **KHÔNG còn tự định giá / accrue phí QL / derive unit-UP-PnL**. **Asset gửi per-KH/ngày GD**: `aum` (NAV ròng — model REALIZED, phí QL đã trừ) + `daily_return` (TWR) + `cash` (tổng) + `cash_in/cash_out`. SDI **ingest ghi THẲNG `T_SI_BALANCE`** (`SP_INGEST_ASSET_NAV`, Kafka batch ≤100 item/msg, idempotent) + MERGE roll-forward `T_SI_CURRENT` — **KHÔNG tính thêm gì**. *(Landing-table `T_SI_ASSET_DAILY` đã GỠ — không còn bảng trung gian.)*
 
-- **AUM = NAV = Asset gửi trực tiếp** (không còn `total_asset − payable`, không còn `stock + cash`). `cash` gửi kèm để hiển thị (FR-06) + cash drag. `cash` = **TỔNG tiền dư** (1 số — Asset không chia nhỏ). **[thin-layer]** Asset KHÔNG gửi `stock_value` ⇒ reconcile NAV_CONSISTENCY (`nav` vs `stock+cash`) đã GỠ.
+- **AUM = NAV = Asset gửi trực tiếp** (không còn `total_asset − payable`, không còn `stock + cash`). `cash` gửi kèm để hiển thị (FR-06) + cash drag. `cash` = **TỔNG tiền dư, ĐÃ GỘP** hai khoản chờ về; Asset gửi **thêm** `cash_available` / `dividend_pending` / `sell_pending` để báo cáo AUM tách cột (xem §8 `T_SI_BALANCE`). **[thin-layer]** Asset KHÔNG gửi `stock_value` ⇒ reconcile NAV_CONSISTENCY (`nav` vs `stock+cash`) đã GỠ; **giá trị chứng khoán = AUM − cash** (suy ra).
 - **Asset là nguồn NAV/tiền/hiệu suất DUY NHẤT**. SDI mirror số Asset đẩy về, không tự cộng/trừ; không suy cash/NAV/return từ holdings.
 - **Phí QL: model REALIZED** — phí chỉ giảm tài sản khi BO cắt thật (qua cash). **BO KHÔNG gửi số phí lũy kế (accrued)** cho Asset; Asset đã trừ phí sẵn trong NAV. SDI **KHÔNG accrue, KHÔNG quản payable**. Thuế GD do FO/BO net vào cash khi khớp (ngoài SDI).
 - **`CF_t` chỉ lấy từ cashflow event** (nhãn DEPOSIT/SIP/WITHDRAW) — **không** suy từ Δ tổng tiền. Event phải khớp đúng ngày + số tiền với thời điểm FO phản ánh vào cash.
@@ -80,6 +82,7 @@ Tổng tiền chỉ để tính NAV. Các thành phần tiền lưu **theo loạ
 | Dùng cho | Lấy từ |
 |---|---|
 | Cash drag / FR-06 | `cash` (tổng) Asset gửi |
+| Báo cáo AUM — 4 cột tiền | `cash` (tổng) − `dividend_pending` − `sell_pending` = tiền mặt; `cash_available` trả riêng (≠ tiền mặt) |
 | Cashflow (đối soát 2 nguồn) | event nhãn DEPOSIT/SIP/WITHDRAW (SDI originator) vs `cash_in/out` Asset gửi |
 | Income | đã nằm trong `aum`/`cash` Asset gửi (không tag cash_in) |
 
@@ -183,6 +186,11 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_FEE_CONFIG`** — **[BRD asset-sync] ĐÃ GỠ.** SDI không còn accrue/cấu hình phí (phí QL đã trừ sẵn trong NAV Asset gửi — model realized). Catalog chính sách phí giờ thuộc Asset/BO, không phải SDI.
 - **`T_MASTER_PORTFOLIO_TICKER`** (`C_MASTER_CODE`, effective_date, ticker; target_weight) — **FO tính & feed**; Σ = 100% cổ phiếu/eff_date.
 - **`T_SI_PORTFOLIO`** (`C_SI_ACCOUNT` UNIQUE; `C_CUST_CODE`, `C_MASTER_CODE`, sub_account_no, join_date, status, close_date, initial_amount, sip_amount, sip_schedule, min_invest) — registry tiểu khoản + cấu hình đầu tư KH (FR-04). **[BRD asset-sync] Phí không thuộc SDI** (đã trừ sẵn trong NAV Asset gửi).
+- **`T_CUSTOMER_INFO`** (`C_CUST_CODE` PK clustered + `PK_CUSTOMER_INFO` GUID; `C_TKCK`, `C_FULL_NAME`, `C_MKT_ID_REFERRER`, `C_MKT_ID_MANAGER`, và **3 cặp code+name**: `C_DEPARTMENT_*` / `C_BUSINESS_UNIT_*` / `C_DIVISION_*`, `C_UPDATED_AT`) — dimension **thông tin KH + quy kết tổ chức** (phòng ban / đơn vị KD / khối / người giới thiệu / sale quản lý) cho báo cáo AUM. **Không phải dữ liệu SDI tự dựng** — đã có sẵn ở hệ tài khoản + CRM; bảng này là **bản sao cần job đẩy về** (hoặc bỏ hẳn, xem view dưới). Tách bảng riêng thay vì nhét vào `T_SI_PORTFOLIO` vì quy kết tổ chức đổi theo CRM (chuyển sale, đổi phòng ban) — trộn vào registry sẽ biến bảng đăng ký thành nơi CRM ghi đè.
+  - ⚠️ **Là ảnh HIỆN TẠI, KHÔNG có lịch sử**: báo cáo AUM **ngày quá khứ vẫn quy kết theo tổ chức HÔM NAY**. Sale chuyển phòng hôm nay ⇒ doanh số tháng trước theo về phòng mới. Muốn quy kết đúng thời điểm phải thêm chiều thời gian — **chốt với nghiệp vụ trước khi làm**.
+- **`V_CUSTOMER_INFO`** — ★ **ĐIỂM NỐI DUY NHẤT** giữa báo cáo và nguồn thông tin KH/tổ chức. `SP_GET_REPORT_AUM_TOTAL` join **view này**, KHÔNG join thẳng bảng ⇒ đổi nguồn = sửa **thân view**, không đụng SP. Thân mặc định trỏ `T_CUSTOMER_INFO` (để deploy sạch + smoke chạy ngay); môi trường đã có bảng thật thì `CREATE OR ALTER VIEW` repoint và bỏ job đẩy. **Hợp đồng: giữ nguyên 11 tên cột.**
+  - ⚠️ **View PHẢI DUY NHẤT theo `C_CUST_CODE`.** Trả trùng ⇒ báo cáo **nhân đôi dòng** và Σ AUM phình mà **không lỗi nào bật**. Nguồn có nhiều dòng/KH (lịch sử quy kết, nhiều TK) phải chốt lấy 1 dòng **trong view**.
+  - ⚠️ Nguồn ở **hệ khác** (Oracle…) thì view không với tới — cần linked server hoặc job sync về `T_CUSTOMER_INFO`. Đây là **quyết định hạ tầng**, không phải chuyện sửa SQL.
 
 ### Market data
 - **`T_PRICE_DAILY`** (ticker, business_date PK; **ref_price** NOT NULL, close_price, **is_ex_rights** [1=ngày có sự kiện quyền gây chia giá / 0=phiên thường]) — **gộp corporate action vào bảng giá**: `ref_price` = giá tham chiếu đầu phiên sở publish MỖI ngày (phiên thường = close hôm trước; ex-rights = giá sau chia), là mẫu số daily-return J12 → engine self-contained, KHÔNG tra bản ghi ngày trước. `is_ex_rights` = metadata. Bỏ bảng `T_CORPORATE_ACTION` riêng (type/ratio/cash_div không tham gia tính; cổ tức/quyền vào NAV qua FO sync).
@@ -193,14 +201,15 @@ Prefix bảng `T_`, cột `C_`. **Quy chuẩn kiểu:** Tiền VND & quantity = 
 - **`T_REBALANCE_REQUEST`** (request_id PK; `C_MASTER_CODE`, business_date, type[REBALANCE|DEPLOY|REDEEM], status) — **SDI → FO**, trigger (không chứa weights).
 - **`T_SI_HOLDING_HIST`** (`C_SI_ACCOUNT`, ticker, valid_from; valid_to, quantity, avg_cost) — **HISTORY holdings theo KHOẢNG (INTERVAL / SCD-2)**: **FULL history BẮT BUỘC (compliance), KHÔNG trùng lặp** — holding bất biến N năm = **1 dòng** (`valid_to=NULL` = đang mở). Maintain bằng **DIFF** current vs dòng open **TẠI INGEST (per-event Kafka)** (đóng dòng đổi/biến mất → mở dòng mới). Reconstruct ngày D: `valid_from≤D AND (valid_to>D OR valid_to IS NULL)`. FO ingest holdings THẲNG `T_SI_PORTFOLIO_HOLDING` (current); **EOD core KHÔNG đọc hist**.
 - **`T_SI_CASH_HIST`** — **[BRD asset-sync] ĐÃ GỠ.** History cash interval không còn (tiền/NAV nay từ Asset; sửa quá khứ = re-ingest, không reconstruct cash từ history).
-- **State per-KH `T_SI_CURRENT`** (roll-forward) — **[thin-layer]** giữ `C_AUM` (= `C_LAST_AUM`, NAV ròng Asset gửi) + `cash` (tổng). **Không còn** `C_PAYABLE_FEE`/`C_STOCK_VALUE`/`C_UNIT`/`C_LAST_UNIT_PRICE` (Asset cấp `aum`+`daily_return`; AUM = NAV).
+- **State per-KH `T_SI_CURRENT`** (roll-forward) — **[thin-layer]** giữ `C_AUM` (= `C_LAST_AUM`, NAV ròng Asset gửi) + **4 cột tiền Asset gửi**: `C_CASH` (TỔNG), `C_CASH_AVAILABLE` (khả dụng), `C_DIVIDEND_PENDING`, `C_SELL_PENDING` (xem chú giải cột tiền dưới `T_SI_BALANCE`). **Không còn** `C_PAYABLE_FEE`/`C_STOCK_VALUE`/`C_UNIT`/`C_LAST_UNIT_PRICE` (Asset cấp `aum`+`daily_return`; AUM = NAV).
 - **`T_SI_CASHFLOW_EVENT`** (event_id PK; `C_SI_ACCOUNT`, business_date, event_type[INITIAL|TOPUP|SIP|INTEREST_IN|WITHDRAW], amount, created_time) — external cashflow (SDI originator); **[thin-layer]** dùng để **đối soát** với `cash_in/out` Asset gửi (KHÔNG còn để tính unit — Asset cấp `daily_return` đã khử dòng tiền).
 - **`T_SI_INCOME_FEE`** — **[BRD asset-sync] ĐÃ GỠ.** Sổ cái phí/thu nhập per-KH (cổ tức + phí lưu ký + phí ACCRUE cắt) không còn ở SDI: phí QL đã trừ sẵn trong NAV Asset gửi (model realized), cổ tức/income đã nằm trong NAV/`cash` Asset gửi. Cùng đó gỡ proc `SP_INGEST_FEE_CHARGE` (net-off payable).
 - **`T_SI_FEE_ACCRUAL` / payable / Option B breakdown per-type** — **[BRD asset-sync] ĐÃ GỠ TOÀN BỘ.** Không còn `C_PAYABLE_FEE`, không accrue, không breakdown per-type. Phí QL chỉ giảm tài sản khi BO cắt thật (qua cash, đã phản ánh trong NAV Asset gửi) — SDI không lưu/dựng lại số phí lũy kế.
 - **`T_SI_UNIT_LEDGER`** — **[thin-layer] ĐÃ GỠ.** Sổ cái unit thay đổi (cf_net/delta_unit/unit) không còn — SDI không phát hành unit (Asset cấp `daily_return`).
 
 ### Per-KH daily performance (LỊCH SỬ — materialize)
-- **`T_SI_BALANCE`** (business_date, `C_SI_ACCOUNT`; **`C_AUM`** (NAV ròng Asset gửi), **`C_DAILY_RETURN`** (TWR Asset gửi), **cash_in, cash_out**, **accum_active_ret, accum_active_ret_sq, ret_day_count**) — **BẮT BUỘC**: chuỗi AUM + daily_return per-ngày để serve %PnL compound + vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). **[thin-layer]** `C_AUM` = NAV ròng (= NAV); **đã GỠ cột** `unit`/`unit_price`/`daily_pnl`/`payable_fee`/`nav_gross`.
+- **`T_SI_BALANCE`** (business_date, `C_SI_ACCOUNT`; **`C_AUM`** (NAV ròng Asset gửi), **`C_DAILY_RETURN`** (TWR Asset gửi), **cash, cash_available, dividend_pending, sell_pending, cash_in, cash_out**, **accum_active_ret, accum_active_ret_sq, ret_day_count**) — **BẮT BUỘC**: chuỗi AUM + daily_return per-ngày để serve %PnL compound + vẽ chart FR-03. ~2,5 tỷ dòng/10 năm → CCI + partition (có thể lấy điểm thưa để giảm tải). **[thin-layer]** `C_AUM` = NAV ròng (= NAV); **đã GỠ cột** `unit`/`unit_price`/`daily_pnl`/`payable_fee`/`nav_gross`.
+  - **Bốn cột tiền (Asset gửi) — quan hệ phải nhớ đúng:** `C_CASH` là **TỔNG, ĐÃ GỘP** hai khoản chờ về ⇒ **`Tiền mặt = C_CASH − C_DIVIDEND_PENDING − C_SELL_PENDING`** (không có cột "tiền mặt"; nó là phần CÒN LẠI, nhờ vậy 4 cột báo cáo luôn cộng khớp theo định nghĩa). `C_CASH_AVAILABLE` **KHÁC** tiền mặt — khả dụng loại thêm tiền phong toả/chờ khớp nên `C_CASH − C_CASH_AVAILABLE ≥ dividend_pending + sell_pending`; **đừng dùng thay nhau**. Ingest chặn `div+sell > cash` (**err=22, từ chối cả batch**) nên tiền mặt không thể ra âm. JSON key Asset: `dividend_pending` / `sell_pending` (ISNULL→0 ⇒ payload cũ vẫn ingest được).
   - **`accum_active_ret` / `accum_active_ret_sq` / `ret_day_count`** (FLOAT/INT) — **lũy kế TE prefix-sum** (active return = `daily_return` KH − `daily_return` master index), maintain bởi **J12B** (xem §9.2). Cho phép serve-layer PM tính Tracking Error qua range BẤT KỲ bằng HIỆU 2 mốc base/end (đọc 2 lát, không quét lịch sử): `Var=(ΣA²−(ΣA)²/n)/(n−1)`, `TE=√Var×√min(n,252)`. Tiêu thụ ở [SDI-pm-tool-spec.md](./SDI-pm-tool-spec.md) (US1/US2). Index `IX_SI_NAV_BALANCE_MASTER (C_MASTER_CODE,C_BUSINESS_DATE)` INCLUDE 3 cột này + `daily_return`/`aum` để phủ đọc-2-lát.
 
 ### Chuỗi daily master-level (materialize, nhỏ)
@@ -319,6 +328,21 @@ J0 GATE → INGEST-NAV (LƯU aum+daily_return, KHÔNG derive)
 | FR-06 Báo cáo tài sản | GET /customer/{id}/si/{si}/asset-report | `SP_GET_ASSET_REPORT` | **[thin-layer]** T_SI_BALANCE (`aum` ròng @asOf + %PnL compound) + `cash` (tổng) Asset gửi; `AUM = NAV` + holdings chi tiết per-mã (FO @asOf × giá). **Bỏ unit/UP + payable + breakdown per-type** (SDI không tính unit / không quản phí) |
 
 > **FR-06 result sets [thin-layer]:** **RS1** summary (`aum` ròng + `cash` + %PnL compound; `AUM = NAV`), **RS2** holdings chi tiết per-mã @asOf (FO×giá; composition). **Đã BỎ RS3/RS4/RS5** (income/phí breakdown) + cột unit/UP — phí QL đã trừ trong NAV Asset, không còn unit price. *(Asset không gửi `stock_value` ⇒ không còn so RS2 Σ vs Asset stock.)*
+
+### Báo cáo vận hành — `SP_GET_REPORT_AUM_TOTAL` (không thuộc FR-01..06)
+
+**Báo cáo tổng tài sản AUM** = ảnh chụp **per-tiểu-khoản tại MỘT ngày chốt**, phục vụ màn hình lọc của vận hành/sale (khác FR-01..06 là API của UI khách hàng). **RS1** = lưới; **RS2** = dòng tổng (#tiểu khoản, Σ AUM, Σ chứng khoán, Σ tiền) — tắt bằng `@p_include_total=0`.
+
+| Nhóm | Tham số | Ghi chú |
+|---|---|---|
+| Ngày | `@p_from_date`, `@p_to_date` | **`@p_to_date` = NGÀY CHỐT SỐ** (NULL = phiên có dữ liệu gần nhất); mọi số tiền là ảnh chụp cuối ngày đó. **`@p_from_date` CHỈ lọc TẬP tiểu khoản** (đã mở trước/trong kỳ, chưa đóng trước kỳ) — **KHÔNG đổi số tiền**. Căn cứ: lưới không có cột ngày ⇒ báo cáo MỘT ngày, không phải dải. |
+| Tổ chức | `@p_division`, `@p_business_unit`, `@p_department`, `@p_referrer_id`, `@p_manager_id` | Từ `V_CUSTOMER_INFO` (LEFT JOIN — chưa đấu nguồn thì cột NULL và filter tổ chức không khớp dòng nào; **đúng hành vi, không phải lỗi**). |
+| Danh mục / TK | `@p_master_code`, `@p_alias`, `@p_tkck`, `@p_si_account` | `@p_alias` = alias DM Index. |
+
+- **`Giá trị chứng khoán = AUM − Tổng tiền`** — **suy ra, không phải số Asset gửi** ([thin-layer] Asset không gửi `stock_value`). **CÙNG cách suy với `SP_GET_ASSET_REPORT`** — đừng sửa một chỗ mà quên chỗ kia.
+- **Bốn cột tiền luôn cộng khớp**: `Tổng tiền = Tiền mặt + Cổ tức chờ về + Tiền bán CK chờ về`, với `Tiền mặt` là phần CÒN LẠI của `C_CASH` (xem chú giải 4 cột tiền ở §8 `T_SI_BALANCE`). Cột `C_CASH_AVAILABLE` trả **thêm** để phân biệt "tiền mặt" ≠ "tiền khả dụng".
+- **err**: `0` OK · `3` ngày chốt chưa có dữ liệu số dư (date-guard: chặn ngày tương lai / Asset chưa đồng bộ — nếu không, báo cáo trả 0 dòng và người đọc tưởng "hôm đó không ai có tài sản") · `20` tham số không hợp lệ (`from > to`) · `-1` runtime. KHÔNG THROW.
+- ⚠️ **Date-guard ở đây KHÔNG dùng lịch giao dịch** — khác các API khác (chúng gate bằng `UDF_IS_BUSINESS_DATE` / `T_TRADING_HOLIDAY`). Lý do: Asset gửi số dư **mọi ngày dương lịch** kể cả T7/CN ⇒ chốt AUM cuối tuần là **hợp lệ**. Lịch GD chỉ gate phần **TÍNH TOÁN** (index/EOD), không gate báo cáo. Guard ở đây là **data-existence** (`EXISTS` dòng `T_SI_BALANCE` @ngày chốt).
 
 ---
 

@@ -184,9 +184,13 @@ GO
 
 /*===========================================================================
   INGEST — Kafka per-KH (FORWARD). App đọc event 1 KH → EXEC proc này (JSON).
-    Xử lý NGAY khi nhận: cash (state + interval CASH_HIST), holdings (current + interval
-    HOLDING_HIST), cổ tức/phí (append dedup). Thay J01_SYNC_FO + J14B_HISTORY cũ.
-  Idempotent: cash/holdings so-trạng-thái (redelivery=no-op); fee dedup theo C_SOURCE_EVENT_ID.
+    Xử lý NGAY khi nhận: **CHỈ holdings** (current `T_SI_PORTFOLIO_HOLDING` + interval
+    `T_SI_HOLDING_HIST`) + upsert registry `T_SI_CURRENT` + watermark. Thay J01_SYNC_FO + J14B_HISTORY cũ.
+  ⚠️ [BRD asset-sync] TIỀN & CỔ TỨC/PHÍ KHÔNG QUA ĐÂY NỮA — Asset gửi (`SP_INGEST_ASSET_NAV`).
+    `T_SI_CASH_HIST` + `T_SI_INCOME_FEE` đã GỠ. Trong JSON dưới: `cash` còn PARSE nhưng KHÔNG GHI
+    đi đâu, `fees` KHÔNG parse (bỏ qua hoàn toàn) — cả hai là legacy payload FO, xoá khỏi contract
+    được. Đừng đọc proc này như nơi tiền vào hệ.
+  Idempotent: holdings so-trạng-thái (redelivery=no-op).
   FORWARD-ONLY: event quá khứ (business_date < watermark) → THROW (history CHƯA hỗ trợ — sẽ làm sau).
   Cashflow nạp/rút KHÔNG qua đây (SDI là nguồn → ghi thẳng T_SI_CASHFLOW_EVENT).
   JSON (seam FO — chốt spec chỉ sửa lớp parse này): event định danh theo SUB-ACCOUNT (si_account).

@@ -191,7 +191,7 @@ INDEX DONE) gọi tuần tự:
 
 ## Ingest FO (Kafka per-KH) — `SP_INGEST_CUSTOMER`
 FO đồng bộ EOD qua **Kafka, mỗi event = 1 KH** (gồm các sub-account: cash + holdings + cổ tức/phí). App đọc event → `EXEC SP_INGEST_CUSTOMER @json` (JSON). Xử lý **NGAY khi nhận** (forward):
-- **Cash** → cập nhật `T_SI_CURRENT` (`C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH`) + diff interval `T_SI_CASH_HIST` (**đủ 3 khoản** `C_CASH`+`C_PENDING_CASH`+`C_DIV_CASH` — trước chỉ cash; SCD-2: dòng mới khi BẤT KỲ khoản nào đổi → reconstruct receivables AS-OF cho rerun quá khứ). Maintain tại ingest + `SP_EOD_HISTORY`.
+- **Cash** → **[BRD asset-sync] KHÔNG còn qua đây.** Tiền là số **Asset gửi** (`SP_INGEST_ASSET_NAV` ghi `C_CASH`/`C_CASH_AVAILABLE`/`C_DIVIDEND_PENDING`/`C_SELL_PENDING`). `T_SI_CASH_HIST` đã GỠ (SDI không tự tính NAV nên không cần interval cash; sửa quá khứ = re-ingest). Proc vẫn *parse* `$.cash` nhưng **không ghi** — payload FO còn field này chỉ là legacy, bỏ được.
 - **Holdings** → overwrite `T_SI_PORTFOLIO_HOLDING` (current) + diff interval `T_SI_HOLDING_HIST`.
 - **Cổ tức/phí**: [BRD asset-sync] đã gộp trong tiền/NAV ròng Asset gửi (SDI KHÔNG quản chi tiết income/fee; `T_SI_INCOME_FEE` + accrue + `T_FEE_CONFIG` + `SP_INGEST_FEE_CHARGE` đã GỠ).
 - Set watermark `C_LAST_SYNC_DATE=@d` (J0 GATE đếm received vs expected = tiểu khoản ACTIVE).
