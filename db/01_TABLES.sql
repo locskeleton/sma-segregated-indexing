@@ -29,6 +29,7 @@ CREATE TABLE T_MASTER_PORTFOLIO (
     --   NULL sẽ làm vị từ ra UNKNOWN ⇒ master bị loại IM LẶNG khỏi cả 4 scope của J12 (completeness, weight-guard,
     --   CTE W, gate SP_EOD_RUN_INDEX) ⇒ index ngừng được tính mà không một err nào bật.
     C_INCEPTION_DATE DATE            NOT NULL,
+    C_ALIAS          VARCHAR(50)     NULL,   -- "Alias DM Index" — tên rút gọn dùng trên báo cáo/UI (BC tổng tài sản AUM lọc theo cột này)
     -- (phí QL KHÔNG còn cột rate ở đây: chính sách phí cấu hình ở T_FEE_CONFIG global theo fee_type.)
     C_BENCHMARK_CODE VARCHAR(20)     NULL,   -- benchmark đối chiếu (vd 'VNINDEX','VN30') → T_BENCHMARK_DAILY
     CONSTRAINT PK_MASTER_PORTFOLIO PRIMARY KEY (C_MASTER_CODE)
@@ -119,6 +120,40 @@ CREATE UNIQUE INDEX UQ_SI_PORTFOLIO_ACTIVE ON T_SI_PORTFOLIO (C_CUST_CODE, C_MAS
 -- [FR-01] list MỌI sub-account của 1 KH (gồm CLOSED) — by cust. UQ_ACTIVE chỉ phủ ACTIVE nên cần index này.
 CREATE INDEX IX_SI_PORTFOLIO_CUST ON T_SI_PORTFOLIO (C_CUST_CODE)
     INCLUDE (C_SI_ACCOUNT, C_MASTER_CODE, C_STATUS, C_JOIN_DATE);
+
+-- THÔNG TIN KHÁCH HÀNG + QUY KẾT TỔ CHỨC — DIMENSION cho báo cáo, KHÔNG tham gia phép tính nào.
+--
+-- ⚠️ SDI KHÔNG PHẢI NGUỒN của dữ liệu này. Nó nằm ở hệ quản lý tài khoản (T_DM_ACCOUNT bên deposit/BO) +
+--   CRM (quy kết MKT/phòng ban/đơn vị KD/khối). Bảng này là BẢN SAO ĐƯỢC ĐẨY SANG để báo cáo khỏi phải
+--   join xuyên hệ. Chưa đấu nguồn thì bảng rỗng ⇒ báo cáo vẫn chạy, các cột đó ra NULL (LEFT JOIN), và
+--   các filter theo tổ chức sẽ KHÔNG khớp dòng nào — đó là hành vi ĐÚNG, không phải lỗi.
+--
+-- Vì sao tách bảng riêng thay vì nhét vào T_SI_PORTFOLIO: quy kết tổ chức đổi theo thời gian và theo
+--   nghiệp vụ CRM (chuyển sale, đổi phòng ban), không phải thuộc tính của tiểu khoản đầu tư. Trộn vào
+--   registry sẽ biến bảng đăng ký thành nơi CRM ghi đè.
+-- ⚠️ Đây là ảnh HIỆN TẠI (không lịch sử): báo cáo AUM ngày quá khứ vẫn quy kết theo tổ chức HÔM NAY.
+--   Muốn quy kết đúng thời điểm thì phải thêm chiều thời gian — chốt với nghiệp vụ trước khi làm.
+CREATE TABLE T_CUSTOMER_INFO (
+    PK_CUSTOMER_INFO UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_CUSTOMER_INFO_PKID DEFAULT NEWID(),
+    C_CUST_CODE          VARCHAR(10)    NOT NULL,   -- khớp T_SI_PORTFOLIO.C_CUST_CODE
+    C_TKCK               VARCHAR(32)    NULL,       -- tài khoản chứng khoán (TK mẹ) tại hệ lưu ký
+    C_FULL_NAME          NVARCHAR(200)  NULL,       -- họ tên KH
+    C_MKT_ID_REFERRER    VARCHAR(32)    NULL,       -- MKT_ID người GIỚI THIỆU
+    C_MKT_ID_MANAGER     VARCHAR(32)    NULL,       -- MKT_ID sale QUẢN LÝ
+    C_DEPARTMENT_CODE    VARCHAR(32)    NULL,       -- phòng ban
+    C_DEPARTMENT_NAME    NVARCHAR(200)  NULL,
+    C_BUSINESS_UNIT_CODE VARCHAR(32)    NULL,       -- đơn vị kinh doanh
+    C_BUSINESS_UNIT_NAME NVARCHAR(200)  NULL,
+    C_DIVISION_CODE      VARCHAR(32)    NULL,       -- khối nghiệp vụ
+    C_DIVISION_NAME      NVARCHAR(200)  NULL,
+    C_UPDATED_AT         DATETIME2(3)   NULL,
+    CONSTRAINT PK_CUSTOMER_INFO_NK PRIMARY KEY CLUSTERED (C_CUST_CODE),
+    CONSTRAINT UQ_CUSTOMER_INFO_PKID UNIQUE NONCLUSTERED (PK_CUSTOMER_INFO)
+);
+-- Filter báo cáo lọc theo tổ chức trước rồi mới join sang số dư ⇒ index theo đúng thứ tự lọc của UI.
+CREATE INDEX IX_CUSTOMER_INFO_ORG ON T_CUSTOMER_INFO
+    (C_DIVISION_CODE, C_BUSINESS_UNIT_CODE, C_DEPARTMENT_CODE)
+    INCLUDE (C_CUST_CODE, C_MKT_ID_REFERRER, C_MKT_ID_MANAGER);
 
 /*-------------------------------------------------------------- MARKET DATA ---*/
 -- LỊCH NGHỈ — CORE (trước ở 09_FEE.sql, kéo lên đây 2026-07-11 vì ENGINE cũng phải dùng, không chỉ phí).

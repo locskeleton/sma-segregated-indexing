@@ -238,3 +238,29 @@ Serve-layer **on-read** cho PM theo dõi cấp **master** (spec: `docs/SDI-pm-to
 Công thức (spec §2): AUM = `C_LAST_AUM` (per KH; phí QL đã trừ trong NAV Asset gửi ⇒ AUM = NAV); DM tổng KH = AUM-weighted end-weight (`ΣWᵢ·PnLᵢ`, PnL=TWR unit_price; 2 API đối chiếu RET_INDEX/COMPOUND cùng kết quả); deviation = (R_KH−R_master_index)×10000 BPS; TE per-KH = `STDEV(R_KH,t−R_master,t)×√X` (X=#ngày GD, cap 252), master = AUM-weighted. Ngưỡng per-master `T_MASTER_PM_CONFIG` (NULL→default `UDF_PM_CONFIG`). Verify: `07_PM_SMOKE.sql` (3 KH, số tính tay — KH_ret=.08/master=.071/dev=90BPS/TE≈.0297 MED/histogram/top-N đúng).
 
 > Chưa implement (mở rộng): ingestion file FO → `T_SI_PORTFOLIO_HOLDING` (current) + `T_FO_CASH_SYNC` (feed cash) + `T_SI_INCOME_FEE` (cổ tức/phí, `BULK INSERT`), XIRR (qua SQL CLR), partition/columnstore prod (gồm `T_SI_BALANCE` CCI + interval hist partition theo `valid_from`). *(J15 publish tài sản KH + master NAV/perf → Asset đã bỏ — BRD 2026-06-22; Master Index VẪN đẩy Asset qua `SP_EOD_RUN_INDEX` (`SP_GET_ASSET_INDEX_SNAPSHOT`). Xem [docs/SDI-asset-gap.md](../docs/SDI-asset-gap.md).)*
+
+## Báo cáo tổng tài sản AUM — `SP_GET_REPORT_AUM_TOTAL`
+
+Ảnh chụp per-tiểu-khoản tại **một ngày chốt**, 11 filter đúng như màn hình lọc.
+`RS1` = lưới · `RS2` = dòng tổng (`@p_include_total=0` để chỉ lấy lưới — cần cho caller dùng `INSERT ... EXEC`).
+
+| Filter UI | Tham số | Nguồn |
+|---|---|---|
+| Từ ngày | `@p_from_date` | lọc **tập tiểu khoản** (mở trước/trong kỳ, chưa đóng trước kỳ) |
+| Đến ngày | `@p_to_date` | **ngày chốt số**; NULL = phiên gần nhất |
+| Khối nghiệp vụ / Đơn vị KD / Phòng ban | `@p_division` / `@p_business_unit` / `@p_department` | `T_CUSTOMER_INFO` |
+| ID người giới thiệu / ID sale quản lý | `@p_referrer_id` / `@p_manager_id` | `T_CUSTOMER_INFO` |
+| DM Master | `@p_master_code` | `T_SI_BALANCE` |
+| TKCK | `@p_tkck` | `T_CUSTOMER_INFO.C_TKCK`, fallback `T_SI_PORTFOLIO.C_SUB_ACCOUNT_NO` |
+| Alias DM Index | `@p_alias` | `T_MASTER_PORTFOLIO.C_ALIAS` |
+| Sub SDI | `@p_si_account` | `T_SI_BALANCE` |
+
+> ### ⚠️ Ba thứ SDI KHÔNG có, phải xử lý trước khi báo cáo dùng được thật
+>
+> 1. **`T_CUSTOMER_INFO` chưa có nguồn.** Họ tên KH · TKCK · MKT_ID giới thiệu/quản lý · phòng ban · đơn vị KD · khối — SDI **không phải nguồn** của những dữ liệu này (chúng ở hệ tài khoản `T_DM_ACCOUNT` + CRM). Bảng này là **bản sao được đẩy sang**. Chưa đấu nguồn ⇒ các cột đó `NULL` và **5 filter tổ chức không khớp dòng nào** — đúng hành vi, nhưng báo cáo chưa dùng được.
+> 2. **"Cổ tức chờ về" và "Tiền bán CK chờ về" trả `NULL`.** Asset chỉ gửi **tổng tiền** + **tiền khả dụng**, không tách hai khoản chờ về. Phần suy được (`tổng − khả dụng`) gộp cả tiền phong toả/chờ khớp nên **không được gán bừa** cho một trong hai cột. Muốn có số thật ⇒ **đổi contract với Asset** (thêm 2 field vào payload ingest).
+> 3. **Quy kết tổ chức là ảnh HIỆN TẠI, không có lịch sử.** Báo cáo AUM ngày quá khứ vẫn quy kết theo phòng ban/sale **hôm nay**. Nếu nghiệp vụ cần đúng thời điểm (KH đã chuyển sale) thì `T_CUSTOMER_INFO` phải thêm chiều thời gian — chốt trước khi làm.
+>
+> **Giả định cần xác nhận:** lưới không có cột ngày ⇒ báo cáo là **một ngày** (`@p_to_date`), còn `@p_from_date` chỉ lọc tập tiểu khoản. Nếu nghiệp vụ muốn **một dòng / (tiểu khoản × ngày)** trên cả dải thì phải sửa lại.
+>
+> **"Giá trị chứng khoán" là SUY RA** (`AUM − tổng tiền`), không phải số Asset gửi — cùng cách suy với `SP_GET_ASSET_REPORT`; đổi một chỗ thì phải đổi cả hai.

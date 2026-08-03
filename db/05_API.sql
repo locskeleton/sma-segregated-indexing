@@ -529,3 +529,170 @@ BEGIN
     END CATCH
 END
 GO
+
+/*===========================================================================
+  BÁO CÁO TỔNG TÀI SẢN AUM — SP_GET_REPORT_AUM_TOTAL
+    Ảnh chụp per-tiểu-khoản tại MỘT ngày chốt, kèm 11 filter đúng như màn hình lọc.
+
+  ── NGỮ NGHĨA NGÀY (GIẢ ĐỊNH — cần nghiệp vụ xác nhận) ──────────────────────────────────────
+    @p_to_date   = NGÀY CHỐT SỐ. Mọi số tiền là ảnh chụp CUỐI ngày này. NULL = phiên có dữ liệu
+                   gần nhất. Tiêu đề báo cáo "Ngày: dd/mm/yyyy" chính là ngày này.
+    @p_from_date = CHỈ lọc TẬP tiểu khoản (đã mở trước/trong kỳ, chưa đóng trước kỳ), KHÔNG đổi
+                   số tiền. Căn cứ: lưới KHÔNG có cột ngày ⇒ báo cáo là MỘT ngày, không phải dải.
+
+  ── CỘT SUY RA, KHÔNG PHẢI SỐ ASSET GỬI ─────────────────────────────────────────────────────
+    Giá trị chứng khoán = AUM − Tổng tiền. [thin-layer] Asset KHÔNG gửi stock_value; AUM = NAV =
+    chứng khoán + tổng tiền. CÙNG cách suy với SP_GET_ASSET_REPORT — đừng đổi một chỗ mà quên chỗ kia.
+
+  ── CỘT SDI KHÔNG CÓ SỐ (trả NULL, CÓ CHỦ ĐÍCH) ─────────────────────────────────────────────
+    "Cổ tức chờ về" và "Tiền bán CK chờ về": Asset chỉ gửi TỔNG tiền (C_CASH) và TIỀN KHẢ DỤNG
+    (C_CASH_AVAILABLE), KHÔNG tách hai khoản chờ về. Suy được duy nhất phần "chưa khả dụng" =
+    C_CASH − C_CASH_AVAILABLE, nhưng phần đó GỘP cả tiền phong toả/chờ khớp nên KHÔNG được gán
+    bừa cho một trong hai cột. Muốn có số thật ⇒ ĐỔI CONTRACT với Asset (thêm 2 field).
+    Trả NULL để người đọc biết là CHƯA CÓ, thay vì đưa một con số sai mà trông như thật.
+    "Tiền mặt" = C_CASH_AVAILABLE (tiền khả dụng) — SDI không có khoản mục "tiền mặt" riêng.
+
+  ── DỮ LIỆU TỔ CHỨC ─────────────────────────────────────────────────────────────────────────
+    Họ tên KH / TKCK / MKT_ID / phòng ban / đơn vị KD / khối lấy từ T_CUSTOMER_INFO (bản sao đẩy
+    từ hệ tài khoản + CRM). LEFT JOIN: chưa đấu nguồn thì cột NULL và filter tổ chức không khớp
+    dòng nào — ĐÚNG hành vi, không phải lỗi.
+
+  RS1: lưới báo cáo.  RS2: dòng tổng (số tiểu khoản, Σ AUM, Σ chứng khoán, Σ tiền).
+  err: 0 OK · 3 ngày chốt chưa có dữ liệu · 20 tham số không hợp lệ · -1 runtime. KHÔNG THROW.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_REPORT_AUM_TOTAL
+    @p_from_date     DATE          = NULL,   -- Từ ngày   (lọc tập tiểu khoản)
+    @p_to_date       DATE          = NULL,   -- Đến ngày  (NGÀY CHỐT SỐ; NULL = phiên gần nhất)
+    @p_division      VARCHAR(32)   = NULL,   -- Khối nghiệp vụ
+    @p_business_unit VARCHAR(32)   = NULL,   -- Đơn vị kinh doanh
+    @p_department    VARCHAR(32)   = NULL,   -- Phòng ban
+    @p_referrer_id   VARCHAR(32)   = NULL,   -- ID người giới thiệu
+    @p_manager_id    VARCHAR(32)   = NULL,   -- ID sale quản lý
+    @p_master_code   VARCHAR(20)   = NULL,   -- DM Master
+    @p_tkck          VARCHAR(32)   = NULL,   -- TKCK
+    @p_alias         VARCHAR(50)   = NULL,   -- Alias DM Index
+    @p_si_account    VARCHAR(20)   = NULL,   -- Sub SDI
+    @p_include_total BIT           = 1,      -- 0 = CHỈ trả lưới (RS1), bỏ dòng tổng
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @p_err_code = 0; SET @p_err_msg = NULL;
+    BEGIN TRY
+
+    IF @p_to_date IS NULL
+        SELECT @p_to_date = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE;
+
+    IF @p_to_date IS NULL
+    BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa có dữ liệu số dư nào trong hệ thống.';
+          RAISERROR(@p_err_msg,16,1); END
+
+    IF @p_from_date IS NOT NULL AND @p_from_date > @p_to_date
+    BEGIN SET @p_err_code=20; SET @p_err_msg=N'"Từ ngày" lớn hơn "Đến ngày".';
+          RAISERROR(@p_err_msg,16,1); END
+
+    -- DATE GUARD (err=3): ngày chốt PHẢI có dòng số dư. Chặn ngày tương lai / ngày chưa ingest —
+    --   nếu không, báo cáo trả 0 dòng và người đọc tưởng "hôm đó không ai có tài sản".
+    -- ⚠️ KHÔNG gate bằng lịch giao dịch: Asset gửi số dư MỌI ngày dương lịch (kể cả T7/CN) nên chốt
+    --    AUM cuối tuần là hợp lệ. Lịch chỉ gate phần TÍNH TOÁN (index/EOD), không gate báo cáo.
+    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_to_date)
+    BEGIN SET @p_err_code=3;
+        SET @p_err_msg = CONCAT(N'Chưa có dữ liệu số dư @ ', CONVERT(VARCHAR(10),@p_to_date,23),
+            N' (ngày tương lai hoặc Asset chưa đồng bộ).');
+        RAISERROR(@p_err_msg,16,1); END
+
+    ;WITH R AS (
+        SELECT
+            b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE,
+            b.C_AUM, b.C_CASH, b.C_CASH_AVAILABLE,
+            stock  = b.C_AUM - b.C_CASH,                        -- suy ra: Asset không gửi stock_value
+            tkck   = COALESCE(ci.C_TKCK, p.C_SUB_ACCOUNT_NO),   -- ưu tiên hệ tài khoản; fallback số TK FO
+            ci.C_FULL_NAME, ci.C_MKT_ID_REFERRER, ci.C_MKT_ID_MANAGER,
+            ci.C_DEPARTMENT_NAME, ci.C_BUSINESS_UNIT_NAME, ci.C_DIVISION_NAME,
+            mp.C_MASTER_NAME, mp.C_ALIAS
+        FROM       T_SI_BALANCE       b
+        INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
+        LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
+        LEFT  JOIN T_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE
+        WHERE b.C_BUSINESS_DATE = @p_to_date
+          -- "Từ ngày": tiểu khoản phải đã mở trước/trong kỳ và chưa đóng TRƯỚC kỳ
+          AND (@p_from_date IS NULL
+               OR (p.C_JOIN_DATE <= @p_to_date
+                   AND (p.C_CLOSE_DATE IS NULL OR p.C_CLOSE_DATE >= @p_from_date)))
+          AND (@p_master_code   IS NULL OR b.C_MASTER_CODE         = @p_master_code)
+          AND (@p_si_account    IS NULL OR b.C_SI_ACCOUNT          = @p_si_account)
+          AND (@p_alias         IS NULL OR mp.C_ALIAS              = @p_alias)
+          AND (@p_tkck          IS NULL OR COALESCE(ci.C_TKCK, p.C_SUB_ACCOUNT_NO) = @p_tkck)
+          AND (@p_division      IS NULL OR ci.C_DIVISION_CODE      = @p_division)
+          AND (@p_business_unit IS NULL OR ci.C_BUSINESS_UNIT_CODE = @p_business_unit)
+          AND (@p_department    IS NULL OR ci.C_DEPARTMENT_CODE    = @p_department)
+          AND (@p_referrer_id   IS NULL OR ci.C_MKT_ID_REFERRER    = @p_referrer_id)
+          AND (@p_manager_id    IS NULL OR ci.C_MKT_ID_MANAGER     = @p_manager_id)
+    )
+    SELECT
+        C_STT                = ROW_NUMBER() OVER (ORDER BY R.C_DIVISION_NAME, R.C_BUSINESS_UNIT_NAME,
+                                                           R.C_DEPARTMENT_NAME, R.tkck, R.C_SI_ACCOUNT),
+        C_BUSINESS_DATE      = @p_to_date,
+        C_TKCK               = R.tkck,
+        C_CUST_CODE          = R.C_CUST_CODE,
+        C_FULL_NAME          = R.C_FULL_NAME,        -- NULL nếu chưa đấu T_CUSTOMER_INFO
+        C_SI_ACCOUNT         = R.C_SI_ACCOUNT,       -- Sub SDI
+        C_ALIAS              = R.C_ALIAS,            -- Alias DM Index
+        C_AUM                = R.C_AUM,
+        C_PCT_STOCK_AUM      = CAST(R.stock  * 1.0 / NULLIF(R.C_AUM,0) AS DECIMAL(9,6)),
+        C_STOCK_VALUE        = R.stock,              -- = AUM − tổng tiền (SUY RA)
+        C_PCT_CASH_AUM       = CAST(R.C_CASH * 1.0 / NULLIF(R.C_AUM,0) AS DECIMAL(9,6)),
+        C_CASH_TOTAL         = R.C_CASH,             -- Tổng tiền
+        C_CASH_ON_HAND       = R.C_CASH_AVAILABLE,   -- Tiền mặt ≈ tiền KHẢ DỤNG
+        C_DIVIDEND_PENDING   = CAST(NULL AS DECIMAL(20,0)),   -- Cổ tức chờ về      — Asset CHƯA gửi
+        C_SELL_PENDING       = CAST(NULL AS DECIMAL(20,0)),   -- Tiền bán CK chờ về — Asset CHƯA gửi
+        C_MASTER_CODE        = R.C_MASTER_CODE,      -- DM master
+        C_MASTER_NAME        = R.C_MASTER_NAME,
+        C_MKT_ID_REFERRER    = R.C_MKT_ID_REFERRER,
+        C_MKT_ID_MANAGER     = R.C_MKT_ID_MANAGER,
+        C_DEPARTMENT_NAME    = R.C_DEPARTMENT_NAME,
+        C_BUSINESS_UNIT_NAME = R.C_BUSINESS_UNIT_NAME,
+        C_DIVISION_NAME      = R.C_DIVISION_NAME
+    FROM R
+    ORDER BY R.C_DIVISION_NAME, R.C_BUSINESS_UNIT_NAME, R.C_DEPARTMENT_NAME, R.tkck, R.C_SI_ACCOUNT
+    OPTION (RECOMPILE);   -- 11 filter optional: KHÔNG được dùng chung plan giữa các tổ hợp lọc
+
+    -- RS2: dòng tổng. Phải lặp lại y hệt bộ lọc của RS1 (CTE không dùng lại được ở statement sau).
+    --   ⚠️ Sửa điều kiện lọc ở RS1 thì PHẢI sửa y hệt ở đây, nếu không TỔNG KHÔNG KHỚP LƯỚI.
+    -- @p_include_total=0 để CHỈ còn RS1: caller nào hứng kết quả bằng INSERT ... EXEC (test harness,
+    --   job nạp bảng tạm) sẽ VỠ nếu proc trả 2 result set khác schema — SQL Server đòi mọi result set
+    --   phải khớp bảng đích. App gọi bình thường thì để mặc định 1 và đọc cả hai.
+    IF @p_include_total = 1
+    SELECT
+        C_BUSINESS_DATE = @p_to_date,
+        C_CNT_SI        = COUNT(*),
+        C_TOTAL_AUM     = ISNULL(SUM(b.C_AUM),0),
+        C_TOTAL_STOCK   = ISNULL(SUM(b.C_AUM - b.C_CASH),0),
+        C_TOTAL_CASH    = ISNULL(SUM(b.C_CASH),0)
+    FROM       T_SI_BALANCE       b
+    INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
+    LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
+    LEFT  JOIN T_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE
+    WHERE b.C_BUSINESS_DATE = @p_to_date
+      AND (@p_from_date IS NULL
+           OR (p.C_JOIN_DATE <= @p_to_date
+               AND (p.C_CLOSE_DATE IS NULL OR p.C_CLOSE_DATE >= @p_from_date)))
+      AND (@p_master_code   IS NULL OR b.C_MASTER_CODE         = @p_master_code)
+      AND (@p_si_account    IS NULL OR b.C_SI_ACCOUNT          = @p_si_account)
+      AND (@p_alias         IS NULL OR mp.C_ALIAS              = @p_alias)
+      AND (@p_tkck          IS NULL OR COALESCE(ci.C_TKCK, p.C_SUB_ACCOUNT_NO) = @p_tkck)
+      AND (@p_division      IS NULL OR ci.C_DIVISION_CODE      = @p_division)
+      AND (@p_business_unit IS NULL OR ci.C_BUSINESS_UNIT_CODE = @p_business_unit)
+      AND (@p_department    IS NULL OR ci.C_DEPARTMENT_CODE    = @p_department)
+      AND (@p_referrer_id   IS NULL OR ci.C_MKT_ID_REFERRER    = @p_referrer_id)
+      AND (@p_manager_id    IS NULL OR ci.C_MKT_ID_MANAGER     = @p_manager_id)
+    OPTION (RECOMPILE);
+
+    END TRY
+    BEGIN CATCH
+        IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
+    END CATCH
+END
+GO

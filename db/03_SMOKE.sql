@@ -566,3 +566,107 @@ DELETE FROM T_SI_CASHFLOW_EVENT WHERE C_SI_ACCOUNT='SRC1';
 DELETE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT='SRC1';
 
 PRINT '======== END SMOKE ========';
+
+PRINT '';
+PRINT '======== BÁO CÁO TỔNG TÀI SẢN AUM: SP_GET_REPORT_AUM_TOTAL ========';
+-- Dữ liệu: 3 tiểu khoản của 2 KH, 2 master, ngày chốt 2026-09-01.
+--   RP1 (KH RC1, master RM1): AUM 1,000,000,000 · tổng tiền 200,000,000 · khả dụng 150,000,000
+--   RP2 (KH RC1, master RM2): AUM   500,000,000 · tổng tiền  50,000,000 · khả dụng  50,000,000
+--   RP3 (KH RC2, master RM1): AUM   300,000,000 · tổng tiền  30,000,000 · khả dụng  30,000,000
+--   ⇒ Σ AUM 1,800,000,000 · Σ CK 1,520,000,000 · Σ tiền 280,000,000
+DELETE FROM T_CUSTOMER_INFO WHERE C_CUST_CODE IN ('RC1','RC2');
+INSERT T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION_DATE,C_ALIAS,C_BENCHMARK_CODE) VALUES
+ ('RM1',N'Rep Master 1','ACTIVE','2026-08-01','RIDX1','VNINDEX'),
+ ('RM2',N'Rep Master 2','ACTIVE','2026-08-01','RIDX2','VNINDEX');
+INSERT T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_SUB_ACCOUNT_NO,C_JOIN_DATE,C_STATUS) VALUES
+ ('RP1','RC1','RM1','FO-RC1','2026-08-01','ACTIVE'),
+ ('RP2','RC1','RM2','FO-RC1','2026-08-01','ACTIVE'),
+ ('RP3','RC2','RM1','FO-RC2','2026-08-15','ACTIVE');
+INSERT T_CUSTOMER_INFO (C_CUST_CODE,C_TKCK,C_FULL_NAME,C_MKT_ID_REFERRER,C_MKT_ID_MANAGER,
+                        C_DEPARTMENT_CODE,C_DEPARTMENT_NAME,C_BUSINESS_UNIT_CODE,C_BUSINESS_UNIT_NAME,
+                        C_DIVISION_CODE,C_DIVISION_NAME) VALUES
+ ('RC1','068C111111',N'Nguyễn Văn A','MKT001','MKT002','PB01',N'Phòng KH cá nhân 1','DVKD01',N'Chi nhánh HN','KH01',N'Khối Khách hàng cá nhân'),
+ ('RC2','068C222222',N'Trần Thị B'  ,'MKT003','MKT002','PB02',N'Phòng KH cá nhân 2','DVKD02',N'Chi nhánh HCM','KH01',N'Khối Khách hàng cá nhân');
+INSERT T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_CASH,C_CASH_AVAILABLE) VALUES
+ ('2026-09-01','RP1','RC1','RM1',1000000000,200000000,150000000),
+ ('2026-09-01','RP2','RC1','RM2', 500000000, 50000000, 50000000),
+ ('2026-09-01','RP3','RC2','RM1', 300000000, 30000000, 30000000);
+
+DECLARE @ecP2 INT, @emP2 NVARCHAR(400);
+CREATE TABLE #rp (C_STT BIGINT, C_BUSINESS_DATE DATE, C_TKCK VARCHAR(32), C_CUST_CODE VARCHAR(10),
+    C_FULL_NAME NVARCHAR(200), C_SI_ACCOUNT VARCHAR(20), C_ALIAS VARCHAR(50), C_AUM DECIMAL(20,0),
+    C_PCT_STOCK_AUM DECIMAL(9,6), C_STOCK_VALUE DECIMAL(20,0), C_PCT_CASH_AUM DECIMAL(9,6),
+    C_CASH_TOTAL DECIMAL(20,0), C_CASH_ON_HAND DECIMAL(20,0), C_DIVIDEND_PENDING DECIMAL(20,0),
+    C_SELL_PENDING DECIMAL(20,0), C_MASTER_CODE VARCHAR(20), C_MASTER_NAME NVARCHAR(200),
+    C_MKT_ID_REFERRER VARCHAR(32), C_MKT_ID_MANAGER VARCHAR(32), C_DEPARTMENT_NAME NVARCHAR(200),
+    C_BUSINESS_UNIT_NAME NVARCHAR(200), C_DIVISION_NAME NVARCHAR(200));
+
+-- (a) không lọc gì → 3 dòng, cột suy ra đúng
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n1 INT=(SELECT COUNT(*) FROM #rp);
+DECLARE @ck1 DECIMAL(20,0)=(SELECT C_STOCK_VALUE FROM #rp WHERE C_SI_ACCOUNT='RP1');
+DECLARE @pc1 DECIMAL(9,6)=(SELECT C_PCT_CASH_AUM FROM #rp WHERE C_SI_ACCOUNT='RP1');
+DECLARE @tk1 VARCHAR(32)=(SELECT C_TKCK FROM #rp WHERE C_SI_ACCOUNT='RP1');
+DECLARE @nl1 INT=(SELECT COUNT(*) FROM #rp WHERE C_DIVIDEND_PENDING IS NOT NULL OR C_SELL_PENDING IS NOT NULL);
+IF @ecP2=0 AND @n1=3 AND @ck1=800000000 AND @pc1=0.200000 AND @tk1='068C111111' AND @nl1=0
+   PRINT '  OK không lọc: 3 dòng · CK=AUM−tiền=800tr · %tiền=0.2 · TKCK từ T_CUSTOMER_INFO · 2 cột chờ về = NULL';
+ELSE PRINT CONCAT('  !!! báo cáo cơ bản: ec=',@ecP2,' n=',@n1,' ck=',@ck1,' pct=',@pc1,' tkck=',ISNULL(@tk1,'(null)'),' notnull=',@nl1);
+
+-- (b) lọc DM Master + Alias DM Index
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_master_code='RM1', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n2 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_alias='RIDX2', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n3 INT=(SELECT COUNT(*) FROM #rp);
+IF @n2=2 AND @n3=1 PRINT '  OK lọc DM Master (RM1→2 dòng) · Alias DM Index (RIDX2→1 dòng)';
+ELSE PRINT CONCAT('  !!! lọc master/alias: RM1=',@n2,' RIDX2=',@n3);
+
+-- (c) lọc theo TỔ CHỨC: khối / đơn vị KD / phòng ban / MKT giới thiệu / MKT quản lý
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_division='KH01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n4 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_business_unit='DVKD02', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n5 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_department='PB01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n6 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_referrer_id='MKT003', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n7 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_manager_id='MKT002', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n8 INT=(SELECT COUNT(*) FROM #rp);
+IF @n4=3 AND @n5=1 AND @n6=2 AND @n7=1 AND @n8=3
+   PRINT '  OK lọc tổ chức: khối=3 · đơn vị KD=1 · phòng ban=2 · MKT giới thiệu=1 · MKT quản lý=3';
+ELSE PRINT CONCAT('  !!! lọc tổ chức: khoi=',@n4,' dvkd=',@n5,' pb=',@n6,' gt=',@n7,' ql=',@n8);
+
+-- (d) lọc TKCK + Sub SDI + kết hợp nhiều filter
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_tkck='068C111111', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n9 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_si_account='RP3', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n10 INT=(SELECT COUNT(*) FROM #rp);
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2026-09-01', @p_master_code='RM1', @p_department='PB02', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n11 INT=(SELECT COUNT(*) FROM #rp);
+DECLARE @si11 VARCHAR(20)=(SELECT TOP 1 C_SI_ACCOUNT FROM #rp);
+IF @n9=2 AND @n10=1 AND @n11=1 AND @si11='RP3'
+   PRINT '  OK lọc TKCK=2 · Sub SDI=1 · kết hợp (RM1 + PB02) → đúng 1 dòng RP3';
+ELSE PRINT CONCAT('  !!! lọc tkck/sub/kết hợp: tkck=',@n9,' sub=',@n10,' ket_hop=',@n11,' si=',ISNULL(@si11,'(null)'));
+
+-- (e) "Từ ngày" lọc TẬP tiểu khoản: RP3 mở 15/08 → from=2026-08-20 KHÔNG loại nó (chưa đóng),
+--     nhưng tiểu khoản ĐÃ ĐÓNG trước kỳ thì phải bị loại.
+UPDATE T_SI_PORTFOLIO SET C_STATUS='CLOSED', C_CLOSE_DATE='2026-08-10' WHERE C_SI_ACCOUNT='RP2';
+DELETE #rp; INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_from_date='2026-08-20', @p_to_date='2026-09-01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT;
+DECLARE @n12 INT=(SELECT COUNT(*) FROM #rp);
+DECLARE @hasRP2 INT=(SELECT COUNT(*) FROM #rp WHERE C_SI_ACCOUNT='RP2');
+UPDATE T_SI_PORTFOLIO SET C_STATUS='ACTIVE', C_CLOSE_DATE=NULL WHERE C_SI_ACCOUNT='RP2';
+IF @n12=2 AND @hasRP2=0 PRINT '  OK "Từ ngày" loại tiểu khoản đóng TRƯỚC kỳ (RP2 đóng 10/08) → 2 dòng';
+ELSE PRINT CONCAT('  !!! from_date guard: n=',@n12,' con_RP2=',@hasRP2);
+
+-- (f) guard ngày: tương lai → err=3 ; from > to → err=20
+DELETE #rp;
+BEGIN TRY INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_to_date='2099-01-01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT; END TRY BEGIN CATCH END CATCH
+DECLARE @e1 INT=@ecP2;
+BEGIN TRY INSERT #rp EXEC SP_GET_REPORT_AUM_TOTAL @p_from_date='2026-09-30', @p_to_date='2026-09-01', @p_include_total=0, @p_err_code=@ecP2 OUTPUT, @p_err_msg=@emP2 OUTPUT; END TRY BEGIN CATCH END CATCH
+IF @e1=3 AND @ecP2=20 PRINT '  OK guard: ngày chưa có dữ liệu → err=3 · from>to → err=20';
+ELSE PRINT CONCAT('  !!! guard ngày: tuong_lai=',@e1,' from_gt_to=',@ecP2);
+
+DROP TABLE #rp;
+DELETE FROM T_SI_BALANCE WHERE C_SI_ACCOUNT IN ('RP1','RP2','RP3');
+DELETE FROM T_SI_PORTFOLIO WHERE C_SI_ACCOUNT IN ('RP1','RP2','RP3');
+DELETE FROM T_CUSTOMER_INFO WHERE C_CUST_CODE IN ('RC1','RC2');
+DELETE FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE IN ('RM1','RM2');
