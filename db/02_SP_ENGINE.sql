@@ -376,17 +376,25 @@ BEGIN
 
         DECLARE @src TABLE (C_SI_ACCOUNT VARCHAR(20) PRIMARY KEY, C_AUM DECIMAL(20,0), C_DAILY_RETURN DECIMAL(10,6),
                             C_CASH DECIMAL(20,0), C_CASH_AVAILABLE DECIMAL(20,0),
-                            C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0));
+                            C_CASH_IN DECIMAL(20,0), C_CASH_OUT DECIMAL(20,0),
+                            C_DIVIDEND_PENDING DECIMAL(20,0), C_SELL_PENDING DECIMAL(20,0));
         INSERT @src
         -- cash_available: Asset gửi TIỀN KHẢ DỤNG (số thật sự rút/cắt được — loại phần phong toả/chờ khớp/T+).
         --   Fallback ISNULL(...,cash): payload CŨ chưa có field này ⇒ coi như = tổng tiền (hành vi như trước,
         --   KHÔNG vỡ ingest cũ). Khi Asset đã gửi field → thu phí bám theo số khả dụng thật.
+        -- dividend_pending / sell_pending: TÁCH KHOẢN của `cash` (cash đã GỘP hai khoản này).
+        --   ⚠️ TÊN KEY JSON CẦN ASSET XÁC NHẬN — sai tên thì OPENJSON trả NULL, ISNULL(...,0) biến thành 0
+        --      và báo cáo hiện "cổ tức chờ về = 0" trông y như thật. Nếu tên khác thì SỬA ĐÚNG 2 DÒNG DƯỚI.
+        --   ISNULL(...,0): payload cũ chưa có field ⇒ 0, KHÔNG vỡ ingest cũ (Tiền mặt = cả cash — như trước).
         SELECT j.si_account, j.aum, j.daily_return, j.cash, ISNULL(j.cash_available, j.cash),
-               ISNULL(j.cash_in,0), ISNULL(j.cash_out,0)
+               ISNULL(j.cash_in,0), ISNULL(j.cash_out,0),
+               ISNULL(j.dividend_pending,0), ISNULL(j.sell_pending,0)
         FROM OPENJSON(@p_json) WITH (
             si_account VARCHAR(20) '$.si_account', aum DECIMAL(20,0) '$.aum', daily_return DECIMAL(10,6) '$.daily_return',
             cash DECIMAL(20,0) '$.cash', cash_available DECIMAL(20,0) '$.cash_available',
-            cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out') j;
+            cash_in DECIMAL(20,0) '$.cash_in', cash_out DECIMAL(20,0) '$.cash_out',
+            dividend_pending DECIMAL(20,0) '$.dividend_pending',   -- ★ cổ tức tiền chờ về
+            sell_pending     DECIMAL(20,0) '$.sell_pending') j;    -- ★ tiền bán CK chờ về (T+)
 
         -- [BRD] Asset đẩy CẢ indexing acc KHÔNG có trên SDI → BỎ QUA (KHÔNG reject batch). SDI chỉ nhận SI
         --   có trong registry (T_SI_PORTFOLIO) qua INNER JOIN bên dưới; acc lạ tự bị lọc. "Đủ/thiếu" do
@@ -396,29 +404,51 @@ BEGIN
                    WHERE s.C_AUM IS NULL OR s.C_CASH IS NULL)
             BEGIN SET @p_err_code=21; SET @p_err_msg=N'Thiếu aum/cash cho SI thuộc SDI'; RETURN; END
 
+        -- Hai khoản chờ về là TÁCH KHOẢN CỦA `cash`, nên tổng của chúng KHÔNG được vượt `cash`.
+        --   Vượt ⇒ "Tiền mặt = cash − div − sell" ra ÂM trên báo cáo. Chặn tại ingest thay vì để một con
+        --   số âm vô nghĩa đi ra tận file Excel rồi mới có người hỏi. Cũng chặn giá trị âm (vô nghĩa).
+        DECLARE @badcash NVARCHAR(300) = (
+            SELECT TOP 1 CONCAT(s.C_SI_ACCOUNT, N' (cash=', s.C_CASH, N', div=', s.C_DIVIDEND_PENDING,
+                                N', sell=', s.C_SELL_PENDING, N')')
+            FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT
+            WHERE s.C_DIVIDEND_PENDING < 0 OR s.C_SELL_PENDING < 0
+               OR s.C_DIVIDEND_PENDING + s.C_SELL_PENDING > s.C_CASH
+            ORDER BY s.C_SI_ACCOUNT);
+        IF @badcash IS NOT NULL
+            BEGIN SET @p_err_code=22;
+                  SET @p_err_msg=CONCAT(N'dividend_pending/sell_pending không hợp lệ — phải ≥ 0 và tổng ≤ cash ',
+                        N'(cash là TỔNG đã gộp chúng). SI đầu tiên sai: ', @badcash);
+                  RETURN; END
+
         BEGIN TRAN;
         -- [thin-layer] GHI THẲNG T_SI_BALANCE (history) — KHÔNG qua landing-table/compute. Idempotent (DELETE+INSERT
         --   theo date,si → re-ingest/correction = gửi lại). accum TE reset 0 (SP_EOD_TE_ACCUM set @EOD).
         DELETE FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_business_date
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM @src);
         INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
-            C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_AVAILABLE,C_CASH_IN,C_CASH_OUT)
+            C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_AVAILABLE,C_CASH_IN,C_CASH_OUT,
+            C_DIVIDEND_PENDING,C_SELL_PENDING)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
-               s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_AVAILABLE, s.C_CASH_IN, s.C_CASH_OUT
+               s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_AVAILABLE, s.C_CASH_IN, s.C_CASH_OUT,
+               s.C_DIVIDEND_PENDING, s.C_SELL_PENDING
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;   -- INNER JOIN lọc acc lạ (Asset đẩy dư)
         SET @p_rows = @@ROWCOUNT;   -- #SI THUỘC SDI đã ghi (≤ #item Asset gửi, vì acc lạ bị bỏ qua)
 
         -- roll-forward T_SI_CURRENT (aum + tiền tổng + tiền KHẢ DỤNG). CHỈ khi @ngày >= ngày current hiện có
         --   (re-ingest quá khứ KHÔNG lùi current). C_CASH_AVAILABLE = nguồn số dư của SP_FEE_COLLECT.
         MERGE T_SI_CURRENT t
-        USING (SELECT s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE, s.C_AUM, s.C_CASH, s.C_CASH_AVAILABLE
+        USING (SELECT s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE, s.C_AUM, s.C_CASH, s.C_CASH_AVAILABLE,
+                      s.C_DIVIDEND_PENDING, s.C_SELL_PENDING
                FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT) w
         ON t.C_SI_ACCOUNT=w.C_SI_ACCOUNT
         WHEN MATCHED AND @p_business_date >= ISNULL(t.C_LAST_BUSINESS_DATE,'1900-01-01') THEN UPDATE SET
             t.C_CASH=w.C_CASH, t.C_CASH_AVAILABLE=w.C_CASH_AVAILABLE,
+            t.C_DIVIDEND_PENDING=w.C_DIVIDEND_PENDING, t.C_SELL_PENDING=w.C_SELL_PENDING,
             t.C_LAST_AUM=w.C_AUM, t.C_LAST_BUSINESS_DATE=@p_business_date
-        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_CASH_AVAILABLE,C_LAST_AUM,C_STATUS,C_LAST_BUSINESS_DATE)
-            VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_CASH,w.C_CASH_AVAILABLE,w.C_AUM,'ACTIVE',@p_business_date);
+        WHEN NOT MATCHED THEN INSERT (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_CASH,C_CASH_AVAILABLE,
+                                      C_DIVIDEND_PENDING,C_SELL_PENDING,C_LAST_AUM,C_STATUS,C_LAST_BUSINESS_DATE)
+            VALUES (w.C_SI_ACCOUNT,w.C_CUST_CODE,w.C_MASTER_CODE,w.C_CASH,w.C_CASH_AVAILABLE,
+                    w.C_DIVIDEND_PENDING,w.C_SELL_PENDING,w.C_AUM,'ACTIVE',@p_business_date);
         COMMIT;
     END TRY
     BEGIN CATCH

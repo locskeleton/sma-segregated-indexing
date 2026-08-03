@@ -544,13 +544,13 @@ GO
     Giá trị chứng khoán = AUM − Tổng tiền. [thin-layer] Asset KHÔNG gửi stock_value; AUM = NAV =
     chứng khoán + tổng tiền. CÙNG cách suy với SP_GET_ASSET_REPORT — đừng đổi một chỗ mà quên chỗ kia.
 
-  ── CỘT SDI KHÔNG CÓ SỐ (trả NULL, CÓ CHỦ ĐÍCH) ─────────────────────────────────────────────
-    "Cổ tức chờ về" và "Tiền bán CK chờ về": Asset chỉ gửi TỔNG tiền (C_CASH) và TIỀN KHẢ DỤNG
-    (C_CASH_AVAILABLE), KHÔNG tách hai khoản chờ về. Suy được duy nhất phần "chưa khả dụng" =
-    C_CASH − C_CASH_AVAILABLE, nhưng phần đó GỘP cả tiền phong toả/chờ khớp nên KHÔNG được gán
-    bừa cho một trong hai cột. Muốn có số thật ⇒ ĐỔI CONTRACT với Asset (thêm 2 field).
-    Trả NULL để người đọc biết là CHƯA CÓ, thay vì đưa một con số sai mà trông như thật.
-    "Tiền mặt" = C_CASH_AVAILABLE (tiền khả dụng) — SDI không có khoản mục "tiền mặt" riêng.
+  ── BỐN CỘT TIỀN LUÔN CỘNG KHỚP ─────────────────────────────────────────────────────────────
+    Tổng tiền = Tiền mặt + Cổ tức chờ về + Tiền bán CK chờ về.
+    Asset gửi TỔNG (`cash`) và hai khoản chờ về; "Tiền mặt" là phần CÒN LẠI, KHÔNG phải một số
+    Asset gửi riêng ⇒ bốn cột luôn khớp theo định nghĩa, không bao giờ lệch nhau vài đồng.
+    ⚠️ ĐỪNG dùng C_CASH_AVAILABLE làm "Tiền mặt": khả dụng còn loại thêm tiền PHONG TOẢ/CHỜ KHỚP
+       nên nó NHỎ HƠN, và bốn cột sẽ không cộng khớp. Ingest đã chặn div+sell > cash (err=22) nên
+       "Tiền mặt" không thể ra âm.
 
   ── DỮ LIỆU TỔ CHỨC ─────────────────────────────────────────────────────────────────────────
     Họ tên KH / TKCK / MKT_ID / phòng ban / đơn vị KD / khối lấy từ T_CUSTOMER_INFO (bản sao đẩy
@@ -607,7 +607,9 @@ BEGIN
         SELECT
             b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE,
             b.C_AUM, b.C_CASH, b.C_CASH_AVAILABLE,
+            b.C_DIVIDEND_PENDING, b.C_SELL_PENDING,
             stock  = b.C_AUM - b.C_CASH,                        -- suy ra: Asset không gửi stock_value
+            onhand = b.C_CASH - b.C_DIVIDEND_PENDING - b.C_SELL_PENDING,   -- Tiền mặt = phần CÒN LẠI của tổng tiền
             tkck   = COALESCE(ci.C_TKCK, p.C_SUB_ACCOUNT_NO),   -- ưu tiên hệ tài khoản; fallback số TK FO
             ci.C_FULL_NAME, ci.C_MKT_ID_REFERRER, ci.C_MKT_ID_MANAGER,
             ci.C_DEPARTMENT_NAME, ci.C_BUSINESS_UNIT_NAME, ci.C_DIVISION_NAME,
@@ -644,10 +646,11 @@ BEGIN
         C_PCT_STOCK_AUM      = CAST(R.stock  * 1.0 / NULLIF(R.C_AUM,0) AS DECIMAL(9,6)),
         C_STOCK_VALUE        = R.stock,              -- = AUM − tổng tiền (SUY RA)
         C_PCT_CASH_AUM       = CAST(R.C_CASH * 1.0 / NULLIF(R.C_AUM,0) AS DECIMAL(9,6)),
-        C_CASH_TOTAL         = R.C_CASH,             -- Tổng tiền
-        C_CASH_ON_HAND       = R.C_CASH_AVAILABLE,   -- Tiền mặt ≈ tiền KHẢ DỤNG
-        C_DIVIDEND_PENDING   = CAST(NULL AS DECIMAL(20,0)),   -- Cổ tức chờ về      — Asset CHƯA gửi
-        C_SELL_PENDING       = CAST(NULL AS DECIMAL(20,0)),   -- Tiền bán CK chờ về — Asset CHƯA gửi
+        C_CASH_TOTAL         = R.C_CASH,             -- Tổng tiền (Asset gửi, ĐÃ GỘP 2 khoản chờ về)
+        C_CASH_ON_HAND       = R.onhand,             -- Tiền mặt = tổng tiền − cổ tức chờ − bán chờ
+        C_DIVIDEND_PENDING   = R.C_DIVIDEND_PENDING, -- Cổ tức chờ về
+        C_SELL_PENDING       = R.C_SELL_PENDING,     -- Tiền bán CK chờ về (T+)
+        C_CASH_AVAILABLE     = R.C_CASH_AVAILABLE,   -- (thêm) tiền KHẢ DỤNG — khác "tiền mặt": loại cả phong toả/chờ khớp
         C_MASTER_CODE        = R.C_MASTER_CODE,      -- DM master
         C_MASTER_NAME        = R.C_MASTER_NAME,
         C_MKT_ID_REFERRER    = R.C_MKT_ID_REFERRER,

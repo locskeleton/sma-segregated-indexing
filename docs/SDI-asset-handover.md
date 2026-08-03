@@ -65,6 +65,16 @@ cash_in         -- nạp trong ngày (ĐỐI SOÁT với cashflow SDI tự nhậ
 cash_out        -- rút trong ngày (ĐỐI SOÁT).  thì ghi ở row ngày T7, KHÔNG dồn sang T2.
                 --   ⚠️ CHỈ dòng tiền của KHÁCH. KHÔNG gộp khoản BO cắt phí QL (phí là CHI PHÍ, phải làm
                 --   giảm daily_return; gộp vào cash_out sẽ khử mất phí ⇒ hiệu suất báo GROSS).
+dividend_pending -- [2026-08-03] CỔ TỨC TIỀN CHỜ VỀ.  ── TÁCH KHOẢN CỦA `cash`, KHÔNG cộng thêm ──
+sell_pending     -- [2026-08-03] TIỀN BÁN CK CHỜ VỀ (T+).
+                --   ⚠️ `cash` ĐÃ GỘP hai khoản này ⇒ Tiền mặt = cash − dividend_pending − sell_pending.
+                --      Cộng chúng vào aum/cash lần nữa là ĐẾM HAI LẦN.
+                --   ⚠️ Ràng buộc: cả hai ≥ 0 và dividend_pending + sell_pending ≤ cash.
+                --      SP_INGEST_ASSET_NAV TỪ CHỐI cả batch (err=22) nếu vi phạm — nếu không, cột
+                --      "Tiền mặt" trên báo cáo AUM sẽ ra ÂM.
+                --   ⚠️ KHÁC cash_available: khả dụng loại THÊM tiền phong toả/chờ khớp, nên
+                --      cash − cash_available ≥ dividend_pending + sell_pending. Đừng dùng thay nhau.
+                --   Thiếu field (payload cũ) ⇒ 0, ingest KHÔNG vỡ.
 -- KHÔNG còn `stock_value` / `fee`/`fee_accum` (phí QL đã trừ trong aum — model realized).
 ```
 > **Ngày nghỉ (T7/CN/lễ):** Asset **vẫn gửi** row (aum/cash/cash_available/cash_in/cash_out) vì dòng tiền vẫn phát sinh; `daily_return`=0/NULL. SDI **nhận ingest bình thường** nhưng **KHÔNG chạy EOD/index/TE** ngày đó (lịch = `T_TRADING_HOLIDAY` + rule T7/CN, `UDF_IS_BUSINESS_DATE`). Phí QL thì tính **theo ngày dương lịch** trên **AUM của chính ngày đó** ⇒ nạp/rút cuối tuần vào base phí ngay hôm đó.

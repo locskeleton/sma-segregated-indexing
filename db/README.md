@@ -258,7 +258,11 @@ Công thức (spec §2): AUM = `C_LAST_AUM` (per KH; phí QL đã trừ trong NA
 > ### ⚠️ Ba thứ SDI KHÔNG có, phải xử lý trước khi báo cáo dùng được thật
 >
 > 1. **`T_CUSTOMER_INFO` chưa có nguồn.** Họ tên KH · TKCK · MKT_ID giới thiệu/quản lý · phòng ban · đơn vị KD · khối — SDI **không phải nguồn** của những dữ liệu này (chúng ở hệ tài khoản `T_DM_ACCOUNT` + CRM). Bảng này là **bản sao được đẩy sang**. Chưa đấu nguồn ⇒ các cột đó `NULL` và **5 filter tổ chức không khớp dòng nào** — đúng hành vi, nhưng báo cáo chưa dùng được.
-> 2. **"Cổ tức chờ về" và "Tiền bán CK chờ về" trả `NULL`.** Asset chỉ gửi **tổng tiền** + **tiền khả dụng**, không tách hai khoản chờ về. Phần suy được (`tổng − khả dụng`) gộp cả tiền phong toả/chờ khớp nên **không được gán bừa** cho một trong hai cột. Muốn có số thật ⇒ **đổi contract với Asset** (thêm 2 field vào payload ingest).
+> 2. **Tên JSON key của 2 khoản chờ về cần Asset xác nhận.** Ingest đang đọc `dividend_pending` / `sell_pending`. **Sai tên ⇒ `OPENJSON` trả NULL ⇒ `ISNULL(...,0)` biến thành 0**, và báo cáo hiện "cổ tức chờ về = 0" trông y như thật. Đổi tên = sửa đúng 2 dòng trong `SP_INGEST_ASSET_NAV`. Kiểm nhanh sau khi Asset đẩy lô đầu:
+>    ```sql
+>    SELECT COUNT(*) AS n, SUM(C_DIVIDEND_PENDING) AS div_, SUM(C_SELL_PENDING) AS sell_
+>    FROM T_SI_BALANCE WHERE C_BUSINESS_DATE = '<ngày>';   -- cả hai = 0 tuyệt đối ⇒ nghi sai tên key
+>    ```
 > 3. **Quy kết tổ chức là ảnh HIỆN TẠI, không có lịch sử.** Báo cáo AUM ngày quá khứ vẫn quy kết theo phòng ban/sale **hôm nay**. Nếu nghiệp vụ cần đúng thời điểm (KH đã chuyển sale) thì `T_CUSTOMER_INFO` phải thêm chiều thời gian — chốt trước khi làm.
 >
 > **Giả định cần xác nhận:** lưới không có cột ngày ⇒ báo cáo là **một ngày** (`@p_to_date`), còn `@p_from_date` chỉ lọc tập tiểu khoản. Nếu nghiệp vụ muốn **một dòng / (tiểu khoản × ngày)** trên cả dải thì phải sửa lại.

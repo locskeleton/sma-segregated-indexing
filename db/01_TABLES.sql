@@ -303,6 +303,8 @@ CREATE TABLE T_SI_CURRENT (
                                                                                      --   NGUỒN DUY NHẤT của SP_FEE_COLLECT: thu phí phải theo KHẢ DỤNG, KHÔNG theo
                                                                                      --   C_CASH (tổng gồm tiền đang bị phong toả/chờ khớp/T+ chưa về ⇒ thu theo tổng
                                                                                      --   sẽ sinh lệnh thu vượt số rút được → BO reject / âm tiền KH).
+    C_DIVIDEND_PENDING DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_DIVP DEFAULT 0,     -- cổ tức TIỀN chờ về (đã gộp trong C_CASH)
+    C_SELL_PENDING     DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_SELP DEFAULT 0,     -- tiền bán CK chờ về T+ (đã gộp trong C_CASH)
     C_LAST_AUM         DECIMAL(20,0)  NOT NULL CONSTRAINT DF_CNC_NAV DEFAULT 0,      -- AUM gần nhất = Asset gửi trực tiếp. (rename→C_AUM ở bước cuối)
     C_STATUS           VARCHAR(10)    NOT NULL CONSTRAINT DF_CNC_STATUS DEFAULT 'ACTIVE', -- ACTIVE | CLOSED…
     C_LAST_BUSINESS_DATE DATE         NULL,                       -- ngày EOD compute gần nhất
@@ -363,6 +365,13 @@ CREATE TABLE T_SI_BALANCE (
     C_CASH_AVAILABLE DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CASHAV DEFAULT 0, -- TIỀN KHẢ DỤNG (Asset gửi) — số thật sự rút/cắt được (lịch sử; nguồn thu phí = bản current)
     C_CASH_IN        DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_CIN  DEFAULT 0,  -- [thin-layer] nạp ngày (Asset) — net flow master + reconcile vs cashflow SDI
     C_CASH_OUT       DECIMAL(20,0)   NOT NULL CONSTRAINT DF_SI_BAL_COUT DEFAULT 0,  -- [thin-layer] rút ngày (Asset) — net flow + reconcile
+    -- TÁCH KHOẢN CỦA C_CASH (Asset gửi) — dùng cho báo cáo tổng tài sản AUM.
+    -- ⚠️ C_CASH là TỔNG ĐÃ GỘP hai khoản này: Tiền mặt = C_CASH − C_DIVIDEND_PENDING − C_SELL_PENDING.
+    --    KHÔNG cộng thêm vào AUM (chúng đã nằm trong cash, và cash đã nằm trong aum) — cộng nữa là đếm hai lần.
+    -- ⚠️ KHÁC C_CASH_AVAILABLE: khả dụng loại thêm cả tiền PHONG TOẢ/CHỜ KHỚP, nên
+    --    C_CASH − C_CASH_AVAILABLE ≥ C_DIVIDEND_PENDING + C_SELL_PENDING. Đừng dùng thay nhau.
+    C_DIVIDEND_PENDING DECIMAL(20,0) NOT NULL CONSTRAINT DF_SI_BAL_DIVP DEFAULT 0,  -- cổ tức TIỀN chờ về
+    C_SELL_PENDING     DECIMAL(20,0) NOT NULL CONSTRAINT DF_SI_BAL_SELP DEFAULT 0,  -- tiền bán CK chờ về (T+)
     -- [PM tool] TE prefix-sum: lũy kế active return (= KH return − master index return) từ inception.
     --   Cho phép tính STDEV(active) qua range BẤT KỲ bằng HIỆU 2 mốc (base/end) → đọc 2 lát, không quét.
     --   Maintain ở EOD bước SP_EOD_TE_ACCUM (sau J12, cần index daily return). FLOAT (double) cho ổn số.
