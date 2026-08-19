@@ -27,10 +27,34 @@
 |---|---|---|
 | Biết gì về FO | **Không gì cả** | Tất cả |
 | Bảng | `T_JOB_DEFINITION`, `T_JOB_RUN` | `T_SI_BALANCE`, `T_MASTER_BALANCE` (cột `C_SRC`) |
-| Proc | `SP_JOB_ENQUEUE` · `_CLAIM` · `_HEARTBEAT` · `_COMPLETE` · `_RECOVER` · `_PURGE` | `SP_GET_FO_SNAPSHOT_SCOPE` · `SP_INGEST_FO_SNAPSHOT_RT` · `SP_RT_MASTER_AGG` · `SP_GET_PM_RT_OVERVIEW` |
+| Proc | `SP_JOB_ENQUEUE` · `_CLAIM` · `_HEARTBEAT` · `_COMPLETE` · `_RECOVER` | `SP_GET_FO_SNAPSHOT_SCOPE` · `SP_INGEST_FO_SNAPSHOT_RT` · `SP_RT_MASTER_AGG` |
 | Thêm job mới | INSERT 1 dòng + 1 class C# | — |
 
 Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…) **không sửa một dòng nào** ở tầng A. Đó là thước đo duy nhất của chữ "generic".
+
+### Cái gì nằm trên luồng chạy job, cái gì không
+
+Sau vài vòng refactor (bộ quét chuyển lên pod, Kafka làm chuông cửa, Redis lọc trước), một số proc **không còn nằm trên đường chạy của một lượt job**. Chúng vẫn đúng và vẫn deploy, nhưng đọc `11_JOB.sql` mà tưởng mọi thứ đều chạy mỗi 15 phút là hiểu sai kiến trúc.
+
+| Object | Vai trò | Chạy khi nào |
+|---|---|---|
+| `UDF_JOB_NOW` · `UDF_JOB_IN_WINDOW` | đồng hồ + khung giờ | mỗi lượt |
+| `SP_JOB_ENQUEUE` → `_CLAIM` → `_HEARTBEAT` → `_COMPLETE` | vòng đời một lượt | mỗi lượt |
+| `SP_JOB_RECOVER` | lưới an toàn | 30s/lần, **chỉ khi có khung giờ đang mở** |
+| `SP_GET_FO_SNAPSHOT_SCOPE` → `SP_INGEST_FO_SNAPSHOT_RT` → `SP_RT_MASTER_AGG` | tầng B | mỗi lượt FO |
+| `UDF_JOB_SLOT_AT` · `UDF_JOB_FIRE_KEY` | **THAM CHIẾU** — pod tính, SQL đối chiếu | mỗi lượt, nhưng **không phải nơi sinh mốc** |
+| `SP_GET_SCHEDULABLE_JOBS` | dự phòng | chỉ khi cache Redis trống |
+| `SP_SET_JOB_SCHEDULE` + `TR_..._PURGE_PENDING` | đường **cấu hình** | khi người vận hành đổi lịch |
+| ⚠️ `SP_JOB_PURGE` | dọn nhật ký | **chưa có ai gọi** |
+| ⚠️ `SP_GET_JOB_STATUS` | API theo dõi cho ops/UI | **chưa có consumer** |
+| `SP_GET_PM_RT_OVERVIEW` | API đọc cho dashboard PM | khi người dùng mở màn hình |
+
+Hai dòng có ⚠️ là thứ đáng chú ý:
+
+- **`SP_JOB_PURGE` chưa được đấu.** Không gọi thì `T_JOB_RUN` tích ~25 dòng/ngày (~9.000/năm) — không sập gì, nhưng cũng không ai dọn. Cách đấu gọn nhất là khai chính nó thành một job (`INSERT T_JOB_DEFINITION ... 'JobPurgeHandler', 86400`) — dùng khung này để dọn cho khung.
+- **`SP_GET_JOB_STATUS` chưa có consumer**, nhưng **đừng bỏ**: nó là chỗ *duy nhất* phơi ra `C_RECOVER_WAKE_7D`, tức là chỗ duy nhất phát hiện được *"chuông Kafka đã tắt từ lâu mà hệ vẫn chạy đúng nhờ bộ hồi phục"*. Bỏ đi là mất luôn tín hiệu đó.
+
+**Đã xoá** (đừng đi tìm): `SP_JOB_ENQUEUE_DUE` (bộ quét trên pod thay thế) · `UDF_JOB_CAN_RUN` (hạn tươi neo vào mốc thay thế).
 
 ---
 

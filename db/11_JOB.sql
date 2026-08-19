@@ -47,6 +47,27 @@ GO
     (Tầng 4 nằm ở C#: TradingWindowGuard kiểm TRƯỚC TỪNG HTTP call trong vòng lặp batch —
      một chu kỳ 1000 batch bắt đầu lúc 14h50 PHẢI tự dừng giữa chừng khi chuông 15h00 điểm.)
 
+  *** BẢN ĐỒ OBJECT — CÁI NÀO NẰM TRÊN LUỒNG CHẠY JOB, CÁI NÀO KHÔNG ***
+    Sau vài vòng refactor (bộ quét chuyển lên pod, Kafka làm chuông cửa, Redis lọc trước), một số
+    object KHÔNG còn nằm trên đường chạy của một lượt job nữa. Chúng vẫn đúng và vẫn deploy được,
+    nhưng đọc file này mà tưởng mọi thứ đều chạy mỗi 15 phút là hiểu sai kiến trúc.
+
+    ┌ LUỒNG CHÍNH (chạy mỗi lượt job) ────────────────────────────────────────────────────────┐
+    │ UDF_JOB_NOW · UDF_JOB_IN_WINDOW                                                          │
+    │ SP_JOB_ENQUEUE → SP_JOB_CLAIM → SP_JOB_HEARTBEAT → SP_JOB_COMPLETE                       │
+    │ SP_JOB_RECOVER  (30s/lần, CHỈ khi có khung giờ đang mở)                                  │
+    │ [tầng B] SP_GET_FO_SNAPSHOT_SCOPE → SP_INGEST_FO_SNAPSHOT_RT → SP_RT_MASTER_AGG          │
+    └──────────────────────────────────────────────────────────────────────────────────────────┘
+    ┌ NGOÀI LUỒNG CHÍNH ───────────────────────────────────────────────────────────────────────┐
+    │ UDF_JOB_SLOT_AT · UDF_JOB_FIRE_KEY  → THAM CHIẾU: pod tự tính mốc/khoá, SQL chỉ ĐỐI CHIẾU │
+    │ SP_GET_SCHEDULABLE_JOBS             → chỉ chạy khi cache Redis trống (dự phòng)          │
+    │ SP_SET_JOB_SCHEDULE + TR_..._PURGE_PENDING → đường CẤU HÌNH, không phải đường chạy        │
+    │ SP_JOB_PURGE                        → CHƯA CÓ AI GỌI                                     │
+    │ SP_GET_JOB_STATUS                   → API theo dõi cho ops/UI, CHƯA CÓ CONSUMER          │
+    │ SP_GET_PM_RT_OVERVIEW               → API đọc cho dashboard PM, không thuộc khung job     │
+    └──────────────────────────────────────────────────────────────────────────────────────────┘
+    ĐÃ XOÁ (đừng đi tìm): SP_JOB_ENQUEUE_DUE (pod thay thế) · UDF_JOB_CAN_RUN (hạn tươi thay thế).
+
   *** ERR-CODE ***
     0=OK · 1=job_code không tồn tại · 2=job đang tắt (DISABLED) · 3=NGOÀI khung giờ/không phải
     ngày GD · 4=fire_key đã tồn tại (idempotent, KHÔNG phải lỗi) · 5=claim hụt (pod khác đang giữ)
@@ -236,6 +257,11 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — BẢN THAM CHIẾU]
+    Bộ quét trên pod mới là nơi TÍNH mốc (để khỏi chạm DB mỗi 10 giây). Hàm này tồn tại để
+    (a) SP_JOB_ENQUEUE ĐỐI CHIẾU lại mốc pod gửi lên, và (b) giữ phép tính mốc còn ca kiểm chứng
+    trong 12_JOB_SMOKE. GIỮ — bỏ đi là mất cả hai. Nhưng đừng nhầm nó là nơi sinh mốc.
+
   UDF_JOB_SLOT_AT — MỐC SLOT của job tại thời điểm @p_at. Neo vào 00:00 giờ VN:
       slot = 00:00 + floor(giây_từ_nửa_đêm / chu_kỳ) × chu_kỳ
 
@@ -261,6 +287,9 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — BẢN THAM CHIẾU] Cùng vai trò với UDF_JOB_SLOT_AT: định nghĩa CHUẨN của
+    khoá, để pod khỏi tự format và hai bên khỏi hiểu khác nhau. GIỮ.
+
   UDF_JOB_FIRE_KEY — KHOÁ CHỐNG TRÙNG của một mốc: 'yyyyMMddHHmmss'.
     ★ PHẢI CÓ GIÂY: C_INTERVAL_SEC cho phép tới 30s ⇒ khoá chỉ tới phút thì hai mốc trong cùng một
       phút trùng khoá, UQ nuốt mốc thứ hai, và job khai 30 giây LẶNG LẼ chạy 60 giây/lần.
@@ -276,6 +305,10 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — DỰ PHÒNG] Ở trạng thái ổn định bộ quét đọc cấu hình từ cache Redis
+    (SDI:JOB:CFG) nên proc này gần như KHÔNG được gọi. Nó chỉ chạy khi cache trống/hỏng — tức là
+    lúc pod vừa khởi động hoặc vừa có người đổi lịch. GIỮ: mất nó thì cache trống = job đứng im.
+
   SP_GET_SCHEDULABLE_JOBS — danh sách job định kỳ + cấu hình lịch, cho bộ quét trên pod nạp vào
     bộ nhớ (và đẩy lên Redis cache). Đọc 1 lần/phút/pod là cùng, hoặc 0 lần nếu cache Redis còn.
     KHÔNG trả gì ngoài thứ bộ quét cần — payload/handler/timeout để SP_JOB_CLAIM lo.
@@ -303,6 +336,9 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — ĐƯỜNG CẤU HÌNH] Chỉ chạy khi người vận hành đổi lịch, không phải mỗi lượt
+    job. GIỮ: đây là cổng duy nhất được phép đổi lịch.
+
   SP_SET_JOB_SCHEDULE — CỔNG DUY NHẤT để đổi lịch chạy của một job
     (chu kỳ 15' / 30' / 1 tiếng…, khung giờ, bật/tắt, payload).
 
@@ -399,6 +435,9 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — ĐƯỜNG CẤU HÌNH] Chỉ bắn khi có người sửa T_JOB_DEFINITION. GIỮ: nó là thứ
+    giữ cho luật "đổi cấu hình ⇒ dọn lượt chờ" đúng kể cả khi người ta không đi qua cổng.
+
   TR_JOB_DEFINITION_PURGE_PENDING — LƯỚI CHẶN CUỐI cho luật "đổi cấu hình ⇒ dọn lượt chờ".
 
   ⚠️ ĐÂY LÀ TRIGGER DUY NHẤT TRONG REPO. Repo vốn theo lối "cổng proc" (xem SP_INGEST_MASTER_
@@ -823,6 +862,14 @@ END
 GO
 
 /*===========================================================================
+  ⚠️ [NGOÀI LUỒNG CHÍNH — CHƯA CÓ AI GỌI] Không có handler C# nào, không có scheduler nào đấu vào
+    proc này. Hiện nó CHỈ được gọi trong 12_JOB_SMOKE.
+    GIỮ hay không là lựa chọn có hệ quả: không gọi thì T_JOB_RUN tích ~25 dòng/ngày (~9.000/năm) —
+    không sập gì, nhưng cũng không ai dọn. Muốn đấu thì cách gọn nhất là khai chính nó thành một job:
+        INSERT T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_INTERVAL_SEC,C_TIMEOUT_SEC)
+        VALUES ('JOB_PURGE', N'Dọn nhật ký job', 'JobPurgeHandler', 86400, 300);
+    — dùng chính khung này để dọn cho khung. Chưa làm vì chưa ai yêu cầu.
+
   SP_JOB_PURGE — dọn nhật ký cũ. Job 15 phút × 6 tiếng × ngày GD ≈ 25 dòng/ngày cho FO,
     nhưng job fan-out (nếu sau này có) sinh hàng nghìn dòng/ngày ⇒ phải có đường dọn từ đầu.
     CHỈ xoá lượt ĐÃ ĐÓNG. KHÔNG BAO GIỜ xoá DEAD: đó là những lượt cần người nhìn.
@@ -847,6 +894,11 @@ END
 GO
 
 /*===========================================================================
+  ⚠️ [NGOÀI LUỒNG CHÍNH — CHƯA CÓ CONSUMER] Đây là API cho màn hình theo dõi / người trực, không
+    nằm trên đường chạy job. Chưa có UI hay job nào gọi; hiện chỉ 12_JOB_SMOKE gọi để kiểm chạy được.
+    GIỮ — nó là chỗ DUY NHẤT phơi ra C_RECOVER_WAKE_7D, tức là chỗ duy nhất phát hiện được
+    "chuông Kafka đã tắt từ lâu mà hệ vẫn chạy đúng nhờ bộ hồi phục". Bỏ đi thì mất luôn tín hiệu đó.
+
   SP_GET_JOB_STATUS — API theo dõi. RS1: từng job (lượt gần nhất + sức khoẻ).
     RS2: các lượt DEAD/FAILED gần đây (thứ cần người xử lý).
 ===========================================================================*/
@@ -1152,6 +1204,9 @@ END
 GO
 
 /*===========================================================================
+  [NGOÀI LUỒNG CHÍNH — API ĐỌC] Không thuộc khung job: nó phục vụ màn hình PM, do tầng API gọi
+    khi người dùng mở dashboard. Đặt trong file này vì nó là proc DUY NHẤT được phép đọc dòng RT.
+
   SP_GET_PM_RT_OVERVIEW — API DASHBOARD PM NEAR-REALTIME (cấp master).
     Đây là proc DUY NHẤT được phép đọc dòng RT. 05_API/06_PM_API vẫn chỉ đọc số chốt.
 
