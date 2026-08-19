@@ -104,7 +104,9 @@ public class FoSnapshotJobHandler : IJobHandler
 
         foreach (var batch in batches)
         {
-            if (ct.IsCancellationRequested || Volatile.Read(ref closed)) break;
+            // IsStillMine đọc từ RAM (0 query): mất lease hoặc job vừa bị TẮT thì dừng ngay ở
+            //   ranh giới batch, không chờ tới lúc token bị huỷ giữa một lời gọi HTTP.
+            if (ct.IsCancellationRequested || Volatile.Read(ref closed) || !ctx.IsStillMine()) break;
 
             await gate.WaitAsync(ct);
             tasks.Add(Task.Run(async () =>
@@ -137,7 +139,10 @@ public class FoSnapshotJobHandler : IJobHandler
                     Interlocked.Add(ref written, n);
                     if (skipped > 0) Interlocked.Add(ref skippedEod, skipped);
 
-                    await ctx.HeartbeatAsync(Interlocked.Read(ref written));
+                    // ★ CHỈ ghi vào RAM — 0 câu truy vấn. Nhịp tim nền tự đẩy con số này xuống DB
+                    //   mỗi ~30 giây. Bản đầu gọi thẳng heartbeat ở đây ⇒ 1000 câu UPDATE vào ĐÚNG
+                    //   MỘT DÒNG mỗi chu kỳ, phát ra từ 4 luồng ⇒ điểm nghẽn khoá dòng tự chế.
+                    ctx.ReportProgress(Interlocked.Read(ref written));
                 }
                 catch (TradingWindowClosedException ex)
                 {

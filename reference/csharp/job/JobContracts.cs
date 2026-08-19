@@ -37,12 +37,32 @@ public sealed class JobContext
     public int      Attempt      { get; init; }
 
     /// <summary>
-    /// Báo tiến độ + GIA HẠN LEASE. Trả false ⇒ pod này KHÔNG CÒN LÀ CHỦ của lượt chạy
-    /// (lease đã bị thu hồi, pod khác đang chạy) ⇒ handler PHẢI dừng ngay và KHÔNG ghi thêm gì.
-    /// Vòng lặp dài (1000 batch) BẮT BUỘC gọi hàm này định kỳ, nếu không lease hết hạn giữa chừng
-    /// và sẽ có pod thứ hai chạy song song cùng một chu kỳ.
+    /// BÁO TIẾN ĐỘ — chỉ ghi vào một biến trong RAM. KHÔNG chạm DB, không await, không khoá.
+    /// Gọi thoải mái trong vòng lặp nóng: 1000 batch gọi 1000 lần cũng bằng 0 lượt truy vấn.
+    /// Con số này được nhịp tim nền đẩy xuống `T_JOB_RUN.C_ROWS` mỗi ~20-30 giây.
+    ///
+    /// ⚠️ Đây là hàm handler NÊN dùng. Bản đầu chỉ có `HeartbeatAsync` và
+    ///    `FoSnapshotJobHandler` gọi nó sau MỖI batch ⇒ 1000 câu UPDATE vào ĐÚNG MỘT DÒNG mỗi
+    ///    chu kỳ, phát ra từ 4 luồng song song ⇒ tự tạo điểm nghẽn khoá dòng, và tất cả chỉ để
+    ///    ghi một con số không ai đọc trong lúc job đang chạy.
     /// </summary>
-    public Func<long, Task<bool>> HeartbeatAsync { get; init; } = _ => Task.FromResult(true);
+    public Action<long> ReportProgress { get; init; } = _ => { };
+
+    /// <summary>
+    /// CÒN LÀ CHỦ LƯỢT CHẠY NÀY KHÔNG — đọc từ RAM, cập nhật bởi nhịp tim nền.
+    /// false ⇒ lease đã bị thu hồi (pod này treo quá lâu) HOẶC job vừa bị TẮT ⇒ handler phải
+    /// dừng ngay và KHÔNG ghi thêm gì. Vòng lặp dài nên kiểm cờ này mỗi vòng — nó miễn phí.
+    /// </summary>
+    public Func<bool> IsStillMine { get; init; } = () => true;
+
+    /// <summary>
+    /// ÉP một nhịp tim NGAY (chạm DB) và trả lời "còn là chủ không".
+    /// Handler thường KHÔNG cần gọi — nhịp tim nền đã lo cả việc gia hạn lease lẫn cập nhật cờ.
+    /// Chỉ dùng khi cần một câu trả lời TƯƠI ngay trước một hành động không thể hoàn tác.
+    /// CÓ CHẶN TẦN SUẤT: gọi dày hơn ngưỡng thì trả lại kết quả gần nhất, không bắn thêm query —
+    /// để một handler viết ẩu cũng không thể biến hàm này thành vòi tưới DB.
+    /// </summary>
+    public Func<Task<bool>> HeartbeatAsync { get; init; } = () => Task.FromResult(true);
 }
 
 /// <summary>Tra handler theo khoá. Đăng ký bằng DI, không hard-code switch-case.</summary>
@@ -77,6 +97,8 @@ public sealed class JobClaim
     public DateTime? BusinessDate { get; init; }
     public string?   PayloadJson  { get; init; }
     public int       Attempt      { get; init; }
+    /// <summary>T_JOB_DEFINITION.C_TIMEOUT_SEC — worker suy nhịp tim từ đây (nhịp = timeout/4).</summary>
+    public int       TimeoutSec   { get; init; } = 300;
 }
 
 public sealed class DueJob

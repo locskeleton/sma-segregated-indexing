@@ -56,6 +56,108 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
 
 ---
 
+## 2b. Vì sao dùng Redis Streams — và nó KHÔNG mua cho ta cái gì
+
+### Streams giữ vai trò gì
+
+**Đường vận chuyển + chuông cửa. Hết.** Nó **không** giữ một mảnh tính đúng nào:
+
+| Câu hỏi | Ai trả lời |
+|---|---|
+| "Job này đã được xếp lịch chưa?" | `UQ_JOB_RUN_NK (job_code, fire_key)` |
+| "Ai được chạy lượt này?" | `SP_JOB_CLAIM` — `UPDATE ... WHERE C_STATUS='READY'` |
+| "Lượt này còn hiệu lực không?" | `C_MAX_DELAY_SEC` + `UDF_JOB_IN_WINDOW` |
+| "Pod này còn là chủ không?" | lease + `C_OWNER` trong `SP_JOB_HEARTBEAT` |
+| **"Có việc mới — dậy đi!"** | **Redis Stream** |
+
+Xoá sạch Redis thì hệ **chậm đi**, không sai đi. Đó là điều kiện để nguyên tắc ① đứng vững.
+
+### So với ba lựa chọn khác
+
+| Phương án | Điểm chết |
+|---|---|
+| **Redis pub/sub** | Bắn-rồi-quên. Message phát ra lúc không pod nào đang nghe là **mất luôn**. Không có dấu vết để nhặt lại. |
+| **Redis List (`BLPOP`)** | Không có consumer group, không có pending list. Pod `BLPOP` xong rồi chết ⇒ message **bốc hơi**, không ai biết nó từng tồn tại. |
+| **DB polling 1–2 giây** | Đúng và đơn giản nhất, nhưng dồn tải nhàn rỗi lên SQL Server: 10 pod × 1 query/giây = **600 query/phút** chỉ để hỏi "có gì mới không", 24/7, kể cả 2 giờ sáng. |
+| **Redis Streams** | Có consumer group (chia việc không cần điều phối) + **PEL**: pod nhận message rồi chết vẫn để lại dấu, `XAUTOCLAIM` nhặt được. Tải nhàn rỗi rơi vào Redis thay vì SQL Server. |
+
+`XAUTOCLAIM` + PEL là thứ pub/sub và List **không thể** có. Đó là lý do kỹ thuật thật sự để chọn Streams giữa các phương án Redis.
+
+### ⚠️ Sự thật cần biết: không có "blocking" thật
+
+`StackExchange.Redis` **không hỗ trợ** lệnh chặn (`XREADGROUP ... BLOCK`) — thư viện này ghép nhiều lệnh trên một kết nối dùng chung, một lệnh chặn sẽ treo cả kết nối của mọi thứ khác. Nên `JobDispatcherService` **vẫn là vòng lặp hỏi thăm**, chỉ khác là hỏi Redis (mỗi 500ms) thay vì hỏi SQL Server.
+
+⇒ Lợi ích thực tế, nói cho đúng:
+- **độ trễ ≤ 500ms** thay vì ≤ 1–2 giây;
+- **tải hỏi thăm rơi vào Redis** (20 lệnh/giây với 10 pod — không đáng kể) thay vì vào SQL Server;
+- **PEL/XAUTOCLAIM** cứu được message đã giao cho pod đã chết.
+
+Không phải "đẩy tức thì". Ai đọc code mà tưởng là push thật sẽ đặt kỳ vọng sai lúc đo độ trễ.
+
+### Khi nào NÊN bỏ Streams
+
+Nếu **không** bao giờ thêm job kiểu fan-out (mỗi chu kỳ sinh hàng nghìn job con) và độ trễ 1–2 giây là chấp nhận được, thì **DB polling thuần** là lựa chọn đúng: bỏ được ~200 dòng code, một dependency, và toàn bộ phần consumer group / XACK / PEL. Với 24 lượt job mỗi ngày, đó là một sự đơn giản hoá hoàn toàn chính đáng.
+
+Lý do giữ Streams:
+1. Job đẩy tay qua API (yêu cầu "cứ có job đẩy vào là xử lý") muốn dưới một giây, không phải 2 giây.
+2. Nếu sau này chuyển FO sang mô hình fan-out (1000 job con/chu kỳ), DB polling sẽ tệ đi rất nhanh còn Streams thì không.
+
+Đổi ý lúc nào cũng được mà **không đụng tới tính đúng**: bỏ Streams đi thì chỉ cần `SP_JOB_REAP` đổi từ "lưới an toàn" thành "đường chính", còn `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó chính là lợi ích của việc không giao một mảnh tính đúng nào cho Redis.
+
+---
+
+## 2c. Nhịp tim — và vì sao nó KHÔNG gọi DB liên tục
+
+Nhịp tim làm hai việc: **gia hạn lease** (để không ai giật mất job đang chạy) và **phát hiện mất quyền** (lease bị thu hồi, hoặc job vừa bị TẮT).
+
+### Bản đầu SAI: 1000 câu UPDATE vào một dòng
+
+`FoSnapshotJobHandler` gọi `ctx.HeartbeatAsync(...)` **sau mỗi batch**. Với ~1000 batch/chu kỳ:
+
+- **1000 câu `UPDATE T_JOB_RUN`** mỗi chu kỳ — tất cả vào **đúng một dòng**;
+- phát ra từ **4 luồng song song** ⇒ chúng xếp hàng chờ khoá dòng của nhau;
+- ×24 chu kỳ/ngày = **24.000 lượt ghi/ngày**, chỉ để cập nhật một con số mà **không ai đọc** trong lúc job đang chạy.
+
+Không đủ để sập, nhưng là một điểm nghẽn khoá tự chế và hoàn toàn vô ích.
+
+### Bản sửa: tiến độ ở RAM, chạm DB theo nhịp
+
+`JobContext` tách làm ba, ranh giới rõ ràng:
+
+| Hàm | Chạm DB? | Dùng khi nào |
+|---|---|---|
+| `ReportProgress(rows)` | **Không** — `Interlocked` vào RAM | Gọi thoải mái trong vòng lặp nóng |
+| `IsStillMine()` | **Không** — đọc cờ trong RAM | Kiểm mỗi vòng lặp để dừng sớm |
+| `HeartbeatAsync()` | Có, **nhưng chặn tần suất 5s** | Chỉ khi cần câu trả lời tươi ngay trước một việc không hoàn tác được |
+
+Chỉ **một** nhịp tim nền chạm DB, và mọi lời gọi đều đi qua cùng một cửa có `SemaphoreSlim(1)` — bốn luồng không thể xếp hàng ghi cùng một dòng nữa.
+
+**Nhịp = `C_TIMEOUT_SEC / 4`, kẹp trong [5s, 30s].** Không để cứng 20 giây:
+- nhỏ hơn hẳn lease (biên 4 lần) ⇒ DB chậm một nhịp cũng không mất job vào tay pod khác;
+- không thưa quá ⇒ "job vừa bị TẮT" được phát hiện trong tối đa 30 giây.
+
+Job FO (`timeout 840s`) ⇒ nhịp 30s. Job khai `timeout 60s` ⇒ nhịp 15s.
+
+### Tải DB thực tế của cả khung job
+
+Với **10 pod**, trạng thái ổn định:
+
+| Nguồn | Tần suất | Tổng (10 pod) |
+|---|---|---|
+| `SP_JOB_ENQUEUE_DUE` | 10s/lần, mọi pod | 60 lượt/phút |
+| `SP_JOB_REAP` | 30s/lần, mọi pod | 20 lượt/phút |
+| Nhịp tim | 30s/lần, **chỉ pod đang chạy job** | 2 lượt/phút |
+| `SP_JOB_CLAIM` + `SP_JOB_COMPLETE` | 2 lượt mỗi lần job chạy | 48 lượt/**ngày** |
+| **Tổng** | | **≈ 1,4 truy vấn/giây** |
+
+So với bản đầu: riêng nhịp tim đã là **24.000 lượt ghi/ngày** dồn vào một dòng. Nay còn **~2.900 lượt/ngày** cho **toàn bộ** khung job, và không còn tranh khoá.
+
+Đổi lại, tải hỏi thăm Redis là ~20 lệnh/giây với 10 pod (mỗi pod đọc stream mỗi 500ms) — Redis xử lý cỡ đó bằng vài phần trăm một nhân CPU.
+
+> Muốn giảm nữa thì nới `ScanEvery` (10s) — nó đang lấy mẫu dày gấp 3 lần chu kỳ nhỏ nhất mà cấu hình cho phép (30s). Nhưng ở mức 1,4 truy vấn/giây thì không có gì để tối ưu.
+
+---
+
 ## 3. Bốn yêu cầu BRD — đáp ứng bằng cái gì
 
 ### (1) Chạy được với MỌI loại job

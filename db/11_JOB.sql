@@ -576,8 +576,14 @@ BEGIN
             RETURN;
         END
 
-        SELECT C_JOB_RUN_ID, C_JOB_CODE, C_FIRE_KEY, C_BUSINESS_DATE, C_PAYLOAD, C_ATTEMPT, C_LEASE_UNTIL
-        FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@p_job_run_id;
+        -- Trả kèm C_HANDLER + C_TIMEOUT_SEC (JOIN cấu hình): worker cần handler để biết gọi ai, và
+        --   cần timeout để tự chọn nhịp tim (nhịp = timeout/4). Thiếu 2 cột này thì tầng C# phải
+        --   bắn thêm một query nữa cho MỖI lượt chạy chỉ để đọc hai con số đã nằm sẵn ở đây.
+        SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, d.C_HANDLER, r.C_FIRE_KEY, r.C_BUSINESS_DATE,
+               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC
+        FROM T_JOB_RUN r
+        LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
+        WHERE r.C_JOB_RUN_ID=@p_job_run_id;
     END TRY
     BEGIN CATCH
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();

@@ -30,8 +30,17 @@ namespace SdiCoreMessagingProcess.Jobs;
 public class JobDispatcherService : BackgroundService
 {
     private static readonly TimeSpan BlockTimeout     = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan HeartbeatEvery   = TimeSpan.FromSeconds(20);
     private const int                BatchPerRead     = 10;
+
+    // Nhịp tim: KHÔNG để cứng 20s. Nó phải nhỏ hơn hẳn lease (nếu không, DB chậm một nhịp là
+    //   lease hết hạn và pod khác giành mất job đang chạy), nhưng cũng không được thưa quá vì
+    //   nó chính là độ trễ để phát hiện "job vừa bị TẮT" / "mình vừa mất quyền".
+    //   ⇒ timeout/4, kẹp trong [5s, 30s]: luôn có biên 4 lần lease, và tệ nhất cũng phản ứng
+    //     trong 30 giây. Job khai timeout 60s thì nhịp 15s; job FO khai 840s thì nhịp 30s.
+    private static readonly TimeSpan HeartbeatMin = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan HeartbeatMax = TimeSpan.FromSeconds(30);
+    // Chặn tần suất cho lời gọi ÉP nhịp tim từ handler (ctx.HeartbeatAsync).
+    private static readonly TimeSpan HeartbeatFloor = TimeSpan.FromSeconds(5);
 
     private readonly IDatabase      _redis;
     private readonly ISdiJobGateway _db;
@@ -126,6 +135,37 @@ public class JobDispatcherService : BackgroundService
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, lost.Token);
 
         long progress = 0;
+        var stillMine = 1;                       // cờ đọc từ RAM — handler kiểm mỗi vòng lặp, miễn phí
+        var beatGate  = new SemaphoreSlim(1, 1); // ★ tuần tự hoá: 4 luồng không được xếp hàng UPDATE cùng một dòng
+        var lastBeat  = DateTime.MinValue;
+
+        // MỘT đường duy nhất chạm DB cho nhịp tim. Cả Timer lẫn lời gọi ép từ handler đều đi qua đây.
+        async Task<bool> BeatAsync(bool forced)
+        {
+            await beatGate.WaitAsync();
+            try
+            {
+                // Chặn tần suất: handler gọi dày cỡ nào cũng không tạo thêm được một câu query.
+                //   Đây là thứ khiến API an toàn với người viết handler — họ không phải thuộc luật.
+                if (forced && DateTime.UtcNow - lastBeat < HeartbeatFloor)
+                    return Volatile.Read(ref stillMine) == 1;
+
+                var rows = Interlocked.Read(ref progress);
+                var mine = await _db.HeartbeatAsync(jobRunId, _owner, rows, CancellationToken.None);
+                lastBeat = DateTime.UtcNow;
+
+                if (!mine)
+                {
+                    Volatile.Write(ref stillMine, 0);
+                    Log.Error("[JOB] runId={Id} MẤT QUYỀN (lease bị thu hồi hoặc job vừa bị TẮT). " +
+                              "Dừng ngay để không ghi song song.", jobRunId);
+                    lost.Cancel();
+                }
+                return mine;
+            }
+            finally { beatGate.Release(); }
+        }
+
         var ctx = new JobContext
         {
             JobRunId     = jobRunId,
@@ -134,22 +174,19 @@ public class JobDispatcherService : BackgroundService
             BusinessDate = claim.BusinessDate,
             PayloadJson  = claim.PayloadJson,
             Attempt      = claim.Attempt,
-            HeartbeatAsync = async rows =>
-            {
-                Interlocked.Exchange(ref progress, rows);
-                var mine = await _db.HeartbeatAsync(jobRunId, _owner, rows, CancellationToken.None);
-                if (!mine)
-                {
-                    Log.Error("[JOB] runId={Id} MẤT LEASE — pod khác đã giành. Dừng ngay để không ghi song song.", jobRunId);
-                    lost.Cancel();
-                }
-                return mine;
-            }
+            ReportProgress = rows => Interlocked.Exchange(ref progress, rows),  // RAM, 0 query
+            IsStillMine    = () => Volatile.Read(ref stillMine) == 1,           // RAM, 0 query
+            HeartbeatAsync = () => BeatAsync(forced: true)                      // có chặn tần suất
         };
 
-        // Nhịp tim nền: job dài (vòng 1000 batch) không phải tự nhớ gọi heartbeat mỗi vòng.
-        using var beat = new Timer(async _ => { try { await ctx.HeartbeatAsync(Interlocked.Read(ref progress)); } catch { } },
-                                   null, HeartbeatEvery, HeartbeatEvery);
+        // Nhịp tim nền — NGUỒN DUY NHẤT của tải DB do heartbeat sinh ra. Job dài (vòng 1000 batch)
+        //   không phải tự nhớ gọi gì cả: nó chỉ ReportProgress (RAM) và đọc IsStillMine (RAM).
+        var beatEvery = TimeSpan.FromSeconds(Math.Clamp(claim.TimeoutSec / 4.0,
+                            HeartbeatMin.TotalSeconds, HeartbeatMax.TotalSeconds));
+        // await using: chờ callback đang chạy dứt hẳn rồi mới huỷ Timer (Dispose thường có thể
+        //   cắt ngang một nhịp đang bay và ném ObjectDisposedException vào log).
+        await using var beat = new Timer(async _ => { try { await BeatAsync(forced: false); } catch { } },
+                                         null, beatEvery, beatEvery);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
