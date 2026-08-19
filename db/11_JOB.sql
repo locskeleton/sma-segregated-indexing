@@ -24,11 +24,12 @@ GO
   └───────────────────────────────────────────────────────────────────────────┘
 
   *** BA NGUYÊN TẮC (kế thừa docs/SDI-kafka-batch-sync-design.md) ***
-   ① Redis lo TỐC ĐỘ, DB lo TÍNH ĐÚNG. Redis Streams là đường VẬN CHUYỂN + chuông cửa;
-     quyền "ai được chạy lượt này" nằm ở T_JOB_RUN (một UPDATE có điều kiện). Redis mất sạch
-     key ⇒ job chậm/phải nhặt lại, KHÔNG BAO GIỜ chạy hai lần và KHÔNG mất vĩnh viễn (SP_JOB_REAP).
+   ① Redis lo TỐC ĐỘ, DB lo TÍNH ĐÚNG. Redis Pub/Sub chỉ là CHUÔNG CỬA (đánh thức worker);
+     quyền "ai được chạy lượt này" nằm ở T_JOB_RUN (một UPDATE có điều kiện). Redis chết/mất
+     thông báo ⇒ job chậm tối đa một nhịp SP_JOB_REAP, KHÔNG BAO GIỜ chạy hai lần, KHÔNG mất.
+     Pub/Sub KHÔNG lưu gì cả — và đó là điểm mạnh ở đây, vì sổ cái đã nằm trong DB rồi.
    ② Ngoài khung giờ GD thì TUYỆT ĐỐI không gọi FO — chặn ở 3 tầng ĐỘC LẬP (§ dưới), vì
-     một tầng bất kỳ cũng có thể bị qua mặt (job nằm chờ trong stream vắt qua 15h00 là tình
+     một tầng bất kỳ cũng có thể bị qua mặt (job nằm chờ trong hàng đợi vắt qua 15h00 là tình
      huống BÌNH THƯỜNG, không phải ngoại lệ hiếm).
    ③ Dòng RT KHÔNG BAO GIỜ đè dòng EOD, và KHÔNG BAO GIỜ được coi là số chốt (cột C_SRC).
 
@@ -36,7 +37,7 @@ GO
     Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE_DUE / SP_JOB_ENQUEUE không tạo lượt chạy ngoài khung.
     Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm tra LẠI tại thời điểm worker cầm job → ngoài khung
                           thì đóng dấu SKIPPED, worker KHÔNG chạm FO. Bắt đúng ca "job sinh lúc
-                          14h59, pod nhặt lúc 15h02" (stream tồn đọng, pod restart, reaper trả lại).
+                          14h59, pod nhặt lúc 15h02" (pod bận, pod restart, reaper đánh thức lại).
     Tầng 3 — GHI DỮ LIỆU: SP_INGEST_FO_SNAPSHOT_RT từ chối ngày không phải hôm nay / không phải
                           ngày GD. Đây là lưới cuối: kể cả ai đó gọi proc bằng tay.
     (Tầng 4 nằm ở C#: TradingWindowGuard kiểm TRƯỚC TỪNG HTTP call trong vòng lặp batch —
@@ -150,7 +151,11 @@ CREATE TABLE T_JOB_RUN (
     C_LEASE_UNTIL    DATETIME       NULL,             -- hết hạn mà không heartbeat ⇒ SP_JOB_REAP thu hồi
     C_HEARTBEAT_AT   DATETIME       NULL,
     C_RUN_AFTER      DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_RA  DEFAULT GETDATE(),  -- backoff sau khi FAILED
-    C_STREAM_ID      VARCHAR(40)    NULL,             -- id entry Redis Stream (để XACK/đối chiếu khi mổ xẻ sự cố)
+    -- AI ĐÁNH THỨC lượt chạy này: 'notify' (Pub/Sub — đường bình thường) | 'reap' (SP_JOB_REAP
+    --   nhặt lại vì thông báo bị mất) | 'manual'. ⚠️ Đây KHÔNG phải cột trang trí: Pub/Sub là
+    --   bắn-rồi-quên, nếu nó hỏng thì hệ VẪN CHẠY ĐÚNG nhờ reaper, chỉ chậm đi ~30 giây — và
+    --   không ai nhận ra. Thấy cột này toàn 'reap' nghĩa là chuông cửa đã tắt từ lâu.
+    C_CLAIM_SOURCE   VARCHAR(40)    NULL,
     C_ENQUEUED_AT    DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_EQ  DEFAULT GETDATE(),
     C_STARTED_AT     DATETIME       NULL,
     C_ENDED_AT       DATETIME       NULL,
@@ -171,6 +176,16 @@ GO
 IF IndexProperty(OBJECT_ID('T_JOB_RUN'),'IX_JOB_RUN_CODE_TIME','IndexID') IS NULL
 CREATE INDEX IX_JOB_RUN_CODE_TIME ON T_JOB_RUN (C_JOB_CODE, C_ENQUEUED_AT DESC)
     INCLUDE (C_STATUS, C_ROWS, C_STARTED_AT, C_ENDED_AT);
+GO
+
+-- Migration cho DB đã chạy bản Redis Streams: đổi tên cột C_STREAM_ID (id entry stream) thành
+--   C_CLAIM_SOURCE (nguồn đánh thức). Giữ dữ liệu cũ — id stream cũ nằm lại vài dòng lịch sử là
+--   vô hại, và xoá đi thì mất luôn vết của những lượt chạy thời còn dùng Streams.
+IF COL_LENGTH('T_JOB_RUN','C_STREAM_ID') IS NOT NULL AND COL_LENGTH('T_JOB_RUN','C_CLAIM_SOURCE') IS NULL
+    EXEC sp_rename 'T_JOB_RUN.C_STREAM_ID', 'C_CLAIM_SOURCE', 'COLUMN';
+GO
+IF COL_LENGTH('T_JOB_RUN','C_CLAIM_SOURCE') IS NULL
+    ALTER TABLE T_JOB_RUN ADD C_CLAIM_SOURCE VARCHAR(40) NULL;
 GO
 
 /*===========================================================================
@@ -334,8 +349,8 @@ GO
 
 /*===========================================================================
   SP_JOB_ENQUEUE — ĐẨY MỘT JOB (bất kỳ loại nào) vào hàng đợi. "Cứ có job đẩy vào là chạy":
-    proc trả @p_job_run_id để app XADD ngay vào Redis Stream; worker đang XREADGROUP BLOCK
-    nhận trong vài ms. Không có vòng chờ nào.
+    proc trả @p_job_run_id để app PUBLISH ngay lên kênh Redis; worker đang SUBSCRIBE nhận
+    trong khoảng một mili-giây (đẩy thật, không hỏi thăm). Không có vòng chờ nào.
   IDEMPOTENT theo (job_code, fire_key): gọi lại cùng fire_key ⇒ err=4 + trả id CŨ, KHÔNG sinh lượt mới.
   err: 0 OK · 1 không có job_code · 2 job tắt · 3 ngoài khung giờ (KHÔNG tạo lượt) · 4 đã tồn tại · -1 runtime.
 ===========================================================================*/
@@ -418,7 +433,7 @@ GO
       phút" thì mỗi lần pod restart / job chậm là mốc trôi đi, và sau một ngày không ai còn đoán
       được job chạy vào phút nào — nhật ký thành thứ không đối chiếu được với dữ liệu FO.
 
-  TRẢ VỀ result set các lượt VỪA TẠO (job_run_id, job_code, payload) → app XADD vào Redis Stream.
+  TRẢ VỀ result set các lượt VỪA TẠO (job_run_id, job_code, payload) → app PUBLISH lên kênh Redis.
   KHÔNG tạo lượt mới nếu: ngoài khung giờ · job tắt · (C_SINGLETON=1 và lượt trước còn RUNNING).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_JOB_ENQUEUE_DUE
@@ -499,7 +514,7 @@ GO
 CREATE OR ALTER PROCEDURE SP_JOB_CLAIM
     @p_job_run_id BIGINT,
     @p_owner      VARCHAR(64),                       -- định danh pod (hostname + pid)
-    @p_stream_id  VARCHAR(40)   = NULL,              -- id entry Redis (lưu để đối chiếu khi mổ xẻ sự cố)
+    @p_source     VARCHAR(40)   = NULL,              -- 'notify' | 'reap' | 'manual' — xem C_CLAIM_SOURCE
     @p_err_code   INT           OUTPUT,
     @p_err_msg    NVARCHAR(400) OUTPUT
 AS
@@ -530,7 +545,7 @@ BEGIN
             SET @p_err_code=6; SET @p_err_msg=N'Lượt chạy đã vượt số lần thử → DEAD.'; RETURN;
         END
 
-        -- ★ GUARD TẦNG 2 — bắt ca job nằm trong stream vắt qua 15h00.
+        -- ★ GUARD TẦNG 2 — bắt ca job nằm chờ trong hàng đợi vắt qua 15h00.
         IF dbo.UDF_JOB_IN_WINDOW(@code, @now) = 0
         BEGIN
             UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
@@ -563,7 +578,7 @@ BEGIN
            SET C_STATUS='RUNNING', C_OWNER=@p_owner, C_ATTEMPT=C_ATTEMPT+1,
                C_STARTED_AT=@now, C_HEARTBEAT_AT=@now,
                C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
-               C_STREAM_ID=ISNULL(@p_stream_id, C_STREAM_ID), C_ENDED_AT=NULL
+               C_CLAIM_SOURCE=ISNULL(@p_source, C_CLAIM_SOURCE), C_ENDED_AT=NULL
          WHERE C_JOB_RUN_ID=@p_job_run_id
            AND ( C_STATUS IN ('READY','FAILED')
               OR (C_STATUS='RUNNING' AND C_LEASE_UNTIL < @now) );   -- giành lại từ pod đã chết
@@ -580,7 +595,7 @@ BEGIN
         --   cần timeout để tự chọn nhịp tim (nhịp = timeout/4). Thiếu 2 cột này thì tầng C# phải
         --   bắn thêm một query nữa cho MỖI lượt chạy chỉ để đọc hai con số đã nằm sẵn ở đây.
         SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, d.C_HANDLER, r.C_FIRE_KEY, r.C_BUSINESS_DATE,
-               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC
+               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC, r.C_CLAIM_SOURCE
         FROM T_JOB_RUN r
         LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
         WHERE r.C_JOB_RUN_ID=@p_job_run_id;
@@ -627,7 +642,7 @@ GO
 
 /*===========================================================================
   SP_JOB_COMPLETE — đóng lượt chạy. OK → DONE. Lỗi → FAILED, và nếu còn lượt thử thì tự
-    đặt lại READY + C_RUN_AFTER = now + retry_delay (SP_JOB_REAP sẽ đẩy lại vào stream).
+    đặt lại READY + C_RUN_AFTER = now + retry_delay (SP_JOB_REAP sẽ đánh thức lại).
     ⚠️ Job đã hết giờ (vd FO 15h00) mà FAILED thì lần thử sau sẽ bị GUARD TẦNG 2 đóng dấu
       SKIPPED — đúng ý đồ: thà bỏ một nhịp 15 phút còn hơn gọi FO ngoài giờ.
 ===========================================================================*/
@@ -681,14 +696,14 @@ GO
 
   (1) THU HỒI lượt RUNNING quá hạn lease (pod chết/bị evict giữa chừng) → READY.
   (2) ĐÓNG DẤU SKIPPED lượt nằm chờ QUÁ HẠN (C_MAX_DELAY_SEC) — chống chạy lại việc của giờ trước.
-  (3) TRẢ VỀ các lượt READY tới hạn để app XADD (lại) vào Redis Stream.
+  (3) TRẢ VỀ các lượt READY tới hạn để app PUBLISH (lại) lên kênh Redis.
 
-  ★ (3) LÀ THỨ BÙ ĐẮP CHO VIỆC ĐẶT HÀNG ĐỢI Ở REDIS. Redis Streams giao message rất nhanh
-    nhưng nó KHÔNG phải sổ cái: FLUSHALL / mất pod Redis không bền / TTL / XADD hụt vì pod
-    chết ngay sau khi INSERT xong — mọi trường hợp đó đều làm message BIẾN MẤT trong khi
-    T_JOB_RUN vẫn ghi READY. Không có (3) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
-    Có (3) thì: mất message ⇒ chậm tối đa một nhịp reaper, rồi tự hồi. XADD trùng cũng vô hại
-    vì SP_JOB_CLAIM chỉ cho một pod thắng.
+  ★ (3) LÀ ĐƯỜNG HỒI PHỤC CHÍNH, KHÔNG PHẢI DỰ PHÒNG. Pub/Sub là bắn-rồi-quên: thông báo phát
+    ra lúc không pod nào đang nghe (đang restart, mất kết nối, Redis chết, publish hụt vì pod
+    chết ngay sau khi INSERT) là MẤT LUÔN, trong khi T_JOB_RUN vẫn ghi READY.
+    Không có (3) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
+    Có (3) thì: mất thông báo ⇒ chậm tối đa một nhịp reaper, rồi tự hồi. Publish trùng cũng vô
+    hại vì SP_JOB_CLAIM chỉ cho một pod thắng.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_JOB_REAP
     @p_stale_sec INT           = 30,                 -- READY quá ngần này giây mà chưa ai chạy ⇒ nghi mất message
@@ -794,6 +809,8 @@ BEGIN
                l.C_JOB_RUN_ID AS C_LAST_RUN_ID, l.C_STATUS AS C_LAST_STATUS,
                l.C_STARTED_AT AS C_LAST_STARTED_AT, l.C_ENDED_AT AS C_LAST_ENDED_AT,
                l.C_ROWS AS C_LAST_ROWS, l.C_MESSAGE AS C_LAST_MESSAGE,
+               l.C_CLAIM_SOURCE AS C_LAST_WOKEN_BY,   -- 'notify' bình thường; toàn 'reap' ⇒ Pub/Sub đã tắt
+               q.C_REAP_WAKE_7D,
                DATEDIFF(SECOND, l.C_ENDED_AT, @now) AS C_SEC_SINCE_LAST_END,
                q.C_QUEUED, q.C_RUNNING, q.C_DEAD_7D
         FROM T_JOB_DEFINITION d
@@ -801,7 +818,10 @@ BEGIN
                      ORDER BY r.C_JOB_RUN_ID DESC) l
         OUTER APPLY (SELECT SUM(CASE WHEN r.C_STATUS='READY'   THEN 1 ELSE 0 END) AS C_QUEUED,
                             SUM(CASE WHEN r.C_STATUS='RUNNING' THEN 1 ELSE 0 END) AS C_RUNNING,
-                            SUM(CASE WHEN r.C_STATUS='DEAD' AND r.C_ENDED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_DEAD_7D
+                            SUM(CASE WHEN r.C_STATUS='DEAD' AND r.C_ENDED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_DEAD_7D,
+                            -- #lượt 7 ngày qua phải nhờ reaper đánh thức. >0 lác đác là bình thường;
+                            --   xấp xỉ TỔNG số lượt ⇒ chuông cửa Pub/Sub đang hỏng mà hệ vẫn chạy.
+                            SUM(CASE WHEN r.C_CLAIM_SOURCE='reap' AND r.C_STARTED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_REAP_WAKE_7D
                      FROM T_JOB_RUN r WHERE r.C_JOB_CODE=d.C_JOB_CODE) q
         WHERE (@p_job_code IS NULL OR d.C_JOB_CODE=@p_job_code)
         ORDER BY d.C_JOB_CODE;

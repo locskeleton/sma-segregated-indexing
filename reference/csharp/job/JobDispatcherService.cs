@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
@@ -9,47 +8,51 @@ using StackExchange.Redis;
 namespace SdiCoreMessagingProcess.Jobs;
 
 /// <summary>
-/// WORKER — chạy trên MỌI pod. Nằm chờ ở XREADGROUP BLOCK, có message là chạy ngay (yêu cầu BRD #2:
-/// "cứ có job đẩy vào là thực hiện xử lý"). Không polling DB, không sleep-loop.
+/// WORKER — chạy trên MỌI pod. Nằm nghe kênh Pub/Sub, có thông báo là chạy ngay (yêu cầu BRD #2:
+/// "cứ có job đẩy vào là thực hiện xử lý"). ĐẨY THẬT: không hỏi thăm Redis, không polling DB.
 ///
-/// ★ VÌ SAO KHÔNG BỊ XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3) — ba lớp, lớp sau bọc lớp trước:
-///   1. Consumer group: mỗi entry giao cho MỘT consumer. Đủ cho đường chạy bình thường.
-///   2. SP_JOB_CLAIM: một UPDATE có điều kiện READY→RUNNING. Đây mới là CHỐT THẬT. Kể cả 20 pod
-///      cùng cầm một jobRunId (XAUTOCLAIM, XADD trùng, người ta bấm chạy tay), đúng một pod đổi
-///      được trạng thái; 19 pod còn lại nhận err=5 và đi tiếp.
-///   3. Heartbeat có kiểm chủ sở hữu: pod bị treo lâu → lease hết hạn → pod khác giành job. Pod cũ
-///      tỉnh dậy gọi heartbeat sẽ nhận still_mine=false → tự huỷ token → dừng ghi. Không có cửa
-///      cho hai pod cùng ghi.
+/// ★ VÌ SAO KHÔNG BỊ XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3):
+///   Pub/Sub phát cho MỌI pod ⇒ cả 10 pod cùng nhận một `jobRunId`. Điều đó KHÔNG sao, vì chốt
+///   chặn không nằm ở khâu giao tin: `SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`,
+///   đúng MỘT pod đổi được trạng thái, 9 pod còn lại nhận `err=5` và đi tiếp.
+///   ⇒ Ở đây "ai nhận được tin" là chuyện vô thưởng vô phạt; "ai được chạy" mới là chuyện của DB.
+///   Lớp thứ hai: heartbeat có kiểm chủ sở hữu — pod treo lâu, lease bị thu hồi, pod cũ tỉnh dậy
+///   nhận `still_mine=false` rồi tự dừng. Không có cửa cho hai pod cùng ghi.
 ///
-/// ★ THỨ TỰ COMPLETE → XACK (không được đảo):
-///   Complete trước, XACK sau. Pod chết giữa hai bước ⇒ message được giao lại ⇒ claim thất bại
-///   (lượt đã DONE) ⇒ XACK rồi bỏ qua. Vô hại.
-///   Đảo lại (XACK trước) thì pod chết ⇒ message mất ⇒ lượt chạy kẹt RUNNING tới khi lease hết hạn.
-///   Chậm hơn, và tệ hơn: nhật ký nói "đang chạy" trong khi không ai chạy.
+/// ★ HẠN MỨC JOB ĐỒNG THỜI (`MaxConcurrentJobs`): pod đang chạy đủ job rồi thì **không claim nữa**,
+///   nhường pod rảnh. Đây vừa là cách chia tải tự nhiên (thay cho consumer group của Streams),
+///   vừa là cách chặn một pod ôm hết việc rồi nghẽn. Nếu MỌI pod đều bận thì không ai claim —
+///   dòng vẫn nằm `READY` và `SP_JOB_REAP` phát lại sau ≤30 giây. Không mất việc.
+///
+/// ★ HÀM CALLBACK CỦA PUB/SUB KHÔNG ĐƯỢC CHẶN. `OnMessage` xử lý tuần tự theo kênh: nếu chạy job
+///   ngay trong callback thì một job dài 5 phút sẽ khoá luôn việc nhận thông báo tiếp theo của
+///   pod đó. Nên callback chỉ đọc id rồi ném sang một Task nền có hạn mức, và trả về ngay.
+///
+/// ★ MẤT THÔNG BÁO: Pub/Sub bắn-rồi-quên — mất kết nối, pod đang restart, Redis chết ⇒ tin bay mất.
+///   `SP_JOB_REAP` là ĐƯỜNG HỒI PHỤC CHÍNH (không phải dự phòng). Xem JobChannelKeys.
 /// </summary>
 public class JobDispatcherService : BackgroundService
 {
-    private static readonly TimeSpan BlockTimeout     = TimeSpan.FromSeconds(5);
-    private const int                BatchPerRead     = 10;
+    /// <summary>Số job một pod chạy đồng thời. Job FO là singleton nên thực tế hiếm khi chạm trần.</summary>
+    private const int MaxConcurrentJobs = 4;
 
-    // Nhịp tim: KHÔNG để cứng 20s. Nó phải nhỏ hơn hẳn lease (nếu không, DB chậm một nhịp là
-    //   lease hết hạn và pod khác giành mất job đang chạy), nhưng cũng không được thưa quá vì
-    //   nó chính là độ trễ để phát hiện "job vừa bị TẮT" / "mình vừa mất quyền".
-    //   ⇒ timeout/4, kẹp trong [5s, 30s]: luôn có biên 4 lần lease, và tệ nhất cũng phản ứng
-    //     trong 30 giây. Job khai timeout 60s thì nhịp 15s; job FO khai 840s thì nhịp 30s.
-    private static readonly TimeSpan HeartbeatMin = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan HeartbeatMax = TimeSpan.FromSeconds(30);
+    // Nhịp tim: KHÔNG để cứng. Phải nhỏ hơn hẳn lease (DB chậm một nhịp không được làm mất job vào
+    //   tay pod khác), nhưng cũng chính là độ trễ phát hiện "job vừa bị TẮT" / "mình vừa mất quyền".
+    //   ⇒ timeout/4, kẹp [5s, 30s]: luôn có biên 4 lần lease, tệ nhất cũng phản ứng trong 30 giây.
+    private static readonly TimeSpan HeartbeatMin   = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan HeartbeatMax   = TimeSpan.FromSeconds(30);
     // Chặn tần suất cho lời gọi ÉP nhịp tim từ handler (ctx.HeartbeatAsync).
     private static readonly TimeSpan HeartbeatFloor = TimeSpan.FromSeconds(5);
 
-    private readonly IDatabase      _redis;
+    private readonly ISubscriber    _sub;
     private readonly ISdiJobGateway _db;
     private readonly IJobRegistry   _registry;
     private readonly string         _owner;   // định danh pod: hostname + pid
+    private readonly SemaphoreSlim  _slots = new(MaxConcurrentJobs, MaxConcurrentJobs);
 
-    public JobDispatcherService(IDatabase redis, ISdiJobGateway db, IJobRegistry registry)
+    public JobDispatcherService(ISubscriber sub, ISdiJobGateway db, IJobRegistry registry)
     {
-        _redis    = redis;
+        _sub      = sub;
         _db       = db;
         _registry = registry;
         _owner    = $"{Environment.MachineName}#{Environment.ProcessId}";
@@ -57,64 +60,52 @@ public class JobDispatcherService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        await JobStreamKeys.EnsureGroupAsync(_redis);
-        Log.Information("[JOB] Dispatcher khởi động, owner={Owner}", _owner);
+        // SubscribeAsync trả về hàng đợi tin của kênh. SE.Redis tự đăng ký lại sau khi mất kết nối —
+        //   nhưng tin phát ra TRONG lúc mất kết nối thì mất luôn; SP_JOB_REAP lo phần đó.
+        var queue = await _sub.SubscribeAsync(JobChannelKeys.NotifyChannel);
 
-        while (!ct.IsCancellationRequested)
+        queue.OnMessage(msg =>
         {
-            try
-            {
-                var entries = await _redis.StreamReadGroupAsync(
-                    JobStreamKeys.Stream, JobStreamKeys.Group, _owner,
-                    StreamPosition.NewMessages, count: BatchPerRead);
+            if (!long.TryParse(msg.Message, out var jobRunId)) return;
 
-                if (entries.Length == 0)
-                {
-                    // BLOCK thật sự do StackExchange.Redis không expose trực tiếp trong overload này;
-                    //   nghỉ ngắn rồi đọc lại. 500ms là trễ TỐI ĐA từ lúc job được đẩy vào tới lúc
-                    //   chạy — vẫn là "chạy ngay" ở thang 15 phút của nghiệp vụ, mà không đốt CPU.
-                    await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
-                    continue;
-                }
-
-                foreach (var e in entries)
-                {
-                    if (ct.IsCancellationRequested) break;
-                    await HandleEntryAsync(e, ct);
-                }
-            }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
+            // KHÔNG chạy job trong callback (xem chú thích đầu lớp). Thử lấy một suất; hết suất thì
+            //   bỏ qua — pod khác nhận, hoặc reaper phát lại. Bỏ qua ở đây RẺ hơn nhiều so với claim
+            //   rồi mới phát hiện mình không có chỗ chạy.
+            if (!_slots.Wait(0))
             {
-                // Redis chết / DB chết: KHÔNG được để vòng lặp thoát, vì thoát nghĩa là pod này
-                //   vĩnh viễn không chạy job nào nữa cho tới lần deploy sau — và không ai nhận ra.
-                Log.Error(ex, "[JOB] Vòng lặp dispatcher lỗi — thử lại sau 5s");
-                try { await Task.Delay(BlockTimeout, ct); } catch { break; }
+                Log.Debug("[JOB] Pod đang chạy đủ {N} job — bỏ qua thông báo runId={Id}", MaxConcurrentJobs, jobRunId);
+                return;
             }
-        }
+
+            _ = Task.Run(async () =>
+            {
+                try { await RunOneAsync(jobRunId, JobChannelKeys.SourceNotify, ct); }
+                catch (Exception ex) { Log.Error(ex, "[JOB] runId={Id} lỗi ngoài dự kiến", jobRunId); }
+                finally { _slots.Release(); }
+            }, ct);
+        });
+
+        Log.Information("[JOB] Dispatcher đang nghe kênh {Ch}, owner={Owner}, trần {N} job đồng thời",
+            JobChannelKeys.Notify, _owner, MaxConcurrentJobs);
+
+        // Không có vòng lặp hỏi thăm nào. Chỉ nằm chờ tới khi pod dừng.
+        try { await Task.Delay(Timeout.Infinite, ct); }
+        catch (OperationCanceledException) { }
+        finally { await _sub.UnsubscribeAsync(JobChannelKeys.NotifyChannel); }
     }
 
-    private async Task HandleEntryAsync(StreamEntry e, CancellationToken ct)
+    private async Task RunOneAsync(long jobRunId, string source, CancellationToken ct)
     {
-        var raw = e.Values.FirstOrDefault(v => v.Name == JobStreamKeys.FieldJobRunId).Value;
-        if (!long.TryParse(raw, out var jobRunId))
-        {
-            Log.Warning("[JOB] Entry {Id} không đọc được jobRunId — XACK bỏ qua", e.Id);
-            await AckAsync(e.Id);
-            return;
-        }
-
         // ★ CHỐT CHỐNG TRÙNG. err≠0 ⇒ pod này KHÔNG chạy.
-        var claim = await _db.ClaimAsync(jobRunId, _owner, e.Id.ToString(), ct);
+        var claim = await _db.ClaimAsync(jobRunId, _owner, source, ct);
         if (claim.Err != 0)
         {
-            // err=3 (ngoài khung giờ → SKIPPED) · 5 (pod khác giữ) · 6 (DEAD) đều là kết cục HỢP LỆ:
-            //   message đã được xử lý xong theo nghĩa "không còn gì để làm" ⇒ XACK.
+            // err=3 (ngoài khung giờ / quá hạn → SKIPPED) · 5 (pod khác giữ) · 6 (DEAD) đều là kết
+            //   cục HỢP LỆ. err=5 là chuyện THƯỜNG NGÀY với Pub/Sub: 10 pod nhận tin, 9 pod trượt.
             if (claim.Err == 3)
-                Log.Warning("[JOB] runId={Id} BỎ QUA vì ngoài khung giờ: {Msg}", jobRunId, claim.Msg);
+                Log.Warning("[JOB] runId={Id} BỎ QUA: {Msg}", jobRunId, claim.Msg);
             else
                 Log.Debug("[JOB] runId={Id} không claim được (err={Err}): {Msg}", jobRunId, claim.Err, claim.Msg);
-            await AckAsync(e.Id);
             return;
         }
 
@@ -122,31 +113,29 @@ public class JobDispatcherService : BackgroundService
         if (handler == null)
         {
             // Cấu hình trỏ tới handler chưa deploy. Đánh FAILED để nó hiện trên màn hình theo dõi,
-            //   thay vì im lặng XACK và để job "chạy" mỗi 15 phút mà không làm gì suốt nhiều tuần.
+            //   thay vì im lặng bỏ qua và để job "chạy" mỗi 15 phút mà không làm gì suốt nhiều tuần.
             await _db.CompleteAsync(jobRunId, _owner, ok: false, rows: 0,
                 msg: $"Không tìm thấy handler '{claim.HandlerKey}' trên pod này", ct);
             Log.Error("[JOB] runId={Id} handler '{H}' chưa đăng ký", jobRunId, claim.HandlerKey);
-            await AckAsync(e.Id);
             return;
         }
 
-        // Token của handler = token dừng pod + tín hiệu MẤT LEASE.
-        using var lost = new CancellationTokenSource();
+        // Token của handler = token dừng pod + tín hiệu MẤT QUYỀN.
+        using var lost   = new CancellationTokenSource();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, lost.Token);
 
-        long progress = 0;
-        var stillMine = 1;                       // cờ đọc từ RAM — handler kiểm mỗi vòng lặp, miễn phí
-        var beatGate  = new SemaphoreSlim(1, 1); // ★ tuần tự hoá: 4 luồng không được xếp hàng UPDATE cùng một dòng
-        var lastBeat  = DateTime.MinValue;
+        long progress  = 0;
+        var  stillMine = 1;                       // cờ đọc từ RAM — handler kiểm mỗi vòng, miễn phí
+        var  beatGate  = new SemaphoreSlim(1, 1); // ★ tuần tự hoá: nhiều luồng không xếp hàng UPDATE cùng một dòng
+        var  lastBeat  = DateTime.MinValue;
 
-        // MỘT đường duy nhất chạm DB cho nhịp tim. Cả Timer lẫn lời gọi ép từ handler đều đi qua đây.
+        // MỘT đường duy nhất chạm DB cho nhịp tim. Cả Timer lẫn lời gọi ép từ handler đều qua đây.
         async Task<bool> BeatAsync(bool forced)
         {
             await beatGate.WaitAsync();
             try
             {
                 // Chặn tần suất: handler gọi dày cỡ nào cũng không tạo thêm được một câu query.
-                //   Đây là thứ khiến API an toàn với người viết handler — họ không phải thuộc luật.
                 if (forced && DateTime.UtcNow - lastBeat < HeartbeatFloor)
                     return Volatile.Read(ref stillMine) == 1;
 
@@ -168,23 +157,21 @@ public class JobDispatcherService : BackgroundService
 
         var ctx = new JobContext
         {
-            JobRunId     = jobRunId,
-            JobCode      = claim.JobCode,
-            FireKey      = claim.FireKey,
-            BusinessDate = claim.BusinessDate,
-            PayloadJson  = claim.PayloadJson,
-            Attempt      = claim.Attempt,
+            JobRunId       = jobRunId,
+            JobCode        = claim.JobCode,
+            FireKey        = claim.FireKey,
+            BusinessDate   = claim.BusinessDate,
+            PayloadJson    = claim.PayloadJson,
+            Attempt        = claim.Attempt,
             ReportProgress = rows => Interlocked.Exchange(ref progress, rows),  // RAM, 0 query
             IsStillMine    = () => Volatile.Read(ref stillMine) == 1,           // RAM, 0 query
             HeartbeatAsync = () => BeatAsync(forced: true)                      // có chặn tần suất
         };
 
-        // Nhịp tim nền — NGUỒN DUY NHẤT của tải DB do heartbeat sinh ra. Job dài (vòng 1000 batch)
-        //   không phải tự nhớ gọi gì cả: nó chỉ ReportProgress (RAM) và đọc IsStillMine (RAM).
+        // Nhịp tim nền — NGUỒN DUY NHẤT của tải DB do heartbeat sinh ra.
         var beatEvery = TimeSpan.FromSeconds(Math.Clamp(claim.TimeoutSec / 4.0,
                             HeartbeatMin.TotalSeconds, HeartbeatMax.TotalSeconds));
-        // await using: chờ callback đang chạy dứt hẳn rồi mới huỷ Timer (Dispose thường có thể
-        //   cắt ngang một nhịp đang bay và ném ObjectDisposedException vào log).
+        // await using: chờ callback đang chạy dứt hẳn rồi mới huỷ Timer.
         await using var beat = new Timer(async _ => { try { await BeatAsync(forced: false); } catch { } },
                                          null, beatEvery, beatEvery);
 
@@ -194,14 +181,13 @@ public class JobDispatcherService : BackgroundService
             var rows = await handler.RunAsync(ctx, linked.Token);
             await _db.CompleteAsync(jobRunId, _owner, ok: true, rows: rows,
                 msg: $"OK trong {sw.ElapsedMilliseconds} ms", CancellationToken.None);
-            Log.Information("[JOB] {Code} runId={Id} XONG: {Rows} đơn vị, {Ms} ms",
-                claim.JobCode, jobRunId, rows, sw.ElapsedMilliseconds);
+            Log.Information("[JOB] {Code} runId={Id} XONG: {Rows} đơn vị, {Ms} ms (đánh thức bởi {Src})",
+                claim.JobCode, jobRunId, rows, sw.ElapsedMilliseconds, source);
         }
         catch (OperationCanceledException) when (lost.IsCancellationRequested)
         {
-            // Mất lease: KHÔNG gọi COMPLETE (pod khác đang là chủ, ghi vào sẽ bị từ chối err=5 —
-            //   nhưng quan trọng hơn là không được phép đụng vào lượt chạy của người khác).
-            Log.Warning("[JOB] runId={Id} dừng vì mất lease", jobRunId);
+            // Mất quyền: KHÔNG gọi COMPLETE — pod khác đang là chủ, không được đụng vào lượt của họ.
+            Log.Warning("[JOB] runId={Id} dừng vì mất quyền", jobRunId);
         }
         catch (Exception ex)
         {
@@ -209,15 +195,5 @@ public class JobDispatcherService : BackgroundService
                 msg: ex.Message.Length > 1900 ? ex.Message[..1900] : ex.Message, CancellationToken.None);
             Log.Error(ex, "[JOB] {Code} runId={Id} LỖI sau {Ms} ms", claim.JobCode, jobRunId, sw.ElapsedMilliseconds);
         }
-        finally
-        {
-            await AckAsync(e.Id);   // ★ luôn ACK SAU khi đã đóng sổ ở DB
-        }
-    }
-
-    private async Task AckAsync(RedisValue id)
-    {
-        try { await _redis.StreamAcknowledgeAsync(JobStreamKeys.Stream, JobStreamKeys.Group, id); }
-        catch (Exception ex) { Log.Warning(ex, "[JOB] XACK hụt cho entry {Id} — sẽ bị XAUTOCLAIM giao lại, vô hại", id); }
     }
 }

@@ -7,15 +7,17 @@
 | File | Vai trò |
 |---|---|
 | `JobContracts.cs` | `IJobHandler` · `JobContext` · `JobRegistry` · `ISdiJobGateway` (map 1-1 sang SP) |
-| `JobStreamKeys.cs` | Khoá Redis Streams + tạo consumer group |
-| `JobSchedulerService.cs` | Quét lịch (10s) · REAP (30s) · XAUTOCLAIM (60s) — chạy trên **mọi** pod |
-| `JobDispatcherService.cs` | Worker: đọc stream → `SP_JOB_CLAIM` → chạy handler → `SP_JOB_COMPLETE` → XACK |
+| `JobChannelKeys.cs` | Kênh Redis Pub/Sub (chuông cửa) + hằng số nguồn đánh thức |
+| `JobSchedulerService.cs` | Quét lịch (10s) · REAP (30s) — chạy trên **mọi** pod |
+| `JobDispatcherService.cs` | Worker: nghe kênh → `SP_JOB_CLAIM` → chạy handler → `SP_JOB_COMPLETE` |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
 
 ## Đăng ký DI
 
 ```csharp
+services.AddSingleton<ISubscriber>(sp =>                          // Pub/Sub: kết nối subscriber riêng
+    sp.GetRequiredService<IConnectionMultiplexer>().GetSubscriber());
 services.AddSingleton<ISdiJobGateway, SdiJobGateway>();          // tự cài bằng Dapper/ADO
 services.AddSingleton<IJobRegistry, JobRegistry>();
 services.AddSingleton<IJobHandler, FoSnapshotJobHandler>();      // thêm job mới = thêm 1 dòng ở đây
@@ -70,33 +72,33 @@ Log.Information("[JOB] Đổi lịch: {Msg} (dọn {N} lượt chờ của cấu
 var (id, err) = await _db.EnqueueAsync("CLEANUP_TMP", fireKey: requestId, payload: null,
                                        businessDate: null, user: "api", ct);
 if (err == 0)
-    await _redis.StreamAddAsync(JobStreamKeys.Stream, JobStreamKeys.FieldJobRunId, id);
+    await _sub.PublishAsync(JobChannelKeys.NotifyChannel, id);
 // err == 4 ⇒ requestId này đã đẩy rồi, KHÔNG tạo trùng. Không phải lỗi, không cần retry.
 ```
 
-Worker đang chờ ở vòng đọc stream → nhặt trong vòng ~500ms.
+Worker đang nằm nghe kênh → nhận trong khoảng **một mili-giây** (đẩy thật, không hỏi thăm).
+`PublishAsync` trả về **số pod đã nhận**; bằng 0 nghĩa là không ai đang nghe — hãy log lại, đó là
+cách duy nhất phân biệt "Redis ổn nhưng subscriber chết" với "Redis chết".
 
 ---
 
 ## Ba câu hỏi sẽ bị hỏi khi review
 
-### 1. "Redis Streams đã có consumer group, sao còn cần `SP_JOB_CLAIM`?"
+### 1. "Pub/Sub phát cho MỌI pod thì chẳng phải job chạy 10 lần à?"
 
-Consumer group hứa *mỗi message giao cho một consumer*, **không** hứa *mỗi message được xử lý đúng một lần*. Ba đường làm nó giao lại cùng một `jobRunId`:
+Không. Pub/Sub chỉ quyết **ai nghe được tin**, không quyết **ai được chạy**. Cả 10 pod cùng lao vào `SP_JOB_CLAIM` — một `UPDATE ... WHERE C_STATUS='READY'` — đúng một pod đổi được trạng thái, 9 pod nhận `err=5` rồi đi tiếp. Chốt chặn nằm ở nơi mọi pod nhìn thấy cùng một sự thật, không nằm ở tầng giao tin.
 
-- `XAUTOCLAIM` sau khi pod nhận rồi treo (pod treo ≠ pod chết — nó vẫn có thể tỉnh dậy và chạy tiếp);
-- `XADD` hai lần (scheduler + reaper cùng thấy một dòng READY);
-- pod restart giữa lúc đang xử lý, entry còn trong pending list.
+Giá phải trả: ~9 lượt claim hụt cho mỗi job. Ở 24 lượt/ngày là ~240 truy vấn/ngày — không đáng kể. `JobDispatcherService` còn chặn bớt bằng hạn mức job đồng thời: pod đang bận thì **không thèm claim**, nhường pod rảnh (đây cũng chính là cách chia tải thay cho consumer group của Streams).
 
-`SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`. Ai đổi được trạng thái người đó chạy. Đó là thứ **không thể có hai người thắng**, và nó nằm ở nơi mọi pod nhìn thấy cùng một sự thật.
+### 2. "Pub/Sub bắn-rồi-quên thì mất tin là mất job?"
 
-### 2. "Đặt hàng đợi ở Redis thì mất Redis là mất job?"
+Mất *tin*, không mất *job*. Dòng `T_JOB_RUN` vẫn ở đó với trạng thái `READY`. `SP_JOB_REAP` quét đúng những dòng đó (READY, tới hạn, nằm quá `stale_sec` giây) và **phát lại**.
 
-Mất *message*, không mất *job*. Dòng `T_JOB_RUN` vẫn ở đó với trạng thái `READY`. `SP_JOB_REAP` quét đúng những dòng đó (READY, tới hạn, nằm quá `stale_sec` giây) và trả về để `XADD` lại.
+⇒ Hậu quả tối đa của việc Redis chết hẳn: **chậm một nhịp reaper (30 giây)**. Không dòng nào mất, không dòng nào chạy hai lần.
 
-⇒ Hậu quả tối đa của việc `FLUSHALL` nguyên cụm Redis: **chậm một nhịp reaper (30 giây)**. Không có dòng nào mất, không có dòng nào chạy hai lần.
+Đây là lý do `NotifyAsync` chỉ log WARNING khi publish hụt thay vì ném — ném ở đó là biến một sự cố tự hồi phục thành một lượt chạy FAILED.
 
-Đây là lý do `PushAsync` chỉ log WARNING khi `XADD` hụt thay vì ném — ném ở đó là biến một sự cố tự hồi phục thành một lượt chạy FAILED.
+⚠️ **Cái bẫy vận hành:** chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây — và không ai nhận ra. Vì thế mỗi lượt chạy ghi `C_CLAIM_SOURCE` ('notify' | 'reap'), và `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D`. Con số đó xấp xỉ tổng số lượt ⇒ Pub/Sub đã chết từ lâu.
 
 ### 3. "Guard khung giờ 4 tầng có thừa không?"
 

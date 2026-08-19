@@ -11,7 +11,7 @@
 ## 0. Ba nguyên tắc — kế thừa từ [thiết kế Kafka batch sync](SDI-kafka-batch-sync-design.md)
 
 > ### ① Redis lo TỐC ĐỘ. DB lo TÍNH ĐÚNG.
-> Redis Streams là **đường vận chuyển + chuông cửa**, không phải sổ cái. Mất sạch Redis chỉ được phép làm **chậm**, không được phép làm **mất job** hay **chạy hai lần**.
+> Redis Pub/Sub chỉ là **chuông cửa**, không phải sổ cái. Mất sạch Redis chỉ được phép làm **chậm** (≤30 giây), không được phép làm **mất job** hay **chạy hai lần**.
 >
 > ### ② Chống trùng phải là RÀNG BUỘC DỮ LIỆU, không phải một lời hứa của middleware.
 > "Consumer group giao mỗi message cho một consumer" là đúng — nhưng nó không hứa *xử lý đúng một lần*.
@@ -41,9 +41,9 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
                       │                 hoặc SP_JOB_ENQUEUE (ai cũng đẩy được)
                       ▼
    T_JOB_RUN  ──── READY ──┐
-                      ▲    │  XADD {jobRunId} → Redis Stream
+                      ▲    │  PUBLISH {jobRunId} → kênh Redis
                       │    ▼
-                      │  worker XREADGROUP  ──►  SP_JOB_CLAIM  ──► RUNNING ──► DONE
+                      │  worker SUBSCRIBE   ──►  SP_JOB_CLAIM  ──► RUNNING ──► DONE
                       │                              │ err=5 (pod khác giữ) → XACK, bỏ qua
                       │                              │ err=3 (ngoài giờ)    → SKIPPED
                       │                              │ err=6 (hết lượt thử) → DEAD
@@ -52,15 +52,17 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
                             (30s, mọi pod)
 ```
 
-**Chỉ có `jobRunId` đi trong stream.** Không payload, không trạng thái. Worker cầm id rồi hỏi DB mọi thứ khác — nếu chở bản chụp cấu hình trong message thì một job vừa bị sửa/tắt vẫn chạy theo bản cũ đang nằm trong stream.
+**Chỉ có `jobRunId` đi trên đường truyền.** Không payload, không trạng thái. Worker cầm id rồi hỏi DB mọi thứ khác — chở bản chụp cấu hình trong tin nhắn là mở đường cho một job vừa bị sửa/tắt vẫn chạy theo bản cũ đang bay.
 
 ---
 
-## 2b. Vì sao dùng Redis Streams — và nó KHÔNG mua cho ta cái gì
+## 2b. Vì sao Pub/Sub — và vì sao đã bỏ Redis Streams
 
-### Streams giữ vai trò gì
+> **Lịch sử:** bản đầu dùng Redis Streams + consumer group. Chuyển sang Pub/Sub ngày 2026-08-19 sau khi ngồi đo lại tải và bộ nhớ. Mục này giữ cả lập luận cũ để người sau không phải lần lại từ đầu.
 
-**Đường vận chuyển + chuông cửa. Hết.** Nó **không** giữ một mảnh tính đúng nào:
+### Redis giữ vai trò gì
+
+**Chuông cửa. Hết.** Nó không giữ một mảnh tính đúng nào:
 
 | Câu hỏi | Ai trả lời |
 |---|---|
@@ -68,117 +70,56 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
 | "Ai được chạy lượt này?" | `SP_JOB_CLAIM` — `UPDATE ... WHERE C_STATUS='READY'` |
 | "Lượt này còn hiệu lực không?" | `C_MAX_DELAY_SEC` + `UDF_JOB_IN_WINDOW` |
 | "Pod này còn là chủ không?" | lease + `C_OWNER` trong `SP_JOB_HEARTBEAT` |
-| **"Có việc mới — dậy đi!"** | **Redis Stream** |
+| **"Có việc mới — dậy đi!"** | **Redis Pub/Sub** |
 
-Xoá sạch Redis thì hệ **chậm đi**, không sai đi. Đó là điều kiện để nguyên tắc ① đứng vững.
+Redis chết hẳn thì hệ **chậm đi ≤30 giây**, không sai đi. Đó là điều kiện để nguyên tắc ① đứng vững.
 
-### So với ba lựa chọn khác
+### Bốn phương án, và cái giá thật của từng cái
 
-| Phương án | Điểm chết |
-|---|---|
-| **Redis pub/sub** | Bắn-rồi-quên. Message phát ra lúc không pod nào đang nghe là **mất luôn**. Không có dấu vết để nhặt lại. |
-| **Redis List (`BLPOP`)** | Không có consumer group, không có pending list. Pod `BLPOP` xong rồi chết ⇒ message **bốc hơi**, không ai biết nó từng tồn tại. |
-| **DB polling 1–2 giây** | Đúng và đơn giản nhất, nhưng dồn tải nhàn rỗi lên SQL Server: 10 pod × 1 query/giây = **600 query/phút** chỉ để hỏi "có gì mới không", 24/7, kể cả 2 giờ sáng. |
-| **Redis Streams** | Có consumer group (chia việc không cần điều phối) + **PEL**: pod nhận message rồi chết vẫn để lại dấu, `XAUTOCLAIM` nhặt được. Tải nhàn rỗi rơi vào Redis thay vì SQL Server. |
-
-`XAUTOCLAIM` + PEL là thứ pub/sub và List **không thể** có. Đó là lý do kỹ thuật thật sự để chọn Streams giữa các phương án Redis.
-
-### ⚠️ Sự thật cần biết: không có "blocking" thật
-
-`StackExchange.Redis` **không hỗ trợ** lệnh chặn (`XREADGROUP ... BLOCK`) — thư viện này ghép nhiều lệnh trên một kết nối dùng chung, một lệnh chặn sẽ treo cả kết nối của mọi thứ khác. Nên `JobDispatcherService` **vẫn là vòng lặp hỏi thăm**, chỉ khác là hỏi Redis (mỗi 500ms) thay vì hỏi SQL Server.
-
-⇒ Lợi ích thực tế, nói cho đúng:
-- **độ trễ ≤ 500ms** thay vì ≤ 1–2 giây;
-- **tải hỏi thăm rơi vào Redis** (20 lệnh/giây với 10 pod — không đáng kể) thay vì vào SQL Server;
-- **PEL/XAUTOCLAIM** cứu được message đã giao cho pod đã chết.
-
-Không phải "đẩy tức thì". Ai đọc code mà tưởng là push thật sẽ đặt kỳ vọng sai lúc đo độ trễ.
-
-### Khi nào NÊN bỏ Streams
-
-Nếu **không** bao giờ thêm job kiểu fan-out (mỗi chu kỳ sinh hàng nghìn job con) và độ trễ 1–2 giây là chấp nhận được, thì **DB polling thuần** là lựa chọn đúng: bỏ được ~200 dòng code, một dependency, và toàn bộ phần consumer group / XACK / PEL. Với 24 lượt job mỗi ngày, đó là một sự đơn giản hoá hoàn toàn chính đáng.
-
-Lý do giữ Streams:
-1. Job đẩy tay qua API (yêu cầu "cứ có job đẩy vào là xử lý") muốn dưới một giây, không phải 2 giây.
-2. Nếu sau này chuyển FO sang mô hình fan-out (1000 job con/chu kỳ), DB polling sẽ tệ đi rất nhanh còn Streams thì không.
-
-Đổi ý lúc nào cũng được mà **không đụng tới tính đúng**: bỏ Streams đi thì chỉ cần `SP_JOB_REAP` đổi từ "lưới an toàn" thành "đường chính", còn `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó chính là lợi ích của việc không giao một mảnh tính đúng nào cho Redis.
-
----
-
-## 2c. Tải Redis và rủi ro phình bộ nhớ — đo bằng con số
-
-> Các con số bộ nhớ dưới đây là **ước lượng từ cấu trúc bên trong Redis**, không phải số đo trên cụm thật. Trước khi lên prod nên chạy `MEMORY USAGE SDI:JOB:STREAM` và `XINFO STREAM ... FULL` một lần để đối chiếu.
-
-### Vòng quét có làm Redis tăng tải không?
-
-Không đáng kể — nhưng phải hiểu **vì sao**, chứ không phải tin.
-
-`XREADGROUP ... >` khi **không có gì mới** không hề quét stream: nó so `last-delivered-id` của group với id cuối của stream rồi trả rỗng. Chi phí ngang một lệnh `GET`. Nó **không** duyệt entry, **không** đụng PEL.
-
-| Lệnh | Nhịp | 10 pod | Độ phức tạp |
-|---|---|---|---|
-| `XREADGROUP >` (rỗng) | 500ms/pod | **20 lệnh/giây** | O(1) — so 2 con id |
-| `XAUTOCLAIM` | 60s/pod | 0,17 lệnh/giây | O(số entry duyệt), chặn bởi `count=50` |
-| `XINFO CONSUMERS` + `XGROUP DELCONSUMER` | 1 giờ/pod | ~0,003 lệnh/giây | O(số consumer) |
-| `XADD` | khi có job | **24 lệnh/ngày** | O(1) với `MAXLEN ~` |
-| `XACK` | mỗi job xử lý | 24 lệnh/ngày | O(1) |
-
-**Tổng ≈ 20 lệnh/giây.** Một node Redis chạy được cỡ 10⁵ lệnh/giây ⇒ khung job này dùng khoảng **0,02%** năng lực. Nếu tăng lên 50 pod thì là 100 lệnh/giây — vẫn 0,1%.
-
-Muốn giảm thì nới nhịp đọc từ 500ms lên 1–2 giây; đổi lại độ trễ "đẩy job vào là chạy" tăng đúng bằng ngần đó. Ở mức 0,02% thì không có gì để tối ưu.
-
-### Bộ nhớ: ba khoản, chỉ một khoản từng không có trần
-
-**① Entry trong stream — CÓ TRẦN.**
-`XADD` dùng `MAXLEN ~ 50000` (`useApproximateMaxLength: true`): cắt bớt theo biên node nên là O(1), không phải O(N) như `MAXLEN` chính xác. Entry chỉ chở một trường `jobRunId`; các entry trong cùng một node dùng chung tên trường nên chi phí biên mỗi entry chỉ vài chục byte.
-
-- Trần lý thuyết: 50.000 entry ⇒ **~2–5 MB**.
-- Thực tế job FO: 24 `XADD`/ngày ⇒ phải hơn **5 năm** mới chạm trần. Vài trăm KB/năm.
-- Nếu sau này chuyển sang fan-out (1000 job con/chu kỳ ⇒ 24.000 `XADD`/ngày): chạm trần sau ~2 ngày rồi **đứng yên ở 2–5 MB**. Đây chính là lý do đặt `MAXLEN` ngay từ đầu chứ không đợi tới lúc cần.
-
-**② PEL (pending entries list) — trần bằng số job đang chạy.**
-Mỗi entry đã giao nhưng chưa `XACK` chiếm một bản ghi trong PEL của group **và** một trong PEL của consumer (~100+ byte tổng). Ở luồng chạy bình thường PEL gần như rỗng vì `HandleEntryAsync` `XACK` trong khối `finally` — kể cả nhánh bỏ qua (`err=3/5/6`).
-
-⚠️ **Cái bẫy kinh điển của Streams:** cắt bớt bằng `MAXLEN` **KHÔNG dọn** các tham chiếu PEL trỏ tới entry vừa bị cắt. Một hệ quên `XACK` sẽ tích PEL mãi mãi, và stream trông vẫn "gọn" vì đã trim — bộ nhớ đi vào chỗ người ta không nhìn. Ở đây không dính vì luôn `XACK`, và dù có sót thì `XAUTOCLAIM` nhặt lại rồi `XACK`; khối lượng cũng chỉ 24 entry/ngày.
-
-**③ Consumer — KHÔNG CÓ TRẦN (đã vá).**
-Tên consumer là `hostname#pid`, và `XREADGROUP` **tự tạo** consumer khi gặp tên lạ. Mỗi lần pod khởi động lại (deploy, OOM, evict, scale) là một bản ghi mới nằm lại **vĩnh viễn** — Redis không tự dọn.
-
-- 10 pod × 3 lần deploy/ngày × 365 ngày ≈ **11.000 consumer/năm** ⇒ vài MB.
-- Tiền không phải vấn đề; vấn đề là `XINFO CONSUMERS`, `XPENDING`, `XAUTOCLAIM` đều phải đi qua danh sách đó. Nó không gây sự cố, nó chỉ làm hệ **chậm dần trong nhiều tháng** cho tới lúc không ai còn nhớ vì sao.
-- ⇒ `SweepDeadConsumersAsync` (1 giờ/lần) xoá consumer đã im lặng > 6 giờ **và** không còn message treo. Không xoá consumer còn pending — làm thế là vứt luôn entry khỏi PEL.
-
-**Kết luận bộ nhớ:** trần cứng ≈ **5 MB** cho stream + PEL, và khoản duy nhất từng không có trần (consumer) nay đã có người dọn. Không có đường nào tràn.
-
-### So sánh với các phương án Redis khác
-
-| | Tải lúc rỗi | Bộ nhớ | Cứu được message đang bay? | Đẩy thật? |
+| | Tải lúc rỗi (10 pod) | Bộ nhớ Redis | Cứu message đang bay | Đẩy thật? |
 |---|---|---|---|---|
-| **Pub/Sub** | **0** — kết nối subscriber riêng, callback đẩy về | **0** (không lưu) | ❌ phát lúc không ai nghe = mất luôn | ✅ |
-| **List + `BLPOP`** | 0 nếu chặn được — **nhưng SE.Redis cấm lệnh chặn** ⇒ phải hỏi thăm | độ dài list | ❌ pop xong chết = mất hẳn | ❌ |
-| **Streams** (đang dùng) | 20 lệnh/giây (10 pod) | ~5 MB có trần | ✅ PEL + `XAUTOCLAIM` | ❌ (xem §2b) |
-| **DB polling thuần** | 0 trên Redis; **10 query/giây trên SQL Server** | 0 | ✅ DB là sổ cái | ❌ |
+| **Pub/Sub** *(đang dùng)* | **0** | **0** | ❌ *(nhưng `SP_JOB_REAP` lo)* | ✅ ~1ms |
+| Redis Streams | 20 lệnh/giây | ~5 MB + phải dọn consumer | ✅ PEL + `XAUTOCLAIM` | ❌ ≤500ms |
+| Redis List (`BLPOP`) | phải hỏi thăm | độ dài list | ❌ pop xong chết = mất hẳn | ❌ |
+| DB polling thuần | 0 trên Redis, **10 query/giây trên SQL Server** | 0 | ✅ DB là sổ cái | ❌ |
 
-### Điều đáng nói nhất — và nó không có lợi cho lựa chọn hiện tại
+### Vì sao Streams thua, dù nó "nhiều tính năng hơn"
 
-Thứ **duy nhất** Streams hơn Pub/Sub trong bảng trên là cột "cứu được message đang bay" (PEL + `XAUTOCLAIM`).
+Thứ **duy nhất** Streams cho thêm là khả năng cứu message đã giao cho một pod rồi pod đó chết (PEL + `XAUTOCLAIM`).
 
-Nhưng ở kiến trúc này, **`SP_JOB_REAP` đã làm đúng việc đó rồi** — và làm tốt hơn, vì nó dựng lại từ `T_JOB_RUN` (sổ cái thật) chứ không từ một bản sao trong Redis. Nghĩa là toàn bộ bộ máy consumer group / PEL / `XAUTOCLAIM` / dọn consumer đang **trùng lặp với lưới an toàn sẵn có**.
+Nhưng ở kiến trúc này **`SP_JOB_REAP` đã làm đúng việc đó rồi** — và làm tốt hơn, vì nó dựng lại từ `T_JOB_RUN` (sổ cái thật) chứ không từ một bản sao trong Redis. Nghĩa là toàn bộ bộ máy consumer group / PEL / `XAUTOCLAIM` / dọn consumer chết chỉ **trùng lặp với lưới an toàn sẵn có** — trả tiền hai lần cho cùng một sự bảo đảm.
 
-Trong khi đó Pub/Sub — với `StackExchange.Redis` — là **đẩy thật** (kết nối subscriber riêng, không hỏi thăm), nên nó **thắng cả về độ trễ lẫn tải**:
+Cộng thêm một sự thật về thư viện: **`StackExchange.Redis` không hỗ trợ lệnh chặn** (nó ghép nhiều lệnh trên một kết nối dùng chung, một lệnh chặn sẽ treo cả kết nối). Nên Streams **buộc phải hỏi thăm 500ms/lần** — cái "đẩy tức thì" mà người ta hình dung khi nghe "consumer group" không hề tồn tại ở đây. Còn Pub/Sub thì `Subscribe` chạy trên **kết nối subscriber riêng**, callback được gọi về — đẩy thật.
 
-| | Streams (hiện tại) | Pub/Sub |
+Kết quả của việc đổi:
+
+| | Streams | Pub/Sub |
 |---|---|---|
-| Độ trễ đánh thức | ≤ 500ms (hỏi thăm) | **~1ms (đẩy thật)** |
-| Tải lúc rỗi, 10 pod | 20 lệnh/giây | **0** |
-| Bộ nhớ Redis | ~5 MB + dọn consumer | **0** |
-| Code phải nuôi | group, `XACK`, PEL, `XAUTOCLAIM`, dọn consumer | `Subscribe` + `Publish` |
-| Mất message thì sao | `SP_JOB_REAP` cứu | **`SP_JOB_REAP` cứu** (y hệt) |
+| Độ trễ đánh thức | ≤500ms (hỏi thăm) | **~1ms** |
+| Tải Redis lúc rỗi, 10 pod | 20 lệnh/giây | **0** |
+| Bộ nhớ Redis | ~5 MB, phải dọn consumer 1h/lần | **0** |
+| Code phải nuôi | group, `XACK`, PEL, `XAUTOCLAIM`, dọn consumer chết | `Subscribe` + `Publish` |
+| Rủi ro phình bộ nhớ | consumer tích luỹ theo mỗi lần pod restart | **không có** |
+| Tính đúng | *(không nằm ở Redis)* | **y hệt** |
 
-⇒ **Nếu đổi Pub/Sub, không mất một mảnh tính đúng nào** và bỏ được ~150 dòng. Lý do duy nhất để giữ Streams là muốn Redis tự chia việc theo consumer group cho một luồng fan-out tương lai (hàng nghìn job con/chu kỳ) — với Pub/Sub thì mọi pod đều nhận mọi thông báo rồi tranh nhau ở `SP_JOB_CLAIM`, tốn thêm những lần claim hụt.
+~150 dòng code biến mất, và **không mất một mảnh tính đúng nào** — vì nó vốn không nằm ở Redis.
 
-Ở khối lượng hiện tại (24 lượt/ngày), số lần claim hụt đó là **không đáng kể**. Đây là một quyết định vận hành, không phải quyết định tính đúng — và tài liệu này ghi lại để người sau đổi ý mà không phải suy luận lại từ đầu.
+### Cái giá của Pub/Sub — nói cho đủ
+
+**① Phát cho MỌI pod.** Cả 10 pod cùng lao vào `SP_JOB_CLAIM`, 9 pod nhận `err=5`. Ở 24 lượt job/ngày là ~240 truy vấn/ngày — không đáng kể. `JobDispatcherService` còn chặn bớt bằng **hạn mức job đồng thời**: pod đang bận thì không thèm claim, nhường pod rảnh (đây cũng là cách chia tải thay cho consumer group). Nếu sau này có luồng fan-out (24.000 lượt/ngày × 10 pod = ~3 claim/giây) thì vẫn thừa sức, nhưng lúc đó nên đo lại.
+
+**② Bắn-rồi-quên.** Tin phát ra lúc pod đang restart / mất kết nối / Redis chết là **mất luôn**. `SP_JOB_REAP` vì thế là **đường hồi phục chính, không phải dự phòng** — mất tin ⇒ chậm ≤30 giây.
+
+**③ Hỏng mà không ai biết — cái bẫy vận hành thật sự.** Chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây mỗi lượt. Không có cảnh báo nào tự bật, và người ta sẽ sống chung với nó hàng tháng. Hai thứ để tố giác:
+- mỗi lượt chạy ghi `T_JOB_RUN.C_CLAIM_SOURCE` = `'notify'` | `'reap'`;
+- `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D` — xấp xỉ tổng số lượt nghĩa là Pub/Sub đã chết từ lâu.
+- `PublishAsync` trả **số pod đã nhận**; bằng 0 ⇒ log WARNING ngay (phân biệt "Redis ổn nhưng không ai nghe" với "Redis chết").
+
+**④ Redis Cluster.** `PUBLISH` thường phát tới **mọi node** trong cụm. Chạy cụm lớn thì đổi sang Sharded Pub/Sub (`SPUBLISH`, Redis 7+). Node đơn / sentinel thì không cần bận tâm.
+
+### Nếu muốn bỏ luôn Redis
+
+DB polling thuần (1–2 giây/lần) vẫn là lựa chọn hợp lệ: bỏ nốt dependency Redis, đổi lấy ~10 query/giây trên SQL Server và độ trễ 1–2 giây. Việc phải làm chỉ là đổi `SP_JOB_REAP` từ "đường hồi phục" thành "đường chính" — `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó chính là lợi ích của việc không giao một mảnh tính đúng nào cho Redis: đổi tầng vận chuyển là việc của một buổi chiều, không phải một đợt refactor.
 
 ---
 
@@ -251,7 +192,7 @@ Smoke `12_JOB_SMOKE.sql` khối (A) cố tình chạy toàn bộ vòng đời tr
 
 ### (2) Đẩy job vào là xử lý ngay
 
-`SP_JOB_ENQUEUE` trả `@p_job_run_id` → app `XADD` → worker đang ở vòng đọc stream nhặt trong ~500ms. Không có vòng chờ, không polling DB.
+`SP_JOB_ENQUEUE` trả `@p_job_run_id` → app `PUBLISH` → worker đang nằm nghe kênh nhận trong **~1ms** (đẩy thật). Không vòng chờ, không polling.
 
 `fire_key` làm cho việc đẩy trở nên **idempotent**: cùng `requestId` gọi 10 lần vẫn đúng một lượt chạy (`err=4`, trả id cũ).
 
@@ -259,11 +200,11 @@ Smoke `12_JOB_SMOKE.sql` khối (A) cố tình chạy toàn bộ vòng đời tr
 
 | Lớp | Bắt được gì | Không bắt được gì |
 |---|---|---|
-| Consumer group Redis | Đường chạy bình thường: 1 entry → 1 pod | `XAUTOCLAIM`, `XADD` trùng, pod restart |
+| Pub/Sub | Không chặn gì cả — phát cho MỌI pod (cố ý) | mọi thứ |
 | **`SP_JOB_CLAIM`** (`UPDATE ... WHERE C_STATUS='READY'`) | **Mọi thứ.** 20 pod cầm cùng id ⇒ đúng 1 thắng | Pod thắng rồi treo |
 | Heartbeat có kiểm chủ sở hữu | Pod treo → lease hết → pod khác giành; pod cũ tỉnh dậy nhận `still_mine=false` → tự dừng | — |
 
-Lớp 2 là chốt thật. Lớp 1 chỉ để **rẻ** (đỡ 19 lần gọi DB vô ích), lớp 3 để pod zombie không ghi song song.
+Lớp 2 là chốt thật — và ở Pub/Sub thì nó là chốt **duy nhất** ở khâu giao tin. Lớp 3 để pod zombie không ghi song song. Giá phải trả: mỗi job có N−1 lượt claim hụt (`err=5`), rẻ và đã tính vào §2b.
 
 Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ khâu sinh job**: 10 pod cùng quét thấy slot 9:15 tới hạn, cùng INSERT — CSDL cho đúng một pod thắng, 9 pod nhận lỗi trùng khoá và im lặng bỏ qua. **Không cần leader election.**
 
@@ -272,7 +213,7 @@ Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ kh�
 | Tầng | Ở đâu | Bắt ca gì |
 |---|---|---|
 | 1 | `SP_JOB_ENQUEUE(_DUE)` | Không sinh lượt chạy lúc 15h30 |
-| 2 | `SP_JOB_CLAIM` | **Job sinh lúc 14h59, pod nhặt lúc 15h02** (stream tồn đọng, pod restart, reaper trả lại) → `SKIPPED` |
+| 2 | `SP_JOB_CLAIM` | **Job sinh lúc 14h59, pod nhặt lúc 15h02** (mọi pod đang bận, pod restart, reaper phát lại) → `SKIPPED` |
 | 3 | `SP_INGEST_FO_SNAPSHOT_RT` | Gọi proc bằng tay; ghi ngày không phải hôm nay; ngày nghỉ |
 | **4** | `TradingWindowGuard` (C#) | **Chu kỳ 1000 batch khởi động 14h50, tới batch 700 thì đã 15h02** |
 
@@ -328,14 +269,15 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 
 | Job kẹt ở đâu | Ai cứu | Sau bao lâu |
 |---|---|---|
-| Dòng `READY`, message chưa bao giờ vào stream (`XADD` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Message đã vào stream nhưng Redis mất sạch (`FLUSHALL`, cụm không bền) | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Message đã giao cho pod rồi pod chết (nằm trong PEL của consumer đã chết) | `XAUTOCLAIM` | ≤ 60s + idle 2 phút |
+| Dòng `READY`, tin chưa bao giờ phát được (`PUBLISH` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Tin phát ra lúc KHÔNG pod nào đang nghe (đang deploy / mất kết nối / Redis chết) | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Tin đã tới pod rồi pod chết trước khi claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
 | Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_REAP` bước (1) | ≤ timeout + 30s |
 
 Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Redis chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Redis, nên không có trạng thái nào mất theo Redis.
 
-Consumer group tạo ở `$` (chỉ nhận message mới) — cố ý. Tạo ở `0` thì pod đầu tiên khởi động sẽ hút lại toàn bộ lịch sử stream và bắn hàng nghìn lượt claim vô nghĩa; tất cả đều bị `SP_JOB_CLAIM` chặn (trạng thái đã `DONE`), nhưng vẫn là một trận bão query mỗi lần deploy.
+Pod mới khởi động **không** hút lại lịch sử — Pub/Sub không có lịch sử để hút. Đó là một điểm cộng bị bỏ quên: với Streams, tạo consumer group nhầm ở `0` thay vì `$` là pod đầu tiên kéo về toàn bộ stream và bắn hàng nghìn lượt claim vô nghĩa mỗi lần deploy. Ở đây cái sai đó không tồn tại.
 
 ### 2. Có sinh lại job cũ không?
 
@@ -507,12 +449,12 @@ Không có ba cột này thì một tổng AUM thiếu 200 khách hàng trông *
 | Hỏng gì | Hậu quả | Sai số liệu? |
 |---|---|---|
 | Redis mất sạch key / `FLUSHALL` | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_REAP` đẩy lại sau ≤30s | ❌ |
-| `XADD` hụt (Redis chết lúc scheduler đẩy) | Y như trên | ❌ |
+| `PUBLISH` hụt (Redis chết lúc scheduler rung chuông) | Y như trên | ❌ |
 | Pod chết giữa chu kỳ | Lease hết hạn → REAP thu hồi → pod khác chạy lại. Ingest idempotent (MERGE) nên chạy lại vô hại | ❌ |
 | Pod **treo** rồi tỉnh lại (zombie) | Heartbeat trả `still_mine=false` → tự huỷ token → dừng. `SP_JOB_COMPLETE` của nó cũng bị từ chối (`err=5`) | ❌ |
 | Cùng `jobRunId` giao cho 20 pod | `SP_JOB_CLAIM`: đúng 1 thắng, 19 nhận `err=5` | ❌ |
 | 10 pod cùng quét slot 9:15 | `UQ_JOB_RUN_NK`: đúng 1 dòng | ❌ |
-| Job nằm trong stream vắt qua 15h00 | Tầng 2 → `SKIPPED`, **không** chạm FO | ❌ |
+| Job nằm chờ trong hàng đợi vắt qua 15h00 | Tầng 2 → `SKIPPED`, **không** chạm FO | ❌ |
 | Chu kỳ chạy vắt qua 15h00 | Tầng 4 → dừng giữa chừng, giữ phần đã ghi, coverage `PARTIAL` | ❌ |
 | FO trả thiếu khách hàng | `C_RT_SI_COUNT < C_TOTAL_ACCOUNT` → `PARTIAL`; mốc so sánh dùng **cùng tập** nên % không méo | ❌ |
 | FO trả tài khoản không thuộc SDI | `INNER JOIN` registry lọc | ❌ |
@@ -585,8 +527,8 @@ Theo dõi: `EXEC SP_GET_JOB_STATUS @p_err_code=..., @p_err_msg=...` — RS1 sứ
 
 ## 11. Tóm tắt — 5 câu
 
-1. **Chống trùng nằm ở `UPDATE ... WHERE C_STATUS='READY'`**, không nằm ở consumer group. Redis đi trước cho nhanh, DB chốt lại cho đúng.
+1. **Chống trùng nằm ở `UPDATE ... WHERE C_STATUS='READY'`**, không nằm ở tầng giao tin. Redis rung chuông cho nhanh, DB chốt lại cho đúng — nên Pub/Sub phát cho cả 10 pod vẫn chỉ 1 pod chạy.
 2. **`UQ (job_code, fire_key)` thay thế leader election.** 10 pod cùng quét một slot vẫn ra đúng một lượt chạy.
-3. **`SP_JOB_REAP` là cái giá phải trả cho việc để hàng đợi ở Redis** — và nó trả đủ: mất sạch Redis chỉ tốn 30 giây, không mất job nào.
+3. **`SP_JOB_REAP` là đường hồi phục chính** (Pub/Sub bắn-rồi-quên) — và nó trả đủ: mất sạch Redis chỉ tốn 30 giây, không mất job nào. Đổi lại Redis tốn **0 bộ nhớ** và **0 lệnh/giây** lúc rỗi.
 4. **Guard khung giờ 4 tầng không thừa.** Tầng 4 là tầng duy nhất bắt được ca "chu kỳ dài vắt qua giờ đóng cửa" — thứ mà 3 tầng kia về bản chất không thể thấy.
 5. **Cột `C_SRC` là toàn bộ tính đúng của phương án đổ RT vào bảng EOD.** Bỏ nó ở một chỗ thôi là cổng khoá EOD pass giả, phí tính trên AUM lúc 9h15, và báo cáo đọc số chưa chốt — cả ba đều **sai âm thầm**.

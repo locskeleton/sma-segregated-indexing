@@ -53,7 +53,7 @@ await db.KeyDeleteAsync(keysToDelete);
 
 ## 📁 `job/` — khung job chạy nền (BRD near-realtime FO, 2026-08-19)
 
-Thư mục [`job/`](./job/) là một bộ **độc lập** với các file ở thư mục này: khung chạy job nền dùng chung cho mọi loại job (Redis **Streams** + `T_JOB_RUN` làm sổ cái), kèm job quét snapshot FO 15 phút/lần. Xem [`job/README.md`](./job/README.md) và [`docs/SDI-nearrt-fo-snapshot-design.md`](../../docs/SDI-nearrt-fo-snapshot-design.md).
+Thư mục [`job/`](./job/) là một bộ **độc lập** với các file ở thư mục này: khung chạy job nền dùng chung cho mọi loại job (`T_JOB_RUN` là sổ cái, Redis **Pub/Sub** chỉ làm chuông cửa), kèm job quét snapshot FO 15 phút/lần. Xem [`job/README.md`](./job/README.md) và [`docs/SDI-nearrt-fo-snapshot-design.md`](../../docs/SDI-nearrt-fo-snapshot-design.md).
 
 Quan hệ với các file ở đây: **cùng nguyên tắc ① (Redis lo tốc độ, DB lo tính đúng), khác bài toán.** `BatchSyncService`/`JobRunner` xử lý luồng **Asset ĐẨY sang** (Kafka, at-least-once); `job/` xử lý luồng **SDI CHỦ ĐỘNG GỌI đi** theo lịch. Không thay thế nhau, không dùng chung khoá Redis.
 
