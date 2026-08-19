@@ -101,7 +101,7 @@ public sealed class JobClaim
     public int       Attempt      { get; init; }
     /// <summary>T_JOB_DEFINITION.C_TIMEOUT_SEC — worker suy nhịp tim từ đây (nhịp = timeout/4).</summary>
     public int       TimeoutSec   { get; init; } = 300;
-    /// <summary>Nguồn đánh thức lượt này ('kafka' | 'reap' | 'manual').</summary>
+    /// <summary>Nguồn đánh thức lượt này ('kafka' | 'recover' | 'manual').</summary>
     public string?   ClaimSource  { get; init; }
     /// <summary>
     /// T_JOB_RUN.C_SLOT_AT — MỐC mà lượt này đáng lẽ chạy (09:00, 09:15…). NEO của mọi phép kiểm
@@ -128,10 +128,10 @@ public interface ISdiJobGateway
     /// thái ổn định gần như không gọi tới.
     /// </summary>
     Task<IReadOnlyList<SchedulableJob>> GetSchedulableJobsAsync(CancellationToken ct);
-    Task<IReadOnlyList<DueJob>> ReapAsync(int staleSec, CancellationToken ct);               // SP_JOB_REAP
-    /// <summary>SP_JOB_CLAIM. `source` = 'notify' | 'reap' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
+    Task<IReadOnlyList<DueJob>> RecoverAsync(int staleSec, CancellationToken ct);               // SP_JOB_RECOVER
+    /// <summary>SP_JOB_CLAIM. `source` = 'notify' | 'recover' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
     /// Đừng bỏ tham số này: nó là thứ duy nhất phân biệt "chuông Pub/Sub đang chạy" với "chuông
-    /// đã tắt từ lâu mà reaper vẫn gánh" — hai trạng thái nhìn từ ngoài giống hệt nhau.</summary>
+    /// đã tắt từ lâu mà bộ hồi phục vẫn gánh" — hai trạng thái nhìn từ ngoài giống hệt nhau.</summary>
     Task<JobClaim>              ClaimAsync(long jobRunId, string owner, string source, CancellationToken ct);
     Task<bool>                  HeartbeatAsync(long jobRunId, string owner, long? rows, CancellationToken ct);  // SP_JOB_HEARTBEAT
     Task                        CompleteAsync(long jobRunId, string owner, bool ok, long? rows, string? msg, CancellationToken ct); // SP_JOB_COMPLETE

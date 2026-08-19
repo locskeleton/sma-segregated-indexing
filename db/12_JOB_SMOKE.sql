@@ -43,8 +43,8 @@ BEGIN
 END
 GO
 
--- 3 cột: khớp CẢ result set của SP_SMK_SCAN (id,code) lẫn SP_JOB_REAP (id,code,payload).
---   Lệch cột thì INSERT..EXEC lỗi, và vì SP_JOB_REAP có XACT_ABORT ON nên nó ROLLBACK luôn cả
+-- 3 cột: khớp CẢ result set của SP_SMK_SCAN (id,code) lẫn SP_JOB_RECOVER (id,code,payload).
+--   Lệch cột thì INSERT..EXEC lỗi, và vì SP_JOB_RECOVER có XACT_ABORT ON nên nó ROLLBACK luôn cả
 --   phần UPDATE đã chạy trước đó — hỏng im lặng, khó lần.
 CREATE TABLE #scan (id BIGINT, code VARCHAR(40), payload NVARCHAR(MAX));
 DECLARE @R TABLE (id INT IDENTITY, name VARCHAR(90), ok BIT, detail NVARCHAR(300));
@@ -127,9 +127,9 @@ INSERT INTO @R SELECT 'A4 ★ 2 pod claim cùng 1 lượt ⇒ ĐÚNG 1 thắng (
 INSERT INTO @R SELECT 'A4 claim ⇒ RUNNING + attempt=1 + có lease',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='RUNNING'
                      AND C_ATTEMPT=1 AND C_LEASE_UNTIL IS NOT NULL) THEN 1 ELSE 0 END, NULL;
--- Nguồn đánh thức phải được ghi lại. Kafka hỏng thì hệ VẪN CHẠY ĐÚNG nhờ reaper, chỉ chậm ~30s
+-- Nguồn đánh thức phải được ghi lại. Kafka hỏng thì hệ VẪN CHẠY ĐÚNG nhờ bộ hồi phục, chỉ chậm ~30s
 --   — và không ai nhận ra. Cột này là thứ duy nhất tố giác.
-INSERT INTO @R SELECT 'A4 ★ ghi lại NGUỒN đánh thức (kafka/reap) — soi được chuông có còn sống không',
+INSERT INTO @R SELECT 'A4 ★ ghi lại NGUỒN đánh thức (kafka/recover) — soi được chuông có còn sống không',
   CASE WHEN (SELECT C_CLAIM_SOURCE FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id)='kafka' THEN 1 ELSE 0 END,
   (SELECT C_CLAIM_SOURCE FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
 
@@ -140,10 +140,10 @@ EXEC SP_JOB_HEARTBEAT @p_job_run_id=@id, @p_owner='pod-B', @p_still_mine=@mine O
 INSERT INTO @R SELECT 'A5 ★ heartbeat SAI chủ (pod zombie) ⇒ still_mine=0 ⇒ pod đó phải tự dừng',
   CASE WHEN @mine=0 THEN 1 ELSE 0 END, NULL;
 
--- A6. Lease hết hạn = pod chết → SP_JOB_REAP thu hồi, pod khác giành được
+-- A6. Lease hết hạn = pod chết → SP_JOB_RECOVER thu hồi, pod khác giành được
 UPDATE T_JOB_RUN SET C_LEASE_UNTIL=DATEADD(MINUTE,-5,@now) WHERE C_JOB_RUN_ID=@id;
-EXEC SP_JOB_REAP @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A6 SP_JOB_REAP: lease quá hạn ⇒ RUNNING→READY (không tăng attempt)',
+EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A6 SP_JOB_RECOVER: lease quá hạn ⇒ RUNNING→READY (không tăng attempt)',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='READY'
                      AND C_ATTEMPT=1 AND C_OWNER IS NULL) THEN 1 ELSE 0 END,
   (SELECT CONCAT(C_STATUS,' attempt=',C_ATTEMPT) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
@@ -583,8 +583,8 @@ INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
 VALUES ('SMK_CFG','HOMQUA1459','READY',DATEADD(HOUR,-18,@now),DATEADD(HOUR,-18,@now));
 DECLARE @oldId BIGINT = SCOPE_IDENTITY();
 DELETE #scan;
-INSERT #scan EXEC SP_JOB_REAP @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C6 *** lượt 18 tiếng trước: REAP đóng dấu SKIPPED, KHÔNG đẩy lại để chạy',
+INSERT #scan EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C6 *** lượt 18 tiếng trước: RECOVER đóng dấu SKIPPED, KHÔNG đẩy lại để chạy',
   CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId)='SKIPPED'
         AND NOT EXISTS(SELECT 1 FROM #scan WHERE id=@oldId) THEN 1 ELSE 0 END,
   (SELECT CONCAT(C_STATUS,' | ',LEFT(C_MESSAGE,55)) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId);
@@ -610,7 +610,7 @@ INSERT INTO @R SELECT 'C7 * ...nhưng ĐẨY TAY thì vẫn chạy ngay (err=0 c
 INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
 VALUES ('SMK_OND','CHOLAU','READY',DATEADD(DAY,-3,@now),DATEADD(DAY,-3,@now));
 DECLARE @ondId BIGINT = SCOPE_IDENTITY();
-EXEC SP_JOB_REAP @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 INSERT INTO @R SELECT 'C8 * job on-demand: lượt đẩy tay KHÔNG tự bốc hơi dù đã chờ 3 ngày',
   CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId)='READY' THEN 1 ELSE 0 END,
   (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId);
@@ -639,15 +639,15 @@ INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
 VALUES ('SMK_CFG','MATMSG','READY',DATEADD(SECOND,-120,@now),DATEADD(SECOND,-120,@now));
 DECLARE @lostId BIGINT = SCOPE_IDENTITY();
 DELETE #scan;
-INSERT #scan EXEC SP_JOB_REAP @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C10 * mất message Redis (XADD hụt/FLUSHALL/pod mới): REAP nhặt lại, KHÔNG mất job',
+INSERT #scan EXEC SP_JOB_RECOVER @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C10 * mất message Redis (XADD hụt/FLUSHALL/pod mới): RECOVER nhặt lại, KHÔNG mất job',
   CASE WHEN EXISTS(SELECT 1 FROM #scan WHERE id=@lostId) THEN 1 ELSE 0 END, NULL;
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
 INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
 VALUES ('SMK_CFG','VUASINH','READY',@now,@now);
 DELETE #scan;
-INSERT #scan EXEC SP_JOB_REAP @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C10 lượt VỪA sinh (chưa quá stale_sec): REAP KHÔNG đẩy lại (khỏi XADD trùng mỗi 30s)',
+INSERT #scan EXEC SP_JOB_RECOVER @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C10 lượt VỪA sinh (chưa quá stale_sec): RECOVER KHÔNG đẩy lại (khỏi XADD trùng mỗi 30s)',
   CASE WHEN NOT EXISTS(SELECT 1 FROM #scan WHERE code='SMK_CFG') THEN 1 ELSE 0 END, NULL;
 
 /*---- C11. KHÔNG back-fill: dừng dịch vụ nửa ngày rồi bật lại -> chỉ 1 lượt ----*/

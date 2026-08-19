@@ -33,10 +33,10 @@ public static class JobRedisKeys
     public static string SlotLock(string jobCode, string fireKey) => $"SDI:JOB:SLOT:{jobCode}:{fireKey}";
 
     /// <summary>
-    /// Vé chạy `SP_JOB_REAP`. REAP idempotent nên chạy trùng KHÔNG sai — vé này thuần tuý để 10 pod
+    /// Vé chạy `SP_JOB_RECOVER`. RECOVER idempotent nên chạy trùng KHÔNG sai — vé này thuần tuý để 10 pod
     /// không cùng làm một việc mỗi 30 giây (20 lượt/phút → 2). Lấy hụt vé thì bỏ qua nhịp, không chờ.
     /// </summary>
-    public const string ReapTicket = "SDI:JOB:REAP";
+    public const string RecoverTicket = "SDI:JOB:RECOVER";
 
     /// <summary>
     /// Cache cấu hình lịch (HASH: jobCode → JSON). App XOÁ khoá này ngay sau khi đổi cấu hình qua
@@ -47,7 +47,7 @@ public static class JobRedisKeys
     public const string ConfigHash = "SDI:JOB:CFG";
 
     public static readonly TimeSpan ConfigTtl = TimeSpan.FromHours(1);
-    public static readonly TimeSpan ReapTicketTtl = TimeSpan.FromSeconds(25);   // < nhịp REAP 30s
+    public static readonly TimeSpan RecoverTicketTtl = TimeSpan.FromSeconds(25);   // < nhịp RECOVER 30s
 
     public static TimeSpan SlotTtl(int intervalSec) => TimeSpan.FromSeconds(Math.Max(60, intervalSec * 2));
 }

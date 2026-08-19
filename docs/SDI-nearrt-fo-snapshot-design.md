@@ -11,7 +11,7 @@
 ## 0. Ba nguyên tắc — kế thừa từ [thiết kế Kafka batch sync](SDI-kafka-batch-sync-design.md)
 
 > ### ① TẦNG NHẮN TIN lo TỐC ĐỘ. DB lo TÍNH ĐÚNG.
-> Kafka chỉ là **chuông cửa**, không phải sổ cái. Broker chết chỉ được phép làm **chậm** (≤30 giây, nhờ `SP_JOB_REAP`), không được phép làm **mất job** hay **chạy hai lần**.
+> Kafka chỉ là **chuông cửa**, không phải sổ cái. Broker chết chỉ được phép làm **chậm** (≤30 giây, nhờ `SP_JOB_RECOVER`), không được phép làm **mất job** hay **chạy hai lần**.
 >
 > ### ② Chống trùng phải là RÀNG BUỘC DỮ LIỆU, không phải một lời hứa của middleware.
 > "Consumer group giao mỗi message cho một consumer" là đúng — nhưng nó không hứa *xử lý đúng một lần*.
@@ -27,7 +27,7 @@
 |---|---|---|
 | Biết gì về FO | **Không gì cả** | Tất cả |
 | Bảng | `T_JOB_DEFINITION`, `T_JOB_RUN` | `T_SI_BALANCE`, `T_MASTER_BALANCE` (cột `C_SRC`) |
-| Proc | `SP_JOB_ENQUEUE(_DUE)` · `_CLAIM` · `_HEARTBEAT` · `_COMPLETE` · `_REAP` · `_PURGE` | `SP_GET_FO_SNAPSHOT_SCOPE` · `SP_INGEST_FO_SNAPSHOT_RT` · `SP_RT_MASTER_AGG` · `SP_GET_PM_RT_OVERVIEW` |
+| Proc | `SP_JOB_ENQUEUE` · `_CLAIM` · `_HEARTBEAT` · `_COMPLETE` · `_RECOVER` · `_PURGE` | `SP_GET_FO_SNAPSHOT_SCOPE` · `SP_INGEST_FO_SNAPSHOT_RT` · `SP_RT_MASTER_AGG` · `SP_GET_PM_RT_OVERVIEW` |
 | Thêm job mới | INSERT 1 dòng + 1 class C# | — |
 
 Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…) **không sửa một dòng nào** ở tầng A. Đó là thước đo duy nhất của chữ "generic".
@@ -48,7 +48,7 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
                       │                              │ err=3 (ngoài giờ)    → SKIPPED
                       │                              │ err=6 (hết lượt thử) → DEAD
                       │                              ▼
-                      └──── SP_JOB_REAP ◄──── lease hết hạn (pod chết)
+                      └──── SP_JOB_RECOVER ◄──── lease hết hạn (pod chết)
                             (30s, mọi pod)
 ```
 
@@ -70,7 +70,7 @@ Và Kafka còn tốt hơn Pub/Sub ở đúng chỗ quan trọng: **nó bền**.
 |---|---|---|
 | Message sống qua restart pod | ❌ mất | ✅ đọc tiếp từ offset |
 | Message sống qua sự cố broker | ❌ mất | ✅ có lưu |
-| `SP_JOB_REAP` đóng vai gì | **đường hồi phục chính** | **lưới an toàn** (đúng vai) |
+| `SP_JOB_RECOVER` đóng vai gì | **đường hồi phục chính** | **lưới an toàn** (đúng vai) |
 | Chia việc nhiều pod | phát cho tất cả, N−1 claim hụt | consumer group, mỗi partition một consumer |
 | Đã có trong hệ | ❌ phải dựng thêm | ✅ |
 
@@ -100,7 +100,7 @@ Một chu kỳ quét FO chạy **vài phút** (1000 batch); `max.poll.interval.m
 
 **Cách né:** `Consume` → **commit offset ngay** → `SP_JOB_CLAIM` → ném job sang Task nền → quay lại `Consume`. Vòng poll luôn rảnh.
 
-**Commit trước khi chạy** nghe ngược tai nhưng là lựa chọn đúng: message không phải sổ cái, `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ `SP_JOB_REAP` thu hồi ⇒ chạy lại. Còn commit *sau* khi job xong thì vòng poll phải chờ vài phút — đổi một lưới cứu đã có lấy một cái bẫy đã biết.
+**Commit trước khi chạy** nghe ngược tai nhưng là lựa chọn đúng: message không phải sổ cái, `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ `SP_JOB_RECOVER` thu hồi ⇒ chạy lại. Còn commit *sau* khi job xong thì vòng poll phải chờ vài phút — đổi một lưới cứu đã có lấy một cái bẫy đã biết.
 
 > Khung job hiện tại có thứ luồng Asset cũ không có: **lease + heartbeat**. Pod bị đá vẫn heartbeat nên vẫn giữ lease, pod mới claim nhận `err=5` ⇒ vòng xoáy **không hình thành**. Nhưng đó là lưới cứu, không phải lý do để cố tình nhảy xuống vực.
 
@@ -122,7 +122,7 @@ max.poll.interval.ms = mặc định   # không cần nới, vì không chạy j
 
 ### Đường lùi
 
-Muốn bỏ luôn Kafka khỏi khung job thì chỉ cần đổi `SP_JOB_REAP` từ "lưới an toàn" thành "đường chính" và cho pod poll DB mỗi 1–2 giây. `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó là lợi ích của việc **không giao một mảnh tính đúng nào cho tầng nhắn tin** — đổi tầng vận chuyển là việc của một buổi chiều, không phải một đợt refactor.
+Muốn bỏ luôn Kafka khỏi khung job thì chỉ cần đổi `SP_JOB_RECOVER` từ "lưới an toàn" thành "đường chính" và cho pod poll DB mỗi 1–2 giây. `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó là lợi ích của việc **không giao một mảnh tính đúng nào cho tầng nhắn tin** — đổi tầng vận chuyển là việc của một buổi chiều, không phải một đợt refactor.
 
 ---
 
@@ -214,7 +214,7 @@ Với **10 pod**, trạng thái ổn định:
 | Nguồn | Tần suất | Tổng (10 pod) |
 |---|---|---|
 | `SP_JOB_ENQUEUE_DUE` | 10s/lần, mọi pod | 60 lượt/phút |
-| `SP_JOB_REAP` | 30s/lần, mọi pod | 20 lượt/phút |
+| `SP_JOB_RECOVER` | 30s/lần, mọi pod | 20 lượt/phút |
 | Nhịp tim | 30s/lần, **chỉ pod đang chạy job** | 2 lượt/phút |
 | `SP_JOB_CLAIM` + `SP_JOB_COMPLETE` | 2 lượt mỗi lần job chạy | 48 lượt/**ngày** |
 | **Tổng** | | **≈ 1,4 truy vấn/giây** |
@@ -252,7 +252,7 @@ Smoke `12_JOB_SMOKE.sql` khối (A) cố tình chạy toàn bộ vòng đời tr
 
 | Lớp | Bắt được gì | Không bắt được gì |
 |---|---|---|
-| Kafka consumer group | Mỗi partition một consumer — đủ cho đường chạy bình thường | rebalance giao lại, pod zombie, reaper phát trùng |
+| Kafka consumer group | Mỗi partition một consumer — đủ cho đường chạy bình thường | rebalance giao lại, pod zombie, bộ hồi phục phát trùng |
 | **`SP_JOB_CLAIM`** (`UPDATE ... WHERE C_STATUS='READY'`) | **Mọi thứ.** 20 pod cầm cùng id ⇒ đúng 1 thắng | Pod thắng rồi treo |
 | Heartbeat có kiểm chủ sở hữu | Pod treo → lease hết → pod khác giành; pod cũ tỉnh dậy nhận `still_mine=false` → tự dừng | — |
 
@@ -321,12 +321,12 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 
 | Job kẹt ở đâu | Ai cứu | Sau bao lâu |
 |---|---|---|
-| Dòng `READY`, tin chưa bao giờ phát được (`PUBLISH` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Broker chết lúc produce | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Message đã commit nhưng pod chết trước khi claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Dòng `READY`, tin chưa bao giờ phát được (`PUBLISH` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
+| Broker chết lúc produce | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
+| Message đã commit nhưng pod chết trước khi claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
 | Pod vượt `max.poll.interval` bị đá, rebalance giao lại | `SP_JOB_CLAIM` err=5 (zombie còn giữ lease) | ngay |
-| Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_REAP` bước (1) | ≤ timeout + 30s |
+| Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
+| Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_RECOVER` bước (1) | ≤ timeout + 30s |
 
 Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Kafka chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Kafka, nên không có trạng thái nào mất theo broker.
 
@@ -344,9 +344,9 @@ Pod mới khởi động đọc tiếp từ offset đã commit của group — k
 
 **Không.** Và đây là chỗ bản đầu **sai thật**:
 
-> Lượt sinh 14:59 không kịp chạy → nằm `READY` suốt đêm (reaper không đẩy vì ngoài khung giờ, và không ai đóng dấu nó cả). Sáng hôm sau 09:00 khung giờ **mở lại** ⇒ nó được đẩy ⇒ **chạy lại một lượt của hôm qua**. Guard khung giờ hoàn toàn không cứu được, vì 09:00 hôm sau là "trong giờ" một cách chính đáng.
+> Lượt sinh 14:59 không kịp chạy → nằm `READY` suốt đêm (bộ hồi phục không đẩy vì ngoài khung giờ, và không ai đóng dấu nó cả). Sáng hôm sau 09:00 khung giờ **mở lại** ⇒ nó được đẩy ⇒ **chạy lại một lượt của hôm qua**. Guard khung giờ hoàn toàn không cứu được, vì 09:00 hôm sau là "trong giờ" một cách chính đáng.
 
-Đã thêm `C_MAX_DELAY_SEC` (mặc định = `C_INTERVAL_SEC`), đo từ `C_RUN_AFTER`, chặn ở **hai** chỗ: `SP_JOB_REAP` đóng dấu `SKIPPED` chủ động, và `SP_JOB_CLAIM` từ chối nếu nó lọt tới tay worker bằng đường khác.
+Đã thêm `C_MAX_DELAY_SEC` (mặc định = `C_INTERVAL_SEC`), đo từ `C_RUN_AFTER`, chặn ở **hai** chỗ: `SP_JOB_RECOVER` đóng dấu `SKIPPED` chủ động, và `SP_JOB_CLAIM` từ chối nếu nó lọt tới tay worker bằng đường khác.
 
 Đo từ `C_RUN_AFTER` chứ không phải `C_ENQUEUED_AT` là có chủ đích: lượt **retry** có `C_RUN_AFTER` mới, nên nó không bị tính là "cũ" chỉ vì lượt gốc sinh từ 15 phút trước. Đo nhầm mốc là giết sạch retry của mọi job chu kỳ ngắn.
 
@@ -501,9 +501,9 @@ Không có ba cột này thì một tổng AUM thiếu 200 khách hàng trông *
 
 | Hỏng gì | Hậu quả | Sai số liệu? |
 |---|---|---|
-| Broker Kafka chết / topic bị xoá | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_REAP` produce lại sau ≤30s | ❌ |
+| Broker Kafka chết / topic bị xoá | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_RECOVER` produce lại sau ≤30s | ❌ |
 | Produce hụt (broker chết lúc scheduler rung chuông) | Y như trên | ❌ |
-| Pod chết giữa chu kỳ | Lease hết hạn → REAP thu hồi → pod khác chạy lại. Ingest idempotent (MERGE) nên chạy lại vô hại | ❌ |
+| Pod chết giữa chu kỳ | Lease hết hạn → RECOVER thu hồi → pod khác chạy lại. Ingest idempotent (MERGE) nên chạy lại vô hại | ❌ |
 | Pod **treo** rồi tỉnh lại (zombie) | Heartbeat trả `still_mine=false` → tự huỷ token → dừng. `SP_JOB_COMPLETE` của nó cũng bị từ chối (`err=5`) | ❌ |
 | Cùng `jobRunId` giao cho 20 pod | `SP_JOB_CLAIM`: đúng 1 thắng, 19 nhận `err=5` | ❌ |
 | 10 pod cùng quét slot 9:15 | `UQ_JOB_RUN_NK`: đúng 1 dòng | ❌ |
@@ -582,6 +582,6 @@ Theo dõi: `EXEC SP_GET_JOB_STATUS @p_err_code=..., @p_err_msg=...` — RS1 sứ
 
 1. **Chống trùng nằm ở `UPDATE ... WHERE C_STATUS='READY'`**, không nằm ở tầng giao tin. Kafka rung chuông cho nhanh, DB chốt lại cho đúng — nên rebalance giao lại hay pod zombie đều chỉ dẫn tới `err=5`.
 2. **`UQ (job_code, fire_key)` thay thế leader election.** 10 pod cùng quét một slot vẫn ra đúng một lượt chạy.
-3. **`SP_JOB_REAP` là lưới an toàn** — Kafka có lưu nên message sống qua restart; reaper chỉ còn lo produce hụt, mọi pod đều bận, và pod chết giữa chừng. Khung job **không đụng Redis một dòng nào**.
+3. **`SP_JOB_RECOVER` là lưới an toàn** — Kafka có lưu nên message sống qua restart; bộ hồi phục chỉ còn lo produce hụt, mọi pod đều bận, và pod chết giữa chừng. Khung job **không đụng Redis một dòng nào**.
 4. **Guard khung giờ 4 tầng không thừa.** Tầng 4 là tầng duy nhất bắt được ca "chu kỳ dài vắt qua giờ đóng cửa" — thứ mà 3 tầng kia về bản chất không thể thấy.
 5. **Cột `C_SRC` là toàn bộ tính đúng của phương án đổ RT vào bảng EOD.** Bỏ nó ở một chỗ thôi là cổng khoá EOD pass giả, phí tính trên AUM lúc 9h15, và báo cáo đọc số chưa chốt — cả ba đều **sai âm thầm**.

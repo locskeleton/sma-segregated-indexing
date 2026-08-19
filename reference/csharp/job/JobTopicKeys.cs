@@ -9,8 +9,8 @@ namespace SdiCoreMessagingProcess.Jobs;
 ///   làm cùng một việc. Đổi sang Kafka **bớt đi** một công nghệ, không phải đổi ngang.
 ///
 ///   Và Kafka còn TỐT HƠN Redis Pub/Sub ở đúng chỗ quan trọng: nó **bền**. Pub/Sub bắn-rồi-quên
-///   nên `SP_JOB_REAP` phải gánh vai đường hồi phục chính; Kafka là log có lưu nên message sống
-///   qua restart pod/broker, và `SP_JOB_REAP` trở lại đúng vai **lưới an toàn**.
+///   nên `SP_JOB_RECOVER` phải gánh vai đường hồi phục chính; Kafka là log có lưu nên message sống
+///   qua restart pod/broker, và `SP_JOB_RECOVER` trở lại đúng vai **lưới an toàn**.
 ///
 /// ⚠️⚠️ LUẬT SỐ MỘT — ĐỌC TRƯỚC KHI SỬA `JobDispatcherService`:
 ///   **KHÔNG BAO GIỜ chạy job bên trong vòng poll của consumer.**
@@ -56,5 +56,5 @@ public static class JobTopicKeys
 
     /// <summary>Nguồn đánh thức, ghi vào T_JOB_RUN.C_CLAIM_SOURCE để soi khi mổ xẻ sự cố.</summary>
     public const string SourceKafka = "kafka";
-    public const string SourceReap  = "reap";
+    public const string SourceRecover  = "recover";
 }

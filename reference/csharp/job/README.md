@@ -8,8 +8,8 @@
 |---|---|
 | `JobContracts.cs` | `IJobHandler` · `JobContext` · `JobRegistry` · `ISdiJobGateway` (map 1-1 sang SP) |
 | `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
-| `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé REAP · cache cấu hình |
-| `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · REAP (30s, có vé + cửa chặn khung giờ) |
+| `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé RECOVER · cache cấu hình |
+| `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · RECOVER (30s, có vé + cửa chặn khung giờ) |
 | `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
@@ -83,7 +83,7 @@ if (err == 0)
 ```
 
 Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất job: dòng `T_JOB_RUN` vẫn
-`READY` và `SP_JOB_REAP` produce lại sau ≤30 giây.
+`READY` và `SP_JOB_RECOVER` produce lại sau ≤30 giây.
 
 ---
 
@@ -93,7 +93,7 @@ Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất j
 |---|---|---|
 | Nhịp quét lịch (10s × 10 pod) | `SP_JOB_ENQUEUE_DUE` ~50 logical reads **mỗi nhịp** | **0 lượt gọi DB** (Redis `SET NX`) |
 | Lượt quét/ngày để sinh 25 job | **~86.400** (≈3.400 lượt hỏi/job) | **~25** |
-| `SP_JOB_REAP` | 30s × 10 pod = 20 lượt/phút, 24/7 | có **vé Redis** (1 pod) + **cửa chặn khung giờ** ⇒ ~2 lượt/phút, và **0 ngoài 09:00–15:10** |
+| `SP_JOB_RECOVER` | 30s × 10 pod = 20 lượt/phút, 24/7 | có **vé Redis** (1 pod) + **cửa chặn khung giờ** ⇒ ~2 lượt/phút, và **0 ngoài 09:00–15:10** |
 | Đọc cấu hình | mỗi nhịp | cache Redis, app xoá khi đổi lịch ⇒ ~0 |
 
 **Redis không giữ mảnh tính đúng nào.** Mất khoá mốc ⇒ nhiều pod cùng gọi `SP_JOB_ENQUEUE` ⇒ `UQ (job_code, fire_key)` cho đúng một pod thắng, còn lại `err=4`. Tệ nhất của việc mất sạch Redis: vài lượt gọi DB thừa — **không job nào chạy hai lần, không job nào mất**.
@@ -104,7 +104,7 @@ Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất j
 
 ### 1. "Kafka consumer group đã chống trùng rồi, sao còn `SP_JOB_CLAIM`?"
 
-Consumer group hứa *mỗi partition giao cho một consumer*, **không** hứa *mỗi message xử lý đúng một lần*. Ba đường làm nó giao lại cùng một `jobRunId`: rebalance khi pod vào/ra group; pod vượt `max.poll.interval` bị đá nhưng **thread vẫn chạy** (zombie); và `SP_JOB_REAP` produce lại.
+Consumer group hứa *mỗi partition giao cho một consumer*, **không** hứa *mỗi message xử lý đúng một lần*. Ba đường làm nó giao lại cùng một `jobRunId`: rebalance khi pod vào/ra group; pod vượt `max.poll.interval` bị đá nhưng **thread vẫn chạy** (zombie); và `SP_JOB_RECOVER` produce lại.
 
 `SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`. Ai đổi được trạng thái người đó chạy — thứ **không thể có hai người thắng**, và nó nằm ở nơi mọi pod nhìn thấy cùng một sự thật.
 
@@ -114,13 +114,13 @@ Consumer group hứa *mỗi partition giao cho một consumer*, **không** hứa
 
 ⇒ `Consume` → **commit offset ngay** → claim → ném job sang Task nền → quay lại `Consume`. Vòng poll luôn rảnh.
 
-Commit *trước* khi chạy nghe ngược tai, nhưng message không phải sổ cái — `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ reaper thu hồi ⇒ chạy lại.
+Commit *trước* khi chạy nghe ngược tai, nhưng message không phải sổ cái — `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ bộ hồi phục thu hồi ⇒ chạy lại.
 
 ### 3. "Broker chết thì mất job?"
 
-Không. Dòng `T_JOB_RUN` vẫn `READY`; `SP_JOB_REAP` produce lại sau ≤30 giây. Kafka có lưu nên hầu hết trục trặc kết nối tự khỏi mà không cần tới reaper — nó là **lưới an toàn**, không phải đường chính.
+Không. Dòng `T_JOB_RUN` vẫn `READY`; `SP_JOB_RECOVER` produce lại sau ≤30 giây. Kafka có lưu nên hầu hết trục trặc kết nối tự khỏi mà không cần tới bộ hồi phục — nó là **lưới an toàn**, không phải đường chính.
 
-⚠️ **Cái bẫy vận hành:** chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây — và không ai nhận ra. Vì thế mỗi lượt chạy ghi `C_CLAIM_SOURCE` ('kafka' | 'reap'), và `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D`. Con số đó xấp xỉ tổng số lượt ⇒ Kafka đã chết từ lâu.
+⚠️ **Cái bẫy vận hành:** chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây — và không ai nhận ra. Vì thế mỗi lượt chạy ghi `C_CLAIM_SOURCE` ('kafka' | 'recover'), và `SP_GET_JOB_STATUS` trả `C_RECOVER_WAKE_7D`. Con số đó xấp xỉ tổng số lượt ⇒ Kafka đã chết từ lâu.
 
 ### 3. "Guard khung giờ 4 tầng có thừa không?"
 
@@ -129,7 +129,7 @@ Không. Mỗi tầng bắt một ca mà tầng khác **không thể** bắt:
 | Tầng | Ở đâu | Bắt ca gì |
 |---|---|---|
 | 1 | `SP_JOB_ENQUEUE(_DUE)` | Không sinh lượt chạy lúc 15h30 |
-| 2 | `SP_JOB_CLAIM` | Job sinh lúc 14h59, pod nhặt lúc 15h02 (stream tồn đọng / pod restart / reaper trả lại) |
+| 2 | `SP_JOB_CLAIM` | Job sinh lúc 14h59, pod nhặt lúc 15h02 (stream tồn đọng / pod restart / bộ hồi phục trả lại) |
 | 3 | `SP_INGEST_FO_SNAPSHOT_RT` | Ai đó gọi proc bằng tay; job ghi ngày không phải hôm nay |
 | **4** | `TradingWindowGuard` (C#) | **Chu kỳ 1000 batch khởi động lúc 14h50, tới batch 700 thì đã 15h02** |
 
@@ -144,8 +144,8 @@ Luật giờ chỉ được định nghĩa **một chỗ**: `UDF_JOB_IN_WINDOW` 
 | Đổi chu kỳ 15' → 1 tiếng | `SP_SET_JOB_SCHEDULE` dọn lượt `READY` cũ **rồi** ghi cấu hình mới (một giao dịch) | ❌ | ❌ |
 | Có người `UPDATE` thẳng bảng cấu hình | Trigger `TR_JOB_DEFINITION_PURGE_PENDING` dọn thay | ❌ | ❌ |
 | Đổi cột không liên quan lịch (timeout/retry) | Trigger **không** động vào hàng đợi | ❌ | ❌ |
-| Pod mới init / pod restart | Đọc tiếp từ offset đã commit (`auto.offset.reset=latest`); dòng `READY` chưa ai chạy → `SP_JOB_REAP` | ❌ | ❌ |
-| Broker Kafka chết / topic bị xoá | `SP_JOB_REAP` produce lại trong ≤30s | ❌ | ❌ |
+| Pod mới init / pod restart | Đọc tiếp từ offset đã commit (`auto.offset.reset=latest`); dòng `READY` chưa ai chạy → `SP_JOB_RECOVER` | ❌ | ❌ |
+| Broker Kafka chết / topic bị xoá | `SP_JOB_RECOVER` produce lại trong ≤30s | ❌ | ❌ |
 | Dừng dịch vụ nửa ngày rồi bật lại | Scheduler **chỉ** sinh slot HIỆN TẠI — không dồn slot đã lỡ | ❌ | ❌ |
 | Lượt 14:59 không kịp chạy, sang hôm sau | `C_MAX_DELAY_SEC` → `SKIPPED`. **Không** chạy lại việc của hôm qua | ❌ | ❌ |
 | Xoá chu kỳ (`clearInterval`) | Ngừng sinh + dọn lượt chờ; job về chế độ `ON_DEMAND` | ❌ | ❌ |

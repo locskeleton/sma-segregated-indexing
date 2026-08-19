@@ -19,18 +19,18 @@ namespace SdiCoreMessagingProcess.Jobs;
 ///
 /// ★ COMMIT TRƯỚC KHI CHẠY — CỐ Ý, dù nghe ngược tai.
 ///   Message KHÔNG phải sổ cái; `T_JOB_RUN` mới là. Pod chết sau khi commit mà chưa chạy xong ⇒
-///   lease hết hạn ⇒ `SP_JOB_REAP` thu hồi ⇒ chạy lại. Còn commit SAU khi job xong thì vòng poll
+///   lease hết hạn ⇒ `SP_JOB_RECOVER` thu hồi ⇒ chạy lại. Còn commit SAU khi job xong thì vòng poll
 ///   phải chờ vài phút — đúng cái bẫy ở trên. Đổi một lưới cứu đã có lấy một cái bẫy đã biết là
 ///   một vụ đổi tồi.
 ///
 /// ★ VÌ SAO KHÔNG XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3) — hai lớp:
 ///   1. Kafka consumer group: mỗi partition giao cho một consumer. Đủ cho đường chạy bình thường.
 ///   2. `SP_JOB_CLAIM` (`UPDATE ... WHERE C_STATUS='READY'`) — **chốt thật**. Rebalance giao lại,
-///      pod zombie, reaper phát trùng: đúng một pod đổi được trạng thái, còn lại nhận `err=5`.
+///      pod zombie, bộ hồi phục phát trùng: đúng một pod đổi được trạng thái, còn lại nhận `err=5`.
 ///   Lớp phụ: heartbeat kiểm chủ sở hữu ⇒ pod mất lease tự dừng, không ghi song song.
 ///
 /// ★ HẠN MỨC JOB ĐỒNG THỜI: pod đang chạy đủ job thì **không claim**, nhường pod rảnh. Mọi pod
-///   đều bận ⇒ không ai claim ⇒ dòng vẫn `READY` ⇒ `SP_JOB_REAP` phát lại sau ≤30 giây.
+///   đều bận ⇒ không ai claim ⇒ dòng vẫn `READY` ⇒ `SP_JOB_RECOVER` phát lại sau ≤30 giây.
 /// </summary>
 public class JobDispatcherService : BackgroundService
 {
@@ -100,7 +100,7 @@ public class JobDispatcherService : BackgroundService
                     continue;
                 }
 
-                // Hết suất thì bỏ qua — pod khác nhận, hoặc reaper phát lại sau ≤30s. Bỏ qua ở đây
+                // Hết suất thì bỏ qua — pod khác nhận, hoặc bộ hồi phục phát lại sau ≤30s. Bỏ qua ở đây
                 //   RẺ hơn claim rồi mới phát hiện mình không có chỗ chạy.
                 if (!_slots.Wait(0))
                 {

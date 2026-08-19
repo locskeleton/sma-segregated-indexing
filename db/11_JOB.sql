@@ -11,7 +11,7 @@ GO
   ┌─ TẦNG A. KHUNG JOB (generic, KHÔNG biết FO là gì) ────────────────────────┐
   │  T_JOB_DEFINITION  : khai báo loại job (chu kỳ, khung giờ, timeout, retry)│
   │  T_JOB_RUN         : hàng đợi + nhật ký, 1 dòng = 1 LƯỢT chạy            │
-  │  SP_JOB_ENQUEUE / _CLAIM / _HEARTBEAT / _COMPLETE / _REAP / _PURGE       │
+  │  SP_JOB_ENQUEUE / _CLAIM / _HEARTBEAT / _COMPLETE / _RECOVER / _PURGE       │
   │  SP_SET_JOB_SCHEDULE · SP_GET_SCHEDULABLE_JOBS · SP_GET_JOB_STATUS       │
   │  UDF_JOB_SLOT_AT (bản THAM CHIẾU của phép tính mốc — pod tính, DB đối chiếu)│
   │  Thêm loại job mới = INSERT 1 dòng T_JOB_DEFINITION + 1 handler C#.      │
@@ -25,10 +25,10 @@ GO
   └───────────────────────────────────────────────────────────────────────────┘
 
   *** BA NGUYÊN TẮC (kế thừa docs/SDI-kafka-batch-sync-design.md) ***
-   ① Redis lo TỐC ĐỘ, DB lo TÍNH ĐÚNG. Redis Pub/Sub chỉ là CHUÔNG CỬA (đánh thức worker);
-     quyền "ai được chạy lượt này" nằm ở T_JOB_RUN (một UPDATE có điều kiện). Redis chết/mất
-     thông báo ⇒ job chậm tối đa một nhịp SP_JOB_REAP, KHÔNG BAO GIỜ chạy hai lần, KHÔNG mất.
-     Pub/Sub KHÔNG lưu gì cả — và đó là điểm mạnh ở đây, vì sổ cái đã nằm trong DB rồi.
+   ① TẦNG NHẮN TIN lo TỐC ĐỘ, DB lo TÍNH ĐÚNG. Kafka là CHUÔNG CỬA (đánh thức worker), Redis là
+     BỘ LỌC TRƯỚC (để bộ quét lịch không chạm DB mỗi nhịp); quyền "ai được chạy lượt này" nằm ở
+     T_JOB_RUN — một UPDATE có điều kiện. Kafka/Redis chết ⇒ job chậm tối đa một nhịp
+     SP_JOB_RECOVER, KHÔNG BAO GIỜ chạy hai lần, KHÔNG mất.
    ② Ngoài khung giờ GD thì TUYỆT ĐỐI không gọi FO — chặn ở 3 tầng ĐỘC LẬP (§ dưới), vì
      một tầng bất kỳ cũng có thể bị qua mặt (job nằm chờ trong hàng đợi vắt qua 15h00 là tình
      huống BÌNH THƯỜNG, không phải ngoại lệ hiếm).
@@ -148,7 +148,7 @@ GO
   VÒNG ĐỜI:  READY ──claim──> RUNNING ──> DONE
                 ▲                 │  └──> FAILED ──(còn lượt thử)──> READY (sau C_RETRY_DELAY_SEC)
                 │                 │                └──(hết lượt)──> DEAD
-                └── SP_JOB_REAP ──┘ (lease quá hạn = pod chết giữa chừng)
+                └── SP_JOB_RECOVER ──┘ (lease quá hạn = pod chết giữa chừng)
                               └────> SKIPPED (ra ngoài khung giờ khi tới lượt chạy)
 ===========================================================================*/
 IF OBJECT_ID('T_JOB_RUN') IS NULL
@@ -162,7 +162,7 @@ CREATE TABLE T_JOB_RUN (
     C_PAYLOAD        NVARCHAR(MAX)  NULL,
     C_ATTEMPT        INT            NOT NULL CONSTRAINT DF_JOB_RUN_AT  DEFAULT 0,
     C_OWNER          VARCHAR(64)    NULL,             -- pod đang giữ (hostname/podname)
-    C_LEASE_UNTIL    DATETIME       NULL,             -- hết hạn mà không heartbeat ⇒ SP_JOB_REAP thu hồi
+    C_LEASE_UNTIL    DATETIME       NULL,             -- hết hạn mà không heartbeat ⇒ SP_JOB_RECOVER thu hồi
     C_HEARTBEAT_AT   DATETIME       NULL,
     C_RUN_AFTER      DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_RA  DEFAULT GETDATE(),  -- backoff sau khi FAILED
     -- ★ MỐC mà lượt này ĐÁNG LẼ chạy. Job định kỳ: đúng mốc slot (09:00, 09:15…). Job đẩy tay:
@@ -170,10 +170,10 @@ CREATE TABLE T_JOB_RUN (
     --   Không suy ra từ C_ENQUEUED_AT được: bộ quét chạy mỗi 10 giây nên nó tạo lượt 15:00 vào lúc
     --   15:00:04, và mọi phép so khung giờ dựa trên con số đó sẽ trượt mốc cuối phiên.
     C_SLOT_AT        DATETIME       NULL,
-    -- AI ĐÁNH THỨC lượt chạy này: 'notify' (Pub/Sub — đường bình thường) | 'reap' (SP_JOB_REAP
-    --   nhặt lại vì thông báo bị mất) | 'manual'. ⚠️ Đây KHÔNG phải cột trang trí: Pub/Sub là
-    --   bắn-rồi-quên, nếu nó hỏng thì hệ VẪN CHẠY ĐÚNG nhờ reaper, chỉ chậm đi ~30 giây — và
-    --   không ai nhận ra. Thấy cột này toàn 'reap' nghĩa là chuông cửa đã tắt từ lâu.
+    -- AI ĐÁNH THỨC lượt chạy này: 'kafka' (đường bình thường) | 'recover' (SP_JOB_RECOVER nhặt lại
+    --   vì message thất lạc / pod chết) | 'manual'. ⚠️ KHÔNG phải cột trang trí: nếu chuông Kafka
+    --   hỏng thì hệ VẪN CHẠY ĐÚNG nhờ bộ hồi phục, chỉ chậm ~30 giây — và không ai nhận ra.
+    --   Thấy cột này toàn 'recover' nghĩa là chuông cửa đã tắt từ lâu.
     C_CLAIM_SOURCE   VARCHAR(40)    NULL,
     C_ENQUEUED_AT    DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_EQ  DEFAULT GETDATE(),
     C_STARTED_AT     DATETIME       NULL,
@@ -186,7 +186,7 @@ CREATE TABLE T_JOB_RUN (
     CONSTRAINT CK_JOB_RUN_STATUS CHECK (C_STATUS IN ('READY','RUNNING','DONE','FAILED','SKIPPED','DEAD'))
 );
 GO
--- Quét của SP_JOB_REAP: luôn lọc theo trạng thái trước.
+-- Quét của SP_JOB_RECOVER: luôn lọc theo trạng thái trước.
 IF IndexProperty(OBJECT_ID('T_JOB_RUN'),'IX_JOB_RUN_STATUS','IndexID') IS NULL
 CREATE INDEX IX_JOB_RUN_STATUS ON T_JOB_RUN (C_STATUS, C_RUN_AFTER)
     INCLUDE (C_JOB_CODE, C_LEASE_UNTIL, C_ATTEMPT, C_ENQUEUED_AT);
@@ -290,7 +290,7 @@ BEGIN
         SELECT C_JOB_CODE, C_INTERVAL_SEC, C_WINDOW_FROM, C_WINDOW_TO,
                C_BUSINESS_DAY_ONLY, C_SINGLETON, C_PAYLOAD,
                -- Bộ quét cần con số này để biết "giờ này còn lượt nào có thể đang sống không" —
-               --   ngoài khoảng đó thì KHÔNG có gì để REAP, và nó bỏ luôn nhịp quét DB.
+               --   ngoài khoảng đó thì KHÔNG có gì để RECOVER, và nó bỏ luôn nhịp quét DB.
                COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) AS C_EFFECTIVE_MAX_DELAY_SEC
         FROM T_JOB_DEFINITION
         WHERE C_ENABLED = 1 AND C_INTERVAL_SEC IS NOT NULL
@@ -568,7 +568,7 @@ GO
 CREATE OR ALTER PROCEDURE SP_JOB_CLAIM
     @p_job_run_id BIGINT,
     @p_owner      VARCHAR(64),                       -- định danh pod (hostname + pid)
-    @p_source     VARCHAR(40)   = NULL,              -- 'notify' | 'reap' | 'manual' — xem C_CLAIM_SOURCE
+    @p_source     VARCHAR(40)   = NULL,              -- 'kafka' | 'recover' | 'manual' — xem C_CLAIM_SOURCE
     @p_err_code   INT           OUTPUT,
     @p_err_msg    NVARCHAR(400) OUTPUT
 AS
@@ -589,7 +589,7 @@ BEGIN
         IF @code IS NULL
             BEGIN SET @p_err_code=1; SET @p_err_msg=CONCAT(N'Không có lượt chạy id=', @p_job_run_id); RETURN; END
 
-        -- Hết lượt thử → DEAD. Chốt ở đây (chứ không chỉ ở COMPLETE) vì lượt bị REAP trả về READY
+        -- Hết lượt thử → DEAD. Chốt ở đây (chứ không chỉ ở COMPLETE) vì lượt bị RECOVER trả về READY
         --   nhiều lần cũng phải có điểm dừng, nếu không job hỏng sẽ quay vòng mãi mãi.
         IF @attempt >= @maxatt
         BEGIN
@@ -703,7 +703,7 @@ GO
 
 /*===========================================================================
   SP_JOB_COMPLETE — đóng lượt chạy. OK → DONE. Lỗi → FAILED, và nếu còn lượt thử thì tự
-    đặt lại READY + C_RUN_AFTER = now + retry_delay (SP_JOB_REAP sẽ đánh thức lại).
+    đặt lại READY + C_RUN_AFTER = now + retry_delay (SP_JOB_RECOVER sẽ đánh thức lại).
     ⚠️ Job đã hết giờ (vd FO 15h00) mà FAILED thì lần thử sau sẽ bị GUARD TẦNG 2 đóng dấu
       SKIPPED — đúng ý đồ: thà bỏ một nhịp 15 phút còn hơn gọi FO ngoài giờ.
 ===========================================================================*/
@@ -753,20 +753,22 @@ END
 GO
 
 /*===========================================================================
-  SP_JOB_REAP — LƯỚI AN TOÀN, chạy trên MỌI pod (vd 30 giây/lần). Làm 3 việc:
+  SP_JOB_RECOVER — LƯỚI AN TOÀN, chạy trên MỌI pod (vd 30 giây/lần). Làm 3 việc:
 
   (1) THU HỒI lượt RUNNING quá hạn lease (pod chết/bị evict giữa chừng) → READY.
   (2) ĐÓNG DẤU SKIPPED lượt nằm chờ QUÁ HẠN (C_MAX_DELAY_SEC) — chống chạy lại việc của giờ trước.
-  (3) TRẢ VỀ các lượt READY tới hạn để app PUBLISH (lại) lên kênh Redis.
+  (3) TRẢ VỀ các lượt READY tới hạn để app produce (lại) lên topic Kafka.
 
-  ★ (3) LÀ ĐƯỜNG HỒI PHỤC CHÍNH, KHÔNG PHẢI DỰ PHÒNG. Pub/Sub là bắn-rồi-quên: thông báo phát
-    ra lúc không pod nào đang nghe (đang restart, mất kết nối, Redis chết, publish hụt vì pod
-    chết ngay sau khi INSERT) là MẤT LUÔN, trong khi T_JOB_RUN vẫn ghi READY.
+  ★ (3) LÀ LƯỚI AN TOÀN. Kafka CÓ LƯU nên message sống qua restart pod/broker — khác hẳn thời
+    Pub/Sub (bắn-rồi-quên, mọi trục trặc kết nối đều mất tin). Còn lại ba ca hiếm mà (3) lo:
+      · produce hụt (broker chết đúng lúc scheduler rung chuông);
+      · MỌI pod đều bận (hết hạn mức job đồng thời) nên không ai claim;
+      · pod chết sau khi commit offset nhưng trước khi claim xong.
+    Cả ba đều để lại dòng T_JOB_RUN ở trạng thái READY mà không ai đánh thức.
     Không có (3) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
-    Có (3) thì: mất thông báo ⇒ chậm tối đa một nhịp reaper, rồi tự hồi. Publish trùng cũng vô
-    hại vì SP_JOB_CLAIM chỉ cho một pod thắng.
+    Produce trùng thì vô hại: SP_JOB_CLAIM chỉ cho một pod thắng.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_JOB_REAP
+CREATE OR ALTER PROCEDURE SP_JOB_RECOVER
     @p_stale_sec INT           = 30,                 -- READY quá ngần này giây mà chưa ai chạy ⇒ nghi mất message
     @p_err_code  INT           OUTPUT,
     @p_err_msg   NVARCHAR(400) OUTPUT
@@ -872,8 +874,8 @@ BEGIN
                l.C_JOB_RUN_ID AS C_LAST_RUN_ID, l.C_STATUS AS C_LAST_STATUS,
                l.C_STARTED_AT AS C_LAST_STARTED_AT, l.C_ENDED_AT AS C_LAST_ENDED_AT,
                l.C_ROWS AS C_LAST_ROWS, l.C_MESSAGE AS C_LAST_MESSAGE,
-               l.C_CLAIM_SOURCE AS C_LAST_WOKEN_BY,   -- 'notify' bình thường; toàn 'reap' ⇒ Pub/Sub đã tắt
-               q.C_REAP_WAKE_7D,
+               l.C_CLAIM_SOURCE AS C_LAST_WOKEN_BY,   -- 'kafka' bình thường; toàn 'recover' ⇒ chuông đã tắt
+               q.C_RECOVER_WAKE_7D,
                DATEDIFF(SECOND, l.C_ENDED_AT, @now) AS C_SEC_SINCE_LAST_END,
                q.C_QUEUED, q.C_RUNNING, q.C_DEAD_7D
         FROM T_JOB_DEFINITION d
@@ -882,9 +884,9 @@ BEGIN
         OUTER APPLY (SELECT SUM(CASE WHEN r.C_STATUS='READY'   THEN 1 ELSE 0 END) AS C_QUEUED,
                             SUM(CASE WHEN r.C_STATUS='RUNNING' THEN 1 ELSE 0 END) AS C_RUNNING,
                             SUM(CASE WHEN r.C_STATUS='DEAD' AND r.C_ENDED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_DEAD_7D,
-                            -- #lượt 7 ngày qua phải nhờ reaper đánh thức. >0 lác đác là bình thường;
-                            --   xấp xỉ TỔNG số lượt ⇒ chuông cửa Pub/Sub đang hỏng mà hệ vẫn chạy.
-                            SUM(CASE WHEN r.C_CLAIM_SOURCE='reap' AND r.C_STARTED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_REAP_WAKE_7D
+                            -- #lượt 7 ngày qua phải nhờ bộ hồi phục đánh thức. >0 lác đác là bình thường;
+                            --   xấp xỉ TỔNG số lượt ⇒ chuông cửa Kafka đang hỏng mà hệ vẫn chạy.
+                            SUM(CASE WHEN r.C_CLAIM_SOURCE='recover' AND r.C_STARTED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_RECOVER_WAKE_7D
                      FROM T_JOB_RUN r WHERE r.C_JOB_CODE=d.C_JOB_CODE) q
         WHERE (@p_job_code IS NULL OR d.C_JOB_CODE=@p_job_code)
         ORDER BY d.C_JOB_CODE;

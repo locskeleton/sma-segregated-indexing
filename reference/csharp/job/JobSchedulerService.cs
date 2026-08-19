@@ -41,13 +41,13 @@ public sealed class SchedulableJob
 ///   sau khi đổi lịch qua `SP_SET_JOB_SCHEDULE`, nên nhịp kế tiếp đã thấy cấu hình mới.
 ///   Khung giờ 09:00–15:00 gần như không đổi, nên ở trạng thái ổn định lớp này cũng ~0 lượt gọi DB.
 ///
-/// ★ REAP có VÉ: `SP_JOB_REAP` idempotent nên chạy trùng không sai — vé Redis chỉ để 10 pod không
+/// ★ RECOVER có VÉ: `SP_JOB_RECOVER` idempotent nên chạy trùng không sai — vé Redis chỉ để 10 pod không
 ///   cùng làm một việc mỗi 30 giây (20 lượt/phút → 2). Lấy hụt vé thì bỏ qua nhịp, không chờ.
 /// </summary>
 public class JobSchedulerService : BackgroundService
 {
     private static readonly TimeSpan ScanEvery   = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan ReapEvery   = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan RecoverEvery   = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ConfigEvery = TimeSpan.FromSeconds(60);
 
     private readonly IDatabase                 _redis;
@@ -57,7 +57,7 @@ public class JobSchedulerService : BackgroundService
 
     private IReadOnlyList<SchedulableJob> _jobs = Array.Empty<SchedulableJob>();
     private DateTime _lastConfig = DateTime.MinValue;
-    private DateTime _lastReap   = DateTime.MinValue;
+    private DateTime _lastRecover   = DateTime.MinValue;
     private DateTime _bizDay     = DateTime.MinValue;
     private bool     _bizOk;
 
@@ -80,10 +80,10 @@ public class JobSchedulerService : BackgroundService
                 if (DateTime.UtcNow - _lastConfig > ConfigEvery) await RefreshConfigAsync(ct);
                 await ScanAsync(ct);
 
-                if (DateTime.UtcNow - _lastReap > ReapEvery)
+                if (DateTime.UtcNow - _lastRecover > RecoverEvery)
                 {
-                    _lastReap = DateTime.UtcNow;
-                    await ReapAsync(ct);
+                    _lastRecover = DateTime.UtcNow;
+                    await RecoverAsync(ct);
                 }
 
             }
@@ -167,13 +167,13 @@ public class JobSchedulerService : BackgroundService
     internal static string FireKey(DateTime slot) => slot.ToString("yyyyMMddHHmmss");
 
     /// <summary>
-    /// ★ CỬA CHẶN TRƯỚC REAP — thứ giết nốt phần "quét DB liên tục" còn lại.
+    /// ★ CỬA CHẶN TRƯỚC RECOVER — thứ giết nốt phần "quét DB liên tục" còn lại.
     ///
-    /// REAP chỉ có việc khi CÓ THỂ đang tồn tại một lượt chạy sống: lượt READY chưa ai nhặt, hoặc
+    /// RECOVER chỉ có việc khi CÓ THỂ đang tồn tại một lượt chạy sống: lượt READY chưa ai nhặt, hoặc
     /// lượt RUNNING của một pod đã chết. Cả hai chỉ sinh ra trong khung giờ của job, và chết hẳn
     /// sau `windowTo + maxDelay`. Ngoài khoảng đó **không có gì để thu hồi** — quét là quét không.
     ///
-    /// Job FO chạy 09:00–15:00 ⇒ REAP chỉ cần chạy ~09:00–15:10. 18 tiếng còn lại mỗi ngày, cộng
+    /// Job FO chạy 09:00–15:00 ⇒ RECOVER chỉ cần chạy ~09:00–15:10. 18 tiếng còn lại mỗi ngày, cộng
     /// toàn bộ T7/CN/lễ, bộ quét **không gửi một câu truy vấn nào**.
     /// Job KHÔNG khai khung giờ ⇒ luôn coi là mở (đúng: nó có thể chạy bất cứ lúc nào).
     /// </summary>
@@ -188,7 +188,7 @@ public class JobSchedulerService : BackgroundService
         return false;
     }
 
-    private async Task ReapAsync(CancellationToken ct)
+    private async Task RecoverAsync(CancellationToken ct)
     {
         // Không có khung nào đang mở ⇒ không thể có lượt chạy nào sống ⇒ khỏi hỏi DB.
         if (!AnyWindowOpen(TradingWindowGuard.NowVn())) return;
@@ -196,20 +196,20 @@ public class JobSchedulerService : BackgroundService
         try
         {
             // Vé: lấy hụt thì pod khác đang lo, bỏ qua nhịp này.
-            var got = await _redis.StringSetAsync(JobRedisKeys.ReapTicket, _owner,
-                JobRedisKeys.ReapTicketTtl, When.NotExists);
+            var got = await _redis.StringSetAsync(JobRedisKeys.RecoverTicket, _owner,
+                JobRedisKeys.RecoverTicketTtl, When.NotExists);
             if (!got) return;
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[JOB] Redis lỗi khi lấy vé REAP — chạy REAP luôn (idempotent)");
+            Log.Warning(ex, "[JOB] Redis lỗi khi lấy vé RECOVER — chạy RECOVER luôn (idempotent)");
         }
 
-        var revived = await _db.ReapAsync(staleSec: 30, ct);
+        var revived = await _db.RecoverAsync(staleSec: 30, ct);
         if (revived.Count > 0)
-            Log.Warning("[JOB] REAP: {N} lượt READY không ai chạy — produce lại", revived.Count);
+            Log.Warning("[JOB] RECOVER: {N} lượt READY không ai chạy — produce lại", revived.Count);
         foreach (var r in revived)
-            await NotifyAsync(r.JobRunId, r.JobCode, JobTopicKeys.SourceReap, ct);
+            await NotifyAsync(r.JobRunId, r.JobCode, JobTopicKeys.SourceRecover, ct);
     }
 
     private async Task RefreshConfigAsync(CancellationToken ct)
@@ -266,7 +266,7 @@ public class JobSchedulerService : BackgroundService
     /// thứ khác; chở bản chụp cấu hình trong message là mở đường cho một job vừa bị sửa/tắt vẫn
     /// chạy theo bản cũ đang nằm trong topic (Kafka có lưu, nên bản cũ đó sống rất dai).
     ///
-    /// Produce hụt KHÔNG phải thảm hoạ: dòng `T_JOB_RUN` đã `READY` và nhịp REAP sau sẽ produce lại.
+    /// Produce hụt KHÔNG phải thảm hoạ: dòng `T_JOB_RUN` đã `READY` và nhịp RECOVER sau sẽ produce lại.
     /// Vì thế chỉ log WARNING, không ném — ném là biến một sự cố tự hồi phục thành lượt chạy FAILED.
     /// </summary>
     private async Task NotifyAsync(long jobRunId, string jobCode, string src, CancellationToken ct)
@@ -283,7 +283,7 @@ public class JobSchedulerService : BackgroundService
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[JOB] Produce hụt cho runId={Id} — REAP sẽ produce lại", jobRunId);
+            Log.Warning(ex, "[JOB] Produce hụt cho runId={Id} — RECOVER sẽ produce lại", jobRunId);
         }
     }
 }
