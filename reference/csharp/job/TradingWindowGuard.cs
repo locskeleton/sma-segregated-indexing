@@ -16,8 +16,13 @@ public sealed class JobWindow
 {
     public bool      Enabled         { get; init; }
     public TimeSpan? From            { get; init; }   // null = mọi giờ
-    public TimeSpan? To              { get; init; }
+    public TimeSpan? To              { get; init; }   // MỐC CUỐI được SINH job (đóng: 15:00 hợp lệ)
     public bool      BusinessDayOnly { get; init; }
+    /// <summary>
+    /// Ân hạn sau <see cref="To"/> để chu kỳ sinh ĐÚNG mốc cuối được chạy cho xong.
+    /// = T_JOB_DEFINITION.C_TIMEOUT_SEC. KHÔNG phải "nới giờ giao dịch" — xem UDF_JOB_CAN_RUN.
+    /// </summary>
+    public int       GraceSec        { get; init; }
 }
 
 /// <summary>
@@ -70,8 +75,8 @@ public sealed class TradingWindowGuard
     public static DateTime NowVn() => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Vn);
 
     /// <summary>
-    /// Ném <see cref="TradingWindowClosedException"/> nếu ĐÃ ra ngoài khung. Gọi trước MỖI call FO.
-    /// Biên [from, to): 15:00:00 chẵn là đã đóng — "đến 3h chiều" nghĩa là phiên hết lúc 3h.
+    /// Ném <see cref="TradingWindowClosedException"/> nếu đã quá HẠN CHÓT CHẠY. Gọi trước MỖI call FO.
+    /// Hạn chót = To + GraceSec (không phải To) — xem chú thích trong thân hàm.
     /// </summary>
     public async Task EnsureOpenAsync(CancellationToken ct)
     {
@@ -83,11 +88,20 @@ public sealed class TradingWindowGuard
 
         if (w.From is { } from && w.To is { } to)
         {
+            // ★ HẠN CHÓT = to + ÂN HẠN, KHÔNG phải to.
+            //   Luật nghiệp vụ: 15:00 là mốc CUỐI CÙNG được gọi sang FO; chu kỳ nổ đúng 15:00 mà
+            //   chạy tới 15:07 là BÌNH THƯỜNG — 1000 batch không xong trong 0 giây. Cái bị cấm là
+            //   SINH thêm mốc mới sau khi hết phiên, và việc đó do UDF_JOB_IN_WINDOW gác ở tầng 1,
+            //   không phải ở đây. Cắt cứng tại 15:00:00 ở tầng này là giết chính ảnh chụp đóng cửa
+            //   mà mốc 15:00 sinh ra để lấy.
+            //   Ân hạn = C_TIMEOUT_SEC nên tầng 4 (C#) và UDF_JOB_CAN_RUN (SQL) dùng CÙNG một con
+            //   số — hai bên không thể lệch pha.
+            var hardStop = to + TimeSpan.FromSeconds(w.GraceSec);
             var tod = now.TimeOfDay;
-            if (tod < from || tod >= to)
+            if (tod < from || tod > hardStop)
                 throw new TradingWindowClosedException(
-                    $"Phiên đã đóng: {now:yyyy-MM-dd HH:mm:ss} (giờ VN), khung cho phép " +
-                    $"{from:hh\\:mm}–{to:hh\\:mm}. DỪNG gọi FO.");
+                    $"Ngoai han chay: {now:yyyy-MM-dd HH:mm:ss} (gio VN). Moc cuoi duoc sinh {to}, " +
+                    $"han chot chay {hardStop} (an han {w.GraceSec}s). DUNG goi FO.");
         }
 
         if (w.BusinessDayOnly)

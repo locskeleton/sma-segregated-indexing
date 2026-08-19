@@ -35,9 +35,11 @@ GO
 
   *** GUARD KHUNG GIỜ — 3 TẦNG, CỐ Ý TRÙNG NHAU ***
     Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE_DUE / SP_JOB_ENQUEUE không tạo lượt chạy ngoài khung.
-    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm tra LẠI tại thời điểm worker cầm job → ngoài khung
-                          thì đóng dấu SKIPPED, worker KHÔNG chạm FO. Bắt đúng ca "job sinh lúc
-                          14h59, pod nhặt lúc 15h02" (pod bận, pod restart, reaper đánh thức lại).
+                          Biên [09:00, 15:00] ĐÓNG HAI ĐẦU và kiểm trên MỐC SLOT ⇒ 15:00 là mốc
+                          cuối cùng được sinh; 15:15 thì không, phải đợi phiên GD kế tiếp.
+    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm tra LẠI bằng UDF_JOB_CAN_RUN (khung + ân hạn timeout)
+                          → quá hạn thì đóng dấu SKIPPED, worker KHÔNG chạm FO. Ân hạn là để chu
+                          kỳ sinh đúng 15:00 được chạy cho xong, KHÔNG phải để mở thêm giờ.
     Tầng 3 — GHI DỮ LIỆU: SP_INGEST_FO_SNAPSHOT_RT từ chối ngày không phải hôm nay / không phải
                           ngày GD. Đây là lưới cuối: kể cả ai đó gọi proc bằng tay.
     (Tầng 4 nằm ở C#: TradingWindowGuard kiểm TRƯỚC TỪNG HTTP call trong vòng lặp batch —
@@ -206,9 +208,55 @@ BEGIN
     IF @en IS NULL OR @en = 0 RETURN 0;                                   -- không tồn tại / đang tắt
     IF @bdo = 1 AND dbo.UDF_IS_BUSINESS_DATE(CAST(@p_at AS DATE)) = 0 RETURN 0;  -- T7/CN/lễ
     IF @wf IS NULL RETURN 1;                                              -- không khai khung ⇒ mọi giờ
-    -- Biên: [from, to) — 15:00:00 chẵn là ĐÃ NGOÀI khung. "Đến 3h chiều" nghĩa là phiên đã đóng
-    --   lúc 15:00, không phải "còn được gọi thêm một nhịp lúc 15:00".
-    IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) < @wt RETURN 1;
+    -- ★ Biên [from, to] ĐÓNG HAI ĐẦU: mốc 15:00 LÀ một mốc sinh job hợp lệ (ảnh chụp đóng cửa).
+    --   Khung 09:00–15:00 với chu kỳ 1 tiếng ⇒ 7 mốc: 9,10,11,12,13,14,15.
+    IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) <= @wt RETURN 1;
+    RETURN 0;
+END
+GO
+
+/*===========================================================================
+  UDF_JOB_CAN_RUN — "tại thời điểm @p_at, lượt chạy này còn được phép CHẠY (và gọi hệ ngoài) không?"
+
+  ★ KHÁC UDF_JOB_IN_WINDOW, và sự khác nhau đó là CỐ Ý — hai câu hỏi khác nhau:
+      UDF_JOB_IN_WINDOW : "có được SINH job tại mốc này không?"   → [from, to]
+      UDF_JOB_CAN_RUN   : "có được CHẠY tại lúc này không?"        → [from, to + timeout]
+
+  VÌ SAO PHẢI TÁCH: chu kỳ nổ đúng 15:00 thì KHÔNG THỂ xong trong 0 giây — 1000 batch mất vài
+    phút. Nếu tầng 2 (claim) và tầng 4 (gọi FO) cùng cắt cứng tại 15:00:00 thì mốc 15:00 vừa sinh
+    ra đã chết yểu: claim lúc 15:00:03 là trượt. Ảnh chụp đóng cửa sẽ KHÔNG BAO GIỜ có.
+
+  Luật nghiệp vụ (chốt với PM): "15:00 là mốc CUỐI CÙNG được gọi sang FO; chu kỳ đó hoàn thành sau
+    15:00 là bình thường. Điều bị cấm là SINH THÊM job mới sau khi hết phiên" — cấm đó do
+    UDF_JOB_IN_WINDOW gác, không phải hàm này.
+
+  Ân hạn = C_TIMEOUT_SEC, KHÔNG thêm tham số cấu hình mới: đó vốn là khoảng thời gian mà hệ đã
+    tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease). Quá mốc đó thì lease cũng
+    hết hạn và SP_JOB_REAP thu hồi — hai giới hạn trùng nhau, không thể lệch pha.
+===========================================================================*/
+CREATE OR ALTER FUNCTION UDF_JOB_CAN_RUN (@p_job_code VARCHAR(40), @p_at DATETIME)
+RETURNS BIT
+AS
+BEGIN
+    DECLARE @en BIT, @bdo BIT, @wf TIME(0), @wt TIME(0), @to INT;
+    SELECT @en=C_ENABLED, @bdo=C_BUSINESS_DAY_ONLY, @wf=C_WINDOW_FROM, @wt=C_WINDOW_TO,
+           @to=C_TIMEOUT_SEC
+    FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code;
+
+    IF @en IS NULL OR @en = 0 RETURN 0;
+    IF @bdo = 1 AND dbo.UDF_IS_BUSINESS_DATE(CAST(@p_at AS DATE)) = 0 RETURN 0;
+    IF @wf IS NULL RETURN 1;
+
+    -- Hạn chót = to + timeout, KẸP TRONG NGÀY. Không cho tràn sang 00:00 hôm sau: khung 23:30 với
+    --   timeout 14 phút mà cộng thẳng sẽ ra 23:44 (vẫn trong ngày, ok), nhưng khung 23:55 sẽ ra
+    --   00:09 hôm sau — cộng kiểu TIME sẽ QUẤN VÒNG và biến thành "được chạy từ 0h", tức là mở
+    --   toang cả đêm. Kẹp về 23:59:59 là hành vi đúng và dễ hiểu.
+    DECLARE @hardStop TIME(0) = CASE
+        WHEN DATEDIFF(SECOND, CAST('00:00:00' AS TIME(0)), @wt) + ISNULL(@to,300) >= 86399
+        THEN CAST('23:59:59' AS TIME(0))
+        ELSE DATEADD(SECOND, ISNULL(@to,300), @wt) END;
+
+    IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) <= @hardStop RETURN 1;
     RETURN 0;
 END
 GO
@@ -450,6 +498,14 @@ BEGIN
 
         -- Ứng viên: job định kỳ, đang bật, ĐANG trong khung giờ, và (nếu singleton) không có lượt đang chạy.
         DECLARE @due TABLE (job_code VARCHAR(40), fire_key VARCHAR(64), payload NVARCHAR(MAX), bdate DATE);
+        -- ★ KIỂM BIÊN TRÊN **MỐC SLOT**, KHÔNG PHẢI TRÊN THỜI ĐIỂM QUÉT.
+        --   Đây là chỗ cực dễ sai và sai thì không ai thấy: bộ quét chạy mỗi 10 giây nên nó gần
+        --   như không bao giờ chạy đúng 15:00:00.000 — nó chạy lúc 15:00:04. Kiểm khung trên
+        --   `now` với biên đóng `<= 15:00:00` thì 15:00:04 trượt ⇒ MỐC 15:00 KHÔNG BAO GIỜ SINH RA,
+        --   và người ta chỉ phát hiện khi thắc mắc vì sao ảnh chụp đóng cửa không có.
+        --   Kiểm trên mốc slot thì 15:00:04 → slot 15:00:00 → nằm trong khung ⇒ sinh đúng.
+        --   Đồng thời đúng luôn yêu cầu "không sinh job mới sau khi hết phiên": 15:15:04 → slot
+        --   15:15:00 > 15:00 ⇒ không sinh, phải đợi phiên GD kế tiếp.
         INSERT @due (job_code, fire_key, payload, bdate)
         SELECT d.C_JOB_CODE,
                -- fire_key = mốc slot 'yyyyMMddHHmmss' (style 112 = yyyymmdd, + HHmmss ghép tay).
@@ -467,7 +523,10 @@ BEGIN
         FROM T_JOB_DEFINITION d
         WHERE d.C_ENABLED = 1
           AND d.C_INTERVAL_SEC IS NOT NULL
-          AND dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) = 1        -- ★ GUARD TẦNG 1
+          -- ★ GUARD TẦNG 1 — áp lên MỐC SLOT (xem chú thích trên), không phải @now.
+          AND dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE,
+                DATEADD(SECOND, (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC,
+                        @midnight)) = 1
           AND ( d.C_SINGLETON = 0
              OR NOT EXISTS (SELECT 1 FROM T_JOB_RUN r
                             WHERE r.C_JOB_CODE = d.C_JOB_CODE
@@ -545,12 +604,16 @@ BEGIN
             SET @p_err_code=6; SET @p_err_msg=N'Lượt chạy đã vượt số lần thử → DEAD.'; RETURN;
         END
 
-        -- ★ GUARD TẦNG 2 — bắt ca job nằm chờ trong hàng đợi vắt qua 15h00.
-        IF dbo.UDF_JOB_IN_WINDOW(@code, @now) = 0
+        -- ★ GUARD TẦNG 2 — dùng UDF_JOB_CAN_RUN (khung + ÂN HẠN timeout), KHÔNG dùng
+        --   UDF_JOB_IN_WINDOW. Lượt sinh đúng mốc 15:00 phải claim được lúc 15:00:03; cắt cứng tại
+        --   15:00:00 là giết chính cái ảnh chụp đóng cửa mà mốc đó sinh ra để lấy.
+        --   Vẫn chặn: lượt của phiên HÔM QUA (sai ngày GD) và lượt vượt quá hạn chót.
+        IF dbo.UDF_JOB_CAN_RUN(@code, @now) = 0
         BEGIN
             UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
                    C_MESSAGE=CONCAT(N'BỎ QUA: tới lượt chạy lúc ', CONVERT(VARCHAR(19),@now,120),
-                                    N' (giờ VN) đã NGOÀI khung giờ cho phép của job ', @code, N'.')
+                                    N' (giờ VN) đã quá hạn chót chạy của job ', @code,
+                                    N' (khung + ân hạn timeout).')
             WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
             SET @p_err_code=3;
             SET @p_err_msg=N'Ngoài khung giờ tại thời điểm chạy — đã đóng dấu SKIPPED, KHÔNG gọi hệ ngoài.';
@@ -746,9 +809,10 @@ BEGIN
         WHERE r.C_STATUS='READY'
           AND r.C_RUN_AFTER <= @now
           AND DATEDIFF(SECOND, r.C_ENQUEUED_AT, @now) >= @p_stale_sec
-          -- Không đẩy lại job đã ra ngoài khung giờ: bước (2) hoặc lượt claim kế tiếp sẽ đóng dấu
-          --   SKIPPED. Đẩy lại chỉ tổ sinh vòng lặp vô nghĩa lúc 22h đêm.
-          AND dbo.UDF_JOB_IN_WINDOW(r.C_JOB_CODE, @now) = 1
+          -- Đẩy lại theo CAN_RUN (khung + ân hạn), không phải IN_WINDOW: lượt 15:00 mất message
+          --   phải được đánh thức lại lúc 15:00:35, nếu không thì mốc cuối phiên mất trắng mỗi khi
+          --   Kafka nấc một nhịp. Job đã quá hạn chót thì bước (2) đã đóng dấu SKIPPED rồi.
+          AND dbo.UDF_JOB_CAN_RUN(r.C_JOB_CODE, @now) = 1
         ORDER BY r.C_JOB_RUN_ID;
     END TRY
     BEGIN CATCH
@@ -805,7 +869,8 @@ BEGIN
                     ELSE 'INTERVAL' END AS C_SCHEDULE_MODE,
                COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) AS C_EFFECTIVE_MAX_DELAY_SEC,
                d.C_WINDOW_FROM, d.C_WINDOW_TO, d.C_BUSINESS_DAY_ONLY,
-               dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) AS C_IN_WINDOW_NOW,
+               dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) AS C_CAN_ENQUEUE_NOW,  -- còn được SINH job không
+               dbo.UDF_JOB_CAN_RUN  (d.C_JOB_CODE, @now) AS C_CAN_RUN_NOW,      -- còn được CHẠY không (có ân hạn)
                l.C_JOB_RUN_ID AS C_LAST_RUN_ID, l.C_STATUS AS C_LAST_STATUS,
                l.C_STARTED_AT AS C_LAST_STARTED_AT, l.C_ENDED_AT AS C_LAST_ENDED_AT,
                l.C_ROWS AS C_LAST_ROWS, l.C_MESSAGE AS C_LAST_MESSAGE,
@@ -1128,7 +1193,7 @@ BEGIN
                      THEN CAST((rt.C_AUM - pv.C_AUM_PREV_SAMESET) * 1.0 / pv.C_AUM_PREV_SAMESET AS DECIMAL(18,8))
                 END AS C_CHANGE_PCT,   -- ⚠️ biến động tài sản, CHƯA khử dòng tiền — KHÔNG phải hiệu suất
                 CASE WHEN rt.C_RT_SI_COUNT = rt.C_TOTAL_ACCOUNT THEN 'FULL' ELSE 'PARTIAL' END AS C_COVERAGE,
-                dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', @now) AS C_IN_TRADING_WINDOW
+                dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', @now) AS C_IN_TRADING_WINDOW
         FROM (SELECT DISTINCT C_MASTER_CODE FROM T_MASTER_BALANCE
               WHERE C_BUSINESS_DATE=@today AND C_SRC='RT') m
         INNER JOIN T_MASTER_BALANCE rt

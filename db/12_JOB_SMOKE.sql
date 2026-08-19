@@ -85,10 +85,10 @@ INSERT INTO @R SELECT 'A3 TẦNG 1: enqueue ngoài khung ⇒ err=3 + KHÔNG có 
   CONCAT('err=',@ec);
 
 -- A4. ★ NHIỀU POD KHÔNG XỬ LÝ TRÙNG (yêu cầu BRD #3) — hai pod tranh cùng 1 lượt
-EXEC SP_JOB_CLAIM @p_job_run_id=@id, @p_owner='pod-A', @p_source='notify',
+EXEC SP_JOB_CLAIM @p_job_run_id=@id, @p_owner='pod-A', @p_source='kafka',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 DECLARE @ecA INT = @ec;
-EXEC SP_JOB_CLAIM @p_job_run_id=@id, @p_owner='pod-B', @p_source='notify',
+EXEC SP_JOB_CLAIM @p_job_run_id=@id, @p_owner='pod-B', @p_source='kafka',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 INSERT INTO @R SELECT 'A4 ★ 2 pod claim cùng 1 lượt ⇒ ĐÚNG 1 thắng (A=0, B=5)',
   CASE WHEN @ecA=0 AND @ec=5 AND (SELECT C_OWNER FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id)='pod-A'
@@ -96,10 +96,10 @@ INSERT INTO @R SELECT 'A4 ★ 2 pod claim cùng 1 lượt ⇒ ĐÚNG 1 thắng (
 INSERT INTO @R SELECT 'A4 claim ⇒ RUNNING + attempt=1 + có lease',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='RUNNING'
                      AND C_ATTEMPT=1 AND C_LEASE_UNTIL IS NOT NULL) THEN 1 ELSE 0 END, NULL;
--- Nguồn đánh thức phải được ghi lại. Pub/Sub là bắn-rồi-quên: nếu chuông tắt hẳn thì hệ VẪN CHẠY
---   ĐÚNG nhờ reaper, chỉ chậm ~30s — và không ai nhận ra. Cột này là thứ duy nhất tố giác.
-INSERT INTO @R SELECT 'A4 ★ ghi lại NGUỒN đánh thức (notify/reap) — dấu hiệu chuông Pub/Sub còn sống',
-  CASE WHEN (SELECT C_CLAIM_SOURCE FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id)='notify' THEN 1 ELSE 0 END,
+-- Nguồn đánh thức phải được ghi lại. Kafka hỏng thì hệ VẪN CHẠY ĐÚNG nhờ reaper, chỉ chậm ~30s
+--   — và không ai nhận ra. Cột này là thứ duy nhất tố giác.
+INSERT INTO @R SELECT 'A4 ★ ghi lại NGUỒN đánh thức (kafka/reap) — soi được chuông có còn sống không',
+  CASE WHEN (SELECT C_CLAIM_SOURCE FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id)='kafka' THEN 1 ELSE 0 END,
   (SELECT C_CLAIM_SOURCE FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
 
 -- A5. Heartbeat có hàng rào chủ sở hữu (chống pod zombie ghi song song)
@@ -227,12 +227,33 @@ INSERT INTO @R SELECT 'A12 seed FO_SNAPSHOT_RT: 15 phút · 09:00–15:00 · ch�
 -- Biên khung giờ tính TAY (không phụ thuộc lúc chạy smoke): 08:59 ngoài · 09:00 trong · 14:59 trong · 15:00 NGOÀI
 DECLARE @gd DATE = @today;
 WHILE dbo.UDF_IS_BUSINESS_DATE(@gd)=0 SET @gd = DATEADD(DAY,1,@gd);   -- lấy 1 ngày GD bất kỳ để test biên
-INSERT INTO @R SELECT 'A12 ★ biên khung: 08:59 NGOÀI · 09:00 TRONG · 14:59 TRONG · 15:00 NGOÀI (đóng cửa là hết)',
+-- SINH job: biên [09:00, 15:00] ĐÓNG HAI ĐẦU ⇒ 15:00 là mốc CUỐI CÙNG hợp lệ (ảnh chụp đóng cửa).
+INSERT INTO @R SELECT 'A12 ★ SINH job: 08:59 NGOÀI · 09:00 TRONG · 15:00 TRONG (mốc cuối) · 15:01 NGOÀI',
   CASE WHEN dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE, 8*60+59, CAST(@gd AS DATETIME)))=0
         AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE, 9*60,    CAST(@gd AS DATETIME)))=1
-        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,14*60+59, CAST(@gd AS DATETIME)))=1
-        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=0
+        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=1
+        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+1,  CAST(@gd AS DATETIME)))=0
        THEN 1 ELSE 0 END, CONCAT('ngày GD dùng để test = ', CONVERT(VARCHAR(10),@gd,23));
+-- CHẠY: khung + ÂN HẠN = C_TIMEOUT_SEC (840s = 14 phút) ⇒ chu kỳ nổ 15:00 được chạy tới 15:14.
+--   Chỗ dễ hiểu sai nhất: cắt cứng tại 15:00 ở tầng 2/4 là giết chính mốc 15:00 vừa sinh ra.
+INSERT INTO @R SELECT 'A12 ★★ CHẠY (có ân hạn): 15:00 OK · 15:13 OK · 15:15 HẾT · 08:59 chưa tới',
+  CASE WHEN dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=1
+        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+13, CAST(@gd AS DATETIME)))=1
+        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+15, CAST(@gd AS DATETIME)))=0
+        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE, 8*60+59, CAST(@gd AS DATETIME)))=0
+       THEN 1 ELSE 0 END, NULL;
+-- Đếm ĐÚNG số mốc trong phiên — ví dụ nghiệp vụ đã chốt: khung 9h-15h, chu kỳ 1 tiếng ⇒ 7 mốc.
+DECLARE @n1h INT=0, @n15m INT=0, @sec INT;
+SET @sec = 9*3600;
+WHILE @sec <= 15*3600 BEGIN
+    IF dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(SECOND,@sec,CAST(@gd AS DATETIME)))=1 SET @n1h += 1;
+    SET @sec += 3600; END
+SET @sec = 9*3600;
+WHILE @sec <= 15*3600 BEGIN
+    IF dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(SECOND,@sec,CAST(@gd AS DATETIME)))=1 SET @n15m += 1;
+    SET @sec += 900; END
+INSERT INTO @R SELECT 'A12 ★ khung 09:00-15:00: chu kỳ 1 tiếng ⇒ 7 mốc · chu kỳ 15 phút ⇒ 25 mốc',
+  CASE WHEN @n1h=7 AND @n15m=25 THEN 1 ELSE 0 END, CONCAT('1h=',@n1h,' 15m=',@n15m);
 -- Ngày NGHỈ: đúng 10h sáng nhưng là Chủ nhật ⇒ vẫn 0
 DECLARE @sun DATE = @today;
 WHILE DATEPART(WEEKDAY, @sun) <> 1 SET @sun = DATEADD(DAY,1,@sun);   -- (DATEFIRST mặc định 7 ⇒ 1 = Chủ nhật)

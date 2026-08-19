@@ -1,40 +1,43 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Serilog;
-using StackExchange.Redis;
 
 namespace SdiCoreMessagingProcess.Jobs;
 
 /// <summary>
-/// WORKER — chạy trên MỌI pod. Nằm nghe kênh Pub/Sub, có thông báo là chạy ngay (yêu cầu BRD #2:
-/// "cứ có job đẩy vào là thực hiện xử lý"). ĐẨY THẬT: không hỏi thăm Redis, không polling DB.
+/// WORKER — chạy trên MỌI pod. Consumer Kafka của topic `sdi.job.notify`.
 ///
-/// ★ VÌ SAO KHÔNG BỊ XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3):
-///   Pub/Sub phát cho MỌI pod ⇒ cả 10 pod cùng nhận một `jobRunId`. Điều đó KHÔNG sao, vì chốt
-///   chặn không nằm ở khâu giao tin: `SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`,
-///   đúng MỘT pod đổi được trạng thái, 9 pod còn lại nhận `err=5` và đi tiếp.
-///   ⇒ Ở đây "ai nhận được tin" là chuyện vô thưởng vô phạt; "ai được chạy" mới là chuyện của DB.
-///   Lớp thứ hai: heartbeat có kiểm chủ sở hữu — pod treo lâu, lease bị thu hồi, pod cũ tỉnh dậy
-///   nhận `still_mine=false` rồi tự dừng. Không có cửa cho hai pod cùng ghi.
+/// ★★ LUẬT SỐ MỘT: VÒNG POLL KHÔNG BAO GIỜ ĐƯỢC CHẶN.
+///   Trình tự: `Consume` → commit offset → `SP_JOB_CLAIM` → ném job sang Task nền → quay lại
+///   `Consume`. Chu kỳ FO chạy vài phút nằm HOÀN TOÀN ngoài vòng poll.
+///   Chạy job trong vòng poll = vượt `max.poll.interval.ms` = Kafka đá pod khỏi group, NHƯNG
+///   không giết thread ⇒ pod cũ thành zombie vẫn ghi DB trong khi pod mới xử lý lại cùng message.
+///   `docs/SDI-kafka-batch-sync-design.md` §6 đã ghi lại đúng vòng xoáy đó.
 ///
-/// ★ HẠN MỨC JOB ĐỒNG THỜI (`MaxConcurrentJobs`): pod đang chạy đủ job rồi thì **không claim nữa**,
-///   nhường pod rảnh. Đây vừa là cách chia tải tự nhiên (thay cho consumer group của Streams),
-///   vừa là cách chặn một pod ôm hết việc rồi nghẽn. Nếu MỌI pod đều bận thì không ai claim —
-///   dòng vẫn nằm `READY` và `SP_JOB_REAP` phát lại sau ≤30 giây. Không mất việc.
+/// ★ COMMIT TRƯỚC KHI CHẠY — CỐ Ý, dù nghe ngược tai.
+///   Message KHÔNG phải sổ cái; `T_JOB_RUN` mới là. Pod chết sau khi commit mà chưa chạy xong ⇒
+///   lease hết hạn ⇒ `SP_JOB_REAP` thu hồi ⇒ chạy lại. Còn commit SAU khi job xong thì vòng poll
+///   phải chờ vài phút — đúng cái bẫy ở trên. Đổi một lưới cứu đã có lấy một cái bẫy đã biết là
+///   một vụ đổi tồi.
 ///
-/// ★ HÀM CALLBACK CỦA PUB/SUB KHÔNG ĐƯỢC CHẶN. `OnMessage` xử lý tuần tự theo kênh: nếu chạy job
-///   ngay trong callback thì một job dài 5 phút sẽ khoá luôn việc nhận thông báo tiếp theo của
-///   pod đó. Nên callback chỉ đọc id rồi ném sang một Task nền có hạn mức, và trả về ngay.
+/// ★ VÌ SAO KHÔNG XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3) — hai lớp:
+///   1. Kafka consumer group: mỗi partition giao cho một consumer. Đủ cho đường chạy bình thường.
+///   2. `SP_JOB_CLAIM` (`UPDATE ... WHERE C_STATUS='READY'`) — **chốt thật**. Rebalance giao lại,
+///      pod zombie, reaper phát trùng: đúng một pod đổi được trạng thái, còn lại nhận `err=5`.
+///   Lớp phụ: heartbeat kiểm chủ sở hữu ⇒ pod mất lease tự dừng, không ghi song song.
 ///
-/// ★ MẤT THÔNG BÁO: Pub/Sub bắn-rồi-quên — mất kết nối, pod đang restart, Redis chết ⇒ tin bay mất.
-///   `SP_JOB_REAP` là ĐƯỜNG HỒI PHỤC CHÍNH (không phải dự phòng). Xem JobChannelKeys.
+/// ★ HẠN MỨC JOB ĐỒNG THỜI: pod đang chạy đủ job thì **không claim**, nhường pod rảnh. Mọi pod
+///   đều bận ⇒ không ai claim ⇒ dòng vẫn `READY` ⇒ `SP_JOB_REAP` phát lại sau ≤30 giây.
 /// </summary>
 public class JobDispatcherService : BackgroundService
 {
     /// <summary>Số job một pod chạy đồng thời. Job FO là singleton nên thực tế hiếm khi chạm trần.</summary>
     private const int MaxConcurrentJobs = 4;
+
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
 
     // Nhịp tim: KHÔNG để cứng. Phải nhỏ hơn hẳn lease (DB chậm một nhịp không được làm mất job vào
     //   tay pod khác), nhưng cũng chính là độ trễ phát hiện "job vừa bị TẮT" / "mình vừa mất quyền".
@@ -44,54 +47,86 @@ public class JobDispatcherService : BackgroundService
     // Chặn tần suất cho lời gọi ÉP nhịp tim từ handler (ctx.HeartbeatAsync).
     private static readonly TimeSpan HeartbeatFloor = TimeSpan.FromSeconds(5);
 
-    private readonly ISubscriber    _sub;
+    private readonly ConsumerConfig _cfg;
     private readonly ISdiJobGateway _db;
     private readonly IJobRegistry   _registry;
     private readonly string         _owner;   // định danh pod: hostname + pid
     private readonly SemaphoreSlim  _slots = new(MaxConcurrentJobs, MaxConcurrentJobs);
 
-    public JobDispatcherService(ISubscriber sub, ISdiJobGateway db, IJobRegistry registry)
+    public JobDispatcherService(ConsumerConfig cfg, ISdiJobGateway db, IJobRegistry registry)
     {
-        _sub      = sub;
+        _cfg = cfg;
+        // Ba dòng dưới KHÔNG được đổi — xem JobTopicKeys.
+        _cfg.GroupId          = JobTopicKeys.Group;
+        _cfg.EnableAutoCommit = false;                    // commit TAY, ngay sau khi nhận
+        _cfg.AutoOffsetReset  = AutoOffsetReset.Latest;   // group mới KHÔNG dội lại cả topic
+
         _db       = db;
         _registry = registry;
         _owner    = $"{Environment.MachineName}#{Environment.ProcessId}";
     }
 
-    protected override async Task ExecuteAsync(CancellationToken ct)
+    protected override Task ExecuteAsync(CancellationToken ct)
+        // Vòng consume là công việc CHẶN của thư viện Kafka ⇒ chạy trên thread riêng, đừng chiếm
+        //   thread pool của host.
+        => Task.Factory.StartNew(() => ConsumeLoop(ct), ct,
+               TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+    private void ConsumeLoop(CancellationToken ct)
     {
-        // SubscribeAsync trả về hàng đợi tin của kênh. SE.Redis tự đăng ký lại sau khi mất kết nối —
-        //   nhưng tin phát ra TRONG lúc mất kết nối thì mất luôn; SP_JOB_REAP lo phần đó.
-        var queue = await _sub.SubscribeAsync(JobChannelKeys.NotifyChannel);
+        using var consumer = new ConsumerBuilder<string, string>(_cfg)
+            .SetErrorHandler((_, e) => Log.Error("[JOB] Kafka lỗi: {Reason} (fatal={F})", e.Reason, e.IsFatal))
+            .SetPartitionsAssignedHandler((_, parts) =>
+                Log.Information("[JOB] Nhận {N} partition sau rebalance", parts.Count))
+            .Build();
 
-        queue.OnMessage(msg =>
+        consumer.Subscribe(JobTopicKeys.Topic);
+        Log.Information("[JOB] Dispatcher nghe topic {T}, group {G}, owner={Owner}, trần {N} job đồng thời",
+            JobTopicKeys.Topic, JobTopicKeys.Group, _owner, MaxConcurrentJobs);
+
+        while (!ct.IsCancellationRequested)
         {
-            if (!long.TryParse(msg.Message, out var jobRunId)) return;
-
-            // KHÔNG chạy job trong callback (xem chú thích đầu lớp). Thử lấy một suất; hết suất thì
-            //   bỏ qua — pod khác nhận, hoặc reaper phát lại. Bỏ qua ở đây RẺ hơn nhiều so với claim
-            //   rồi mới phát hiện mình không có chỗ chạy.
-            if (!_slots.Wait(0))
+            try
             {
-                Log.Debug("[JOB] Pod đang chạy đủ {N} job — bỏ qua thông báo runId={Id}", MaxConcurrentJobs, jobRunId);
-                return;
+                var cr = consumer.Consume(ct);
+                if (cr?.Message == null) continue;
+
+                // ★ COMMIT NGAY. Vòng poll phải luôn rảnh (xem chú thích đầu lớp).
+                consumer.Commit(cr);
+
+                if (!long.TryParse(cr.Message.Value, out var jobRunId))
+                {
+                    Log.Warning("[JOB] Message không đọc được jobRunId: {V}", cr.Message.Value);
+                    continue;
+                }
+
+                // Hết suất thì bỏ qua — pod khác nhận, hoặc reaper phát lại sau ≤30s. Bỏ qua ở đây
+                //   RẺ hơn claim rồi mới phát hiện mình không có chỗ chạy.
+                if (!_slots.Wait(0))
+                {
+                    Log.Debug("[JOB] Pod đang chạy đủ {N} job — bỏ qua runId={Id}", MaxConcurrentJobs, jobRunId);
+                    continue;
+                }
+
+                _ = Task.Run(async () =>
+                {
+                    try { await RunOneAsync(jobRunId, JobTopicKeys.SourceKafka, ct); }
+                    catch (Exception ex) { Log.Error(ex, "[JOB] runId={Id} lỗi ngoài dự kiến", jobRunId); }
+                    finally { _slots.Release(); }
+                }, ct);
             }
-
-            _ = Task.Run(async () =>
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
             {
-                try { await RunOneAsync(jobRunId, JobChannelKeys.SourceNotify, ct); }
-                catch (Exception ex) { Log.Error(ex, "[JOB] runId={Id} lỗi ngoài dự kiến", jobRunId); }
-                finally { _slots.Release(); }
-            }, ct);
-        });
+                // Gồm cả CommitFailed khi pod vừa bị đá khỏi group. KHÔNG được thoát vòng lặp:
+                //   thoát nghĩa là pod này vĩnh viễn không chạy job nào nữa tới lần deploy sau, và
+                //   không ai nhận ra vì các pod khác vẫn chạy bình thường.
+                Log.Error(ex, "[JOB] Vòng consume lỗi — thử lại sau {S}s", RetryDelay.TotalSeconds);
+                try { Task.Delay(RetryDelay, ct).Wait(ct); } catch { break; }
+            }
+        }
 
-        Log.Information("[JOB] Dispatcher đang nghe kênh {Ch}, owner={Owner}, trần {N} job đồng thời",
-            JobChannelKeys.Notify, _owner, MaxConcurrentJobs);
-
-        // Không có vòng lặp hỏi thăm nào. Chỉ nằm chờ tới khi pod dừng.
-        try { await Task.Delay(Timeout.Infinite, ct); }
-        catch (OperationCanceledException) { }
-        finally { await _sub.UnsubscribeAsync(JobChannelKeys.NotifyChannel); }
+        try { consumer.Close(); } catch { }
     }
 
     private async Task RunOneAsync(long jobRunId, string source, CancellationToken ct)
@@ -100,8 +135,8 @@ public class JobDispatcherService : BackgroundService
         var claim = await _db.ClaimAsync(jobRunId, _owner, source, ct);
         if (claim.Err != 0)
         {
-            // err=3 (ngoài khung giờ / quá hạn → SKIPPED) · 5 (pod khác giữ) · 6 (DEAD) đều là kết
-            //   cục HỢP LỆ. err=5 là chuyện THƯỜNG NGÀY với Pub/Sub: 10 pod nhận tin, 9 pod trượt.
+            // err=3 (quá hạn chót / sai ngày GD → SKIPPED) · 5 (pod khác giữ) · 6 (DEAD) đều là
+            //   kết cục HỢP LỆ, không phải sự cố.
             if (claim.Err == 3)
                 Log.Warning("[JOB] runId={Id} BỎ QUA: {Msg}", jobRunId, claim.Msg);
             else

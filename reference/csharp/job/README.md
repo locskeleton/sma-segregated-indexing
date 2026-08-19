@@ -7,17 +7,19 @@
 | File | Vai trò |
 |---|---|
 | `JobContracts.cs` | `IJobHandler` · `JobContext` · `JobRegistry` · `ISdiJobGateway` (map 1-1 sang SP) |
-| `JobChannelKeys.cs` | Kênh Redis Pub/Sub (chuông cửa) + hằng số nguồn đánh thức |
+| `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
 | `JobSchedulerService.cs` | Quét lịch (10s) · REAP (30s) — chạy trên **mọi** pod |
-| `JobDispatcherService.cs` | Worker: nghe kênh → `SP_JOB_CLAIM` → chạy handler → `SP_JOB_COMPLETE` |
+| `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
 
 ## Đăng ký DI
 
 ```csharp
-services.AddSingleton<ISubscriber>(sp =>                          // Pub/Sub: kết nối subscriber riêng
-    sp.GetRequiredService<IConnectionMultiplexer>().GetSubscriber());
+services.AddSingleton(new ConsumerConfig { BootstrapServers = cfg["Kafka:Brokers"] });
+services.AddSingleton<IProducer<string, string>>(_ =>
+    new ProducerBuilder<string, string>(
+        new ProducerConfig { BootstrapServers = cfg["Kafka:Brokers"], Acks = Acks.All }).Build());
 services.AddSingleton<ISdiJobGateway, SdiJobGateway>();          // tự cài bằng Dapper/ADO
 services.AddSingleton<IJobRegistry, JobRegistry>();
 services.AddSingleton<IJobHandler, FoSnapshotJobHandler>();      // thêm job mới = thêm 1 dòng ở đây
@@ -72,33 +74,37 @@ Log.Information("[JOB] Đổi lịch: {Msg} (dọn {N} lượt chờ của cấu
 var (id, err) = await _db.EnqueueAsync("CLEANUP_TMP", fireKey: requestId, payload: null,
                                        businessDate: null, user: "api", ct);
 if (err == 0)
-    await _sub.PublishAsync(JobChannelKeys.NotifyChannel, id);
+    await _producer.ProduceAsync(JobTopicKeys.Topic,
+        new Message<string, string> { Key = JobTopicKeys.KeyOf(id), Value = id.ToString() });
 // err == 4 ⇒ requestId này đã đẩy rồi, KHÔNG tạo trùng. Không phải lỗi, không cần retry.
 ```
 
-Worker đang nằm nghe kênh → nhận trong khoảng **một mili-giây** (đẩy thật, không hỏi thăm).
-`PublishAsync` trả về **số pod đã nhận**; bằng 0 nghĩa là không ai đang nghe — hãy log lại, đó là
-cách duy nhất phân biệt "Redis ổn nhưng subscriber chết" với "Redis chết".
+Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất job: dòng `T_JOB_RUN` vẫn
+`READY` và `SP_JOB_REAP` produce lại sau ≤30 giây.
 
 ---
 
 ## Ba câu hỏi sẽ bị hỏi khi review
 
-### 1. "Pub/Sub phát cho MỌI pod thì chẳng phải job chạy 10 lần à?"
+### 1. "Kafka consumer group đã chống trùng rồi, sao còn `SP_JOB_CLAIM`?"
 
-Không. Pub/Sub chỉ quyết **ai nghe được tin**, không quyết **ai được chạy**. Cả 10 pod cùng lao vào `SP_JOB_CLAIM` — một `UPDATE ... WHERE C_STATUS='READY'` — đúng một pod đổi được trạng thái, 9 pod nhận `err=5` rồi đi tiếp. Chốt chặn nằm ở nơi mọi pod nhìn thấy cùng một sự thật, không nằm ở tầng giao tin.
+Consumer group hứa *mỗi partition giao cho một consumer*, **không** hứa *mỗi message xử lý đúng một lần*. Ba đường làm nó giao lại cùng một `jobRunId`: rebalance khi pod vào/ra group; pod vượt `max.poll.interval` bị đá nhưng **thread vẫn chạy** (zombie); và `SP_JOB_REAP` produce lại.
 
-Giá phải trả: ~9 lượt claim hụt cho mỗi job. Ở 24 lượt/ngày là ~240 truy vấn/ngày — không đáng kể. `JobDispatcherService` còn chặn bớt bằng hạn mức job đồng thời: pod đang bận thì **không thèm claim**, nhường pod rảnh (đây cũng chính là cách chia tải thay cho consumer group của Streams).
+`SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`. Ai đổi được trạng thái người đó chạy — thứ **không thể có hai người thắng**, và nó nằm ở nơi mọi pod nhìn thấy cùng một sự thật.
 
-### 2. "Pub/Sub bắn-rồi-quên thì mất tin là mất job?"
+### 2. "Chạy job trong consumer có sao không?"
 
-Mất *tin*, không mất *job*. Dòng `T_JOB_RUN` vẫn ở đó với trạng thái `READY`. `SP_JOB_REAP` quét đúng những dòng đó (READY, tới hạn, nằm quá `stale_sec` giây) và **phát lại**.
+**Có, và đây là cái bẫy nguy hiểm nhất của cả thiết kế.** Chu kỳ FO chạy vài phút, `max.poll.interval.ms` mặc định 5 phút. Chạy job trong vòng poll ⇒ Kafka đá pod khỏi group ⇒ nhưng **không giết thread** ⇒ pod cũ thành zombie vẫn ghi DB trong khi pod mới xử lý lại cùng message. `docs/SDI-kafka-batch-sync-design.md` §6 đã ghi lại đúng vòng xoáy này.
 
-⇒ Hậu quả tối đa của việc Redis chết hẳn: **chậm một nhịp reaper (30 giây)**. Không dòng nào mất, không dòng nào chạy hai lần.
+⇒ `Consume` → **commit offset ngay** → claim → ném job sang Task nền → quay lại `Consume`. Vòng poll luôn rảnh.
 
-Đây là lý do `NotifyAsync` chỉ log WARNING khi publish hụt thay vì ném — ném ở đó là biến một sự cố tự hồi phục thành một lượt chạy FAILED.
+Commit *trước* khi chạy nghe ngược tai, nhưng message không phải sổ cái — `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ reaper thu hồi ⇒ chạy lại.
 
-⚠️ **Cái bẫy vận hành:** chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây — và không ai nhận ra. Vì thế mỗi lượt chạy ghi `C_CLAIM_SOURCE` ('notify' | 'reap'), và `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D`. Con số đó xấp xỉ tổng số lượt ⇒ Pub/Sub đã chết từ lâu.
+### 3. "Broker chết thì mất job?"
+
+Không. Dòng `T_JOB_RUN` vẫn `READY`; `SP_JOB_REAP` produce lại sau ≤30 giây. Kafka có lưu nên hầu hết trục trặc kết nối tự khỏi mà không cần tới reaper — nó là **lưới an toàn**, không phải đường chính.
+
+⚠️ **Cái bẫy vận hành:** chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây — và không ai nhận ra. Vì thế mỗi lượt chạy ghi `C_CLAIM_SOURCE` ('kafka' | 'reap'), và `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D`. Con số đó xấp xỉ tổng số lượt ⇒ Kafka đã chết từ lâu.
 
 ### 3. "Guard khung giờ 4 tầng có thừa không?"
 
@@ -122,12 +128,12 @@ Luật giờ chỉ được định nghĩa **một chỗ**: `UDF_JOB_IN_WINDOW` 
 | Đổi chu kỳ 15' → 1 tiếng | `SP_SET_JOB_SCHEDULE` dọn lượt `READY` cũ **rồi** ghi cấu hình mới (một giao dịch) | ❌ | ❌ |
 | Có người `UPDATE` thẳng bảng cấu hình | Trigger `TR_JOB_DEFINITION_PURGE_PENDING` dọn thay | ❌ | ❌ |
 | Đổi cột không liên quan lịch (timeout/retry) | Trigger **không** động vào hàng đợi | ❌ | ❌ |
-| Pod mới init / pod restart | Consumer group tạo ở `$`; entry treo của pod chết → `XAUTOCLAIM`; dòng `READY` mất message → `SP_JOB_REAP` | ❌ | ❌ |
-| Redis `FLUSHALL` | `SP_JOB_REAP` đẩy lại trong ≤30s | ❌ | ❌ |
+| Pod mới init / pod restart | Đọc tiếp từ offset đã commit (`auto.offset.reset=latest`); dòng `READY` chưa ai chạy → `SP_JOB_REAP` | ❌ | ❌ |
+| Broker Kafka chết / topic bị xoá | `SP_JOB_REAP` produce lại trong ≤30s | ❌ | ❌ |
 | Dừng dịch vụ nửa ngày rồi bật lại | Scheduler **chỉ** sinh slot HIỆN TẠI — không dồn slot đã lỡ | ❌ | ❌ |
 | Lượt 14:59 không kịp chạy, sang hôm sau | `C_MAX_DELAY_SEC` → `SKIPPED`. **Không** chạy lại việc của hôm qua | ❌ | ❌ |
 | Xoá chu kỳ (`clearInterval`) | Ngừng sinh + dọn lượt chờ; job về chế độ `ON_DEMAND` | ❌ | ❌ |
 | Chưa từng cấu hình chu kỳ | `ON_DEMAND` — chỉ chạy khi có người đẩy. `SP_GET_JOB_STATUS` hiện rõ chế độ | ❌ | ❌ |
 | Tắt job giữa lúc đang chạy | Heartbeat trả `still_mine=false` → worker dừng trong ~20s | ❌ | ❌ |
 
-Toàn bộ bảng này có ca kiểm chứng trong `db/12_JOB_SMOKE.sql` khối **(C)** — trừ ba dòng có chữ *Redis*, vốn cần một cụm Redis thật để chạy (phần DB của chúng đã được kiểm).
+Toàn bộ bảng này có ca kiểm chứng trong `db/12_JOB_SMOKE.sql` khối **(C)** — trừ mấy dòng liên quan tới *broker/rebalance*, vốn cần một cụm Kafka thật để chạy (phần DB của chúng đã được kiểm).

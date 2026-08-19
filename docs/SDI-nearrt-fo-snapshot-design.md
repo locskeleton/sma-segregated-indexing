@@ -10,8 +10,8 @@
 
 ## 0. Ba nguyên tắc — kế thừa từ [thiết kế Kafka batch sync](SDI-kafka-batch-sync-design.md)
 
-> ### ① Redis lo TỐC ĐỘ. DB lo TÍNH ĐÚNG.
-> Redis Pub/Sub chỉ là **chuông cửa**, không phải sổ cái. Mất sạch Redis chỉ được phép làm **chậm** (≤30 giây), không được phép làm **mất job** hay **chạy hai lần**.
+> ### ① TẦNG NHẮN TIN lo TỐC ĐỘ. DB lo TÍNH ĐÚNG.
+> Kafka chỉ là **chuông cửa**, không phải sổ cái. Broker chết chỉ được phép làm **chậm** (≤30 giây, nhờ `SP_JOB_REAP`), không được phép làm **mất job** hay **chạy hai lần**.
 >
 > ### ② Chống trùng phải là RÀNG BUỘC DỮ LIỆU, không phải một lời hứa của middleware.
 > "Consumer group giao mỗi message cho một consumer" là đúng — nhưng nó không hứa *xử lý đúng một lần*.
@@ -41,9 +41,9 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
                       │                 hoặc SP_JOB_ENQUEUE (ai cũng đẩy được)
                       ▼
    T_JOB_RUN  ──── READY ──┐
-                      ▲    │  PUBLISH {jobRunId} → kênh Redis
+                      ▲    │  produce {jobRunId} → topic sdi.job.notify
                       │    ▼
-                      │  worker SUBSCRIBE   ──►  SP_JOB_CLAIM  ──► RUNNING ──► DONE
+                      │  consumer (commit ngay) ─► SP_JOB_CLAIM ─► RUNNING ─► DONE
                       │                              │ err=5 (pod khác giữ) → XACK, bỏ qua
                       │                              │ err=3 (ngoài giờ)    → SKIPPED
                       │                              │ err=6 (hết lượt thử) → DEAD
@@ -56,70 +56,110 @@ Thêm loại job thứ hai (dọn dẹp, tính lại index, đẩy báo cáo…)
 
 ---
 
-## 2b. Vì sao Pub/Sub — và vì sao đã bỏ Redis Streams
+## 2b. Vì sao Kafka — và cái bẫy phải né khi dùng nó
 
-> **Lịch sử:** bản đầu dùng Redis Streams + consumer group. Chuyển sang Pub/Sub ngày 2026-08-19 sau khi ngồi đo lại tải và bộ nhớ. Mục này giữ cả lập luận cũ để người sau không phải lần lại từ đầu.
+> **Lịch sử:** Redis Streams (bản đầu) → Redis Pub/Sub → **Kafka** (chốt 2026-08-19). Mục này giữ cả ba lập luận để người sau không phải lần lại từ đầu.
 
-### Redis giữ vai trò gì
+### Vì sao đổi
 
-**Chuông cửa. Hết.** Nó không giữ một mảnh tính đúng nào:
+Hệ **đã có sẵn Kafka** để xử lý event: consumer pattern, monitoring, alerting, người trực đã quen. Dựng thêm một tầng nhắn tin thứ hai bằng Redis là bắt cả tổ chức nuôi hai thứ làm cùng một việc. Đổi sang Kafka là **bớt đi** một công nghệ, không phải đổi ngang.
 
-| Câu hỏi | Ai trả lời |
-|---|---|
-| "Job này đã được xếp lịch chưa?" | `UQ_JOB_RUN_NK (job_code, fire_key)` |
-| "Ai được chạy lượt này?" | `SP_JOB_CLAIM` — `UPDATE ... WHERE C_STATUS='READY'` |
-| "Lượt này còn hiệu lực không?" | `C_MAX_DELAY_SEC` + `UDF_JOB_IN_WINDOW` |
-| "Pod này còn là chủ không?" | lease + `C_OWNER` trong `SP_JOB_HEARTBEAT` |
-| **"Có việc mới — dậy đi!"** | **Redis Pub/Sub** |
+Và Kafka còn tốt hơn Pub/Sub ở đúng chỗ quan trọng: **nó bền**.
 
-Redis chết hẳn thì hệ **chậm đi ≤30 giây**, không sai đi. Đó là điều kiện để nguyên tắc ① đứng vững.
-
-### Bốn phương án, và cái giá thật của từng cái
-
-| | Tải lúc rỗi (10 pod) | Bộ nhớ Redis | Cứu message đang bay | Đẩy thật? |
-|---|---|---|---|---|
-| **Pub/Sub** *(đang dùng)* | **0** | **0** | ❌ *(nhưng `SP_JOB_REAP` lo)* | ✅ ~1ms |
-| Redis Streams | 20 lệnh/giây | ~5 MB + phải dọn consumer | ✅ PEL + `XAUTOCLAIM` | ❌ ≤500ms |
-| Redis List (`BLPOP`) | phải hỏi thăm | độ dài list | ❌ pop xong chết = mất hẳn | ❌ |
-| DB polling thuần | 0 trên Redis, **10 query/giây trên SQL Server** | 0 | ✅ DB là sổ cái | ❌ |
-
-### Vì sao Streams thua, dù nó "nhiều tính năng hơn"
-
-Thứ **duy nhất** Streams cho thêm là khả năng cứu message đã giao cho một pod rồi pod đó chết (PEL + `XAUTOCLAIM`).
-
-Nhưng ở kiến trúc này **`SP_JOB_REAP` đã làm đúng việc đó rồi** — và làm tốt hơn, vì nó dựng lại từ `T_JOB_RUN` (sổ cái thật) chứ không từ một bản sao trong Redis. Nghĩa là toàn bộ bộ máy consumer group / PEL / `XAUTOCLAIM` / dọn consumer chết chỉ **trùng lặp với lưới an toàn sẵn có** — trả tiền hai lần cho cùng một sự bảo đảm.
-
-Cộng thêm một sự thật về thư viện: **`StackExchange.Redis` không hỗ trợ lệnh chặn** (nó ghép nhiều lệnh trên một kết nối dùng chung, một lệnh chặn sẽ treo cả kết nối). Nên Streams **buộc phải hỏi thăm 500ms/lần** — cái "đẩy tức thì" mà người ta hình dung khi nghe "consumer group" không hề tồn tại ở đây. Còn Pub/Sub thì `Subscribe` chạy trên **kết nối subscriber riêng**, callback được gọi về — đẩy thật.
-
-Kết quả của việc đổi:
-
-| | Streams | Pub/Sub |
+| | Redis Pub/Sub | **Kafka** |
 |---|---|---|
-| Độ trễ đánh thức | ≤500ms (hỏi thăm) | **~1ms** |
-| Tải Redis lúc rỗi, 10 pod | 20 lệnh/giây | **0** |
-| Bộ nhớ Redis | ~5 MB, phải dọn consumer 1h/lần | **0** |
-| Code phải nuôi | group, `XACK`, PEL, `XAUTOCLAIM`, dọn consumer chết | `Subscribe` + `Publish` |
-| Rủi ro phình bộ nhớ | consumer tích luỹ theo mỗi lần pod restart | **không có** |
-| Tính đúng | *(không nằm ở Redis)* | **y hệt** |
+| Message sống qua restart pod | ❌ mất | ✅ đọc tiếp từ offset |
+| Message sống qua sự cố broker | ❌ mất | ✅ có lưu |
+| `SP_JOB_REAP` đóng vai gì | **đường hồi phục chính** | **lưới an toàn** (đúng vai) |
+| Chia việc nhiều pod | phát cho tất cả, N−1 claim hụt | consumer group, mỗi partition một consumer |
+| Đã có trong hệ | ❌ phải dựng thêm | ✅ |
 
-~150 dòng code biến mất, và **không mất một mảnh tính đúng nào** — vì nó vốn không nằm ở Redis.
+### Redis còn vai trò gì? — Không còn
 
-### Cái giá của Pub/Sub — nói cho đủ
+"Quét job" thực chất là `SP_JOB_ENQUEUE_DUE` — **một câu query DB chạy trên timer trong pod**. Chống trùng khi 10 pod cùng quét là `UQ (job_code, fire_key)` ở tầng dữ liệu, không phải lock. Redis không đóng góp vào bước nào:
 
-**① Phát cho MỌI pod.** Cả 10 pod cùng lao vào `SP_JOB_CLAIM`, 9 pod nhận `err=5`. Ở 24 lượt job/ngày là ~240 truy vấn/ngày — không đáng kể. `JobDispatcherService` còn chặn bớt bằng **hạn mức job đồng thời**: pod đang bận thì không thèm claim, nhường pod rảnh (đây cũng là cách chia tải thay cho consumer group). Nếu sau này có luồng fan-out (24.000 lượt/ngày × 10 pod = ~3 claim/giây) thì vẫn thừa sức, nhưng lúc đó nên đo lại.
+```
+Timer 10s trong pod
+   ↓
+EXEC SP_JOB_ENQUEUE_DUE          ← query DB thuần
+   ↓  (UQ job_code+fire_key chọn đúng 1 pod thắng)
+produce Kafka {jobRunId}
+   ↓
+consumer → SP_JOB_CLAIM → chạy
+```
 
-**② Bắn-rồi-quên.** Tin phát ra lúc pod đang restart / mất kết nối / Redis chết là **mất luôn**. `SP_JOB_REAP` vì thế là **đường hồi phục chính, không phải dự phòng** — mất tin ⇒ chậm ≤30 giây.
+⇒ Khung job **không đụng Redis một dòng nào**. Cấu hình `period` nằm ở DB (nguồn sự thật) và được cache khi update — cache đó là việc của tầng ứng dụng, không phải của khung job.
 
-**③ Hỏng mà không ai biết — cái bẫy vận hành thật sự.** Chuông tắt hẳn thì hệ **vẫn chạy đúng**, chỉ chậm ~30 giây mỗi lượt. Không có cảnh báo nào tự bật, và người ta sẽ sống chung với nó hàng tháng. Hai thứ để tố giác:
-- mỗi lượt chạy ghi `T_JOB_RUN.C_CLAIM_SOURCE` = `'notify'` | `'reap'`;
-- `SP_GET_JOB_STATUS` trả `C_REAP_WAKE_7D` — xấp xỉ tổng số lượt nghĩa là Pub/Sub đã chết từ lâu.
-- `PublishAsync` trả **số pod đã nhận**; bằng 0 ⇒ log WARNING ngay (phân biệt "Redis ổn nhưng không ai nghe" với "Redis chết").
+### ⚠️⚠️ Cái bẫy: KHÔNG BAO GIỜ chạy job trong vòng poll
 
-**④ Redis Cluster.** `PUBLISH` thường phát tới **mọi node** trong cụm. Chạy cụm lớn thì đổi sang Sharded Pub/Sub (`SPUBLISH`, Redis 7+). Node đơn / sentinel thì không cần bận tâm.
+`docs/SDI-kafka-batch-sync-design.md` §6 đã ghi lại bằng máu:
 
-### Nếu muốn bỏ luôn Redis
+> *"chain chạy trong handler → block consumer → vượt `max.poll.interval` → Kafka đá pod (nhưng **KHÔNG giết thread** — nó vẫn ghi DB!) → zombie ghi song song → rebalance → giao lại → duplicate → vòng xoáy tự khuếch đại."*
 
-DB polling thuần (1–2 giây/lần) vẫn là lựa chọn hợp lệ: bỏ nốt dependency Redis, đổi lấy ~10 query/giây trên SQL Server và độ trễ 1–2 giây. Việc phải làm chỉ là đổi `SP_JOB_REAP` từ "đường hồi phục" thành "đường chính" — `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó chính là lợi ích của việc không giao một mảnh tính đúng nào cho Redis: đổi tầng vận chuyển là việc của một buổi chiều, không phải một đợt refactor.
+Một chu kỳ quét FO chạy **vài phút** (1000 batch); `max.poll.interval.ms` mặc định **5 phút**. Chạy job trong vòng poll là nhảy thẳng vào cái bẫy đó.
+
+**Cách né:** `Consume` → **commit offset ngay** → `SP_JOB_CLAIM` → ném job sang Task nền → quay lại `Consume`. Vòng poll luôn rảnh.
+
+**Commit trước khi chạy** nghe ngược tai nhưng là lựa chọn đúng: message không phải sổ cái, `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ `SP_JOB_REAP` thu hồi ⇒ chạy lại. Còn commit *sau* khi job xong thì vòng poll phải chờ vài phút — đổi một lưới cứu đã có lấy một cái bẫy đã biết.
+
+> Khung job hiện tại có thứ luồng Asset cũ không có: **lease + heartbeat**. Pod bị đá vẫn heartbeat nên vẫn giữ lease, pod mới claim nhận `err=5` ⇒ vòng xoáy **không hình thành**. Nhưng đó là lưới cứu, không phải lý do để cố tình nhảy xuống vực.
+
+### Cấu hình bắt buộc
+
+```properties
+enable.auto.commit   = false      # commit TAY, ngay sau khi nhận
+auto.offset.reset    = latest     # group mới KHÔNG dội lại cả topic
+max.poll.interval.ms = mặc định   # không cần nới, vì không chạy job trong poll
+```
+
+`auto.offset.reset=earliest` + group mới = dội về hàng nghìn `jobRunId` cũ. Ở hệ này thì **vô hại** — `SP_JOB_CLAIM` chặn (đã `DONE`) và `C_MAX_DELAY_SEC` đóng dấu `SKIPPED` — nhưng vẫn là một trận bão query mỗi lần ai đó đổi tên group.
+
+### Topic & partition
+
+- **Topic riêng** `sdi.job.notify`, tách khỏi luồng ingest Asset. Cách ly hai chiều: chu kỳ FO chậm không đẩy lag sang ingest, và ngược lại. ~25 message/ngày nên chi phí gần bằng 0.
+- **Key = `jobRunId`** (rải đều partition). KHÔNG dùng `jobCode` làm key: như thế mọi lượt FO dồn vào một partition ⇒ một consumer ⇒ một pod gánh hết. Thứ tự message không quan trọng vì mọi quyết định nằm ở `SP_JOB_CLAIM`.
+- **Số partition ≥ số pod** muốn chạy job song song.
+
+### Đường lùi
+
+Muốn bỏ luôn Kafka khỏi khung job thì chỉ cần đổi `SP_JOB_REAP` từ "lưới an toàn" thành "đường chính" và cho pod poll DB mỗi 1–2 giây. `T_JOB_RUN` và toàn bộ chốt chặn giữ nguyên. Đó là lợi ích của việc **không giao một mảnh tính đúng nào cho tầng nhắn tin** — đổi tầng vận chuyển là việc của một buổi chiều, không phải một đợt refactor.
+
+---
+
+## 2c. Mốc sinh job — và vì sao "được chạy" khác "được sinh"
+
+### Mốc cố định theo phiên, không trôi
+
+Mốc slot neo vào **00:00 giờ VN**: `slot = 00:00 + floor(giây_từ_nửa_đêm / period) × period`. Với khung `[09:00, 15:00]`:
+
+| Chu kỳ | Số mốc | Các mốc |
+|---|---|---|
+| 1 tiếng | **7** | 9, 10, 11, 12, 13, 14, **15** |
+| 30 phút | 13 | 9:00, 9:30, … , **15:00** |
+| 15 phút | 25 | 9:00, 9:15, … , **15:00** |
+
+Nếu tính mốc theo "lần chạy trước + period" thì mỗi lần pod restart / job chậm là mốc trôi đi, và sau một ngày không ai đoán được job chạy vào phút nào — nhật ký thành thứ không đối chiếu được với dữ liệu FO.
+
+### ★ Biên `[from, to]` đóng hai đầu, và kiểm trên MỐC SLOT
+
+Luật nghiệp vụ: **15:00 là mốc CUỐI CÙNG được gọi sang FO** (ảnh chụp đóng cửa). Cái bị cấm là **sinh thêm mốc mới sau khi hết phiên** — phải đợi phiên GD kế tiếp.
+
+Hai chi tiết nhỏ mà sai là hỏng cả tính năng:
+
+**① Kiểm biên trên mốc slot, KHÔNG phải trên thời điểm quét.** Bộ quét chạy mỗi 10 giây nên nó gần như không bao giờ chạy đúng `15:00:00.000` — nó chạy lúc `15:00:04`. Kiểm khung trên `now` thì `15:00:04 > 15:00:00` ⇒ **mốc 15:00 không bao giờ sinh ra**, và người ta chỉ phát hiện khi thắc mắc vì sao ảnh chụp đóng cửa không có. Kiểm trên mốc slot thì `15:00:04 → slot 15:00:00 → trong khung ⇒ sinh đúng`; còn `15:15:04 → slot 15:15:00 > 15:00 ⇒ không sinh`.
+
+**② "Được sinh" và "được chạy" là hai câu hỏi khác nhau.**
+
+| Hàm | Trả lời | Khoảng |
+|---|---|---|
+| `UDF_JOB_IN_WINDOW` | "có được **SINH** job tại mốc này không?" | `[09:00, 15:00]` |
+| `UDF_JOB_CAN_RUN` | "có được **CHẠY** tại lúc này không?" | `[09:00, 15:00 + timeout]` |
+
+Chu kỳ nổ đúng 15:00 **không thể** xong trong 0 giây — 1000 batch mất vài phút. Nếu tầng 2 (claim) và tầng 4 (gọi FO) cùng cắt cứng tại `15:00:00` thì mốc 15:00 vừa sinh ra đã chết yểu: claim lúc `15:00:03` là trượt.
+
+Ân hạn = `C_TIMEOUT_SEC`, **không thêm tham số cấu hình mới**: đó vốn là khoảng thời gian hệ đã tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease). Quá mốc đó thì lease cũng hết hạn và `SP_JOB_REAP` thu hồi — hai giới hạn trùng nhau, không thể lệch pha. Job FO: `timeout 840s` ⇒ hạn chót gọi FO = **15:14**.
+
+Tầng 4 (C# `TradingWindowGuard`) đọc `GraceSec = C_TIMEOUT_SEC` từ cùng bảng nên dùng **cùng một con số** với `UDF_JOB_CAN_RUN` bên SQL.
 
 ---
 
@@ -169,7 +209,7 @@ Với **10 pod**, trạng thái ổn định:
 
 So với bản đầu: riêng nhịp tim đã là **24.000 lượt ghi/ngày** dồn vào một dòng. Nay còn **~2.900 lượt/ngày** cho **toàn bộ** khung job, và không còn tranh khoá.
 
-Đổi lại, tải hỏi thăm Redis là ~20 lệnh/giây với 10 pod (mỗi pod đọc stream mỗi 500ms) — Redis xử lý cỡ đó bằng vài phần trăm một nhân CPU.
+Đổi lại, tải trên Kafka là ~25 message/ngày cộng với vòng poll của mỗi consumer — không đáng kể so với luồng ingest Asset đang chạy trên cùng cụm.
 
 > Muốn giảm nữa thì nới `ScanEvery` (10s) — nó đang lấy mẫu dày gấp 3 lần chu kỳ nhỏ nhất mà cấu hình cho phép (30s). Nhưng ở mức 1,4 truy vấn/giây thì không có gì để tối ưu.
 
@@ -192,7 +232,7 @@ Smoke `12_JOB_SMOKE.sql` khối (A) cố tình chạy toàn bộ vòng đời tr
 
 ### (2) Đẩy job vào là xử lý ngay
 
-`SP_JOB_ENQUEUE` trả `@p_job_run_id` → app `PUBLISH` → worker đang nằm nghe kênh nhận trong **~1ms** (đẩy thật). Không vòng chờ, không polling.
+`SP_JOB_ENQUEUE` trả `@p_job_run_id` → app produce Kafka → consumer nhận trong vài chục mili-giây. Không vòng chờ, không polling DB.
 
 `fire_key` làm cho việc đẩy trở nên **idempotent**: cùng `requestId` gọi 10 lần vẫn đúng một lượt chạy (`err=4`, trả id cũ).
 
@@ -200,11 +240,11 @@ Smoke `12_JOB_SMOKE.sql` khối (A) cố tình chạy toàn bộ vòng đời tr
 
 | Lớp | Bắt được gì | Không bắt được gì |
 |---|---|---|
-| Pub/Sub | Không chặn gì cả — phát cho MỌI pod (cố ý) | mọi thứ |
+| Kafka consumer group | Mỗi partition một consumer — đủ cho đường chạy bình thường | rebalance giao lại, pod zombie, reaper phát trùng |
 | **`SP_JOB_CLAIM`** (`UPDATE ... WHERE C_STATUS='READY'`) | **Mọi thứ.** 20 pod cầm cùng id ⇒ đúng 1 thắng | Pod thắng rồi treo |
 | Heartbeat có kiểm chủ sở hữu | Pod treo → lease hết → pod khác giành; pod cũ tỉnh dậy nhận `still_mine=false` → tự dừng | — |
 
-Lớp 2 là chốt thật — và ở Pub/Sub thì nó là chốt **duy nhất** ở khâu giao tin. Lớp 3 để pod zombie không ghi song song. Giá phải trả: mỗi job có N−1 lượt claim hụt (`err=5`), rẻ và đã tính vào §2b.
+Lớp 2 là chốt thật. Lớp 1 chỉ để **rẻ** (đỡ những lần claim vô ích), lớp 3 để pod zombie không ghi song song — mà zombie là chuyện có thật với Kafka: pod vượt `max.poll.interval` bị đá khỏi group nhưng thread vẫn chạy. Xem §2b.
 
 Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ khâu sinh job**: 10 pod cùng quét thấy slot 9:15 tới hạn, cùng INSERT — CSDL cho đúng một pod thắng, 9 pod nhận lỗi trùng khoá và im lặng bỏ qua. **Không cần leader election.**
 
@@ -213,15 +253,15 @@ Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ kh�
 | Tầng | Ở đâu | Bắt ca gì |
 |---|---|---|
 | 1 | `SP_JOB_ENQUEUE(_DUE)` | Không sinh lượt chạy lúc 15h30 |
-| 2 | `SP_JOB_CLAIM` | **Job sinh lúc 14h59, pod nhặt lúc 15h02** (mọi pod đang bận, pod restart, reaper phát lại) → `SKIPPED` |
+| 2 | `SP_JOB_CLAIM` (`UDF_JOB_CAN_RUN`) | **Job của phiên HÔM QUA, hoặc lượt đã quá hạn chót** (khung + ân hạn) → `SKIPPED`. Lượt sinh đúng 15:00 thì VẪN claim được tới 15:14 |
 | 3 | `SP_INGEST_FO_SNAPSHOT_RT` | Gọi proc bằng tay; ghi ngày không phải hôm nay; ngày nghỉ |
-| **4** | `TradingWindowGuard` (C#) | **Chu kỳ 1000 batch khởi động 14h50, tới batch 700 thì đã 15h02** |
+| **4** | `TradingWindowGuard` (C#) | **Chu kỳ chạy quá hạn chót** (khung + ân hạn). Đọc `GraceSec` từ DB nên khớp đúng `UDF_JOB_CAN_RUN` |
 
 Tầng 4 là tầng **duy nhất** bắt được ca cuối: tầng 1 và 2 chỉ kiểm **một lần, lúc bắt đầu**, còn một chu kỳ quét thì kéo dài nhiều phút. Guard đặt **ngay trước mỗi HTTP call**, không phải mỗi N batch — kiểm thưa ra là mở lại một khe hở đúng bằng N batch, và khe đó sẽ được lấp vào đúng ngày chu kỳ chạy chậm nhất.
 
 **Luật giờ chỉ định nghĩa MỘT chỗ:** `T_JOB_DEFINITION`. Tầng 1, 2, 3 gọi `UDF_JOB_IN_WINDOW` (đọc bảng đó); tầng 4 **đọc thẳng bảng đó lúc chạy**, nhớ tạm 60 giây. Không hard-code 9h–15h trong C#, và không nhận khung giờ qua hằng số lúc khởi động — xem §3c câu 6.
 
-**Biên `[from, to)`**: 15:00:00 chẵn là **đã đóng**. "Đến 3h chiều" nghĩa là phiên hết lúc 3h, không phải "còn được gọi thêm một nhịp lúc 3h".
+**Biên `[from, to]` ĐÓNG hai đầu** — 15:00 là mốc cuối cùng được sinh, và chu kỳ đó được chạy tới `15:00 + timeout`. Chi tiết + lý do ở §2c.
 
 **Đồng hồ**: `UDF_JOB_NOW()` neo `SYSUTCDATETIME()` rồi đổi sang giờ VN. `GETDATE()` trả giờ hệ điều hành — một pod SQL chạy UTC là khung 9h–15h lệch 7 tiếng, tức job gọi FO lúc 16h–22h giờ VN. Phía C# dùng `TimeZoneInfo` cùng múi, thử cả tên Windows lẫn Linux.
 
@@ -270,14 +310,15 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 | Job kẹt ở đâu | Ai cứu | Sau bao lâu |
 |---|---|---|
 | Dòng `READY`, tin chưa bao giờ phát được (`PUBLISH` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Tin phát ra lúc KHÔNG pod nào đang nghe (đang deploy / mất kết nối / Redis chết) | `SP_JOB_REAP` bước (3) | ≤ 30s |
-| Tin đã tới pod rồi pod chết trước khi claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Broker chết lúc produce | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Message đã commit nhưng pod chết trước khi claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Pod vượt `max.poll.interval` bị đá, rebalance giao lại | `SP_JOB_CLAIM` err=5 (zombie còn giữ lease) | ngay |
 | Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_REAP` bước (3) | ≤ 30s |
 | Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_REAP` bước (1) | ≤ timeout + 30s |
 
-Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Redis chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Redis, nên không có trạng thái nào mất theo Redis.
+Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Kafka chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Kafka, nên không có trạng thái nào mất theo broker.
 
-Pod mới khởi động **không** hút lại lịch sử — Pub/Sub không có lịch sử để hút. Đó là một điểm cộng bị bỏ quên: với Streams, tạo consumer group nhầm ở `0` thay vì `$` là pod đầu tiên kéo về toàn bộ stream và bắn hàng nghìn lượt claim vô nghĩa mỗi lần deploy. Ở đây cái sai đó không tồn tại.
+Pod mới khởi động đọc tiếp từ offset đã commit của group — không hút lại lịch sử, miễn là `auto.offset.reset=latest` (xem §2b). Đặt `earliest` thì một group mới sẽ dội về hàng nghìn `jobRunId` cũ; tất cả đều bị `SP_JOB_CLAIM` chặn (đã `DONE`) hoặc `C_MAX_DELAY_SEC` đóng dấu `SKIPPED` — vô hại, nhưng là một trận bão query mỗi lần ai đó đổi tên group.
 
 ### 2. Có sinh lại job cũ không?
 
@@ -321,7 +362,7 @@ Không tầng nào — nhưng chỗ này **đã từng sai**: `TradingWindowGuar
 
 Không. Trigger so `inserted` vs `deleted`, chỉ dọn khi giá trị **thật sự đổi**. Đổi `C_TIMEOUT_SEC`/`C_MAX_ATTEMPT`, hoặc ORM ghi lại cả hàng với đúng giá trị cũ — hàng đợi nguyên vẹn.
 
-> Toàn bộ 7 câu trên có ca kiểm chứng trong `db/12_JOB_SMOKE.sql` khối **(C)** (20 ca), trừ ba dòng có chữ *Redis* ở câu 1 — chúng cần một cụm Redis thật để chạy; phần DB của chúng đã được kiểm.
+> Toàn bộ 7 câu trên có ca kiểm chứng trong `db/12_JOB_SMOKE.sql` khối **(C)** (20 ca), trừ mấy dòng liên quan tới *broker* ở câu 1 — chúng cần một cụm Kafka thật để chạy; phần DB của chúng đã được kiểm.
 
 ---
 
@@ -448,8 +489,8 @@ Không có ba cột này thì một tổng AUM thiếu 200 khách hàng trông *
 
 | Hỏng gì | Hậu quả | Sai số liệu? |
 |---|---|---|
-| Redis mất sạch key / `FLUSHALL` | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_REAP` đẩy lại sau ≤30s | ❌ |
-| `PUBLISH` hụt (Redis chết lúc scheduler rung chuông) | Y như trên | ❌ |
+| Broker Kafka chết / topic bị xoá | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_REAP` produce lại sau ≤30s | ❌ |
+| Produce hụt (broker chết lúc scheduler rung chuông) | Y như trên | ❌ |
 | Pod chết giữa chu kỳ | Lease hết hạn → REAP thu hồi → pod khác chạy lại. Ingest idempotent (MERGE) nên chạy lại vô hại | ❌ |
 | Pod **treo** rồi tỉnh lại (zombie) | Heartbeat trả `still_mine=false` → tự huỷ token → dừng. `SP_JOB_COMPLETE` của nó cũng bị từ chối (`err=5`) | ❌ |
 | Cùng `jobRunId` giao cho 20 pod | `SP_JOB_CLAIM`: đúng 1 thắng, 19 nhận `err=5` | ❌ |
@@ -527,8 +568,8 @@ Theo dõi: `EXEC SP_GET_JOB_STATUS @p_err_code=..., @p_err_msg=...` — RS1 sứ
 
 ## 11. Tóm tắt — 5 câu
 
-1. **Chống trùng nằm ở `UPDATE ... WHERE C_STATUS='READY'`**, không nằm ở tầng giao tin. Redis rung chuông cho nhanh, DB chốt lại cho đúng — nên Pub/Sub phát cho cả 10 pod vẫn chỉ 1 pod chạy.
+1. **Chống trùng nằm ở `UPDATE ... WHERE C_STATUS='READY'`**, không nằm ở tầng giao tin. Kafka rung chuông cho nhanh, DB chốt lại cho đúng — nên rebalance giao lại hay pod zombie đều chỉ dẫn tới `err=5`.
 2. **`UQ (job_code, fire_key)` thay thế leader election.** 10 pod cùng quét một slot vẫn ra đúng một lượt chạy.
-3. **`SP_JOB_REAP` là đường hồi phục chính** (Pub/Sub bắn-rồi-quên) — và nó trả đủ: mất sạch Redis chỉ tốn 30 giây, không mất job nào. Đổi lại Redis tốn **0 bộ nhớ** và **0 lệnh/giây** lúc rỗi.
+3. **`SP_JOB_REAP` là lưới an toàn** — Kafka có lưu nên message sống qua restart; reaper chỉ còn lo produce hụt, mọi pod đều bận, và pod chết giữa chừng. Khung job **không đụng Redis một dòng nào**.
 4. **Guard khung giờ 4 tầng không thừa.** Tầng 4 là tầng duy nhất bắt được ca "chu kỳ dài vắt qua giờ đóng cửa" — thứ mà 3 tầng kia về bản chất không thể thấy.
 5. **Cột `C_SRC` là toàn bộ tính đúng của phương án đổ RT vào bảng EOD.** Bỏ nó ở một chỗ thôi là cổng khoá EOD pass giả, phí tính trên AUM lúc 9h15, và báo cáo đọc số chưa chốt — cả ba đều **sai âm thầm**.
