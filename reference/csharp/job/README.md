@@ -8,7 +8,8 @@
 |---|---|
 | `JobContracts.cs` | `IJobHandler` · `JobContext` · `JobRegistry` · `ISdiJobGateway` (map 1-1 sang SP) |
 | `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
-| `JobSchedulerService.cs` | Quét lịch (10s) · REAP (30s) — chạy trên **mọi** pod |
+| `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé REAP · cache cấu hình |
+| `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · REAP (30s, có vé + cửa chặn khung giờ) |
 | `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
@@ -16,6 +17,8 @@
 ## Đăng ký DI
 
 ```csharp
+services.AddSingleton<IDatabase>(sp =>                            // Redis: LỌC TRƯỚC, không giữ tính đúng
+    sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase());
 services.AddSingleton(new ConsumerConfig { BootstrapServers = cfg["Kafka:Brokers"] });
 services.AddSingleton<IProducer<string, string>>(_ =>
     new ProducerBuilder<string, string>(
@@ -83,6 +86,19 @@ Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất j
 `READY` và `SP_JOB_REAP` produce lại sau ≤30 giây.
 
 ---
+
+## Tải DB của khung job — đo thật
+
+| | Trước | Sau |
+|---|---|---|
+| Nhịp quét lịch (10s × 10 pod) | `SP_JOB_ENQUEUE_DUE` ~50 logical reads **mỗi nhịp** | **0 lượt gọi DB** (Redis `SET NX`) |
+| Lượt quét/ngày để sinh 25 job | **~86.400** (≈3.400 lượt hỏi/job) | **~25** |
+| `SP_JOB_REAP` | 30s × 10 pod = 20 lượt/phút, 24/7 | có **vé Redis** (1 pod) + **cửa chặn khung giờ** ⇒ ~2 lượt/phút, và **0 ngoài 09:00–15:10** |
+| Đọc cấu hình | mỗi nhịp | cache Redis, app xoá khi đổi lịch ⇒ ~0 |
+
+**Redis không giữ mảnh tính đúng nào.** Mất khoá mốc ⇒ nhiều pod cùng gọi `SP_JOB_ENQUEUE` ⇒ `UQ (job_code, fire_key)` cho đúng một pod thắng, còn lại `err=4`. Tệ nhất của việc mất sạch Redis: vài lượt gọi DB thừa — **không job nào chạy hai lần, không job nào mất**.
+
+**Pod tính mốc, DB đối chiếu.** Bộ quét tự tính mốc để khỏi hỏi DB; `SP_JOB_ENQUEUE` so lại với `UDF_JOB_SLOT_AT`. Pod lệch múi giờ / chạy bản cũ / sai chu kỳ ⇒ **bị từ chối `err=20`**, không trôi lệch âm thầm. Phép tính mốc vẫn có ca kiểm chứng trong `12_JOB_SMOKE.sql` vì bản tham chiếu nằm ở SQL.
 
 ## Ba câu hỏi sẽ bị hỏi khi review
 

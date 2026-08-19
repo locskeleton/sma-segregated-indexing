@@ -11,8 +11,9 @@ GO
   ┌─ TẦNG A. KHUNG JOB (generic, KHÔNG biết FO là gì) ────────────────────────┐
   │  T_JOB_DEFINITION  : khai báo loại job (chu kỳ, khung giờ, timeout, retry)│
   │  T_JOB_RUN         : hàng đợi + nhật ký, 1 dòng = 1 LƯỢT chạy            │
-  │  SP_JOB_ENQUEUE / _ENQUEUE_DUE / _CLAIM / _HEARTBEAT / _COMPLETE /       │
-  │  SP_JOB_REAP / _PURGE / SP_GET_JOB_STATUS                                │
+  │  SP_JOB_ENQUEUE / _CLAIM / _HEARTBEAT / _COMPLETE / _REAP / _PURGE       │
+  │  SP_SET_JOB_SCHEDULE · SP_GET_SCHEDULABLE_JOBS · SP_GET_JOB_STATUS       │
+  │  UDF_JOB_SLOT_AT (bản THAM CHIẾU của phép tính mốc — pod tính, DB đối chiếu)│
   │  Thêm loại job mới = INSERT 1 dòng T_JOB_DEFINITION + 1 handler C#.      │
   │  KHÔNG sửa proc nào ở tầng này.                                          │
   └───────────────────────────────────────────────────────────────────────────┘
@@ -34,7 +35,7 @@ GO
    ③ Dòng RT KHÔNG BAO GIỜ đè dòng EOD, và KHÔNG BAO GIỜ được coi là số chốt (cột C_SRC).
 
   *** GUARD KHUNG GIỜ — 3 TẦNG, CỐ Ý TRÙNG NHAU ***
-    Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE_DUE / SP_JOB_ENQUEUE không tạo lượt chạy ngoài khung.
+    Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE không tạo lượt chạy có MỐC ngoài khung.
                           Biên [09:00, 15:00] ĐÓNG HAI ĐẦU và kiểm trên MỐC SLOT ⇒ 15:00 là mốc
                           cuối cùng được sinh; 15:15 thì không, phải đợi phiên GD kế tiếp.
     Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm HAI thứ, trên MỐC SLOT của chính lượt đó:
@@ -185,7 +186,7 @@ CREATE TABLE T_JOB_RUN (
     CONSTRAINT CK_JOB_RUN_STATUS CHECK (C_STATUS IN ('READY','RUNNING','DONE','FAILED','SKIPPED','DEAD'))
 );
 GO
--- Quét của SP_JOB_REAP + SP_JOB_ENQUEUE_DUE: luôn lọc theo trạng thái trước.
+-- Quét của SP_JOB_REAP: luôn lọc theo trạng thái trước.
 IF IndexProperty(OBJECT_ID('T_JOB_RUN'),'IX_JOB_RUN_STATUS','IndexID') IS NULL
 CREATE INDEX IX_JOB_RUN_STATUS ON T_JOB_RUN (C_STATUS, C_RUN_AFTER)
     INCLUDE (C_JOB_CODE, C_LEASE_UNTIL, C_ATTEMPT, C_ENQUEUED_AT);
@@ -231,6 +232,73 @@ BEGIN
     --   Khung 09:00–15:00 với chu kỳ 1 tiếng ⇒ 7 mốc: 9,10,11,12,13,14,15.
     IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) <= @wt RETURN 1;
     RETURN 0;
+END
+GO
+
+/*===========================================================================
+  UDF_JOB_SLOT_AT — MỐC SLOT của job tại thời điểm @p_at. Neo vào 00:00 giờ VN:
+      slot = 00:00 + floor(giây_từ_nửa_đêm / chu_kỳ) × chu_kỳ
+
+  ★ VÌ SAO HÀM NÀY TỒN TẠI DÙ C# CŨNG TỰ TÍNH ĐƯỢC:
+    Bộ quét lịch chạy trên pod và tự tính mốc để KHÔNG phải hỏi DB mỗi 10 giây (xem
+    JobSchedulerService — Redis lọc trước, 99% nhịp quét không chạm DB). Nhưng phép tính mốc là
+    thứ TINH TẾ NHẤT của cả khung: lệch một giây là mất mốc đóng cửa, lệch cách neo là mốc trôi
+    theo giờ pod khởi động. Để nó CHỈ tồn tại trong C# nghĩa là nó không còn ca kiểm chứng nào
+    trong repo này.
+    ⇒ Giữ bản tham chiếu ở đây (có smoke test), và SP_JOB_ENQUEUE ĐỐI CHIẾU mốc mà C# gửi lên với
+      hàm này. C# tính sai ⇒ bị TỪ CHỐI ngay, có mã lỗi, thay vì trôi lệch âm thầm hàng tháng.
+  Trả NULL nếu job không có chu kỳ (job chạy theo yêu cầu — không có khái niệm mốc).
+===========================================================================*/
+CREATE OR ALTER FUNCTION UDF_JOB_SLOT_AT (@p_job_code VARCHAR(40), @p_at DATETIME)
+RETURNS DATETIME
+AS
+BEGIN
+    DECLARE @itv INT = (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code);
+    IF @itv IS NULL RETURN NULL;
+    DECLARE @mid DATETIME = CAST(CAST(@p_at AS DATE) AS DATETIME);
+    RETURN DATEADD(SECOND, (DATEDIFF(SECOND, @mid, @p_at) / @itv) * @itv, @mid);
+END
+GO
+
+/*===========================================================================
+  UDF_JOB_FIRE_KEY — KHOÁ CHỐNG TRÙNG của một mốc: 'yyyyMMddHHmmss'.
+    ★ PHẢI CÓ GIÂY: C_INTERVAL_SEC cho phép tới 30s ⇒ khoá chỉ tới phút thì hai mốc trong cùng một
+      phút trùng khoá, UQ nuốt mốc thứ hai, và job khai 30 giây LẶNG LẼ chạy 60 giây/lần.
+    Bộ quét trên pod KHÔNG cần tự format khoá này — cứ gửi mốc, SP_JOB_ENQUEUE tự suy ra. Bớt một
+    chỗ để C# và SQL có thể hiểu khác nhau.
+===========================================================================*/
+CREATE OR ALTER FUNCTION UDF_JOB_FIRE_KEY (@p_slot DATETIME)
+RETURNS VARCHAR(64)
+AS
+BEGIN
+    RETURN CONVERT(CHAR(8), @p_slot, 112) + FORMAT(@p_slot, 'HHmmss');
+END
+GO
+
+/*===========================================================================
+  SP_GET_SCHEDULABLE_JOBS — danh sách job định kỳ + cấu hình lịch, cho bộ quét trên pod nạp vào
+    bộ nhớ (và đẩy lên Redis cache). Đọc 1 lần/phút/pod là cùng, hoặc 0 lần nếu cache Redis còn.
+    KHÔNG trả gì ngoài thứ bộ quét cần — payload/handler/timeout để SP_JOB_CLAIM lo.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_GET_SCHEDULABLE_JOBS
+    @p_err_code INT           OUTPUT,
+    @p_err_msg  NVARCHAR(400) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @p_err_code=0; SET @p_err_msg=NULL;
+    BEGIN TRY
+        SELECT C_JOB_CODE, C_INTERVAL_SEC, C_WINDOW_FROM, C_WINDOW_TO,
+               C_BUSINESS_DAY_ONLY, C_SINGLETON, C_PAYLOAD,
+               -- Bộ quét cần con số này để biết "giờ này còn lượt nào có thể đang sống không" —
+               --   ngoài khoảng đó thì KHÔNG có gì để REAP, và nó bỏ luôn nhịp quét DB.
+               COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) AS C_EFFECTIVE_MAX_DELAY_SEC
+        FROM T_JOB_DEFINITION
+        WHERE C_ENABLED = 1 AND C_INTERVAL_SEC IS NOT NULL
+        ORDER BY C_PRIORITY, C_JOB_CODE;
+    END TRY
+    BEGIN CATCH
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
+    END CATCH
 END
 GO
 
@@ -380,6 +448,7 @@ CREATE OR ALTER PROCEDURE SP_JOB_ENQUEUE
     @p_fire_key      VARCHAR(64)   = NULL,           -- NULL ⇒ NEWID() (mỗi lần gọi = 1 lượt riêng)
     @p_payload       NVARCHAR(MAX) = NULL,
     @p_business_date DATE          = NULL,
+    @p_slot_at       DATETIME      = NULL,   -- mốc slot (bộ quét trên pod gửi lên). NULL = đẩy tay ⇒ mốc = bây giờ.
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
     @p_err_msg       NVARCHAR(400) OUTPUT,
@@ -396,20 +465,57 @@ BEGIN
         IF @en = 0
             BEGIN SET @p_err_code=2; SET @p_err_msg=CONCAT(N'Job đang TẮT: ', @p_job_code); RETURN; END
 
+        DECLARE @slot DATETIME = ISNULL(@p_slot_at, @now);
+
+        -- ★ ĐỐI CHIẾU MỐC do bộ quét trên pod gửi lên với bản THAM CHIẾU trong DB.
+        --   Bộ quét tự tính mốc để khỏi hỏi DB mỗi 10 giây (Redis lọc trước). Đổi lại, DB phải
+        --   kiểm lại — nếu không thì một pod chạy bản cũ, lệch múi giờ, hay tính sai công thức sẽ
+        --   lặng lẽ sinh job ở mốc lệch, và không có gì phát hiện ra. Sai lệch ⇒ TỪ CHỐI, có mã lỗi.
+        IF @p_slot_at IS NOT NULL
+        BEGIN
+            DECLARE @ref DATETIME = dbo.UDF_JOB_SLOT_AT(@p_job_code, @p_slot_at);
+            IF @ref IS NOT NULL AND @ref <> @p_slot_at
+            BEGIN
+                SET @p_err_code=20;
+                SET @p_err_msg=CONCAT(N'Mốc slot không khớp lưới của job: nhận ',
+                    CONVERT(VARCHAR(19),@p_slot_at,120), N', lưới cho ra ', CONVERT(VARCHAR(19),@ref,120),
+                    N'. Bộ quét trên pod tính sai (lệch múi giờ / chạy bản cũ / sai chu kỳ).');
+                RETURN;
+            END
+        END
+
+        -- ★ SINGLETON — lượt trước còn chạy (lease còn hiệu lực) thì KHÔNG mở lượt mới.
+        --   Trước đây nằm trong SP_JOB_ENQUEUE_DUE; chuyển vào đây khi proc đó bị xoá. Áp cho CẢ
+        --   job đẩy tay: 1000 batch chồng hai chu kỳ là tự bắn vào chân mình ở phía FO, bất kể ai đẩy.
+        IF EXISTS (SELECT 1 FROM T_JOB_DEFINITION d
+                   INNER JOIN T_JOB_RUN r ON r.C_JOB_CODE=d.C_JOB_CODE
+                   WHERE d.C_JOB_CODE=@p_job_code AND d.C_SINGLETON=1
+                     AND r.C_STATUS='RUNNING' AND r.C_LEASE_UNTIL > @now)
+        BEGIN
+            SET @p_err_code=7;
+            SET @p_err_msg=CONCAT(N'Job ', @p_job_code, N' đang chạy (singleton) — không mở lượt mới.');
+            RETURN;
+        END
+
         -- ★ GUARD TẦNG 1 — KHÔNG CÓ CỬA HẬU.
         --   Bản trước có tham số @p_ignore_window cho vận hành "chạy tay ngoài khung". Đã BỎ:
         --   một cửa hậu mà job gọi hệ ngoài cũng đi qua được thì nó không còn là cửa hậu, nó là
         --   cái lỗ. Cần chạy job ngoài khung thì sửa khung bằng SP_SET_JOB_SCHEDULE — có dấu vết,
         --   có người chịu trách nhiệm, và tự dọn lượt chờ của cấu hình cũ.
-        IF dbo.UDF_JOB_IN_WINDOW(@p_job_code, @now) = 0
+        --   Kiểm trên MỐC, không phải trên @now: bộ quét chạy lúc 15:00:04 cho mốc 15:00:00 —
+        --   áp khung lên @now là mất mốc đóng cửa (xem §2c của doc thiết kế).
+        IF dbo.UDF_JOB_IN_WINDOW(@p_job_code, @slot) = 0
         BEGIN
             SET @p_err_code=3;
-            SET @p_err_msg=CONCAT(N'Ngoài khung giờ cho phép của job ', @p_job_code, N' (',
-                CONVERT(VARCHAR(19), @now, 120), N' giờ VN) — KHÔNG tạo lượt chạy.');
+            SET @p_err_msg=CONCAT(N'Mốc ', CONVERT(VARCHAR(19), @slot, 120),
+                N' nằm ngoài khung giờ cho phép của job ', @p_job_code, N' — KHÔNG tạo lượt chạy.');
             RETURN;
         END
 
-        DECLARE @fk VARCHAR(64) = ISNULL(@p_fire_key, CONVERT(VARCHAR(36), NEWID()));
+        -- Khoá chống trùng: người gọi truyền, hoặc suy từ MỐC (job định kỳ), hoặc NEWID (đẩy tay).
+        DECLARE @fk VARCHAR(64) = COALESCE(@p_fire_key,
+                                           CASE WHEN @p_slot_at IS NOT NULL THEN dbo.UDF_JOB_FIRE_KEY(@p_slot_at) END,
+                                           CONVERT(VARCHAR(36), NEWID()));
 
         -- Đã có lượt với fire_key này ⇒ trả id cũ. Kiểm TRƯỚC để đường đi bình thường không
         --   phải dựa vào bắt lỗi trùng khoá; nhưng vẫn có TRY/CATCH bên dưới cho ca 2 pod
@@ -427,7 +533,7 @@ BEGIN
             INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT,C_MESSAGE)
             VALUES (@p_job_code, @fk, 'READY', @p_business_date,
                     ISNULL(@p_payload, (SELECT C_PAYLOAD FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code)),
-                    @now, @now,   -- job đẩy tay: mốc = chính lúc đẩy
+                    @now, @slot,
                     @now, CONCAT(N'enqueue by ', ISNULL(@p_user,'(system)')));
             SET @p_job_run_id = SCOPE_IDENTITY();
         END TRY
@@ -442,94 +548,6 @@ BEGIN
         END CATCH
     END TRY
     BEGIN CATCH
-        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
-    END CATCH
-END
-GO
-
-/*===========================================================================
-  SP_JOB_ENQUEUE_DUE — QUÉT CẤU HÌNH: job định kỳ nào tới hạn thì tạo lượt chạy.
-    MỌI POD đều gọi proc này (vd 10 giây/lần) — an toàn, vì UQ (job_code, fire_key) quyết ai thắng.
-
-  SLOT neo vào 00:00 GIỜ VN:  slot = 00:00 + floor(giây_từ_nửa_đêm / interval) × interval
-    ⇒ interval 900s cho ra 9:00 / 9:15 / 9:30... CỐ ĐỊNH. Nếu tính slot theo "lần chạy trước + 15
-      phút" thì mỗi lần pod restart / job chậm là mốc trôi đi, và sau một ngày không ai còn đoán
-      được job chạy vào phút nào — nhật ký thành thứ không đối chiếu được với dữ liệu FO.
-
-  TRẢ VỀ result set các lượt VỪA TẠO (job_run_id, job_code, payload) → app PUBLISH lên kênh Redis.
-  KHÔNG tạo lượt mới nếu: ngoài khung giờ · job tắt · (C_SINGLETON=1 và lượt trước còn RUNNING).
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_JOB_ENQUEUE_DUE
-    @p_user     VARCHAR(64)   = NULL,
-    @p_err_code INT           OUTPUT,
-    @p_err_msg  NVARCHAR(400) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON; SET XACT_ABORT ON;
-    SET @p_err_code=0; SET @p_err_msg=NULL;
-    BEGIN TRY
-        DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-        DECLARE @midnight DATETIME = CAST(CAST(@now AS DATE) AS DATETIME);
-
-        -- Ứng viên: job định kỳ, đang bật, ĐANG trong khung giờ, và (nếu singleton) không có lượt đang chạy.
-        DECLARE @due TABLE (job_code VARCHAR(40), fire_key VARCHAR(64), payload NVARCHAR(MAX),
-                            bdate DATE, slot_at DATETIME);
-        -- ★ KIỂM BIÊN TRÊN **MỐC SLOT**, KHÔNG PHẢI TRÊN THỜI ĐIỂM QUÉT.
-        --   Đây là chỗ cực dễ sai và sai thì không ai thấy: bộ quét chạy mỗi 10 giây nên nó gần
-        --   như không bao giờ chạy đúng 15:00:00.000 — nó chạy lúc 15:00:04. Kiểm khung trên
-        --   `now` với biên đóng `<= 15:00:00` thì 15:00:04 trượt ⇒ MỐC 15:00 KHÔNG BAO GIỜ SINH RA,
-        --   và người ta chỉ phát hiện khi thắc mắc vì sao ảnh chụp đóng cửa không có.
-        --   Kiểm trên mốc slot thì 15:00:04 → slot 15:00:00 → nằm trong khung ⇒ sinh đúng.
-        --   Đồng thời đúng luôn yêu cầu "không sinh job mới sau khi hết phiên": 15:15:04 → slot
-        --   15:15:00 > 15:00 ⇒ không sinh, phải đợi phiên GD kế tiếp.
-        INSERT @due (job_code, fire_key, payload, bdate, slot_at)
-        SELECT d.C_JOB_CODE,
-               -- fire_key = mốc slot 'yyyyMMddHHmmss' (style 112 = yyyymmdd, + HHmmss ghép tay).
-               --   ★ PHẢI CÓ GIÂY. Bản đầu chỉ tới PHÚT và nó sai thật: C_INTERVAL_SEC cho phép tới 30s
-               --     ⇒ hai slot trong cùng một phút cho ra CÙNG một fire_key ⇒ slot thứ hai bị UQ chặn
-               --     ⇒ job khai 30 giây LẶNG LẼ chạy 60 giây/lần. Không lỗi, không log, chỉ chạy thưa
-               --     đi một nửa. Cùng lý do đó, đổi chu kỳ giữa ngày (900s → 60s) có thể đụng đúng mốc
-               --     15 phút vừa dùng và mất một nhịp. Thêm giây là hết cả hai.
-               CONVERT(CHAR(8), DATEADD(SECOND,
-                     (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 112)
-               + FORMAT(DATEADD(SECOND,
-                     (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 'HHmmss'),
-               d.C_PAYLOAD,
-               CAST(@now AS DATE),
-               DATEADD(SECOND, (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight)
-        FROM T_JOB_DEFINITION d
-        WHERE d.C_ENABLED = 1
-          AND d.C_INTERVAL_SEC IS NOT NULL
-          -- ★ GUARD TẦNG 1 — áp lên MỐC SLOT (xem chú thích trên), không phải @now.
-          AND dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE,
-                DATEADD(SECOND, (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC,
-                        @midnight)) = 1
-          AND ( d.C_SINGLETON = 0
-             OR NOT EXISTS (SELECT 1 FROM T_JOB_RUN r
-                            WHERE r.C_JOB_CODE = d.C_JOB_CODE
-                              AND r.C_STATUS = 'RUNNING'
-                              -- lease còn hiệu lực mới tính là "đang chạy"; hết hạn = pod chết,
-                              --   để SP_JOB_REAP thu hồi chứ không chặn slot kế tiếp vĩnh viễn.
-                              AND r.C_LEASE_UNTIL > @now) );
-
-        -- INSERT ... WHERE NOT EXISTS + UQ: pod nào thắng thì thắng. Không lock, không chờ.
-        DECLARE @new TABLE (id BIGINT, job_code VARCHAR(40), payload NVARCHAR(MAX));
-        INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT,C_MESSAGE)
-        OUTPUT inserted.C_JOB_RUN_ID, inserted.C_JOB_CODE, inserted.C_PAYLOAD INTO @new
-        SELECT u.job_code, u.fire_key, 'READY', u.bdate, u.payload, @now, u.slot_at, @now,
-               CONCAT(N'scheduler slot ', u.fire_key)
-        FROM @due u
-        WHERE NOT EXISTS (SELECT 1 FROM T_JOB_RUN r
-                          WHERE r.C_JOB_CODE=u.job_code AND r.C_FIRE_KEY=u.fire_key);
-
-        SELECT id AS C_JOB_RUN_ID, job_code AS C_JOB_CODE, payload AS C_PAYLOAD FROM @new;
-    END TRY
-    BEGIN CATCH
-        -- Vỡ UQ = pod khác vừa tạo đúng slot đó. Đây là hành vi MONG MUỐN của thiết kế, không
-        --   phải sự cố ⇒ nuốt, trả rỗng. Ném ra thì log mọi pod đỏ lòm 15 phút/lần, và người ta
-        --   sẽ học cách phớt lờ log — rồi bỏ sót lỗi thật.
-        IF ERROR_NUMBER() IN (2601,2627) BEGIN SELECT TOP 0 CAST(NULL AS BIGINT) AS C_JOB_RUN_ID,
-               CAST(NULL AS VARCHAR(40)) AS C_JOB_CODE, CAST(NULL AS NVARCHAR(MAX)) AS C_PAYLOAD; RETURN; END
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
     END CATCH
 END
@@ -815,7 +833,7 @@ BEGIN
     SET NOCOUNT ON;
     -- ★ SÀN 1 NGÀY — KHÔNG cho dọn lượt của HÔM NAY. Đây không phải sự thận trọng thừa:
     --   dọn một lượt DONE mà mốc slot của nó VẪN LÀ SLOT HIỆN TẠI thì `NOT EXISTS` trong
-    --   SP_JOB_ENQUEUE_DUE lại thấy trống ⇒ sinh lại đúng lượt vừa xong ⇒ JOB CHẠY HAI LẦN trong
+    --   bộ quét lại thấy mốc đó trống ⇒ sinh lại đúng lượt vừa xong ⇒ JOB CHẠY HAI LẦN trong
     --   một slot. Chính hàng rào chống trùng (UQ fire_key) bị chặt mất chân bởi thao tác dọn dẹp.
     --   Từ 1 ngày trở lên thì fire_key mang ngày cũ, không thể trùng slot hiện tại.
     IF @p_keep_days IS NULL OR @p_keep_days < 1 SET @p_keep_days = 1;

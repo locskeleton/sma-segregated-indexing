@@ -123,7 +123,11 @@ public sealed class DueJob
 /// </summary>
 public interface ISdiJobGateway
 {
-    Task<IReadOnlyList<DueJob>> EnqueueDueAsync(CancellationToken ct);                       // SP_JOB_ENQUEUE_DUE
+    /// <summary>
+    /// SP_GET_SCHEDULABLE_JOBS — cấu hình lịch cho bộ quét. Đọc khi cache Redis trống; ở trạng
+    /// thái ổn định gần như không gọi tới.
+    /// </summary>
+    Task<IReadOnlyList<SchedulableJob>> GetSchedulableJobsAsync(CancellationToken ct);
     Task<IReadOnlyList<DueJob>> ReapAsync(int staleSec, CancellationToken ct);               // SP_JOB_REAP
     /// <summary>SP_JOB_CLAIM. `source` = 'notify' | 'reap' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
     /// Đừng bỏ tham số này: nó là thứ duy nhất phân biệt "chuông Pub/Sub đang chạy" với "chuông
@@ -131,7 +135,15 @@ public interface ISdiJobGateway
     Task<JobClaim>              ClaimAsync(long jobRunId, string owner, string source, CancellationToken ct);
     Task<bool>                  HeartbeatAsync(long jobRunId, string owner, long? rows, CancellationToken ct);  // SP_JOB_HEARTBEAT
     Task                        CompleteAsync(long jobRunId, string owner, bool ok, long? rows, string? msg, CancellationToken ct); // SP_JOB_COMPLETE
-    Task<(long Id, int Err)>    EnqueueAsync(string jobCode, string? fireKey, string? payload, DateTime? businessDate, string user, CancellationToken ct); // SP_JOB_ENQUEUE
+    /// <summary>
+    /// SP_JOB_ENQUEUE. `slotAt` = MỐC mà lượt này đáng lẽ chạy (bộ quét tự tính); truyền null cho
+    /// job đẩy tay. `fireKey` để null khi đã có `slotAt` — SQL tự suy khoá bằng UDF_JOB_FIRE_KEY,
+    /// bớt một chỗ để C# và SQL có thể định dạng khác nhau.
+    /// err: 0 OK · 1 job lạ · 2 job tắt · 3 mốc ngoài khung · 4 mốc đã có (idempotent) · 7 singleton
+    ///      đang chạy · 20 mốc không khớp lưới (bộ quét tính sai).
+    /// </summary>
+    Task<(long Id, int Err)>    EnqueueAsync(string jobCode, string? fireKey, string? payload,
+                                             DateTime? businessDate, DateTime? slotAt, string user, CancellationToken ct);
 
     /// <summary>SELECT dbo.UDF_IS_BUSINESS_DATE(@d) — lịch nghỉ nằm ở DB (T_TRADING_HOLIDAY),
     /// KHÔNG hard-code trong C#. TradingWindowGuard gọi hàm này (nhớ theo ngày, 1 lượt/chu kỳ).</summary>
