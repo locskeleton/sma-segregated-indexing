@@ -35,6 +35,8 @@ public sealed class JobContext
     public DateTime? BusinessDate { get; init; }
     public string?  PayloadJson  { get; init; }
     public int      Attempt      { get; init; }
+    /// <summary>MỐC mà lượt này đáng lẽ chạy — handler truyền vào TradingWindowGuard.</summary>
+    public DateTime SlotAt       { get; init; }
 
     /// <summary>
     /// BÁO TIẾN ĐỘ — chỉ ghi vào một biến trong RAM. KHÔNG chạm DB, không await, không khoá.
@@ -99,8 +101,13 @@ public sealed class JobClaim
     public int       Attempt      { get; init; }
     /// <summary>T_JOB_DEFINITION.C_TIMEOUT_SEC — worker suy nhịp tim từ đây (nhịp = timeout/4).</summary>
     public int       TimeoutSec   { get; init; } = 300;
-    /// <summary>Nguồn đánh thức lượt này ('notify' | 'reap' | 'manual').</summary>
+    /// <summary>Nguồn đánh thức lượt này ('kafka' | 'reap' | 'manual').</summary>
     public string?   ClaimSource  { get; init; }
+    /// <summary>
+    /// T_JOB_RUN.C_SLOT_AT — MỐC mà lượt này đáng lẽ chạy (09:00, 09:15…). NEO của mọi phép kiểm
+    /// giờ giấc: hạn tươi đo từ đây, KHÔNG đo từ lúc pod nhận được message.
+    /// </summary>
+    public DateTime  SlotAt       { get; init; }
 }
 
 public sealed class DueJob
@@ -132,10 +139,12 @@ public interface ISdiJobGateway
 
     /// <summary>
     /// Khung giờ HIỆU LỰC của job, đọc thẳng T_JOB_DEFINITION:
-    ///   SELECT C_ENABLED, C_WINDOW_FROM, C_WINDOW_TO, C_BUSINESS_DAY_ONLY
+    ///   SELECT C_ENABLED, C_WINDOW_FROM, C_WINDOW_TO, C_BUSINESS_DAY_ONLY,
+    ///          COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) AS MaxDelaySec
     ///   FROM T_JOB_DEFINITION WHERE C_JOB_CODE = @code
     /// TradingWindowGuard gọi hàm này (nhớ tạm 60s). KHÔNG nhận khung giờ qua hằng số DI: đổi cấu
     /// hình trong DB mà tầng 4 vẫn gác theo khung cũ thì đúng cái tầng chạm FO là tầng hiểu sai luật.
+    /// MaxDelaySec = CÙNG con số SP_JOB_CLAIM dùng ⇒ tầng 2 và tầng 4 không thể lệch pha.
     /// </summary>
     Task<JobWindow>             GetJobWindowAsync(string jobCode, CancellationToken ct);
 

@@ -23,8 +23,8 @@ DECLARE @today DATE = CAST(@now AS DATE);
 DECLARE @isGD BIT = dbo.UDF_IS_BUSINESS_DATE(@today);
 
 /*--- dọn dữ liệu test cũ ---*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','FO_SNAPSHOT_RT');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND');
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','FO_SNAPSHOT_RT');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE');
 DELETE FROM T_SI_BALANCE     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_CURRENT     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_PORTFOLIO   WHERE C_SI_ACCOUNT LIKE 'RT%';
@@ -234,13 +234,11 @@ INSERT INTO @R SELECT 'A12 ★ SINH job: 08:59 NGOÀI · 09:00 TRONG · 15:00 TR
         AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=1
         AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+1,  CAST(@gd AS DATETIME)))=0
        THEN 1 ELSE 0 END, CONCAT('ngày GD dùng để test = ', CONVERT(VARCHAR(10),@gd,23));
--- CHẠY: khung + ÂN HẠN = C_TIMEOUT_SEC (840s = 14 phút) ⇒ chu kỳ nổ 15:00 được chạy tới 15:14.
---   Chỗ dễ hiểu sai nhất: cắt cứng tại 15:00 ở tầng 2/4 là giết chính mốc 15:00 vừa sinh ra.
-INSERT INTO @R SELECT 'A12 ★★ CHẠY (có ân hạn): 15:00 OK · 15:13 OK · 15:15 HẾT · 08:59 chưa tới',
-  CASE WHEN dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=1
-        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+13, CAST(@gd AS DATETIME)))=1
-        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+15, CAST(@gd AS DATETIME)))=0
-        AND dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', DATEADD(MINUTE, 8*60+59, CAST(@gd AS DATETIME)))=0
+-- CHẠY: KHÔNG còn khái niệm "khung + ân hạn". Chỉ còn HẠN TƯƠI (C_MAX_DELAY_SEC=600s) đo từ MỐC.
+--   ⇒ lượt 15:00 hết hiệu lực lúc 15:10, bất kể nó nằm chờ hay đã thử lại mấy lần.
+INSERT INTO @R SELECT 'A12 ★★ hạn tươi neo vào MỐC: 15:00 mốc hợp lệ, hết hiệu lực sau 600s (15:10)',
+  CASE WHEN (SELECT C_MAX_DELAY_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=600
+        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60, CAST(@gd AS DATETIME)))=1
        THEN 1 ELSE 0 END, NULL;
 -- Đếm ĐÚNG số mốc trong phiên — ví dụ nghiệp vụ đã chốt: khung 9h-15h, chu kỳ 1 tiếng ⇒ 7 mốc.
 DECLARE @n1h INT=0, @n15m INT=0, @sec INT;
@@ -264,14 +262,15 @@ INSERT INTO @R SELECT 'A12 ★ 10h sáng CHỦ NHẬT ⇒ 0 (đúng giờ nhưng
 -- A13. Vận hành: chạy tay ngoài khung (cửa hậu cho job VÔ HẠI), theo dõi, dọn nhật ký.
 --   4 proc này lúc đầu KHÔNG có ca test nào — tự review mới lòi ra. Proc không có test là proc
 --   chưa từng chạy, và nó sẽ chạy lần đầu vào lúc có sự cố, tức là lúc tệ nhất.
-EXEC SP_JOB_ENQUEUE @p_job_code='SMK_WIN', @p_fire_key='IGN', @p_ignore_window=1,
+-- ★ KHÔNG CÒN CỬA HẬU. Tham số @p_ignore_window đã bị BỎ: một cửa hậu mà job gọi hệ ngoài cũng
+--   đi qua được thì nó không phải cửa hậu, nó là cái lỗ. Đẩy tay ngoài khung ⇒ err=3, KHÔNG tạo
+--   lượt nào. Cần chạy ngoài khung thì sửa khung bằng SP_SET_JOB_SCHEDULE (có dấu vết, có người
+--   chịu trách nhiệm, và tự dọn lượt chờ của cấu hình cũ).
+EXEC SP_JOB_ENQUEUE @p_job_code='SMK_WIN', @p_fire_key='IGN',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@id2 OUTPUT;
-INSERT INTO @R SELECT 'A13 @p_ignore_window=1 ⇒ chạy tay ngoài khung được (job vô hại)',
-  CASE WHEN @ec=0 AND @id2 IS NOT NULL THEN 1 ELSE 0 END, CONCAT('err=',@ec);
--- ...nhưng cửa hậu KHÔNG mở được đường gọi FO: tầng 2 vẫn chặn khi tới lượt chạy.
-EXEC SP_JOB_CLAIM @p_job_run_id=@id2, @p_owner='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A13 ★ cửa hậu ignore_window KHÔNG qua được tầng 2 ⇒ vẫn SKIPPED',
-  CASE WHEN @ec=3 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+INSERT INTO @R SELECT 'A13 ★ KHÔNG còn cửa hậu: đẩy tay ngoài khung ⇒ err=3 + 0 lượt được tạo',
+  CASE WHEN @ec=3 AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_WIN' AND C_FIRE_KEY='IGN')
+       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
 
 -- SP_GET_JOB_STATUS trả HAI result set (RS1 sức khoẻ + RS2 lượt cần xử lý) đúng quy ước read API
 --   của repo ⇒ KHÔNG hứng được bằng INSERT..EXEC. Chạy thẳng và soi @p_err_code.
@@ -674,6 +673,75 @@ EXEC SP_SET_JOB_SCHEDULE @p_job_code='FO_SNAPSHOT_RT', @p_interval_sec=900, @p_u
 INSERT INTO @R SELECT 'C14 trả lại 15 phút: err=0',
   CASE WHEN @ec=0 AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=900
        THEN 1 ELSE 0 END, NULL;
+
+/*---- C15. HẠN TƯƠI neo vào MỐC SLOT — thay cho khái niệm "khung + ân hạn" đã bỏ ----*/
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
+-- Khung 00:00-23:59 để mọi mốc đều nằm trong khung ⇒ cô lập đúng phép đo HẠN TƯƠI,
+--   không phụ thuộc smoke chạy vào giờ nào trong ngày.
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_INTERVAL_SEC,
+        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_MAX_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_FRESH',N'Hạn tươi (smoke)','SmokeHandler',900,'00:00:00','23:59:00',0,300,3,600,0);
+-- Job có khung giờ HẸP: dùng để kiểm "mốc nằm ngoài khung thì chặn", tách khỏi phép đo hạn tươi.
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_INTERVAL_SEC,
+        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_MAX_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_LATE',N'Mốc ngoài khung (smoke)','SmokeHandler',900,'00:00:00','00:01:00',0,300,3,600,0);
+
+-- (a) MỐC CÒN TƯƠI (60 giây trước) ⇒ CHẠY ĐƯỢC. Đây chính là ca "mốc 15:00 claim lúc 15:00:03":
+--     nếu áp khung giờ lên @now thay vì lên MỐC thì ca này trượt và ảnh chụp đóng cửa chết yểu.
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
+VALUES ('SMK_FRESH','TUOI','READY',@now,DATEADD(SECOND,-60,@now),@now);
+DECLARE @freshId BIGINT = SCOPE_IDENTITY();
+EXEC SP_JOB_CLAIM @p_job_run_id=@freshId, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★ mốc còn TƯƠI (60s) ⇒ claim OK (mốc cuối phiên KHÔNG chết yểu)',
+  CASE WHEN @ec=0 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@freshId)='RUNNING'
+       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+-- (b) MỐC QUÁ HẠN TƯƠI (700 giây > 600) ⇒ SKIPPED, dù mốc vẫn nằm trong khung.
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
+VALUES ('SMK_FRESH','HET','READY',@now,DATEADD(SECOND,-700,@now),@now);
+DECLARE @staleId BIGINT = SCOPE_IDENTITY();
+EXEC SP_JOB_CLAIM @p_job_run_id=@staleId, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★ mốc quá HẠN TƯƠI (700s > 600s) ⇒ err=3 + SKIPPED, dù vẫn trong khung',
+  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@staleId)='SKIPPED'
+       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+-- (c) RETRY KHÔNG làm mới hạn tươi. Đẩy C_RUN_AFTER lên hiện tại (giả lập vừa hết backoff) nhưng
+--     giữ nguyên mốc cũ ⇒ vẫn phải SKIPPED. Nếu đo hạn tươi từ C_RUN_AFTER thì ca này lọt, và một
+--     lượt thử lại mãi sẽ tự làm mới hạn của chính nó rồi bò qua giờ đóng cửa.
+UPDATE T_JOB_RUN SET C_STATUS='READY', C_ENDED_AT=NULL, C_RUN_AFTER=@now, C_ATTEMPT=1
+ WHERE C_JOB_RUN_ID=@staleId;
+EXEC SP_JOB_CLAIM @p_job_run_id=@staleId, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★★ RETRY KHÔNG làm mới hạn tươi (đo từ MỐC, không phải C_RUN_AFTER)',
+  CASE WHEN @ec=3 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+-- (d) MỐC NGOÀI KHUNG ⇒ chặn, dù còn tươi nguyên (60 giây). Hai guard độc lập nhau.
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
+VALUES ('SMK_LATE','NGOAI','READY',@now,DATEADD(SECOND,-60,@now),@now);
+DECLARE @outId BIGINT = SCOPE_IDENTITY();
+EXEC SP_JOB_CLAIM @p_job_run_id=@outId, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★ mốc NGOÀI khung (khung 00:00-00:01) ⇒ chặn, dù còn tươi nguyên',
+  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@outId)='SKIPPED'
+       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+-- (e) SP_JOB_ENQUEUE_DUE ghi đúng MỐC SLOT (không phải thời điểm quét).
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH';
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★ ENQUEUE_DUE ghi C_SLOT_AT = mốc slot (giây = 00, chia hết chu kỳ)',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH'
+                     AND C_SLOT_AT IS NOT NULL
+                     AND DATEPART(SECOND, C_SLOT_AT)=0
+                     AND DATEDIFF(SECOND, CAST(CAST(C_SLOT_AT AS DATE) AS DATETIME), C_SLOT_AT) % 900 = 0)
+       THEN 1 ELSE 0 END,
+  (SELECT TOP 1 CONVERT(VARCHAR(19),C_SLOT_AT,120) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH');
+
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
 
 DROP TABLE #dueC;
 DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');

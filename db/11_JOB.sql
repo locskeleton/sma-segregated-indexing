@@ -37,9 +37,10 @@ GO
     Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE_DUE / SP_JOB_ENQUEUE không tạo lượt chạy ngoài khung.
                           Biên [09:00, 15:00] ĐÓNG HAI ĐẦU và kiểm trên MỐC SLOT ⇒ 15:00 là mốc
                           cuối cùng được sinh; 15:15 thì không, phải đợi phiên GD kế tiếp.
-    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm tra LẠI bằng UDF_JOB_CAN_RUN (khung + ân hạn timeout)
-                          → quá hạn thì đóng dấu SKIPPED, worker KHÔNG chạm FO. Ân hạn là để chu
-                          kỳ sinh đúng 15:00 được chạy cho xong, KHÔNG phải để mở thêm giờ.
+    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm HAI thứ, trên MỐC SLOT của chính lượt đó:
+                          (a) mốc có nằm trong khung + đúng ngày GD không (UDF_JOB_IN_WINDOW);
+                          (b) còn TƯƠI không (C_MAX_DELAY_SEC tính từ mốc).
+                          Trượt cái nào cũng đóng dấu SKIPPED, worker KHÔNG chạm FO.
     Tầng 3 — GHI DỮ LIỆU: SP_INGEST_FO_SNAPSHOT_RT từ chối ngày không phải hôm nay / không phải
                           ngày GD. Đây là lưới cuối: kể cả ai đó gọi proc bằng tay.
     (Tầng 4 nằm ở C#: TradingWindowGuard kiểm TRƯỚC TỪNG HTTP call trong vòng lặp batch —
@@ -109,15 +110,25 @@ GO
 IF COL_LENGTH('T_JOB_DEFINITION','C_MAX_DELAY_SEC') IS NULL
     ALTER TABLE T_JOB_DEFINITION ADD C_MAX_DELAY_SEC INT NULL;
 GO
-/*  C_MAX_DELAY_SEC — "lượt chạy này nằm chờ quá lâu thì THÔI, đừng chạy nữa".
-    Đo từ C_RUN_AFTER (thời điểm lượt chạy BẮT ĐẦU đủ điều kiện chạy), KHÔNG phải C_ENQUEUED_AT.
-      · Lượt mới : C_RUN_AFTER = lúc sinh ⇒ đo đúng "nằm chờ bao lâu mà không ai nhặt".
-      · Lượt RETRY: C_RUN_AFTER = lúc hết backoff ⇒ retry KHÔNG bị tính là "cũ" chỉ vì lượt gốc
-        sinh từ 15 phút trước. Đo từ C_ENQUEUED_AT sẽ giết sạch retry của job có chu kỳ ngắn.
-    NULL ⇒ lấy C_INTERVAL_SEC làm mặc định: một lượt của job 15 phút mà nằm chờ quá 15 phút thì
-      slot kế tiếp đã thay nó rồi — chạy nữa là chạy lại việc cũ.
-    NULL cho cả hai (job on-demand, không chu kỳ) ⇒ KHÔNG hết hạn: job người ta đẩy tay phải nằm
-      đó chờ tới lượt, không được tự bốc hơi.                                                     */
+/*  ★★ C_MAX_DELAY_SEC — HẠN TƯƠI của một lượt chạy, đo từ C_SLOT_AT.
+      "Lượt này còn ý nghĩa nữa không, tính từ mốc mà nó ĐÁNG LẼ chạy?"
+
+    ĐÂY LÀ CON SỐ DUY NHẤT quyết định giờ giấc lúc CHẠY. Không có khái niệm "khung giờ + ân hạn"
+      nào khác, và cố ý như vậy: số liệu near-realtime chỉ có nghĩa TRONG phiên để PM ra quyết
+      định. Trễ 40 phút thì nó không còn là near-realtime, nó là số rác — chạy cho có chỉ tổ gọi
+      FO ngoài giờ. Vì thế KHÔNG xây cơ chế "gửi bằng được sau khi FO trễ".
+
+    Đo từ C_SLOT_AT (mốc đáng lẽ chạy), KHÔNG phải C_RUN_AFTER:
+      · C_RUN_AFTER bị đẩy lên sau mỗi lần retry ⇒ một lượt thử lại mãi sẽ tự làm mới hạn tươi của
+        chính nó và bò qua giờ đóng cửa. Neo vào mốc slot thì hạn tươi là TUYỆT ĐỐI: lượt 15:00 hết
+        hiệu lực lúc 15:10, bất kể nó đã thử lại mấy lần.
+      · Đánh đổi (biết và chấp nhận): retry chỉ có ý nghĩa khi còn trong hạn tươi. Job cấu hình
+        retry_delay dài hơn max_delay thì lượt thử lại sẽ bị SKIPPED — đúng ý đồ, không phải lỗi.
+
+    NULL ⇒ lấy C_INTERVAL_SEC làm mặc định: lượt của job 15 phút mà quá 15 phút thì slot kế tiếp
+      đã thay nó rồi — chạy nữa là chạy lại việc cũ.
+    NULL cho cả hai (job on-demand, không chu kỳ) ⇒ KHÔNG hết hạn: job đẩy tay phải nằm chờ tới
+      lượt, không tự bốc hơi.                                                                     */
 
 /*===========================================================================
   T_JOB_RUN — HÀNG ĐỢI **VÀ** NHẬT KÝ trong CÙNG MỘT bảng. 1 dòng = 1 LƯỢT chạy.
@@ -153,6 +164,11 @@ CREATE TABLE T_JOB_RUN (
     C_LEASE_UNTIL    DATETIME       NULL,             -- hết hạn mà không heartbeat ⇒ SP_JOB_REAP thu hồi
     C_HEARTBEAT_AT   DATETIME       NULL,
     C_RUN_AFTER      DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_RA  DEFAULT GETDATE(),  -- backoff sau khi FAILED
+    -- ★ MỐC mà lượt này ĐÁNG LẼ chạy. Job định kỳ: đúng mốc slot (09:00, 09:15…). Job đẩy tay:
+    --   thời điểm đẩy. Đây là NEO của mọi phép kiểm giờ giấc về sau — xem chú thích C_MAX_DELAY_SEC.
+    --   Không suy ra từ C_ENQUEUED_AT được: bộ quét chạy mỗi 10 giây nên nó tạo lượt 15:00 vào lúc
+    --   15:00:04, và mọi phép so khung giờ dựa trên con số đó sẽ trượt mốc cuối phiên.
+    C_SLOT_AT        DATETIME       NULL,
     -- AI ĐÁNH THỨC lượt chạy này: 'notify' (Pub/Sub — đường bình thường) | 'reap' (SP_JOB_REAP
     --   nhặt lại vì thông báo bị mất) | 'manual'. ⚠️ Đây KHÔNG phải cột trang trí: Pub/Sub là
     --   bắn-rồi-quên, nếu nó hỏng thì hệ VẪN CHẠY ĐÚNG nhờ reaper, chỉ chậm đi ~30 giây — và
@@ -189,6 +205,9 @@ GO
 IF COL_LENGTH('T_JOB_RUN','C_CLAIM_SOURCE') IS NULL
     ALTER TABLE T_JOB_RUN ADD C_CLAIM_SOURCE VARCHAR(40) NULL;
 GO
+IF COL_LENGTH('T_JOB_RUN','C_SLOT_AT') IS NULL
+    ALTER TABLE T_JOB_RUN ADD C_SLOT_AT DATETIME NULL;
+GO
 
 /*===========================================================================
   UDF_JOB_IN_WINDOW — "job này ĐƯỢC PHÉP chạy tại thời điểm @p_at hay không?"
@@ -211,64 +230,6 @@ BEGIN
     -- ★ Biên [from, to] ĐÓNG HAI ĐẦU: mốc 15:00 LÀ một mốc sinh job hợp lệ (ảnh chụp đóng cửa).
     --   Khung 09:00–15:00 với chu kỳ 1 tiếng ⇒ 7 mốc: 9,10,11,12,13,14,15.
     IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) <= @wt RETURN 1;
-    RETURN 0;
-END
-GO
-
-/*===========================================================================
-  UDF_JOB_CAN_RUN — "tại thời điểm @p_at, lượt chạy này còn được phép CHẠY (và gọi hệ ngoài) không?"
-
-  ★ KHÁC UDF_JOB_IN_WINDOW, và sự khác nhau đó là CỐ Ý — hai câu hỏi khác nhau:
-      UDF_JOB_IN_WINDOW : "có được SINH job tại mốc này không?"   → [from, to]
-      UDF_JOB_CAN_RUN   : "có được CHẠY tại lúc này không?"        → [from, to + timeout]
-
-  VÌ SAO PHẢI TÁCH: chu kỳ nổ đúng 15:00 thì KHÔNG THỂ xong trong 0 giây — 1000 batch mất vài
-    phút. Nếu tầng 2 (claim) và tầng 4 (gọi FO) cùng cắt cứng tại 15:00:00 thì mốc 15:00 vừa sinh
-    ra đã chết yểu: claim lúc 15:00:03 là trượt. Ảnh chụp đóng cửa sẽ KHÔNG BAO GIỜ có.
-
-  Luật nghiệp vụ (chốt với PM): "15:00 là mốc CUỐI CÙNG được gọi sang FO; chu kỳ đó hoàn thành sau
-    15:00 là bình thường. Điều bị cấm là SINH THÊM job mới sau khi hết phiên" — cấm đó do
-    UDF_JOB_IN_WINDOW gác, không phải hàm này.
-
-  Ân hạn = C_TIMEOUT_SEC, KHÔNG thêm tham số cấu hình mới: đó vốn là khoảng thời gian mà hệ đã
-    tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease).
-
-  CÓ THỪA SO VỚI C_MAX_DELAY_SEC KHÔNG? — Không. Hai hàm chặn hai loại "quá hạn" khác nhau:
-    C_MAX_DELAY_SEC : nằm chờ quá lâu SO VỚI CHU KỲ (tương đối, đo từ C_RUN_AFTER)
-                      → che cả job KHÔNG có khung giờ
-    UDF_JOB_CAN_RUN : ra ngoài KHUNG GIỜ (tuyệt đối, theo giờ trong ngày)
-                      → che cả job KHÔNG có chu kỳ (on-demand, max_delay hiệu lực = NULL)
-  Với job FO (có cả hai) thì C_MAX_DELAY_SEC=600s chặt hơn CAN_RUN=840s nên nó chặn trước, và hàm
-    này im lặng suốt đường chạy bình thường. Nhưng nó là thứ DUY NHẤT chặn hai ca:
-      ① @p_ignore_window đẩy tay lúc 22h — lượt VỪA SINH nên max_delay cho qua (ca smoke A13);
-      ② tầng 4 (C#) chặn chu kỳ khởi động hợp lệ nhưng FO chậm, bò tới 17h — max_delay đo lúc
-        NẰM CHỜ chứ không đo lúc ĐANG CHẠY, còn lease thì heartbeat gia hạn liên tục khi worker
-        còn sống nên worker khoẻ mạnh chạy 3 tiếng vẫn giữ lease. Không có hàm này thì KHÔNG CÓ GÌ
-        chặn việc bắn request sang FO lúc 17h.
-===========================================================================*/
-CREATE OR ALTER FUNCTION UDF_JOB_CAN_RUN (@p_job_code VARCHAR(40), @p_at DATETIME)
-RETURNS BIT
-AS
-BEGIN
-    DECLARE @en BIT, @bdo BIT, @wf TIME(0), @wt TIME(0), @to INT;
-    SELECT @en=C_ENABLED, @bdo=C_BUSINESS_DAY_ONLY, @wf=C_WINDOW_FROM, @wt=C_WINDOW_TO,
-           @to=C_TIMEOUT_SEC
-    FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code;
-
-    IF @en IS NULL OR @en = 0 RETURN 0;
-    IF @bdo = 1 AND dbo.UDF_IS_BUSINESS_DATE(CAST(@p_at AS DATE)) = 0 RETURN 0;
-    IF @wf IS NULL RETURN 1;
-
-    -- Hạn chót = to + timeout, KẸP TRONG NGÀY. Không cho tràn sang 00:00 hôm sau: khung 23:30 với
-    --   timeout 14 phút mà cộng thẳng sẽ ra 23:44 (vẫn trong ngày, ok), nhưng khung 23:55 sẽ ra
-    --   00:09 hôm sau — cộng kiểu TIME sẽ QUẤN VÒNG và biến thành "được chạy từ 0h", tức là mở
-    --   toang cả đêm. Kẹp về 23:59:59 là hành vi đúng và dễ hiểu.
-    DECLARE @hardStop TIME(0) = CASE
-        WHEN DATEDIFF(SECOND, CAST('00:00:00' AS TIME(0)), @wt) + ISNULL(@to,300) >= 86399
-        THEN CAST('23:59:59' AS TIME(0))
-        ELSE DATEADD(SECOND, ISNULL(@to,300), @wt) END;
-
-    IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) <= @hardStop RETURN 1;
     RETURN 0;
 END
 GO
@@ -419,7 +380,6 @@ CREATE OR ALTER PROCEDURE SP_JOB_ENQUEUE
     @p_fire_key      VARCHAR(64)   = NULL,           -- NULL ⇒ NEWID() (mỗi lần gọi = 1 lượt riêng)
     @p_payload       NVARCHAR(MAX) = NULL,
     @p_business_date DATE          = NULL,
-    @p_ignore_window BIT           = 0,              -- 1 = chạy tay ngoài khung (vận hành). KHÔNG dùng cho job gọi FO.
     @p_user          VARCHAR(64)   = NULL,
     @p_err_code      INT           OUTPUT,
     @p_err_msg       NVARCHAR(400) OUTPUT,
@@ -436,10 +396,12 @@ BEGIN
         IF @en = 0
             BEGIN SET @p_err_code=2; SET @p_err_msg=CONCAT(N'Job đang TẮT: ', @p_job_code); RETURN; END
 
-        -- ★ GUARD TẦNG 1. @p_ignore_window là cửa hậu cho vận hành chạy tay các job VÔ HẠI
-        --   (dọn dẹp, tính lại...). Job chạm hệ ngoài như FO_SNAPSHOT_RT vẫn bị tầng 2 + tầng 3
-        --   chặn, nên cửa hậu này KHÔNG mở được đường gọi FO ngoài giờ.
-        IF @p_ignore_window = 0 AND dbo.UDF_JOB_IN_WINDOW(@p_job_code, @now) = 0
+        -- ★ GUARD TẦNG 1 — KHÔNG CÓ CỬA HẬU.
+        --   Bản trước có tham số @p_ignore_window cho vận hành "chạy tay ngoài khung". Đã BỎ:
+        --   một cửa hậu mà job gọi hệ ngoài cũng đi qua được thì nó không còn là cửa hậu, nó là
+        --   cái lỗ. Cần chạy job ngoài khung thì sửa khung bằng SP_SET_JOB_SCHEDULE — có dấu vết,
+        --   có người chịu trách nhiệm, và tự dọn lượt chờ của cấu hình cũ.
+        IF dbo.UDF_JOB_IN_WINDOW(@p_job_code, @now) = 0
         BEGIN
             SET @p_err_code=3;
             SET @p_err_msg=CONCAT(N'Ngoài khung giờ cho phép của job ', @p_job_code, N' (',
@@ -462,10 +424,11 @@ BEGIN
         END
 
         BEGIN TRY
-            INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_ENQUEUED_AT,C_MESSAGE)
+            INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT,C_MESSAGE)
             VALUES (@p_job_code, @fk, 'READY', @p_business_date,
                     ISNULL(@p_payload, (SELECT C_PAYLOAD FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code)),
-                    @now, @now, CONCAT(N'enqueue by ', ISNULL(@p_user,'(system)')));
+                    @now, @now,   -- job đẩy tay: mốc = chính lúc đẩy
+                    @now, CONCAT(N'enqueue by ', ISNULL(@p_user,'(system)')));
             SET @p_job_run_id = SCOPE_IDENTITY();
         END TRY
         BEGIN CATCH
@@ -509,7 +472,8 @@ BEGIN
         DECLARE @midnight DATETIME = CAST(CAST(@now AS DATE) AS DATETIME);
 
         -- Ứng viên: job định kỳ, đang bật, ĐANG trong khung giờ, và (nếu singleton) không có lượt đang chạy.
-        DECLARE @due TABLE (job_code VARCHAR(40), fire_key VARCHAR(64), payload NVARCHAR(MAX), bdate DATE);
+        DECLARE @due TABLE (job_code VARCHAR(40), fire_key VARCHAR(64), payload NVARCHAR(MAX),
+                            bdate DATE, slot_at DATETIME);
         -- ★ KIỂM BIÊN TRÊN **MỐC SLOT**, KHÔNG PHẢI TRÊN THỜI ĐIỂM QUÉT.
         --   Đây là chỗ cực dễ sai và sai thì không ai thấy: bộ quét chạy mỗi 10 giây nên nó gần
         --   như không bao giờ chạy đúng 15:00:00.000 — nó chạy lúc 15:00:04. Kiểm khung trên
@@ -518,7 +482,7 @@ BEGIN
         --   Kiểm trên mốc slot thì 15:00:04 → slot 15:00:00 → nằm trong khung ⇒ sinh đúng.
         --   Đồng thời đúng luôn yêu cầu "không sinh job mới sau khi hết phiên": 15:15:04 → slot
         --   15:15:00 > 15:00 ⇒ không sinh, phải đợi phiên GD kế tiếp.
-        INSERT @due (job_code, fire_key, payload, bdate)
+        INSERT @due (job_code, fire_key, payload, bdate, slot_at)
         SELECT d.C_JOB_CODE,
                -- fire_key = mốc slot 'yyyyMMddHHmmss' (style 112 = yyyymmdd, + HHmmss ghép tay).
                --   ★ PHẢI CÓ GIÂY. Bản đầu chỉ tới PHÚT và nó sai thật: C_INTERVAL_SEC cho phép tới 30s
@@ -531,7 +495,8 @@ BEGIN
                + FORMAT(DATEADD(SECOND,
                      (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 'HHmmss'),
                d.C_PAYLOAD,
-               CAST(@now AS DATE)
+               CAST(@now AS DATE),
+               DATEADD(SECOND, (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight)
         FROM T_JOB_DEFINITION d
         WHERE d.C_ENABLED = 1
           AND d.C_INTERVAL_SEC IS NOT NULL
@@ -549,9 +514,9 @@ BEGIN
 
         -- INSERT ... WHERE NOT EXISTS + UQ: pod nào thắng thì thắng. Không lock, không chờ.
         DECLARE @new TABLE (id BIGINT, job_code VARCHAR(40), payload NVARCHAR(MAX));
-        INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_ENQUEUED_AT,C_MESSAGE)
+        INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT,C_MESSAGE)
         OUTPUT inserted.C_JOB_RUN_ID, inserted.C_JOB_CODE, inserted.C_PAYLOAD INTO @new
-        SELECT u.job_code, u.fire_key, 'READY', u.bdate, u.payload, @now, @now,
+        SELECT u.job_code, u.fire_key, 'READY', u.bdate, u.payload, @now, u.slot_at, @now,
                CONCAT(N'scheduler slot ', u.fire_key)
         FROM @due u
         WHERE NOT EXISTS (SELECT 1 FROM T_JOB_RUN r
@@ -595,11 +560,11 @@ BEGIN
     BEGIN TRY
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
         DECLARE @code VARCHAR(40), @status VARCHAR(10), @attempt INT, @maxatt INT, @timeout INT,
-                @maxdelay INT, @runafter DATETIME, @age INT;
+                @maxdelay INT, @slotat DATETIME, @age INT;
         SELECT @code=r.C_JOB_CODE, @status=r.C_STATUS, @attempt=r.C_ATTEMPT,
                @maxatt=d.C_MAX_ATTEMPT, @timeout=d.C_TIMEOUT_SEC,
                @maxdelay=COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),  -- NULL (job on-demand) = không hết hạn
-               @runafter=r.C_RUN_AFTER
+               @slotat=ISNULL(r.C_SLOT_AT, r.C_ENQUEUED_AT)              -- dòng cũ trước migration: lùi về enqueued
         FROM T_JOB_RUN r LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
         WHERE r.C_JOB_RUN_ID=@p_job_run_id;
 
@@ -616,35 +581,38 @@ BEGIN
             SET @p_err_code=6; SET @p_err_msg=N'Lượt chạy đã vượt số lần thử → DEAD.'; RETURN;
         END
 
-        -- ★ GUARD TẦNG 2 — dùng UDF_JOB_CAN_RUN (khung + ÂN HẠN timeout), KHÔNG dùng
-        --   UDF_JOB_IN_WINDOW. Lượt sinh đúng mốc 15:00 phải claim được lúc 15:00:03; cắt cứng tại
-        --   15:00:00 là giết chính cái ảnh chụp đóng cửa mà mốc đó sinh ra để lấy.
-        --   Vẫn chặn: lượt của phiên HÔM QUA (sai ngày GD) và lượt vượt quá hạn chót.
-        IF dbo.UDF_JOB_CAN_RUN(@code, @now) = 0
+        -- ★ GUARD TẦNG 2 — kiểm khung giờ trên MỐC SLOT của chính lượt này, KHÔNG phải trên @now.
+        --   Lượt sinh đúng mốc 15:00 phải claim được lúc 15:00:03; áp khung lên @now là giết chính
+        --   cái ảnh chụp đóng cửa mà mốc đó sinh ra để lấy.
+        --   Vẫn chặn: lượt của phiên HÔM QUA / ngày nghỉ (UDF_IS_BUSINESS_DATE trong hàm này) và
+        --   lượt có mốc nằm ngoài khung (job đẩy tay lúc 22h). "Còn tươi không" là việc của guard
+        --   HẠN TƯƠI ngay bên dưới — hai câu hỏi khác nhau, đừng gộp.
+        IF dbo.UDF_JOB_IN_WINDOW(@code, @slotat) = 0
         BEGIN
             UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
-                   C_MESSAGE=CONCAT(N'BỎ QUA: tới lượt chạy lúc ', CONVERT(VARCHAR(19),@now,120),
-                                    N' (giờ VN) đã quá hạn chót chạy của job ', @code,
-                                    N' (khung + ân hạn timeout).')
+                   C_MESSAGE=CONCAT(N'BỎ QUA: mốc ', CONVERT(VARCHAR(19),@slotat,120),
+                                    N' nằm ngoài khung giờ cho phép của job ', @code, N'.')
             WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
             SET @p_err_code=3;
             SET @p_err_msg=N'Ngoài khung giờ tại thời điểm chạy — đã đóng dấu SKIPPED, KHÔNG gọi hệ ngoài.';
             RETURN;
         END
 
-        -- ★ GUARD HẾT HẠN — "đừng chạy lại việc của giờ trước / của hôm qua".
-        --   Ca thật: lượt sinh 14:59 không kịp chạy, nằm READY qua đêm. Sáng mai 09:00 nó lại
-        --   NẰM TRONG khung giờ và ĐÚNG ngày GD ⇒ guard khung giờ cho qua ⇒ job chạy lại một
-        --   lượt của HÔM QUA. Chỉ có mốc hết hạn mới chặn được ca này.
-        SET @age = DATEDIFF(SECOND, @runafter, @now);
+        -- ★ GUARD HẠN TƯƠI — con số DUY NHẤT quyết định "muộn quá thì thôi".
+        --   Số liệu near-realtime chỉ có nghĩa TRONG phiên để PM ra quyết định; trễ 40 phút thì nó
+        --   là số rác, chạy cho có chỉ tổ gọi FO ngoài giờ. KHÔNG xây cơ chế "gửi bằng được".
+        --   Đo từ MỐC SLOT nên hạn tươi là tuyệt đối: lượt 15:00 hết hiệu lực lúc 15:10, bất kể
+        --   nó đã nằm chờ hay đã thử lại mấy lần.
+        SET @age = DATEDIFF(SECOND, @slotat, @now);
         IF @maxdelay IS NOT NULL AND @age > @maxdelay
         BEGIN
             UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
-                   C_MESSAGE=CONCAT(N'BỎ QUA: nằm chờ ', @age, N' giây (quá hạn ', @maxdelay,
-                        N's) — lượt kế tiếp đã thay nó, chạy lại là chạy lại việc cũ.')
+                   C_MESSAGE=CONCAT(N'BỎ QUA: đã ', @age, N' giây kể từ mốc ',
+                        CONVERT(VARCHAR(19),@slotat,120), N' (hạn tươi ', @maxdelay,
+                        N's) — số không còn là near-realtime, lượt kế tiếp đã thay nó.')
             WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
             SET @p_err_code=3;
-            SET @p_err_msg=CONCAT(N'Lượt chạy đã quá hạn (chờ ', @age, N's > ', @maxdelay, N's) — SKIPPED.');
+            SET @p_err_msg=CONCAT(N'Lượt chạy đã quá hạn tươi (', @age, N's > ', @maxdelay, N's) — SKIPPED.');
             RETURN;
         END
 
@@ -806,14 +774,15 @@ BEGIN
         --       Guard khung giờ không cứu được, vì 09:00 hôm sau là hoàn toàn "trong giờ".
         UPDATE r
            SET r.C_STATUS='SKIPPED', r.C_ENDED_AT=@now,
-               r.C_MESSAGE=CONCAT(N'BỎ QUA: nằm chờ ', DATEDIFF(SECOND, r.C_RUN_AFTER, @now),
-                    N' giây, quá hạn ', COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),
-                    N's — lượt kế tiếp đã thay nó.')
+               r.C_MESSAGE=CONCAT(N'BỎ QUA: đã ', DATEDIFF(SECOND, ISNULL(r.C_SLOT_AT,r.C_ENQUEUED_AT), @now),
+                    N' giây kể từ mốc, quá hạn tươi ', COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),
+                    N's — số không còn là near-realtime.')
           FROM T_JOB_RUN r
           INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
          WHERE r.C_STATUS='READY'
            AND COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) IS NOT NULL
-           AND DATEDIFF(SECOND, r.C_RUN_AFTER, @now) > COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC);
+           AND DATEDIFF(SECOND, ISNULL(r.C_SLOT_AT,r.C_ENQUEUED_AT), @now)
+                 > COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC);
 
         -- (3) Lượt READY tới hạn, nằm lâu bất thường ⇒ trả về cho app XADD lại.
         SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, r.C_PAYLOAD
@@ -821,10 +790,10 @@ BEGIN
         WHERE r.C_STATUS='READY'
           AND r.C_RUN_AFTER <= @now
           AND DATEDIFF(SECOND, r.C_ENQUEUED_AT, @now) >= @p_stale_sec
-          -- Đẩy lại theo CAN_RUN (khung + ân hạn), không phải IN_WINDOW: lượt 15:00 mất message
-          --   phải được đánh thức lại lúc 15:00:35, nếu không thì mốc cuối phiên mất trắng mỗi khi
-          --   Kafka nấc một nhịp. Job đã quá hạn chót thì bước (2) đã đóng dấu SKIPPED rồi.
-          AND dbo.UDF_JOB_CAN_RUN(r.C_JOB_CODE, @now) = 1
+          -- Khung giờ áp lên MỐC SLOT của lượt, không phải @now: lượt 15:00 mất message phải được
+          --   đánh thức lại lúc 15:00:35, nếu không thì mốc cuối phiên mất trắng mỗi khi Kafka nấc
+          --   một nhịp. Lượt quá hạn tươi thì bước (2) đã đóng dấu SKIPPED rồi.
+          AND dbo.UDF_JOB_IN_WINDOW(r.C_JOB_CODE, ISNULL(r.C_SLOT_AT, r.C_ENQUEUED_AT)) = 1
         ORDER BY r.C_JOB_RUN_ID;
     END TRY
     BEGIN CATCH
@@ -881,8 +850,7 @@ BEGIN
                     ELSE 'INTERVAL' END AS C_SCHEDULE_MODE,
                COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) AS C_EFFECTIVE_MAX_DELAY_SEC,
                d.C_WINDOW_FROM, d.C_WINDOW_TO, d.C_BUSINESS_DAY_ONLY,
-               dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) AS C_CAN_ENQUEUE_NOW,  -- còn được SINH job không
-               dbo.UDF_JOB_CAN_RUN  (d.C_JOB_CODE, @now) AS C_CAN_RUN_NOW,      -- còn được CHẠY không (có ân hạn)
+               dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) AS C_IN_WINDOW_NOW,   -- bây giờ có trong khung không
                l.C_JOB_RUN_ID AS C_LAST_RUN_ID, l.C_STATUS AS C_LAST_STATUS,
                l.C_STARTED_AT AS C_LAST_STARTED_AT, l.C_ENDED_AT AS C_LAST_ENDED_AT,
                l.C_ROWS AS C_LAST_ROWS, l.C_MESSAGE AS C_LAST_MESSAGE,
@@ -1205,7 +1173,7 @@ BEGIN
                      THEN CAST((rt.C_AUM - pv.C_AUM_PREV_SAMESET) * 1.0 / pv.C_AUM_PREV_SAMESET AS DECIMAL(18,8))
                 END AS C_CHANGE_PCT,   -- ⚠️ biến động tài sản, CHƯA khử dòng tiền — KHÔNG phải hiệu suất
                 CASE WHEN rt.C_RT_SI_COUNT = rt.C_TOTAL_ACCOUNT THEN 'FULL' ELSE 'PARTIAL' END AS C_COVERAGE,
-                dbo.UDF_JOB_CAN_RUN('FO_SNAPSHOT_RT', @now) AS C_IN_TRADING_WINDOW
+                dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', @now) AS C_IN_TRADING_WINDOW
         FROM (SELECT DISTINCT C_MASTER_CODE FROM T_MASTER_BALANCE
               WHERE C_BUSINESS_DATE=@today AND C_SRC='RT') m
         INNER JOIN T_MASTER_BALANCE rt

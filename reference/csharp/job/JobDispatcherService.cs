@@ -198,6 +198,7 @@ public class JobDispatcherService : BackgroundService
             BusinessDate   = claim.BusinessDate,
             PayloadJson    = claim.PayloadJson,
             Attempt        = claim.Attempt,
+            SlotAt         = claim.SlotAt,
             ReportProgress = rows => Interlocked.Exchange(ref progress, rows),  // RAM, 0 query
             IsStillMine    = () => Volatile.Read(ref stillMine) == 1,           // RAM, 0 query
             HeartbeatAsync = () => BeatAsync(forced: true)                      // có chặn tần suất

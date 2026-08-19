@@ -140,54 +140,38 @@ Mốc slot neo vào **00:00 giờ VN**: `slot = 00:00 + floor(giây_từ_nửa_�
 
 Nếu tính mốc theo "lần chạy trước + period" thì mỗi lần pod restart / job chậm là mốc trôi đi, và sau một ngày không ai đoán được job chạy vào phút nào — nhật ký thành thứ không đối chiếu được với dữ liệu FO.
 
-### ★ Biên `[from, to]` đóng hai đầu, và kiểm trên MỐC SLOT
+### ★ Biên `[from, to]` đóng hai đầu, và MỌI phép kiểm giờ đều neo vào MỐC SLOT
 
 Luật nghiệp vụ: **15:00 là mốc CUỐI CÙNG được gọi sang FO** (ảnh chụp đóng cửa). Cái bị cấm là **sinh thêm mốc mới sau khi hết phiên** — phải đợi phiên GD kế tiếp.
 
-Hai chi tiết nhỏ mà sai là hỏng cả tính năng:
+Và một luật thứ hai, quan trọng không kém: **số near-realtime chỉ có nghĩa TRONG phiên**, để PM ra quyết định. Trễ 40 phút thì nó không còn là near-realtime, nó là số rác — chạy cho có chỉ tổ gọi FO ngoài giờ. Vì thế **không xây cơ chế "gửi bằng được sau khi FO trễ"**.
 
-**① Kiểm biên trên mốc slot, KHÔNG phải trên thời điểm quét.** Bộ quét chạy mỗi 10 giây nên nó gần như không bao giờ chạy đúng `15:00:00.000` — nó chạy lúc `15:00:04`. Kiểm khung trên `now` thì `15:00:04 > 15:00:00` ⇒ **mốc 15:00 không bao giờ sinh ra**, và người ta chỉ phát hiện khi thắc mắc vì sao ảnh chụp đóng cửa không có. Kiểm trên mốc slot thì `15:00:04 → slot 15:00:00 → trong khung ⇒ sinh đúng`; còn `15:15:04 → slot 15:15:00 > 15:00 ⇒ không sinh`.
+Hai luật đó gộp lại thành **hai phép kiểm, cả hai đều neo vào `C_SLOT_AT`** (mốc mà lượt chạy đáng lẽ chạy):
 
-**② "Được sinh" và "được chạy" là hai câu hỏi khác nhau.**
-
-| Hàm | Trả lời | Khoảng |
+| Phép kiểm | Hỏi gì | Ở đâu |
 |---|---|---|
-| `UDF_JOB_IN_WINDOW` | "có được **SINH** job tại mốc này không?" | `[09:00, 15:00]` |
-| `UDF_JOB_CAN_RUN` | "có được **CHẠY** tại lúc này không?" | `[09:00, 15:00 + timeout]` |
+| `UDF_JOB_IN_WINDOW(job, slot)` | mốc có nằm trong `[09:00, 15:00]` + đúng ngày GD không? | tầng 1 (sinh), tầng 2 (claim), tầng 4 (C#) |
+| `C_MAX_DELAY_SEC` | `now − slot` còn trong hạn tươi không? | tầng 2 (claim), tầng 4 (C#) |
 
-Chu kỳ nổ đúng 15:00 **không thể** xong trong 0 giây — 1000 batch mất vài phút. Nếu tầng 2 (claim) và tầng 4 (gọi FO) cùng cắt cứng tại `15:00:00` thì mốc 15:00 vừa sinh ra đã chết yểu: claim lúc `15:00:03` là trượt.
+**Không còn khái niệm "khung giờ + ân hạn".** Bản trước có `UDF_JOB_CAN_RUN` = `[from, to + C_TIMEOUT_SEC]` — đã **xoá**. Nó thừa: hạn tươi neo vào mốc đã làm đúng việc đó, bằng một con số dễ hiểu hơn ("lượt 15:00 hết hiệu lực lúc 15:10") thay vì một phép cộng hai cấu hình.
 
-Ân hạn = `C_TIMEOUT_SEC`, **không thêm tham số cấu hình mới**: đó vốn là khoảng thời gian hệ đã tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease). Quá mốc đó thì lease cũng hết hạn và `SP_JOB_REAP` thu hồi — hai giới hạn trùng nhau, không thể lệch pha. Job FO: `timeout 840s` ⇒ hạn chót gọi FO = **15:14**.
+### Hai chi tiết nhỏ mà sai là hỏng cả tính năng
 
-Tầng 4 (C# `TradingWindowGuard`) đọc `GraceSec = C_TIMEOUT_SEC` từ cùng bảng nên dùng **cùng một con số** với `UDF_JOB_CAN_RUN` bên SQL.
+**① Kiểm biên trên MỐC SLOT, KHÔNG phải trên thời điểm quét/claim.** Bộ quét chạy mỗi 10 giây nên nó gần như không bao giờ chạy đúng `15:00:00.000` — nó chạy lúc `15:00:04`. Áp khung lên `now` thì `15:00:04 > 15:00:00` ⇒ **mốc 15:00 không bao giờ sinh ra**, và người ta chỉ phát hiện khi thắc mắc vì sao ảnh chụp đóng cửa không có. Cùng lỗi đó ở tầng claim: lượt 15:00 nhận lúc `15:00:03` sẽ bị từ chối.
 
-### `UDF_JOB_CAN_RUN` có thừa so với `C_MAX_DELAY_SEC` không? — Đo thật
+Neo vào mốc thì cả hai đều đúng: `15:00:04 → slot 15:00:00 → trong khung ⇒ sinh`; `15:15:04 → slot 15:15:00 > 15:00 ⇒ không sinh`, đợi phiên kế tiếp.
 
-Câu hỏi hợp lý, vì hai thứ trông như cùng chặn "lượt chạy quá muộn". Đo bằng chính hai hàm đó:
+**② Hạn tươi đo từ `C_SLOT_AT`, KHÔNG phải `C_RUN_AFTER`.** `C_RUN_AFTER` bị đẩy lên sau mỗi lần retry ⇒ một lượt thử lại mãi sẽ **tự làm mới hạn tươi của chính nó** và bò qua giờ đóng cửa. Neo vào mốc thì hạn là tuyệt đối: lượt 15:00 hết hiệu lực lúc 15:10, bất kể đã nằm chờ hay thử lại mấy lần.
 
-| Tình huống | `C_MAX_DELAY_SEC` cho qua | `CAN_RUN` cho qua | Ai thực sự chặn |
-|---|---|---|---|
-| FO: lượt 15:00, claim 15:05 | ✓ | ✓ | *(chạy)* |
-| FO: lượt 15:00, claim **15:11** | ✗ | ✓ | **`C_MAX_DELAY_SEC`** |
-| FO: lượt 15:00, claim 15:20 | ✗ | ✗ | cả hai |
-| **On-demand đẩy tay, claim 22:00** | ✓ | ✗ | **`UDF_JOB_CAN_RUN`** |
-| Job KHÔNG khung giờ, chờ 2 tiếng (chu kỳ 1h) | ✗ | ✓ | `C_MAX_DELAY_SEC` |
+> Đánh đổi đã biết và chấp nhận: retry chỉ có ý nghĩa khi còn trong hạn tươi. Job cấu hình `retry_delay` dài hơn `max_delay` thì lượt thử lại sẽ bị `SKIPPED` — đúng ý đồ, không phải lỗi.
 
-Hai hàm chặn **hai loại "quá hạn" khác nhau**, và không hàm nào thay được hàm kia:
+### Không còn cửa hậu
 
-| | Đo cái gì | Che job nào |
-|---|---|---|
-| `C_MAX_DELAY_SEC` | nằm chờ quá lâu **so với chu kỳ** (tương đối, từ `C_RUN_AFTER`) | job có chu kỳ — kể cả job **không** khung giờ |
-| `UDF_JOB_CAN_RUN` | ra ngoài **khung giờ** (tuyệt đối, theo giờ trong ngày) | job có khung giờ — kể cả job **không** chu kỳ (on-demand) |
+Bản trước có `@p_ignore_window` để vận hành "chạy tay ngoài khung". **Đã bỏ.** Một cửa hậu mà job gọi hệ ngoài cũng đi qua được thì nó không phải cửa hậu, nó là cái lỗ. Cần chạy ngoài khung thì sửa khung bằng `SP_SET_JOB_SCHEDULE` — có dấu vết, có người chịu trách nhiệm, và tự dọn lượt chờ của cấu hình cũ.
 
-Với job FO (có cả hai) thì `C_MAX_DELAY_SEC` chặt hơn nên nó chặn trước, và `CAN_RUN` im lặng suốt đường chạy bình thường. Nhưng `CAN_RUN` là thứ **duy nhất** đứng chắn ở hai chỗ:
+### Và chặn SỚM
 
-**① Cửa hậu `@p_ignore_window`.** Vận hành đẩy tay một lượt FO lúc 22h: lượt đó **vừa sinh** nên `C_MAX_DELAY_SEC` cho qua (chưa "cũ" chút nào). Chỉ `CAN_RUN` chặn — xem ca smoke **A13**.
-
-**② Chu kỳ khởi động hợp lệ nhưng chạy quá lâu.** Lượt 15:00 bắt đầu đúng giờ, FO nghẽn, chu kỳ bò tới 17h:
-- `C_MAX_DELAY_SEC` không cứu — nó đo lúc **nằm chờ**, không đo lúc **đang chạy**;
-- lease/timeout cũng không — **heartbeat gia hạn lease liên tục** khi worker còn sống, nên một worker khoẻ mạnh chạy 3 tiếng vẫn giữ lease ngon lành;
-- ⇒ `TradingWindowGuard` (tầng 4, dùng cùng công thức `CAN_RUN`) là **thứ duy nhất** đứng giữa "FO chậm" và "bắn request lúc 17h".
+`FoSnapshotJobHandler` gọi guard **trước khi đọc scope** (~50k dòng), trước khi chia batch, trước khi chạm FO. Ngoài giờ thì không có lý do gì để tốn một câu query 50k dòng rồi mới phát hiện ra điều đó. Trong vòng lặp vẫn kiểm lại trước **mỗi** call — vì hạn tươi có thể hết giữa chừng khi FO chậm.
 
 ---
 
@@ -281,15 +265,15 @@ Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ kh�
 | Tầng | Ở đâu | Bắt ca gì |
 |---|---|---|
 | 1 | `SP_JOB_ENQUEUE(_DUE)` | Không sinh lượt chạy lúc 15h30 |
-| 2 | `SP_JOB_CLAIM` (`UDF_JOB_CAN_RUN`) | **Job của phiên HÔM QUA, hoặc lượt đã quá hạn chót** (khung + ân hạn) → `SKIPPED`. Lượt sinh đúng 15:00 thì VẪN claim được tới 15:14 |
+| 2 | `SP_JOB_CLAIM` | Mốc ngoài khung / sai ngày GD / **quá hạn tươi** → `SKIPPED`. Lượt sinh đúng 15:00 vẫn claim được ở 15:00:03, nhưng hết hiệu lực lúc 15:10 |
 | 3 | `SP_INGEST_FO_SNAPSHOT_RT` | Gọi proc bằng tay; ghi ngày không phải hôm nay; ngày nghỉ |
-| **4** | `TradingWindowGuard` (C#) | **Chu kỳ chạy quá hạn chót** (khung + ân hạn). Đọc `GraceSec` từ DB nên khớp đúng `UDF_JOB_CAN_RUN` |
+| **4** | `TradingWindowGuard` (C#) | **Chu kỳ chạy quá hạn tươi** (FO chậm). Đọc `MaxDelaySec` từ DB — CÙNG con số tầng 2 dùng. Chặn TRƯỚC khi đọc scope, và trước MỖI call FO |
 
 Tầng 4 là tầng **duy nhất** bắt được ca cuối: tầng 1 và 2 chỉ kiểm **một lần, lúc bắt đầu**, còn một chu kỳ quét thì kéo dài nhiều phút. Guard đặt **ngay trước mỗi HTTP call**, không phải mỗi N batch — kiểm thưa ra là mở lại một khe hở đúng bằng N batch, và khe đó sẽ được lấp vào đúng ngày chu kỳ chạy chậm nhất.
 
 **Luật giờ chỉ định nghĩa MỘT chỗ:** `T_JOB_DEFINITION`. Tầng 1, 2, 3 gọi `UDF_JOB_IN_WINDOW` (đọc bảng đó); tầng 4 **đọc thẳng bảng đó lúc chạy**, nhớ tạm 60 giây. Không hard-code 9h–15h trong C#, và không nhận khung giờ qua hằng số lúc khởi động — xem §3c câu 6.
 
-**Biên `[from, to]` ĐÓNG hai đầu** — 15:00 là mốc cuối cùng được sinh, và chu kỳ đó được chạy tới `15:00 + timeout`. Chi tiết + lý do ở §2c.
+**Biên `[from, to]` ĐÓNG hai đầu** — 15:00 là mốc cuối cùng được sinh, và lượt đó còn hiệu lực trong `C_MAX_DELAY_SEC` kể từ mốc (FO: tới 15:10). Chi tiết + lý do ở §2c.
 
 **Đồng hồ**: `UDF_JOB_NOW()` neo `SYSUTCDATETIME()` rồi đổi sang giờ VN. `GETDATE()` trả giờ hệ điều hành — một pod SQL chạy UTC là khung 9h–15h lệch 7 tiếng, tức job gọi FO lúc 16h–22h giờ VN. Phía C# dùng `TimeZoneInfo` cùng múi, thử cả tên Windows lẫn Linux.
 

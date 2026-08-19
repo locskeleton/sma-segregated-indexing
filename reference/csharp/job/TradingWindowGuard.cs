@@ -19,10 +19,11 @@ public sealed class JobWindow
     public TimeSpan? To              { get; init; }   // MỐC CUỐI được SINH job (đóng: 15:00 hợp lệ)
     public bool      BusinessDayOnly { get; init; }
     /// <summary>
-    /// Ân hạn sau <see cref="To"/> để chu kỳ sinh ĐÚNG mốc cuối được chạy cho xong.
-    /// = T_JOB_DEFINITION.C_TIMEOUT_SEC. KHÔNG phải "nới giờ giao dịch" — xem UDF_JOB_CAN_RUN.
+    /// HẠN TƯƠI của một lượt chạy, tính từ MỐC SLOT của nó.
+    /// = COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) — CÙNG con số SP_JOB_CLAIM dùng, nên tầng 2 và
+    /// tầng 4 không thể lệch pha. Null = không hết hạn (job on-demand không chu kỳ).
     /// </summary>
-    public int       GraceSec        { get; init; }
+    public int?      MaxDelaySec     { get; init; }
 }
 
 /// <summary>
@@ -78,44 +79,61 @@ public sealed class TradingWindowGuard
     /// Ném <see cref="TradingWindowClosedException"/> nếu đã quá HẠN CHÓT CHẠY. Gọi trước MỖI call FO.
     /// Hạn chót = To + GraceSec (không phải To) — xem chú thích trong thân hàm.
     /// </summary>
-    public async Task EnsureOpenAsync(CancellationToken ct)
+    /// <summary>
+    /// Ném <see cref="TradingWindowClosedException"/> nếu lượt chạy này KHÔNG còn được phép chạm FO.
+    /// Gọi TRƯỚC KHI lấy dữ liệu / chia batch, và TRƯỚC MỖI call FO trong vòng lặp.
+    ///
+    /// Ba câu hỏi, không có câu nào là "bây giờ mấy giờ so với 15:00":
+    ///   ① Job còn bật không?
+    ///   ② MỐC của lượt này có nằm trong khung giờ không? (mốc, KHÔNG phải `now` — lượt 15:00
+    ///      claim lúc 15:00:03 vẫn hợp lệ; áp khung lên `now` là giết ảnh chụp đóng cửa)
+    ///   ③ Lượt này còn TƯƠI không — `now - slot &lt;= MaxDelaySec`?
+    ///
+    /// ③ là thứ thay cho toàn bộ khái niệm "khung + ân hạn" của bản trước. Số liệu near-realtime
+    /// chỉ có nghĩa TRONG phiên để PM ra quyết định; trễ 40 phút thì nó là số rác, và gọi FO lúc đó
+    /// vừa vô ích vừa vi phạm "ngoài giờ không gọi FO". Nên KHÔNG có cơ chế "gửi bằng được".
+    /// </summary>
+    /// <param name="slotAt">Mốc mà lượt chạy này đáng lẽ chạy (JobContext.SlotAt).</param>
+    public async Task EnsureOpenAsync(DateTime slotAt, CancellationToken ct)
     {
         var w   = await GetWindowAsync(ct);
         var now = NowVn();
 
+        // ① Tắt job là dừng được cả chu kỳ đang chạy (~1 phút, bằng TTL cache).
         if (!w.Enabled)
-            throw new TradingWindowClosedException($"Job {_jobCode} đang TẮT — DỪNG gọi FO.");
+            throw new TradingWindowClosedException($"Job {_jobCode} dang TAT - DUNG goi FO.");
 
+        // ② Khung giờ áp lên MỐC, không phải lên `now`.
         if (w.From is { } from && w.To is { } to)
         {
-            // ★ HẠN CHÓT = to + ÂN HẠN, KHÔNG phải to.
-            //   Luật nghiệp vụ: 15:00 là mốc CUỐI CÙNG được gọi sang FO; chu kỳ nổ đúng 15:00 mà
-            //   chạy tới 15:07 là BÌNH THƯỜNG — 1000 batch không xong trong 0 giây. Cái bị cấm là
-            //   SINH thêm mốc mới sau khi hết phiên, và việc đó do UDF_JOB_IN_WINDOW gác ở tầng 1,
-            //   không phải ở đây. Cắt cứng tại 15:00:00 ở tầng này là giết chính ảnh chụp đóng cửa
-            //   mà mốc 15:00 sinh ra để lấy.
-            //   Ân hạn = C_TIMEOUT_SEC nên tầng 4 (C#) và UDF_JOB_CAN_RUN (SQL) dùng CÙNG một con
-            //   số — hai bên không thể lệch pha.
-            var hardStop = to + TimeSpan.FromSeconds(w.GraceSec);
-            var tod = now.TimeOfDay;
-            if (tod < from || tod > hardStop)
+            var slotTod = slotAt.TimeOfDay;
+            if (slotTod < from || slotTod > to)
                 throw new TradingWindowClosedException(
-                    $"Ngoai han chay: {now:yyyy-MM-dd HH:mm:ss} (gio VN). Moc cuoi duoc sinh {to}, " +
-                    $"han chot chay {hardStop} (an han {w.GraceSec}s). DUNG goi FO.");
+                    $"Moc {slotAt:yyyy-MM-dd HH:mm:ss} nam ngoai khung {from}-{to}. DUNG goi FO.");
         }
 
+        // ③ HẠN TƯƠI — con số duy nhất quyết định "muộn quá thì thôi".
+        if (w.MaxDelaySec is { } maxDelay)
+        {
+            var age = (now - slotAt).TotalSeconds;
+            if (age > maxDelay)
+                throw new TradingWindowClosedException(
+                    $"Da {age:F0}s ke tu moc {slotAt:HH:mm:ss} (han tuoi {maxDelay}s) - so khong con " +
+                    $"la near-realtime. DUNG goi FO.");
+        }
+
+        // Lịch nghỉ nằm ở T_TRADING_HOLIDAY, không hard-code trong C#. Nhớ theo NGÀY: một chu kỳ
+        //   chỉ nằm trong một ngày nên tối đa 1 lượt hỏi DB cho cả chu kỳ.
         if (w.BusinessDayOnly)
         {
-            // Lịch nghỉ nằm ở T_TRADING_HOLIDAY, không hard-code trong C#. Nhớ theo NGÀY: một chu kỳ
-            //   chỉ nằm trong một ngày nên tối đa 1 lượt hỏi DB cho cả chu kỳ.
-            var day = now.Date;
+            var day = slotAt.Date;
             if (_cachedDay != day)
             {
                 _cachedIsGd = await _db.IsBusinessDateAsync(day);
                 _cachedDay  = day;
             }
             if (!_cachedIsGd)
-                throw new TradingWindowClosedException($"{day:yyyy-MM-dd} KHÔNG phải ngày giao dịch. DỪNG gọi FO.");
+                throw new TradingWindowClosedException($"{day:yyyy-MM-dd} KHONG phai ngay giao dich. DUNG goi FO.");
         }
     }
 

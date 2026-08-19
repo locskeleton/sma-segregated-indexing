@@ -74,11 +74,13 @@ public class FoSnapshotJobHandler : IJobHandler
 
         var bizDate = ctx.BusinessDate ?? TradingWindowGuard.NowVn().Date;
 
-        // Kiểm một lần trước khi tốn công đọc scope (~50k dòng). Trong vòng lặp còn kiểm lại từng call.
+        // ★★ CHẶN TRƯỚC MỌI THỨ — trước khi đọc scope (~50k dòng), trước khi chia batch, trước khi
+        //   chạm FO. Ngoài giờ giao dịch thì số near-realtime không có ý nghĩa gì với PM, nên không
+        //   có lý do gì để tốn một câu query 50k dòng rồi mới phát hiện ra điều đó.
         //   BẮT exception ở đây thay vì để nó bay lên: phiên đóng KHÔNG phải lỗi của job. Ném lên
         //   thì dispatcher đánh FAILED → retry → đập vào guard tầng 2 → SKIPPED, và nhật ký có một
         //   vệt đỏ mỗi ngày lúc 15h mà không ai cần. Trả 0 là mô tả đúng chuyện đã xảy ra.
-        try { await _window.EnsureOpenAsync(ct); }
+        try { await _window.EnsureOpenAsync(ctx.SlotAt, ct); }
         catch (TradingWindowClosedException ex)
         {
             Log.Warning("[FO-RT] Không bắt đầu chu kỳ: {Msg}", ex.Message);
@@ -116,8 +118,9 @@ public class FoSnapshotJobHandler : IJobHandler
                     if (Volatile.Read(ref closed)) return;
 
                     // ★★ GUARD TẦNG 4 — ngay trước khi chạm FO. Không có dòng này thì một chu kỳ
-                    //    bắt đầu lúc 14h50 vẫn bắn request sang FO sau 15h00.
-                    await _window.EnsureOpenAsync(ct);
+                    //    bắt đầu hợp lệ nhưng FO chậm vẫn bắn request sau khi số đã hết ý nghĩa.
+                    //    Hạn tươi neo vào MỐC nên nó là mốc TUYỆT ĐỐI, không trôi theo tiến độ.
+                    await _window.EnsureOpenAsync(ctx.SlotAt, ct);
 
                     var rows = await _fo.GetSnapshotAsync(batch, ct);
                     if (rows.Count == 0) return;
