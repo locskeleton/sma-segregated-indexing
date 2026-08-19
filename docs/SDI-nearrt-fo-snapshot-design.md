@@ -161,6 +161,34 @@ Chu kỳ nổ đúng 15:00 **không thể** xong trong 0 giây — 1000 batch m�
 
 Tầng 4 (C# `TradingWindowGuard`) đọc `GraceSec = C_TIMEOUT_SEC` từ cùng bảng nên dùng **cùng một con số** với `UDF_JOB_CAN_RUN` bên SQL.
 
+### `UDF_JOB_CAN_RUN` có thừa so với `C_MAX_DELAY_SEC` không? — Đo thật
+
+Câu hỏi hợp lý, vì hai thứ trông như cùng chặn "lượt chạy quá muộn". Đo bằng chính hai hàm đó:
+
+| Tình huống | `C_MAX_DELAY_SEC` cho qua | `CAN_RUN` cho qua | Ai thực sự chặn |
+|---|---|---|---|
+| FO: lượt 15:00, claim 15:05 | ✓ | ✓ | *(chạy)* |
+| FO: lượt 15:00, claim **15:11** | ✗ | ✓ | **`C_MAX_DELAY_SEC`** |
+| FO: lượt 15:00, claim 15:20 | ✗ | ✗ | cả hai |
+| **On-demand đẩy tay, claim 22:00** | ✓ | ✗ | **`UDF_JOB_CAN_RUN`** |
+| Job KHÔNG khung giờ, chờ 2 tiếng (chu kỳ 1h) | ✗ | ✓ | `C_MAX_DELAY_SEC` |
+
+Hai hàm chặn **hai loại "quá hạn" khác nhau**, và không hàm nào thay được hàm kia:
+
+| | Đo cái gì | Che job nào |
+|---|---|---|
+| `C_MAX_DELAY_SEC` | nằm chờ quá lâu **so với chu kỳ** (tương đối, từ `C_RUN_AFTER`) | job có chu kỳ — kể cả job **không** khung giờ |
+| `UDF_JOB_CAN_RUN` | ra ngoài **khung giờ** (tuyệt đối, theo giờ trong ngày) | job có khung giờ — kể cả job **không** chu kỳ (on-demand) |
+
+Với job FO (có cả hai) thì `C_MAX_DELAY_SEC` chặt hơn nên nó chặn trước, và `CAN_RUN` im lặng suốt đường chạy bình thường. Nhưng `CAN_RUN` là thứ **duy nhất** đứng chắn ở hai chỗ:
+
+**① Cửa hậu `@p_ignore_window`.** Vận hành đẩy tay một lượt FO lúc 22h: lượt đó **vừa sinh** nên `C_MAX_DELAY_SEC` cho qua (chưa "cũ" chút nào). Chỉ `CAN_RUN` chặn — xem ca smoke **A13**.
+
+**② Chu kỳ khởi động hợp lệ nhưng chạy quá lâu.** Lượt 15:00 bắt đầu đúng giờ, FO nghẽn, chu kỳ bò tới 17h:
+- `C_MAX_DELAY_SEC` không cứu — nó đo lúc **nằm chờ**, không đo lúc **đang chạy**;
+- lease/timeout cũng không — **heartbeat gia hạn lease liên tục** khi worker còn sống, nên một worker khoẻ mạnh chạy 3 tiếng vẫn giữ lease ngon lành;
+- ⇒ `TradingWindowGuard` (tầng 4, dùng cùng công thức `CAN_RUN`) là **thứ duy nhất** đứng giữa "FO chậm" và "bắn request lúc 17h".
+
 ---
 
 ## 2d. Nhịp tim — và vì sao nó KHÔNG gọi DB liên tục

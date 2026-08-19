@@ -231,8 +231,20 @@ GO
     UDF_JOB_IN_WINDOW gác, không phải hàm này.
 
   Ân hạn = C_TIMEOUT_SEC, KHÔNG thêm tham số cấu hình mới: đó vốn là khoảng thời gian mà hệ đã
-    tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease). Quá mốc đó thì lease cũng
-    hết hạn và SP_JOB_REAP thu hồi — hai giới hạn trùng nhau, không thể lệch pha.
+    tuyên bố "một lượt chạy được phép kéo dài tối đa ngần này" (lease).
+
+  CÓ THỪA SO VỚI C_MAX_DELAY_SEC KHÔNG? — Không. Hai hàm chặn hai loại "quá hạn" khác nhau:
+    C_MAX_DELAY_SEC : nằm chờ quá lâu SO VỚI CHU KỲ (tương đối, đo từ C_RUN_AFTER)
+                      → che cả job KHÔNG có khung giờ
+    UDF_JOB_CAN_RUN : ra ngoài KHUNG GIỜ (tuyệt đối, theo giờ trong ngày)
+                      → che cả job KHÔNG có chu kỳ (on-demand, max_delay hiệu lực = NULL)
+  Với job FO (có cả hai) thì C_MAX_DELAY_SEC=600s chặt hơn CAN_RUN=840s nên nó chặn trước, và hàm
+    này im lặng suốt đường chạy bình thường. Nhưng nó là thứ DUY NHẤT chặn hai ca:
+      ① @p_ignore_window đẩy tay lúc 22h — lượt VỪA SINH nên max_delay cho qua (ca smoke A13);
+      ② tầng 4 (C#) chặn chu kỳ khởi động hợp lệ nhưng FO chậm, bò tới 17h — max_delay đo lúc
+        NẰM CHỜ chứ không đo lúc ĐANG CHẠY, còn lease thì heartbeat gia hạn liên tục khi worker
+        còn sống nên worker khoẻ mạnh chạy 3 tiếng vẫn giữ lease. Không có hàm này thì KHÔNG CÓ GÌ
+        chặn việc bắn request sang FO lúc 17h.
 ===========================================================================*/
 CREATE OR ALTER FUNCTION UDF_JOB_CAN_RUN (@p_job_code VARCHAR(40), @p_at DATETIME)
 RETURNS BIT
