@@ -27,9 +27,12 @@ namespace SdiCoreMessagingProcess.Jobs;
 /// </summary>
 public class JobSchedulerService : BackgroundService
 {
-    private static readonly TimeSpan ScanEvery   = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan ReapEvery   = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan ClaimEvery  = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ScanEvery    = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReapEvery    = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ClaimEvery   = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ConsumerSweep = TimeSpan.FromHours(1);
+    /// <summary>Consumer im lặng lâu hơn ngần này VÀ không còn message treo ⇒ xoá khỏi group.</summary>
+    private static readonly TimeSpan ConsumerIdleMax = TimeSpan.FromHours(6);
 
     private readonly IDatabase      _redis;
     private readonly ISdiJobGateway _db;
@@ -37,6 +40,7 @@ public class JobSchedulerService : BackgroundService
 
     private DateTime _lastReap  = DateTime.MinValue;
     private DateTime _lastClaim = DateTime.MinValue;
+    private DateTime _lastSweep = DateTime.MinValue;
 
     public JobSchedulerService(IDatabase redis, ISdiJobGateway db)
     {
@@ -73,6 +77,13 @@ public class JobSchedulerService : BackgroundService
                 {
                     _lastClaim = DateTime.UtcNow;
                     await AutoClaimStuckAsync();
+                }
+
+                // ④ dọn consumer chết — thứ DUY NHẤT trong thiết kế này phình không giới hạn
+                if (DateTime.UtcNow - _lastSweep > ConsumerSweep)
+                {
+                    _lastSweep = DateTime.UtcNow;
+                    await SweepDeadConsumersAsync();
                 }
             }
             catch (Exception ex)
@@ -124,6 +135,47 @@ public class JobSchedulerService : BackgroundService
         catch (Exception ex)
         {
             Log.Warning(ex, "[JOB] XAUTOCLAIM lỗi — bỏ qua nhịp này");
+        }
+    }
+
+    /// <summary>
+    /// ★ DỌN CONSUMER CHẾT — chỗ DUY NHẤT trong thiết kế này có thể phình KHÔNG GIỚI HẠN.
+    ///
+    /// Tên consumer là `hostname#pid`, và `XREADGROUP` TỰ TẠO consumer khi thấy tên lạ. Mỗi lần
+    /// pod khởi động lại (deploy, OOM, evict, scale) là một tên mới ⇒ một bản ghi consumer mới
+    /// nằm lại trong group VĨNH VIỄN. Redis không tự dọn.
+    ///
+    /// Không chết ai ngay: mỗi consumer rỗng chỉ tốn khoảng trăm byte. Nhưng nó là thứ **không có
+    /// trần** — 10 pod × vài lần deploy/ngày × 365 ngày = hàng chục nghìn bản ghi, và `XPENDING` /
+    /// `XINFO CONSUMERS` / `XAUTOCLAIM` đều phải đi qua danh sách đó. Bug loại này không gây sự cố,
+    /// nó chỉ làm hệ chậm dần trong nhiều tháng cho tới lúc không ai còn nhớ vì sao.
+    ///
+    /// AN TOÀN: chỉ xoá consumer **không còn message treo** (`PendingMessageCount == 0`) và đã im
+    /// lặng quá lâu. Xoá consumer CÒN pending là **vứt luôn** những entry đó khỏi PEL — mất hẳn
+    /// đường để `XAUTOCLAIM` cứu. (Ở hệ này thì `SP_JOB_REAP` vẫn dựng lại được từ DB, nhưng
+    /// không có lý do gì để tự đẩy mình vào chỗ phải nhờ lưới cứu.)
+    /// </summary>
+    private async Task SweepDeadConsumersAsync()
+    {
+        try
+        {
+            var consumers = await _redis.StreamConsumersAsync(JobStreamKeys.Stream, JobStreamKeys.Group);
+            var removed = 0;
+            foreach (var c in consumers)
+            {
+                if (c.Name == _owner) continue;                                    // không tự xoá mình
+                if (c.PendingMessageCount > 0) continue;                            // còn việc treo ⇒ để XAUTOCLAIM lo
+                if (c.IdleTimeInMilliseconds < ConsumerIdleMax.TotalMilliseconds) continue;
+
+                await _redis.StreamDeleteConsumerAsync(JobStreamKeys.Stream, JobStreamKeys.Group, c.Name);
+                removed++;
+            }
+            if (removed > 0)
+                Log.Information("[JOB] Dọn {N} consumer chết khỏi group (pod đã restart/scale down)", removed);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "[JOB] Dọn consumer lỗi — bỏ qua nhịp này (không ảnh hưởng chạy job)");
         }
     }
 }

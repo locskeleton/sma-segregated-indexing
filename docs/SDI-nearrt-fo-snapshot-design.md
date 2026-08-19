@@ -106,7 +106,83 @@ Lý do giữ Streams:
 
 ---
 
-## 2c. Nhịp tim — và vì sao nó KHÔNG gọi DB liên tục
+## 2c. Tải Redis và rủi ro phình bộ nhớ — đo bằng con số
+
+> Các con số bộ nhớ dưới đây là **ước lượng từ cấu trúc bên trong Redis**, không phải số đo trên cụm thật. Trước khi lên prod nên chạy `MEMORY USAGE SDI:JOB:STREAM` và `XINFO STREAM ... FULL` một lần để đối chiếu.
+
+### Vòng quét có làm Redis tăng tải không?
+
+Không đáng kể — nhưng phải hiểu **vì sao**, chứ không phải tin.
+
+`XREADGROUP ... >` khi **không có gì mới** không hề quét stream: nó so `last-delivered-id` của group với id cuối của stream rồi trả rỗng. Chi phí ngang một lệnh `GET`. Nó **không** duyệt entry, **không** đụng PEL.
+
+| Lệnh | Nhịp | 10 pod | Độ phức tạp |
+|---|---|---|---|
+| `XREADGROUP >` (rỗng) | 500ms/pod | **20 lệnh/giây** | O(1) — so 2 con id |
+| `XAUTOCLAIM` | 60s/pod | 0,17 lệnh/giây | O(số entry duyệt), chặn bởi `count=50` |
+| `XINFO CONSUMERS` + `XGROUP DELCONSUMER` | 1 giờ/pod | ~0,003 lệnh/giây | O(số consumer) |
+| `XADD` | khi có job | **24 lệnh/ngày** | O(1) với `MAXLEN ~` |
+| `XACK` | mỗi job xử lý | 24 lệnh/ngày | O(1) |
+
+**Tổng ≈ 20 lệnh/giây.** Một node Redis chạy được cỡ 10⁵ lệnh/giây ⇒ khung job này dùng khoảng **0,02%** năng lực. Nếu tăng lên 50 pod thì là 100 lệnh/giây — vẫn 0,1%.
+
+Muốn giảm thì nới nhịp đọc từ 500ms lên 1–2 giây; đổi lại độ trễ "đẩy job vào là chạy" tăng đúng bằng ngần đó. Ở mức 0,02% thì không có gì để tối ưu.
+
+### Bộ nhớ: ba khoản, chỉ một khoản từng không có trần
+
+**① Entry trong stream — CÓ TRẦN.**
+`XADD` dùng `MAXLEN ~ 50000` (`useApproximateMaxLength: true`): cắt bớt theo biên node nên là O(1), không phải O(N) như `MAXLEN` chính xác. Entry chỉ chở một trường `jobRunId`; các entry trong cùng một node dùng chung tên trường nên chi phí biên mỗi entry chỉ vài chục byte.
+
+- Trần lý thuyết: 50.000 entry ⇒ **~2–5 MB**.
+- Thực tế job FO: 24 `XADD`/ngày ⇒ phải hơn **5 năm** mới chạm trần. Vài trăm KB/năm.
+- Nếu sau này chuyển sang fan-out (1000 job con/chu kỳ ⇒ 24.000 `XADD`/ngày): chạm trần sau ~2 ngày rồi **đứng yên ở 2–5 MB**. Đây chính là lý do đặt `MAXLEN` ngay từ đầu chứ không đợi tới lúc cần.
+
+**② PEL (pending entries list) — trần bằng số job đang chạy.**
+Mỗi entry đã giao nhưng chưa `XACK` chiếm một bản ghi trong PEL của group **và** một trong PEL của consumer (~100+ byte tổng). Ở luồng chạy bình thường PEL gần như rỗng vì `HandleEntryAsync` `XACK` trong khối `finally` — kể cả nhánh bỏ qua (`err=3/5/6`).
+
+⚠️ **Cái bẫy kinh điển của Streams:** cắt bớt bằng `MAXLEN` **KHÔNG dọn** các tham chiếu PEL trỏ tới entry vừa bị cắt. Một hệ quên `XACK` sẽ tích PEL mãi mãi, và stream trông vẫn "gọn" vì đã trim — bộ nhớ đi vào chỗ người ta không nhìn. Ở đây không dính vì luôn `XACK`, và dù có sót thì `XAUTOCLAIM` nhặt lại rồi `XACK`; khối lượng cũng chỉ 24 entry/ngày.
+
+**③ Consumer — KHÔNG CÓ TRẦN (đã vá).**
+Tên consumer là `hostname#pid`, và `XREADGROUP` **tự tạo** consumer khi gặp tên lạ. Mỗi lần pod khởi động lại (deploy, OOM, evict, scale) là một bản ghi mới nằm lại **vĩnh viễn** — Redis không tự dọn.
+
+- 10 pod × 3 lần deploy/ngày × 365 ngày ≈ **11.000 consumer/năm** ⇒ vài MB.
+- Tiền không phải vấn đề; vấn đề là `XINFO CONSUMERS`, `XPENDING`, `XAUTOCLAIM` đều phải đi qua danh sách đó. Nó không gây sự cố, nó chỉ làm hệ **chậm dần trong nhiều tháng** cho tới lúc không ai còn nhớ vì sao.
+- ⇒ `SweepDeadConsumersAsync` (1 giờ/lần) xoá consumer đã im lặng > 6 giờ **và** không còn message treo. Không xoá consumer còn pending — làm thế là vứt luôn entry khỏi PEL.
+
+**Kết luận bộ nhớ:** trần cứng ≈ **5 MB** cho stream + PEL, và khoản duy nhất từng không có trần (consumer) nay đã có người dọn. Không có đường nào tràn.
+
+### So sánh với các phương án Redis khác
+
+| | Tải lúc rỗi | Bộ nhớ | Cứu được message đang bay? | Đẩy thật? |
+|---|---|---|---|---|
+| **Pub/Sub** | **0** — kết nối subscriber riêng, callback đẩy về | **0** (không lưu) | ❌ phát lúc không ai nghe = mất luôn | ✅ |
+| **List + `BLPOP`** | 0 nếu chặn được — **nhưng SE.Redis cấm lệnh chặn** ⇒ phải hỏi thăm | độ dài list | ❌ pop xong chết = mất hẳn | ❌ |
+| **Streams** (đang dùng) | 20 lệnh/giây (10 pod) | ~5 MB có trần | ✅ PEL + `XAUTOCLAIM` | ❌ (xem §2b) |
+| **DB polling thuần** | 0 trên Redis; **10 query/giây trên SQL Server** | 0 | ✅ DB là sổ cái | ❌ |
+
+### Điều đáng nói nhất — và nó không có lợi cho lựa chọn hiện tại
+
+Thứ **duy nhất** Streams hơn Pub/Sub trong bảng trên là cột "cứu được message đang bay" (PEL + `XAUTOCLAIM`).
+
+Nhưng ở kiến trúc này, **`SP_JOB_REAP` đã làm đúng việc đó rồi** — và làm tốt hơn, vì nó dựng lại từ `T_JOB_RUN` (sổ cái thật) chứ không từ một bản sao trong Redis. Nghĩa là toàn bộ bộ máy consumer group / PEL / `XAUTOCLAIM` / dọn consumer đang **trùng lặp với lưới an toàn sẵn có**.
+
+Trong khi đó Pub/Sub — với `StackExchange.Redis` — là **đẩy thật** (kết nối subscriber riêng, không hỏi thăm), nên nó **thắng cả về độ trễ lẫn tải**:
+
+| | Streams (hiện tại) | Pub/Sub |
+|---|---|---|
+| Độ trễ đánh thức | ≤ 500ms (hỏi thăm) | **~1ms (đẩy thật)** |
+| Tải lúc rỗi, 10 pod | 20 lệnh/giây | **0** |
+| Bộ nhớ Redis | ~5 MB + dọn consumer | **0** |
+| Code phải nuôi | group, `XACK`, PEL, `XAUTOCLAIM`, dọn consumer | `Subscribe` + `Publish` |
+| Mất message thì sao | `SP_JOB_REAP` cứu | **`SP_JOB_REAP` cứu** (y hệt) |
+
+⇒ **Nếu đổi Pub/Sub, không mất một mảnh tính đúng nào** và bỏ được ~150 dòng. Lý do duy nhất để giữ Streams là muốn Redis tự chia việc theo consumer group cho một luồng fan-out tương lai (hàng nghìn job con/chu kỳ) — với Pub/Sub thì mọi pod đều nhận mọi thông báo rồi tranh nhau ở `SP_JOB_CLAIM`, tốn thêm những lần claim hụt.
+
+Ở khối lượng hiện tại (24 lượt/ngày), số lần claim hụt đó là **không đáng kể**. Đây là một quyết định vận hành, không phải quyết định tính đúng — và tài liệu này ghi lại để người sau đổi ý mà không phải suy luận lại từ đầu.
+
+---
+
+## 2d. Nhịp tim — và vì sao nó KHÔNG gọi DB liên tục
 
 Nhịp tim làm hai việc: **gia hạn lease** (để không ai giật mất job đang chạy) và **phát hiện mất quyền** (lease bị thu hồi, hoặc job vừa bị TẮT).
 

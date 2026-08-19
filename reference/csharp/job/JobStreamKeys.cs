@@ -35,8 +35,18 @@ public static class JobStreamKeys
     public const string FieldJobRunId = "jobRunId";
 
     /// <summary>
-    /// Chặn stream phình vô hạn. MAXLEN ~ vài chục nghìn là quá đủ: entry đã XACK không còn giá trị,
-    /// và lịch sử thật nằm ở T_JOB_RUN (có tra được, có index, có ai chạy khi nào).
+    /// TRẦN CỨNG cho bộ nhớ stream. Dùng kèm `useApproximateMaxLength: true` (`MAXLEN ~`) để việc
+    /// cắt bớt là O(1) theo biên node, thay vì O(N) như MAXLEN chính xác.
+    ///
+    /// Entry chỉ chở một trường `jobRunId`, các entry cùng node dùng chung tên trường ⇒ chi phí biên
+    /// vài chục byte/entry ⇒ **trần ~2–5 MB**. Với job FO (24 XADD/ngày) thì phải hơn 5 năm mới chạm
+    /// trần; nhưng nếu sau này có luồng fan-out (1000 job con/chu kỳ) thì chạm sau ~2 ngày rồi ĐỨNG
+    /// YÊN. Đặt trần ngay từ đầu chính là để lúc đó không phải sửa gì.
+    ///
+    /// ⚠️ Cắt bớt KHÔNG dọn tham chiếu PEL trỏ tới entry vừa bị cắt — cái bẫy kinh điển của Streams.
+    ///   Hệ này luôn XACK (kể cả nhánh bỏ qua) nên PEL gần như rỗng; đừng bỏ XACK ở bất kỳ nhánh nào.
+    ///
+    /// Lịch sử THẬT nằm ở T_JOB_RUN (tra được, có index, biết ai chạy khi nào) — stream không phải sổ.
     /// </summary>
     public const int MaxLen = 50_000;
 
