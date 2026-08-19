@@ -289,11 +289,16 @@ BEGIN
         DECLARE @due TABLE (job_code VARCHAR(40), fire_key VARCHAR(64), payload NVARCHAR(MAX), bdate DATE);
         INSERT @due (job_code, fire_key, payload, bdate)
         SELECT d.C_JOB_CODE,
-               -- fire_key = mốc slot 'yyyyMMddHHmm' (style 112 = yyyymmdd, +HH+mm ghép tay)
+               -- fire_key = mốc slot 'yyyyMMddHHmmss' (style 112 = yyyymmdd, + HHmmss ghép tay).
+               --   ★ PHẢI CÓ GIÂY. Bản đầu chỉ tới PHÚT và nó sai thật: C_INTERVAL_SEC cho phép tới 30s
+               --     ⇒ hai slot trong cùng một phút cho ra CÙNG một fire_key ⇒ slot thứ hai bị UQ chặn
+               --     ⇒ job khai 30 giây LẶNG LẼ chạy 60 giây/lần. Không lỗi, không log, chỉ chạy thưa
+               --     đi một nửa. Cùng lý do đó, đổi chu kỳ giữa ngày (900s → 60s) có thể đụng đúng mốc
+               --     15 phút vừa dùng và mất một nhịp. Thêm giây là hết cả hai.
                CONVERT(CHAR(8), DATEADD(SECOND,
                      (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 112)
                + FORMAT(DATEADD(SECOND,
-                     (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 'HHmm'),
+                     (DATEDIFF(SECOND, @midnight, @now) / d.C_INTERVAL_SEC) * d.C_INTERVAL_SEC, @midnight), 'HHmmss'),
                d.C_PAYLOAD,
                CAST(@now AS DATE)
         FROM T_JOB_DEFINITION d
@@ -686,6 +691,10 @@ BEGIN
         IF @p_json IS NULL OR ISJSON(@p_json)<>1 BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_json không hợp lệ'; RETURN; END
 
         -- ★ GUARD TẦNG 3 — lưới cuối, chặn cả trường hợp gọi proc bằng tay.
+        --   ⚠️ CỐ Ý chỉ chặn theo NGÀY, KHÔNG chặn theo GIỜ. Điều BRD cấm là GỌI SANG FO ngoài
+        --     9h–15h (tầng 1/2/4 lo việc đó). Còn GHI thì khác: một batch lấy về hợp lệ lúc
+        --     14:59:58 có thể ghi xong lúc 15:00:01. Chặn theo giờ ở đây sẽ VỨT BỎ dữ liệu đã
+        --     lấy đúng luật — mất số của vài chục khách hàng để đổi lấy một cái đúng hình thức.
         IF @p_business_date <> CAST(@now AS DATE)
         BEGIN
             SET @p_err_code=22;
@@ -698,6 +707,21 @@ BEGIN
             SET @p_err_code=22;
             SET @p_err_msg=CONCAT(N'Ngày ', CONVERT(VARCHAR(10),@p_business_date,23),
                                   N' KHÔNG phải ngày giao dịch — không có snapshot giữa phiên.');
+            RETURN;
+        END
+
+        -- si_account TRÙNG trong cùng một batch: bắt TRƯỚC, bằng thông điệp người đọc hiểu được.
+        --   Không bắt ở đây thì nó vỡ PK của bảng tạm @src và trả err=-1 kèm nguyên văn
+        --   "Violation of PRIMARY KEY constraint 'PK__#A5C69A4__...'" — người trực đọc xong không
+        --   biết là lỗi của FO hay của SDI. (MERGE cũng không cho phép một dòng đích khớp 2 dòng nguồn.)
+        DECLARE @dupsi VARCHAR(20) = (
+            SELECT TOP 1 si_account FROM OPENJSON(@p_json) WITH (si_account VARCHAR(20) '$.si_account')
+            GROUP BY si_account HAVING COUNT(*) > 1 ORDER BY si_account);
+        IF @dupsi IS NOT NULL
+        BEGIN
+            SET @p_err_code=21;
+            SET @p_err_msg=CONCAT(N'FO trả TRÙNG tiểu khoản trong cùng batch (vd ', @dupsi,
+                                  N') — từ chối cả batch, không ghi dòng nào.');
             RETURN;
         END
 
@@ -730,7 +754,12 @@ BEGIN
         INNER JOIN T_SI_BALANCE b ON b.C_SI_ACCOUNT=s.C_SI_ACCOUNT AND b.C_BUSINESS_DATE=@p_business_date
         WHERE b.C_SRC='EOD';
 
-        MERGE T_SI_BALANCE AS t
+        -- ★ HOLDLOCK (= SERIALIZABLE) BẮT BUỘC cho MERGE: không có nó, hai phiên cùng chạy MỘT
+        --   batch (pod mất lease giữa chừng, pod mới chạy lại chu kỳ đó) cùng đọc thấy NOT MATCHED
+        --   rồi cùng INSERT ⇒ vỡ UQ_SI_NAV_BALANCE_NK ⇒ cả batch rollback err=-1. HOLDLOCK giữ
+        --   khoá dải trên khoá tìm kiếm nên phiên thứ hai chờ rồi đi nhánh MATCHED (update) — đúng
+        --   ý nghĩa "upsert". Đây là lỗi kinh điển của MERGE, và nó chỉ lộ ra khi có tải thật.
+        MERGE T_SI_BALANCE WITH (HOLDLOCK) AS t
         USING (SELECT s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE, s.C_AUM, s.C_CASH,
                       s.C_CASH_AVAILABLE, s.C_DIVIDEND_PENDING, s.C_SELL_PENDING
                FROM @src s
@@ -806,7 +835,7 @@ BEGIN
             SELECT C_MASTER_CODE, COUNT(*) AS NACC
             FROM T_SI_PORTFOLIO WHERE C_STATUS='ACTIVE' GROUP BY C_MASTER_CODE
         )
-        MERGE T_MASTER_BALANCE AS t
+        MERGE T_MASTER_BALANCE WITH (HOLDLOCK) AS t   -- ★ xem chú thích HOLDLOCK ở SP_INGEST_FO_SNAPSHOT_RT
         USING (SELECT a.C_MASTER_CODE, a.AUM, a.CASH, a.NRT, a.RTAT, ISNULL(x.NACC,a.NRT) AS NACC
                FROM agg a LEFT JOIN tot x ON x.C_MASTER_CODE=a.C_MASTER_CODE) s
            ON t.C_BUSINESS_DATE=@p_business_date AND t.C_MASTER_CODE=s.C_MASTER_CODE

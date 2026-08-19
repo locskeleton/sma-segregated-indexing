@@ -23,8 +23,8 @@ DECLARE @today DATE = CAST(@now AS DATE);
 DECLARE @isGD BIT = dbo.UDF_IS_BUSINESS_DATE(@today);
 
 /*--- dọn dữ liệu test cũ ---*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','FO_SNAPSHOT_RT');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN');
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','FO_SNAPSHOT_RT');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL');
 DELETE FROM T_SI_BALANCE     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_CURRENT     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_PORTFOLIO   WHERE C_SI_ACCOUNT LIKE 'RT%';
@@ -150,28 +150,57 @@ INSERT INTO @R SELECT 'A9 ★ 2 pod cùng quét slot ⇒ pod đầu tạo 1, pod
         AND (SELECT COUNT(*) FROM #due2 WHERE code='SMK_ANY')=0
         AND (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY')=1 THEN 1 ELSE 0 END,
   CONCAT('pass1=',(SELECT COUNT(*) FROM #due1),' pass2=',(SELECT COUNT(*) FROM #due2));
-INSERT INTO @R SELECT 'A9 fire_key = mốc slot yyyyMMddHHmm (không trôi theo giờ pod khởi động)',
+-- fire_key phải có GIÂY: chu kỳ nhỏ nhất cho phép là 30s ⇒ mốc chỉ tới phút thì 2 slot/phút
+--   trùng khoá và job 30s lặng lẽ chạy 60s/lần.
+INSERT INTO @R SELECT 'A9 ★ fire_key = mốc slot yyyyMMddHHmmss (có GIÂY; không trôi theo giờ pod khởi động)',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY'
-                     AND C_FIRE_KEY LIKE CONVERT(CHAR(8),@today,112)+'[0-9][0-9][0-9][0-9]'
-                     AND CAST(RIGHT(C_FIRE_KEY,2) AS INT) % 15 = 0) THEN 1 ELSE 0 END,
+                     AND C_FIRE_KEY LIKE CONVERT(CHAR(8),@today,112)+'[0-9][0-9][0-9][0-9][0-9][0-9]'
+                     AND CAST(SUBSTRING(C_FIRE_KEY,11,2) AS INT) % 15 = 0   -- phút chia hết 15 (interval 900s)
+                     AND RIGHT(C_FIRE_KEY,2) = '00') THEN 1 ELSE 0 END,
   (SELECT TOP 1 C_FIRE_KEY FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY');
+-- Chứng minh trực tiếp bug đã sửa: chu kỳ 30s ⇒ 2 slot LIỀN NHAU trong cùng một phút PHẢI khác khoá.
+DECLARE @m0 DATETIME = CAST(CAST(@now AS DATE) AS DATETIME);
+DECLARE @k1 VARCHAR(64) = CONVERT(CHAR(8), DATEADD(SECOND,(DATEDIFF(SECOND,@m0,@m0)/30)*30,@m0),112)
+                        + FORMAT(DATEADD(SECOND,(DATEDIFF(SECOND,@m0,@m0)/30)*30,@m0),'HHmmss');
+DECLARE @k2 VARCHAR(64) = CONVERT(CHAR(8), DATEADD(SECOND,(DATEDIFF(SECOND,@m0,DATEADD(SECOND,30,@m0))/30)*30,@m0),112)
+                        + FORMAT(DATEADD(SECOND,(DATEDIFF(SECOND,@m0,DATEADD(SECOND,30,@m0))/30)*30,@m0),'HHmmss');
+INSERT INTO @R SELECT 'A9 ★ chu kỳ 30s: 2 slot trong CÙNG một phút ra 2 fire_key KHÁC nhau',
+  CASE WHEN @k1 <> @k2 THEN 1 ELSE 0 END, CONCAT(@k1,' vs ',@k2);
 
--- A10. Singleton: lượt trước còn chạy ⇒ KHÔNG mở lượt mới
-UPDATE T_JOB_DEFINITION SET C_SINGLETON=1, C_INTERVAL_SEC=60 WHERE C_JOB_CODE='SMK_ANY';
-UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-A', C_LEASE_UNTIL=DATEADD(MINUTE,5,@now)
- WHERE C_JOB_CODE='SMK_ANY';
-DECLARE @cntBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY');
+-- A10. Singleton — dùng JOB RIÊNG (SMK_SGL), KHÔNG dùng lại SMK_ANY.
+--   Vì sao: hai chu kỳ khác nhau vẫn có thể cho ra CÙNG một mốc slot (900s và 60s trùng nhau tại
+--   mọi phút chia hết cho 15) ⇒ dùng lại job của A9 thì ca này PASS/FAIL theo giờ chạy smoke.
+--   Đó chính là cách bug fire_key-thiếu-giây lộ ra: ca A10 fail trên DB sạch, pass trên DB cũ.
+--   Test phải tất định — nếu nó phụ thuộc đồng hồ thì lần đỏ tiếp theo sẽ bị cho là "flaky" và bỏ qua.
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
+        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_SGL',N'Job singleton (smoke)','SmokeHandler',1,60, NULL,NULL,0, 60, 2, 0, 1);
+
 CREATE TABLE #due3 (id BIGINT, code VARCHAR(40), payload NVARCHAR(MAX));
 INSERT #due3 EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A10 job singleton mới ⇒ sinh đúng 1 lượt ở nhịp đầu',
+  CASE WHEN (SELECT COUNT(*) FROM #due3 WHERE code='SMK_SGL')=1 THEN 1 ELSE 0 END, NULL;
+
+-- lượt đó đang chạy (lease còn hiệu lực) ⇒ nhịp sau KHÔNG mở lượt mới
+UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-A', C_LEASE_UNTIL=DATEADD(MINUTE,5,@now)
+ WHERE C_JOB_CODE='SMK_SGL';
+DECLARE @cntBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_SGL');
+DELETE #due3;
+INSERT #due3 EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 INSERT INTO @R SELECT 'A10 singleton: lượt trước còn RUNNING ⇒ KHÔNG sinh lượt mới',
-  CASE WHEN (SELECT COUNT(*) FROM #due3 WHERE code='SMK_ANY')=0
-        AND (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY')=@cntBefore THEN 1 ELSE 0 END, NULL;
--- ... nhưng lease CHẾT thì slot kế tiếp KHÔNG bị chặn vĩnh viễn
-UPDATE T_JOB_RUN SET C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now) WHERE C_JOB_CODE='SMK_ANY';
+  CASE WHEN (SELECT COUNT(*) FROM #due3 WHERE code='SMK_SGL')=0
+        AND (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_SGL')=@cntBefore THEN 1 ELSE 0 END, NULL;
+
+-- ... nhưng lease CHẾT thì slot kế tiếp KHÔNG bị chặn vĩnh viễn.
+--   Lùi mốc slot của lượt cũ về quá khứ để nhịp này chắc chắn rơi vào slot KHÁC (tất định,
+--   không phụ thuộc smoke chạy vào giây thứ mấy của phút).
+UPDATE T_JOB_RUN SET C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now), C_FIRE_KEY='19000101000000'
+ WHERE C_JOB_CODE='SMK_SGL';
 DELETE #due3;
 INSERT #due3 EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 INSERT INTO @R SELECT 'A10 ★ singleton + pod chết (lease hết hạn) ⇒ slot mới VẪN mở (không kẹt vĩnh viễn)',
-  CASE WHEN (SELECT COUNT(*) FROM #due3 WHERE code='SMK_ANY')=1 THEN 1 ELSE 0 END, NULL;
+  CASE WHEN (SELECT COUNT(*) FROM #due3 WHERE code='SMK_SGL')=1 THEN 1 ELSE 0 END,
+  CONCAT('sinh=',(SELECT COUNT(*) FROM #due3 WHERE code='SMK_SGL'));
 DROP TABLE #due1, #due2, #due3;
 
 -- A11. GUARD TẦNG 2: job sinh ra hợp lệ, nhưng tới lúc chạy đã ra ngoài khung ⇒ SKIPPED
@@ -205,6 +234,45 @@ WHILE DATEPART(WEEKDAY, @sun) <> 1 SET @sun = DATEADD(DAY,1,@sun);   -- (DATEFIR
 INSERT INTO @R SELECT 'A12 ★ 10h sáng CHỦ NHẬT ⇒ 0 (đúng giờ nhưng sai ngày ⇒ vẫn không gọi FO)',
   CASE WHEN dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(HOUR,10,CAST(@sun AS DATETIME)))=0 THEN 1 ELSE 0 END,
   CONCAT('CN = ', CONVERT(VARCHAR(10),@sun,23));
+
+-- A13. Vận hành: chạy tay ngoài khung (cửa hậu cho job VÔ HẠI), theo dõi, dọn nhật ký.
+--   4 proc này lúc đầu KHÔNG có ca test nào — tự review mới lòi ra. Proc không có test là proc
+--   chưa từng chạy, và nó sẽ chạy lần đầu vào lúc có sự cố, tức là lúc tệ nhất.
+EXEC SP_JOB_ENQUEUE @p_job_code='SMK_WIN', @p_fire_key='IGN', @p_ignore_window=1,
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@id2 OUTPUT;
+INSERT INTO @R SELECT 'A13 @p_ignore_window=1 ⇒ chạy tay ngoài khung được (job vô hại)',
+  CASE WHEN @ec=0 AND @id2 IS NOT NULL THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+-- ...nhưng cửa hậu KHÔNG mở được đường gọi FO: tầng 2 vẫn chặn khi tới lượt chạy.
+EXEC SP_JOB_CLAIM @p_job_run_id=@id2, @p_owner='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A13 ★ cửa hậu ignore_window KHÔNG qua được tầng 2 ⇒ vẫn SKIPPED',
+  CASE WHEN @ec=3 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+-- SP_GET_JOB_STATUS trả HAI result set (RS1 sức khoẻ + RS2 lượt cần xử lý) đúng quy ước read API
+--   của repo ⇒ KHÔNG hứng được bằng INSERT..EXEC. Chạy thẳng và soi @p_err_code.
+EXEC SP_GET_JOB_STATUS @p_job_code='FO_SNAPSHOT_RT', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A13 SP_GET_JOB_STATUS chạy được (2 result set) ⇒ err=0',
+  CASE WHEN @ec=0 THEN 1 ELSE 0 END, CONCAT('err=',@ec,' msg=',ISNULL(@em,'(null)'));
+INSERT INTO @R SELECT 'A13 cột C_IN_WINDOW_NOW phản ánh ĐÚNG khung giờ hiện tại của từng job',
+  CASE WHEN dbo.UDF_JOB_IN_WINDOW('SMK_ANY',@now)=1 AND dbo.UDF_JOB_IN_WINDOW('SMK_WIN',@now)=0
+       THEN 1 ELSE 0 END, NULL;
+
+-- Dựng 1 lượt DEAD để chứng minh SP_JOB_PURGE KHÔNG bao giờ xoá nó.
+--   (Ca cũ dùng lượt DEAD của A7 — nhưng A9 đã DELETE sạch SMK_ANY trước đó, nên nó chỉ PASS
+--    do may mắn chứ không đo được gì. Tự review bắt được, dựng dữ liệu tường minh tại chỗ.)
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT,C_ENDED_AT,C_MESSAGE)
+VALUES ('SMK_ANY','DEADONE','DEAD',@now,DATEADD(DAY,-99,@now),DATEADD(DAY,-99,@now),N'lỗi cũ, cần người xem');
+DECLARE @doneBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN
+                           WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'));
+DECLARE @purged BIGINT;
+EXEC SP_JOB_PURGE @p_keep_days=0, @p_rows=@purged OUTPUT;
+INSERT INTO @R SELECT 'A13 ★ SP_JOB_PURGE: dọn hết DONE/SKIPPED nhưng GIỮ NGUYÊN DEAD (thứ cần người xem)',
+  CASE WHEN @doneBefore > 0 AND @purged = @doneBefore
+        AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'))
+        AND EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY' AND C_FIRE_KEY='DEADONE' AND C_STATUS='DEAD')
+       THEN 1 ELSE 0 END, CONCAT('trước=',@doneBefore,' đã dọn=',@purged);
+INSERT INTO @R SELECT 'A13 SP_JOB_PURGE KHÔNG đụng lượt đang RUNNING/READY (chỉ dọn lượt đã đóng)',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY' AND C_STATUS IN ('RUNNING','READY'))
+       THEN 1 ELSE 0 END, NULL;
 
 /*==============================================================================
   (B) NGHIỆP VỤ FO SNAPSHOT — cần NGÀY GD (guard tầng 3 chỉ nhận hôm nay + ngày GD)
@@ -294,6 +362,23 @@ BEGIN
             AND (SELECT C_SRC FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@today AND C_SI_ACCOUNT='RT03')='EOD'
             AND (SELECT C_DAILY_RETURN FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@today AND C_SI_ACCOUNT='RT03')=0.020000
            THEN 1 ELSE 0 END, CONCAT('skipped_eod=',@skip,' aum=',(SELECT C_AUM FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@today AND C_SI_ACCOUNT='RT03'));
+
+    -- B4b. FO trả TRÙNG tiểu khoản trong cùng batch ⇒ thông điệp đọc được, KHÔNG phải lỗi PK thô
+    EXEC SP_INGEST_FO_SNAPSHOT_RT
+         @p_json=N'[{"si_account":"RT01","aum":1,"cash":1},{"si_account":"RT01","aum":2,"cash":2}]',
+         @p_business_date=@today, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_rows=@rows OUTPUT;
+    INSERT INTO @R SELECT 'B4b FO trả TRÙNG si trong 1 batch ⇒ err=21 + thông điệp nêu đích danh mã',
+      CASE WHEN @ec=21 AND @rows=0 AND @em LIKE N'%RT01%' THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+    -- ...và batch trùng KHÔNG làm hỏng dòng đã ghi đúng trước đó
+    INSERT INTO @R SELECT 'B4b batch bị từ chối KHÔNG đụng dòng RT đã ghi (all-or-nothing)',
+      CASE WHEN (SELECT C_AUM FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@today AND C_SI_ACCOUNT='RT01')=1200000000
+           THEN 1 ELSE 0 END, NULL;
+
+    -- B4c. JSON rỗng ⇒ không lỗi, không ghi (FO trả batch rỗng là chuyện bình thường)
+    EXEC SP_INGEST_FO_SNAPSHOT_RT @p_json=N'[]', @p_business_date=@today,
+         @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_rows=@rows OUTPUT;
+    INSERT INTO @R SELECT 'B4c JSON rỗng ⇒ err=0, rows=0 (không coi là sự cố)',
+      CASE WHEN @ec=0 AND @rows=0 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
 
     -- B5. Gộp cấp master
     EXEC SP_RT_MASTER_AGG @p_business_date=@today, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_rows=@rows OUTPUT;

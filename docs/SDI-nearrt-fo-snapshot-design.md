@@ -153,6 +153,30 @@ Biến động giữa phiên được tính **riêng, on-read**, ở `SP_GET_PM_
 
 ---
 
+### Cái giá của cột `C_SRC` — con số, không phải cảm tính
+
+`T_SI_BALANCE` là bảng lớn nhất hệ (~2,5 tỷ dòng) và **hiện KHÔNG nén** — `CREATE TABLE` của nó không có `WITH (DATA_COMPRESSION = PAGE)` (khác `T_SI_CURRENT` / `T_SI_PORTFOLIO_HOLDING`), và cả 5 index đều `NONE` (kiểm bằng `sys.partitions`).
+
+`VARCHAR(3)` tốn ~5 byte/dòng (3 byte dữ liệu + 2 byte trong mảng offset của cột biến độ dài), nhân với **3 nơi** — bảng + `IX_SI_NAV_BALANCE_MASTER` + `IX_SI_NAV_BALANCE_ACCT`:
+
+```
+2,5 tỷ dòng × 5 byte × 3 ≈ 37 GB
+```
+
+**Vì sao vẫn để `C_SRC` trong `INCLUDE` của cả hai index:** `C_SRC='EOD'` là **vị từ lọc**. Không nằm trong index thì mỗi dòng phải key-lookup về clustered index để đọc giá trị — với các truy vấn PM quét cả master (5.000 KH × N ngày) đó là hàng triệu lookup ngẫu nhiên. Đổi 37 GB đĩa lấy việc **không** làm chậm mọi màn hình PM là đổi đúng.
+
+**Khuyến nghị DBA (chưa làm — nằm ngoài phạm vi thay đổi này):** bật `DATA_COMPRESSION = PAGE` cho `T_SI_BALANCE` và hai index của nó. `C_SRC` có giá trị gần như bất biến (`'EOD'` ở 99,99% dòng) nên từ điển nén trang gần như xoá sạch chi phí của nó — và nén cũng thu nhỏ toàn bộ phần còn lại của bảng. Đây là quyết định hạ tầng (đánh đổi CPU/IO) nên thuộc `00_INFRA.sql`, không nhét vào `01_TABLES.sql`.
+
+### Dòng RT mồ côi — có thể xảy ra, và vô hại theo thiết kế
+
+Kịch bản: FO ghi dòng RT cho tiểu khoản X ngày thứ Hai; Asset **không bao giờ** gửi số chốt cho X ngày đó (EOD bị chặn đúng bởi `err=12`). Dòng RT của X ngày thứ Hai **nằm lại trong lịch sử**.
+
+Hậu quả: **không có** — mọi reader đều lọc `C_SRC='EOD'` nên nó vô hình với EOD, phí, báo cáo, hiệu suất. Và khi Asset gửi bù (re-ingest ngày cũ), `DELETE+INSERT` theo `(date, si)` thay nó bằng số chốt.
+
+Nói cách khác: dòng mồ côi là **triệu chứng nhìn thấy được** của việc Asset gửi thiếu, không phải nguyên nhân gây sai. Muốn dọn thì thêm một job `PURGE_ORPHAN_RT` — đúng loại việc mà khung job sinh ra để làm.
+
+---
+
 ## 5. Chu kỳ quét FO
 
 ```

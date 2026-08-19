@@ -74,8 +74,16 @@ public class FoSnapshotJobHandler : IJobHandler
 
         var bizDate = ctx.BusinessDate ?? TradingWindowGuard.NowVn().Date;
 
-        // Kiểm một lần trước khi tốn công đọc scope. Trong vòng lặp còn kiểm lại từng call.
-        await _window.EnsureOpenAsync(ct);
+        // Kiểm một lần trước khi tốn công đọc scope (~50k dòng). Trong vòng lặp còn kiểm lại từng call.
+        //   BẮT exception ở đây thay vì để nó bay lên: phiên đóng KHÔNG phải lỗi của job. Ném lên
+        //   thì dispatcher đánh FAILED → retry → đập vào guard tầng 2 → SKIPPED, và nhật ký có một
+        //   vệt đỏ mỗi ngày lúc 15h mà không ai cần. Trả 0 là mô tả đúng chuyện đã xảy ra.
+        try { await _window.EnsureOpenAsync(ct); }
+        catch (TradingWindowClosedException ex)
+        {
+            Log.Warning("[FO-RT] Không bắt đầu chu kỳ: {Msg}", ex.Message);
+            return 0;
+        }
 
         var scope = await _db.GetFoSnapshotScopeAsync(cfg.MasterCode, ct);
         if (scope.Count == 0)

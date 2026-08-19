@@ -1,4 +1,4 @@
-# SDI — Kiến trúc DB & EOD ở quy mô lớn (SQL Server)
+﻿# SDI — Kiến trúc DB & EOD ở quy mô lớn (SQL Server)
 
 Bổ trợ cho [SDI-spec.md](./SDI-spec.md). Tập trung: chịu tải dữ liệu lớn + chạy batch chốt EOD trong cửa sổ đêm.
 
@@ -50,9 +50,9 @@ Toàn bộ EOD = **một số ít câu lệnh tập hợp** (JOIN + GROUP BY + M
 | `T_SI_HOLDING_HIST` | **HISTORY holdings INTERVAL** (valid_from..valid_to), full + no-dup | ~20M + Δ/ingest | **CCI**, partition năm(valid_from) — DIFF current→close/open **tại INGEST (per-event Kafka)**; holding bất biến = 1 dòng; KHÔNG trong EOD core |
 | ~~`T_SI_CASH_HIST`~~ **[BRD asset-sync] ĐÃ GỠ** | HISTORY cash-state INTERVAL — không còn (tiền/NAV nay từ Asset; sửa quá khứ = re-ingest, không reconstruct cash) | — | — |
 | `T_SI_CASHFLOW_EVENT` | sổ cái nạp/rút | ~120M | **CCI** (clustered columnstore), partition theo năm |
-| `T_SI_BALANCE` | **lịch sử perf per-tiểu-khoản** (materialize) | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
+| `T_SI_BALANCE` | **lịch sử perf per-tiểu-khoản** (materialize). **[near-RT]** thêm `C_SRC`/`C_RT_AT` — dòng `'RT'` chỉ sống trong ngày rồi bị dòng `'EOD'` thay | ~2,5 tỷ | **CCI** + partition (cần vì holdings không event-source) |
 | ~~`T_SI_UNIT_LEDGER`~~ **[thin-layer] ĐÃ GỠ** | unit thay đổi — không còn (Asset cấp `daily_return`, SDI không phát hành unit) | — | — |
-| `T_MASTER_BALANCE` | master-level daily: **[thin-layer]** `C_AUM` (= Σ aum = Σ NAV) + `C_DAILY_RETURN` (AUM-weighted) + cash_in/out + total_account | ~250K | rowstore, partition năm |
+| `T_MASTER_BALANCE` | master-level daily: **[thin-layer]** `C_AUM` (= Σ aum = Σ NAV) + `C_DAILY_RETURN` (AUM-weighted) + cash_in/out + total_account. **[near-RT]** + `C_SRC`/`C_RT_AT`/`C_RT_SI_COUNT` | ~250K | rowstore, partition năm |
 | `T_MASTER_CURRENT` | NAV/state current cấp master (1 dòng/master, overwrite EOD) — serving overview/AUM | ~100 | rowstore (nhỏ, cache RAM) |
 | `T_MASTER_INDEX_DAILY` / `T_BENCHMARK_DAILY` | index daily | ~250K | rowstore |
 | `T_PRICE_DAILY` | giá EOD | ~4M | rowstore, index (C_BUSINESS_DATE, C_TICKER) — nhỏ, cache RAM |
