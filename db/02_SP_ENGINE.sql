@@ -340,7 +340,7 @@ BEGIN
     SELECT @p_d, b.C_SI_ACCOUNT, b.C_CUST_CODE, b.C_MASTER_CODE, b.C_AUM, b.C_DAILY_RETURN, b.C_CASH, b.C_CASH_IN, b.C_CASH_OUT
     FROM T_SI_BALANCE b
     INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_STATUS='ACTIVE'
-    WHERE b.C_BUSINESS_DATE=@p_d;
+    WHERE b.C_BUSINESS_DATE=@p_d AND b.C_SRC='EOD';   -- ★ [near-RT] CHỈ số chốt. Dòng RT (giữa phiên) KHÔNG được vào scope EOD.
     SET @p_rows = @@ROWCOUNT;   -- #tiểu khoản scope phiên này
 END
 GO
@@ -431,10 +431,12 @@ BEGIN
             AND C_SI_ACCOUNT IN (SELECT C_SI_ACCOUNT FROM @src);
         INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,
             C_AUM,C_DAILY_RETURN,C_CASH,C_CASH_AVAILABLE,C_CASH_IN,C_CASH_OUT,
-            C_DIVIDEND_PENDING,C_SELL_PENDING)
+            C_DIVIDEND_PENDING,C_SELL_PENDING,C_SRC)
         SELECT @p_business_date, s.C_SI_ACCOUNT, p.C_CUST_CODE, p.C_MASTER_CODE,
                s.C_AUM, s.C_DAILY_RETURN, s.C_CASH, s.C_CASH_AVAILABLE, s.C_CASH_IN, s.C_CASH_OUT,
-               s.C_DIVIDEND_PENDING, s.C_SELL_PENDING
+               s.C_DIVIDEND_PENDING, s.C_SELL_PENDING,
+               'EOD'   -- ★ [near-RT] GHI RÕ nguồn (không dựa DEFAULT): DELETE ở trên xoá theo (date,si) BẤT KỂ
+                       --   nguồn ⇒ dòng RT giữa phiên của chính ngày đó bị THAY bằng số chốt này. Đúng ý đồ.
         FROM @src s INNER JOIN T_SI_PORTFOLIO p ON p.C_SI_ACCOUNT=s.C_SI_ACCOUNT;   -- INNER JOIN lọc acc lạ (Asset đẩy dư)
         SET @p_rows = @@ROWCOUNT;   -- #SI THUỘC SDI đã ghi (≤ #item Asset gửi, vì acc lạ bị bỏ qua)
 
@@ -573,6 +575,8 @@ BEGIN
     DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@p_d);
     -- DELETE SCOPED theo master có trong T_EOD_WORK @p_d (forward: all masters = xoá hết @p_d; rerun: chỉ master
     --   bị ảnh hưởng → KHÔNG đụng master khác). Behavior forward giữ nguyên.
+    --   ★ [near-RT] DELETE KHÔNG lọc C_SRC — cố ý: dòng RT giữa phiên của master đó phải bị THAY bằng
+    --     dòng chốt EOD (UQ (date,master) chỉ cho phép 1 dòng). Đây là chỗ RT "tan" vào EOD cuối ngày.
     DELETE m FROM T_MASTER_BALANCE m
         WHERE m.C_BUSINESS_DATE=@p_d
           AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_MASTER_CODE=m.C_MASTER_CODE AND w.C_BUSINESS_DATE=@p_d);
@@ -587,20 +591,23 @@ BEGIN
         FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE
     )
     INSERT INTO T_MASTER_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,
-                             C_AUM,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT)
+                             C_AUM,C_DAILY_RETURN,C_CASH_IN,C_CASH_OUT,C_TOTAL_ACCOUNT,C_SRC)
     SELECT @p_d, a.C_MASTER_CODE, a.CASH,
            a.AUM,   -- [thin-layer] C_AUM = Σ AUM tiểu khoản
            CAST(CASE WHEN a.WRDEN>0 THEN a.WRNUM/a.WRDEN END AS DECIMAL(10,6)),  -- master daily return = AUM-weighted Σ(AUMᵢ·rᵢ)/ΣAUMᵢ (DM tổng KH)
-           a.CFIN, a.CFOUT, a.ACCT
+           a.CFIN, a.CFOUT, a.ACCT, 'EOD'   -- ★ [near-RT] số CHỐT (ghi rõ, không dựa DEFAULT)
     FROM agg a;
     SET @p_rows = @@ROWCOUNT;   -- #master aggregate (bắt NGAY sau INSERT, trước MERGE current bên dưới)
 
     -- current cấp master (overwrite) — CHỈ khi @p_d là ngày MỚI NHẤT (forward). Rerun ngày QUÁ KHỨ → KHÔNG đụng
     --   current (current phải = hôm nay). Forward luôn tính ngày mới nhất ⇒ chạy như cũ.
-    IF @p_d = (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE)
+    --   ★ [near-RT] MAX(...) lọc C_SRC='EOD': "ngày mới nhất" phải hiểu là ngày CHỐT mới nhất. Không lọc thì
+    --     rerun quá khứ trong lúc hôm nay đang có dòng RT vẫn so đúng, nhưng ngữ nghĩa mốc trôi theo RT —
+    --     và T_MASTER_CURRENT là nguồn AUM nhanh của PM, không được phép nhận số giữa phiên.
+    IF @p_d = (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_SRC='EOD')
     MERGE T_MASTER_CURRENT AS t
     USING (SELECT C_MASTER_CODE,C_CASH,C_AUM,C_TOTAL_ACCOUNT,C_BUSINESS_DATE
-           FROM T_MASTER_BALANCE WHERE C_BUSINESS_DATE=@p_d) s
+           FROM T_MASTER_BALANCE WHERE C_BUSINESS_DATE=@p_d AND C_SRC='EOD') s
     ON t.C_MASTER_CODE=s.C_MASTER_CODE
     WHEN MATCHED THEN UPDATE SET
         t.C_CASH=s.C_CASH, t.C_AUM=s.C_AUM, t.C_TOTAL_ACCOUNT=s.C_TOTAL_ACCOUNT,
@@ -1002,8 +1009,10 @@ BEGIN
                    ELSE POWER(CAST(b.C_DAILY_RETURN - idx.C_DAILY_RETURN AS FLOAT),2) END
     FROM T_SI_BALANCE b
     INNER JOIN T_MASTER_INDEX_DAILY idx ON idx.C_MASTER_CODE=b.C_MASTER_CODE AND idx.C_BUSINESS_DATE=@p_d
-    LEFT JOIN T_SI_BALANCE p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_BUSINESS_DATE=@prev
-    WHERE b.C_BUSINESS_DATE=@p_d
+    -- ★ [near-RT] p (mốc lũy kế phiên trước) PHẢI là dòng EOD. Dòng RT có accum=0 ⇒ lấy nhầm là prefix-sum
+    --   TE bị RESET VỀ 0 giữa chuỗi → TE của mọi kỳ chứa ngày đó sai, và sai âm thầm (không NULL, không lỗi).
+    LEFT JOIN T_SI_BALANCE p ON p.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND p.C_BUSINESS_DATE=@prev AND p.C_SRC='EOD'
+    WHERE b.C_BUSINESS_DATE=@p_d AND b.C_SRC='EOD'
       -- SCOPE theo T_EOD_WORK @p_d: forward (work=mọi SI active) → cập nhật hết như cũ; rerun per-KH (work=SI master
       --   bị ảnh hưởng) → CHỈ cập nhật SI đó (tối ưu, không quét toàn bộ SI mỗi ngày). Mọi flow đều populate work @p_d trước TE.
       AND EXISTS (SELECT 1 FROM T_EOD_WORK w WHERE w.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND w.C_BUSINESS_DATE=@p_d);
@@ -1038,7 +1047,7 @@ BEGIN
     FROM T_MASTER_BALANCE p
     INNER JOIN (SELECT C_MASTER_CODE, SUM(C_AUM) NAV FROM T_EOD_WORK WHERE C_BUSINESS_DATE=@p_d GROUP BY C_MASTER_CODE) a
       ON a.C_MASTER_CODE=p.C_MASTER_CODE
-    WHERE p.C_BUSINESS_DATE=@p_d AND ABS(p.C_AUM - a.NAV) > 1;
+    WHERE p.C_BUSINESS_DATE=@p_d AND p.C_SRC='EOD' AND ABS(p.C_AUM - a.NAV) > 1;   -- ★ [near-RT] so số chốt với số chốt
 
     -- [BRD] Check 3 CASHFLOW_MISMATCH (đo vênh 2 nguồn): cashflow SDI tự nhập vs cash_in/out Asset gửi.
     --   ⚠️ CỬA SỔ = (phiên_GD_trước, @p_d] — KHÔNG phải đúng 1 ngày @p_d. Vì sao: KH nạp/rút vào T7/CN thì
@@ -1055,7 +1064,9 @@ BEGIN
     astcf AS (   -- Asset: cộng cash_in/out của MỌI ngày lịch trong dải (Asset gửi cả T7/CN)
         SELECT C_SI_ACCOUNT, MAX(C_MASTER_CODE) AS C_MASTER_CODE, SUM(C_CASH_IN - C_CASH_OUT) AS NET
         FROM T_SI_BALANCE
-        WHERE C_BUSINESS_DATE > @cfprev AND C_BUSINESS_DATE <= @p_d GROUP BY C_SI_ACCOUNT)
+        -- ★ [near-RT] chỉ dòng EOD: dòng RT KHÔNG mang cash_in/out của cả ngày (mới nửa phiên) → gộp vào
+        --   là đối soát ra break GIẢ hàng loạt cho đúng những SI mà Asset chưa kịp gửi số chốt.
+        WHERE C_BUSINESS_DATE > @cfprev AND C_BUSINESS_DATE <= @p_d AND C_SRC='EOD' GROUP BY C_SI_ACCOUNT)
     INSERT INTO T_EOD_RECON_BREAK (C_BUSINESS_DATE,C_CHECK_NAME,C_MASTER_CODE,C_SI_ACCOUNT,C_VALUE_SDI,C_VALUE_CHECK,C_DIFF,C_MESSAGE)
     SELECT @p_d, 'CASHFLOW_MISMATCH', a.C_MASTER_CODE, a.C_SI_ACCOUNT,
            ISNULL(s.NET,0), a.NET, ISNULL(s.NET,0) - a.NET,
@@ -1199,8 +1210,13 @@ BEGIN
 
     -- [thin-layer] COMPLETENESS ASSET_NAV per-SI: MỌI tiểu khoản ACTIVE phải có dòng T_SI_BALANCE @d (Asset gửi đủ).
     --   Thiếu → SI đó bị bỏ ngầm (PM gap). Chặn EOD (err=12).
+    --   ★ [near-RT] BẮT BUỘC lọc C_SRC='EOD'. Job quét FO đổ dòng RT cho MỌI SI indexing lúc 9h–15h ⇒ nếu
+    --     không lọc thì cổng khoá THẬT của cả pipeline (err=12) luôn thấy "đủ" và PASS GIẢ dù Asset chưa
+    --     gửi một dòng chốt nào — EOD chạy trên số giữa phiên. Đây là điểm chết người nhất của việc đổ RT
+    --     vào chung bảng; đừng gỡ dòng này.
     DECLARE @missSI INT = (SELECT COUNT(*) FROM T_SI_PORTFOLIO p WHERE p.C_STATUS='ACTIVE'
-        AND NOT EXISTS (SELECT 1 FROM T_SI_BALANCE a WHERE a.C_SI_ACCOUNT=p.C_SI_ACCOUNT AND a.C_BUSINESS_DATE=@d));
+        AND NOT EXISTS (SELECT 1 FROM T_SI_BALANCE a WHERE a.C_SI_ACCOUNT=p.C_SI_ACCOUNT
+                        AND a.C_BUSINESS_DATE=@d AND a.C_SRC='EOD'));
     IF @missSI > 0
     BEGIN
         SET @p_err_code = 12;
@@ -1386,7 +1402,9 @@ BEGIN
         IF @p_total_record IS NULL
             BEGIN SET @p_err_code=2; SET @p_err_msg=N'ASSET_NAV cần @p_total_record (tổng record Asset khai — để audit)'; RAISERROR(@p_err_msg, 16, 1); END
         DECLARE @anavRecv INT = (SELECT COUNT(DISTINCT C_SI_ACCOUNT) FROM T_SI_BALANCE
-                                 WHERE C_BUSINESS_DATE=@p_business_date);   -- chỉ để AUDIT, KHÔNG gate
+                                 WHERE C_BUSINESS_DATE=@p_business_date AND C_SRC='EOD');
+                                 -- chỉ để AUDIT, KHÔNG gate. ★ [near-RT] lọc EOD: đếm cả dòng RT thì con số
+                                 --   audit này luôn = tổng SI indexing ⇒ mất sạch giá trị đối chiếu với Asset.
         UPDATE T_EOD_PIPELINE SET
                C_ASSET_NAV_TOTAL    = @p_total_record,   -- audit: Asset khai bao nhiêu
                C_ASSET_NAV_RECEIVED = @anavRecv,         -- audit: SDI nhận được bao nhiêu (≤ total nếu có acc lạ)

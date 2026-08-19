@@ -219,7 +219,10 @@ BEGIN
     OUTER APPLY (SELECT TOP 1 r.C_RATE, r.C_DAY_COUNT FROM T_SI_FEE_RATE r
                  WHERE r.C_SI_ACCOUNT=b.C_SI_ACCOUNT AND r.C_EFFECTIVE_FROM <= @p_d
                  ORDER BY r.C_EFFECTIVE_FROM DESC) rt
-    WHERE b.C_BUSINESS_DATE=@p_d AND rt.C_RATE IS NOT NULL;   -- rate NULL = SI không thu phí
+    -- ★ [near-RT FO] C_SRC='EOD' BẮT BUỘC: base tính phí phải là AUM CHỐT. Dòng RT là ảnh chụp lúc 9h15/
+    --   11h45/14h30 — thu phí trên nó là thu sai tiền thật của khách, và sai theo hướng ngẫu nhiên (AUM
+    --   giữa phiên có thể cao/thấp hơn cuối ngày). Phí đã chốt kỳ thì BẤT BIẾN ⇒ sai là phải đi đòi/hoàn.
+    WHERE b.C_BUSINESS_DATE=@p_d AND b.C_SRC='EOD' AND rt.C_RATE IS NOT NULL;   -- rate NULL = SI không thu phí
 
     -- UPSERT (no-delete) trên UQ_SI_FEE_BALANCE_NK (SI, C_FEE_DATE). is_locked=1 → KHÔNG thao tác.
     MERGE T_SI_FEE_BALANCE AS tgt

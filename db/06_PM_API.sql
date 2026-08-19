@@ -1,4 +1,4 @@
-SET QUOTED_IDENTIFIER ON;  -- đọc bảng có filtered index → QI ON lúc CREATE PROC
+﻿SET QUOTED_IDENTIFIER ON;  -- đọc bảng có filtered index → QI ON lúc CREATE PROC
 SET ANSI_NULLS ON;
 GO
 /*==============================================================================
@@ -12,6 +12,15 @@ GO
     DM tổng KH = AUM-weighted (end-weight): Σ Wᵢ·Rᵢ, Wᵢ=AUMᵢ/ΣAUM (TWR compound, KHÔNG còn unit_price)
     Deviation = (Return − Master Index Return) × 10000 (BPS)
     TE per-KH = STDEV(Rᵢ,t − R_master,t) × √X ; Master = Σ(TEᵢ·AUMᵢ)/ΣAUM (X = #ngày GD, cap 252)
+
+  *** ★ [near-RT FO] MỌI TRUY VẤN Ở FILE NÀY LỌC C_SRC='EOD' ***
+    File này = tầng HIỆU SUẤT (T-1), luôn đọc số CHỐT. Từ khi có job quét FO (db/11_JOB.sql),
+    T_SI_BALANCE / T_MASTER_BALANCE có thêm dòng 'RT' của hôm nay ⇒ mọi `MAX(C_BUSINESS_DATE)`
+    ở đây phải lọc, nếu không thì `@end` nhảy sang dòng RT ngay 9h01 và kéo theo:
+      · `@end` = hôm nay ⇒ 2 lát TE (`@base`,`@end`) trượt khỏi dòng có prefix-sum ⇒ TE = NULL hàng loạt
+      · `@cutoff` = UDF_RANGE_CUTOFF(@end) lệch 1 ngày ⇒ MỌI kỳ 1M/3M/YTD lệch mốc đầu
+      · AUM/deviation trộn số giữa phiên với số chốt trong cùng một màn hình
+    Dashboard near-realtime KHÔNG dùng các proc này — nó gọi SP_GET_PM_RT_OVERVIEW (11_JOB.sql).
 ==============================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -122,10 +131,10 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT: chỉ dòng CHỐT (C_SRC='EOD'), KHÔNG lấy ảnh chụp giữa phiên
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     -- master index return kỳ (PR) + #ngày GD (cap 252)
@@ -151,7 +160,7 @@ BEGIN
            @cashOut = ISNULL(SUM(CASE WHEN C_BUSINESS_DATE > @base THEN C_CASH_OUT END),0),
            @aumBase = MAX(CASE WHEN C_BUSINESS_DATE = @base THEN C_AUM END)
     FROM T_MASTER_BALANCE
-    WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE >= @base AND C_BUSINESS_DATE <= @end;
+    WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE >= @base AND C_BUSINESS_DATE <= @end AND C_SRC='EOD';  -- ★RT
 
     -- per-KH (end-weight): AUM/tien từ CURRENT; return Rᵢ = COMPOUND daily_return qua (base,end] (QUÉT NAV_BALANCE);
     --   TE prefix-sum từ 2 LÁT NAV_BALANCE (@base,@end) — hiệu accum 2 mốc (KHÔNG quét ngày giữa). KH join sau base → accum_base=0.
@@ -170,19 +179,19 @@ BEGIN
         SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
-          AND b.C_DAILY_RETURN IS NOT NULL
+          AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
         GROUP BY b.C_SI_ACCOUNT
     ) c ON c.si=k.si;
 
     -- lát @end: accum active đến cuối kỳ
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN T_SI_BALANCE e
-      ON e.C_MASTER_CODE=@p_master_code AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si;
+      ON e.C_MASTER_CODE=@p_master_code AND e.C_BUSINESS_DATE=@end AND e.C_SI_ACCOUNT=k.si AND e.C_SRC='EOD';  -- ★RT
 
     -- lát @base: accum active đến base (thiếu lát ⇒ KH join sau base ⇒ accum_base=0)
     UPDATE k SET car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN T_SI_BALANCE b
-      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si;
+      ON b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE=@base AND b.C_SI_ACCOUNT=k.si AND b.C_SRC='EOD';  -- ★RT
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
     UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
@@ -259,10 +268,10 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT: chỉ dòng CHỐT (C_SRC='EOD'), KHÔNG lấy ảnh chụp giữa phiên
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     -- auto resolution theo độ dài kỳ
@@ -278,7 +287,7 @@ BEGIN
     DECLARE @samp TABLE (d DATE PRIMARY KEY);
     ;WITH dd AS (
         SELECT DISTINCT C_BUSINESS_DATE bd FROM T_MASTER_BALANCE
-        WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE BETWEEN @base AND @end
+        WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE BETWEEN @base AND @end AND C_SRC='EOD'  -- ★RT
     ), bucketed AS (
         SELECT bd,
                CASE @p_resolution
@@ -298,7 +307,7 @@ BEGIN
         SELECT C_BUSINESS_DATE AS d, C_DAILY_RETURN AS r
         FROM T_MASTER_BALANCE
         WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE>@base AND C_BUSINESS_DATE<=@end
-          AND C_DAILY_RETURN IS NOT NULL
+          AND C_DAILY_RETURN IS NOT NULL AND C_SRC='EOD'  -- ★RT
     ), comp AS (
         SELECT s.d AS d,
                CAST(EXP(ISNULL(SUM(LOG(CASE WHEN 1.0 + mret.r <= 0 THEN 1.0 ELSE 1.0 + mret.r END)),0)) AS DECIMAL(18,8)) AS kc
@@ -429,10 +438,10 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT: chỉ dòng CHỐT (C_SRC='EOD'), KHÔNG lấy ảnh chụp giữa phiên
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     -- per-KH %PnL = COMPOUND daily_return qua (base,end] = EXP(Σ ln(1+r))−1 ; KH không có ngày return ⇒ 0
@@ -444,7 +453,7 @@ BEGIN
         SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
-          AND b.C_DAILY_RETURN IS NOT NULL
+          AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
         GROUP BY b.C_SI_ACCOUNT
     ) c ON c.si=nc.C_SI_ACCOUNT
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
@@ -506,10 +515,10 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT: chỉ dòng CHỐT (C_SRC='EOD'), KHÔNG lấy ảnh chụp giữa phiên
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     -- per-KH %PnL = COMPOUND daily_return qua (base,end] = EXP(Σ ln(1+r))−1 ; KH không có ngày return ⇒ 0.
@@ -523,7 +532,7 @@ BEGIN
             SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
             FROM T_SI_BALANCE b
             WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
-              AND b.C_DAILY_RETURN IS NOT NULL
+              AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
             GROUP BY b.C_SI_ACCOUNT
         ) c ON c.si=nc.C_SI_ACCOUNT
         WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE'
@@ -565,14 +574,14 @@ BEGIN
     INSERT #md (m, dend, dfirst)
     SELECT mp.C_MASTER_CODE, MAX(b.C_BUSINESS_DATE), MIN(b.C_BUSINESS_DATE)
     FROM T_MASTER_PORTFOLIO mp
-    INNER JOIN T_MASTER_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE
+    INNER JOIN T_MASTER_BALANCE b ON b.C_MASTER_CODE=mp.C_MASTER_CODE AND b.C_SRC='EOD'  -- ★RT
     WHERE mp.C_STATUS='ACTIVE'
     GROUP BY mp.C_MASTER_CODE;
 
     UPDATE #md SET dcut = dbo.UDF_RANGE_CUTOFF(dend, @p_range);
     UPDATE m SET dbase = COALESCE(
         (SELECT MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-          WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE<=m.dcut),
+          WHERE C_MASTER_CODE=m.m AND C_BUSINESS_DATE<=m.dcut AND C_SRC='EOD'),  -- ★RT
         m.dfirst)
     FROM #md m;
     -- index @base/@end + #ngày GD: 1 read/master (1 pass [dbase,dend]) thay vì 3 subquery.
@@ -614,19 +623,19 @@ BEGIN
         FROM T_SI_BALANCE b
         INNER JOIN #md d ON d.m=b.C_MASTER_CODE
         WHERE b.C_BUSINESS_DATE > d.dbase AND b.C_BUSINESS_DATE <= d.dend
-          AND b.C_DAILY_RETURN IS NOT NULL
+          AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
         GROUP BY b.C_MASTER_CODE, b.C_SI_ACCOUNT
     ) c ON c.m=k.m AND c.si=k.si;
 
     -- lát @end per master (accum active đến cuối kỳ)
     UPDATE k SET car_e=e.C_ACCUM_ACTIVE_RET, car2_e=e.C_ACCUM_ACTIVE_RET_SQ, n_e=e.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN #md d ON d.m=k.m
-    INNER JOIN T_SI_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si;
+    INNER JOIN T_SI_BALANCE e ON e.C_MASTER_CODE=k.m AND e.C_BUSINESS_DATE=d.dend AND e.C_SI_ACCOUNT=k.si AND e.C_SRC='EOD';  -- ★RT
 
     -- lát @base per master (accum active đến base; thiếu lát ⇒ accum_base=0)
     UPDATE k SET car_b=b.C_ACCUM_ACTIVE_RET, car2_b=b.C_ACCUM_ACTIVE_RET_SQ, n_b=b.C_RET_DAY_COUNT
     FROM #kh k INNER JOIN #md d ON d.m=k.m
-    INNER JOIN T_SI_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si;
+    INNER JOIN T_SI_BALANCE b ON b.C_MASTER_CODE=k.m AND b.C_BUSINESS_DATE=d.dbase AND b.C_SI_ACCOUNT=k.si AND b.C_SRC='EOD';  -- ★RT
 
     -- TE per KH = STDEV(active) prefix-sum (hiệu base→end) × √min(n,252)
     UPDATE #kh SET te = CASE WHEN (n_e-n_b) >= 2 THEN
@@ -681,7 +690,8 @@ BEGIN
                               CASE WHEN C_BUSINESS_DATE=d.dbase THEN 1 ELSE 0 END AS isBase,
                               CASE WHEN C_BUSINESS_DATE>d.dbase THEN 1 ELSE 0 END AS aft
                        FROM T_MASTER_BALANCE
-                       WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE>=d.dbase AND C_BUSINESS_DATE<=d.dend) z) x;
+                       WHERE C_MASTER_CODE=d.m AND C_BUSINESS_DATE>=d.dbase AND C_BUSINESS_DATE<=d.dend
+                         AND C_SRC='EOD') z) x;  -- ★RT
 
     -- RS3 list master
     SELECT  mp.C_MASTER_CODE, mp.C_MASTER_NAME, mc.C_TOTAL_ACCOUNT AS C_TOTAL_ACCOUNT,
@@ -844,10 +854,10 @@ BEGIN
     DECLARE @first DATE;
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT: chỉ dòng CHỐT (C_SRC='EOD'), KHÔNG lấy ảnh chụp giữa phiên
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE
-     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     DECLARE @idxBase DECIMAL(18,6), @idxEnd DECIMAL(18,6), @rMaster DECIMAL(18,10);
@@ -868,7 +878,7 @@ BEGIN
         SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
-          AND b.C_DAILY_RETURN IS NOT NULL
+          AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
         GROUP BY b.C_SI_ACCOUNT
     ) c ON c.si=nc.C_SI_ACCOUNT
     WHERE nc.C_MASTER_CODE=@p_master_code AND nc.C_STATUS='ACTIVE';
@@ -936,9 +946,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM T_MASTER_PORTFOLIO WHERE C_MASTER_CODE=@p_master_code)
         BEGIN SET @p_err_code=1; SET @p_err_msg=N'Master not found'; RAISERROR(@p_err_msg,16,1); END
     DECLARE @end DATE, @cutoff DATE, @base DATE, @first DATE;
-    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code;
+    SELECT @end=MAX(C_BUSINESS_DATE), @first=MIN(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_SRC='EOD';  -- ★RT
     SET @cutoff=dbo.UDF_RANGE_CUTOFF(@end,@p_range);
-    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff;
+    SELECT @base=MAX(C_BUSINESS_DATE) FROM T_MASTER_BALANCE WHERE C_MASTER_CODE=@p_master_code AND C_BUSINESS_DATE<=@cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base=@first;
 
     ;WITH kh AS (
@@ -948,7 +958,7 @@ BEGIN
         SELECT b.C_SI_ACCOUNT AS si, CASE WHEN MAX(CASE WHEN b.C_DAILY_RETURN <= -1 THEN 1 ELSE 0 END)=1 THEN -1.0 ELSE EXP(SUM(LOG(CASE WHEN 1.0 + b.C_DAILY_RETURN <= 0 THEN 1.0 ELSE 1.0 + b.C_DAILY_RETURN END))) - 1 END AS R
         FROM T_SI_BALANCE b
         WHERE b.C_MASTER_CODE=@p_master_code AND b.C_BUSINESS_DATE>@base AND b.C_BUSINESS_DATE<=@end
-          AND b.C_DAILY_RETURN IS NOT NULL
+          AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
         GROUP BY b.C_SI_ACCOUNT
     )
     SELECT @p_master_code AS C_MASTER_CODE, @base AS C_BASE_DATE, @end AS C_END_DATE, 'COMPOUND' AS C_METHOD,

@@ -409,18 +409,32 @@ CREATE TABLE T_SI_BALANCE (
     C_ACCUM_ACTIVE_RET    FLOAT       NOT NULL CONSTRAINT DF_SI_NAV_BAL_CAR  DEFAULT 0,  -- Σ aᵢ,d  (a = active return)
     C_ACCUM_ACTIVE_RET_SQ FLOAT       NOT NULL CONSTRAINT DF_SI_NAV_BAL_CARSQ DEFAULT 0, -- Σ aᵢ,d²
     C_RET_DAY_COUNT     INT         NOT NULL CONSTRAINT DF_SI_NAV_BAL_RDC  DEFAULT 0,  -- n (số ngày có active return)
+    -- ★ [near-RT FO] NGUỒN của dòng — xem docs/SDI-nearrt-fo-snapshot-design.md.
+    --   'EOD' = số CHỐT cuối ngày (Asset gửi qua SP_INGEST_ASSET_NAV). Đây là nguồn DUY NHẤT hợp lệ cho
+    --           MỌI phép tính, cổng chặn, phí và báo cáo. Mặc định ⇒ mọi đường ghi cũ KHÔNG đổi hành vi.
+    --   'RT'  = snapshot GIỮA PHIÊN (T0) do job quét FO 15 phút/lần đổ về. CHỈ để PM dashboard NHÌN.
+    --   ⚠️ Vì sao BẮT BUỘC có cột này khi đổ RT vào chính bảng EOD: dòng RT của hôm nay trông y hệt dòng
+    --      EOD với mọi câu truy vấn cũ. Không tách nguồn thì (1) SP_EOD_RUN err=12 "mọi SI ACTIVE đã có
+    --      dòng @d" PASS GIẢ dù Asset chưa gửi gì; (2) SP_EOD_FEE_ACCRUE lấy base = AUM lúc 9h15;
+    --      (3) MAX(C_BUSINESS_DATE) ở read API nhảy sang dòng RT → báo cáo AUM/hiệu suất đọc số giữa phiên.
+    --   Dòng RT SỐNG TỐI ĐA tới cuối ngày: EOD ingest DELETE+INSERT theo (date,si) ⇒ ghi đè bằng dòng EOD.
+    C_SRC               VARCHAR(3)  NOT NULL CONSTRAINT DF_SI_NAV_BAL_SRC DEFAULT 'EOD',
+    C_RT_AT             DATETIME    NULL,     -- thời điểm snapshot FO (chỉ dòng RT) — dashboard hiện "cập nhật lúc HH:mm"
     CONSTRAINT PK_SI_NAV_BALANCE_ID PRIMARY KEY CLUSTERED (C_NAV_BALANCE_ID),
     CONSTRAINT UQ_SI_NAV_BALANCE_PKID UNIQUE NONCLUSTERED (PK_SI_NAV_BALANCE),
-    CONSTRAINT UQ_SI_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_SI_ACCOUNT) -- idempotency
+    CONSTRAINT UQ_SI_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_SI_ACCOUNT), -- idempotency (RT và EOD KHÔNG cùng tồn tại 1 (date,si) ⇒ upsert, không trùng)
+    CONSTRAINT CK_SI_NAV_BALANCE_SRC CHECK (C_SRC IN ('EOD','RT'))
 );
 -- [PM tool] quét per-master theo ngày (US3 chart) + đọc 2 lát base/end (US1/US2 return+TE prefix-sum).
+--   C_SRC nằm trong INCLUDE: mọi reader EOD nay lọc C_SRC='EOD' — thiếu nó thì index hết covering →
+--   key lookup từng dòng trên bảng 2,5 tỷ dòng (regression perf im lặng, chỉ thấy khi prod chậm).
 CREATE INDEX IX_SI_NAV_BALANCE_MASTER ON T_SI_BALANCE (C_MASTER_CODE, C_BUSINESS_DATE)
     INCLUDE (C_SI_ACCOUNT, C_DAILY_RETURN, C_AUM, C_CASH, C_CASH_IN, C_CASH_OUT,
-             C_ACCUM_ACTIVE_RET, C_ACCUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT);
+             C_ACCUM_ACTIVE_RET, C_ACCUM_ACTIVE_RET_SQ, C_RET_DAY_COUNT, C_SRC);
 -- [Customer API FR-02/03/06] đọc lịch sử theo SUB-ACCOUNT. UQ_NK (date,si) là date-leading (cho EOD
 --   DELETE WHERE date=@d) → KHÔNG seek được by si. Index này (si,date) phủ truy vấn per-si (chart/asOf).
 CREATE INDEX IX_SI_NAV_BALANCE_ACCT ON T_SI_BALANCE (C_SI_ACCOUNT, C_BUSINESS_DATE)
-    INCLUDE (C_AUM, C_DAILY_RETURN, C_CASH);
+    INCLUDE (C_AUM, C_DAILY_RETURN, C_CASH, C_SRC);
 
 -- [BRD asset-sync] ĐÃ BỎ T_SI_INCOME_FEE (chi tiết phí/thu nhập): SDI không quản chi tiết giao dịch phí nữa.
 --   Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng). Cổ tức/lưu ký: đã gộp trong tiền/NAV.
@@ -466,8 +480,17 @@ CREATE TABLE T_MASTER_BALANCE (
     C_CASH_IN          DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_CIN  DEFAULT 0,  -- [PM] Σ nạp/SIP/initial/lãi master/ngày
     C_CASH_OUT         DECIMAL(20,0) NOT NULL CONSTRAINT DF_MNB_COUT DEFAULT 0,  -- [PM] Σ rút
     C_TOTAL_ACCOUNT    INT           NOT NULL CONSTRAINT DF_MNB_TACC DEFAULT 0,  -- [PM] #tiểu khoản ACTIVE
+    -- ★ [near-RT FO] NGUỒN dòng — GIỐNG HỆT ngữ nghĩa C_SRC ở T_SI_BALANCE (xem chú thích ở đó).
+    --   'RT' = tổng hợp master GIỮA PHIÊN (SP_RT_MASTER_AGG gộp từ dòng RT cấp SI). PM dashboard near-RT đọc dòng này.
+    --   ⚠️ MỌI read API cũ neo base/end bằng MAX(C_BUSINESS_DATE) trên bảng này ⇒ PHẢI lọc C_SRC='EOD',
+    --      nếu không thì "phiên gần nhất" của mọi màn hình hiệu suất nhảy sang số giữa phiên.
+    C_SRC              VARCHAR(3)    NOT NULL CONSTRAINT DF_MNB_SRC DEFAULT 'EOD',
+    C_RT_AT            DATETIME      NULL,     -- thời điểm snapshot (chỉ dòng RT) — cận trên của các batch đã gộp
+    C_RT_SI_COUNT      INT           NULL,     -- [RT] #tiểu khoản CÓ SỐ RT trong lần gộp này (≤ C_TOTAL_ACCOUNT).
+                                               --   Lệch ⇒ FO chưa trả đủ → dashboard hiện "đang cập nhật (n/N)", KHÔNG im lặng.
     CONSTRAINT PK_MASTER_NAV_BALANCE PRIMARY KEY CLUSTERED (PK_MASTER_NAV_BALANCE),
-    CONSTRAINT UQ_MASTER_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_MASTER_CODE)
+    CONSTRAINT UQ_MASTER_NAV_BALANCE_NK UNIQUE (C_BUSINESS_DATE, C_MASTER_CODE),
+    CONSTRAINT CK_MASTER_NAV_BALANCE_SRC CHECK (C_SRC IN ('EOD','RT'))
 );
 
 -- NAV/state HIỆN TẠI cấp MASTER — 1 dòng/master, overwrite mỗi EOD (J11 MERGE từ T_MASTER_BALANCE @d).

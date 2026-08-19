@@ -13,6 +13,15 @@ GO
       (endpoint registry: join_date/sub_account_no/initial_amount/sip...). Ownership/auth do tầng API gác.
   Read-only. T0 unit price = 10.000.
 
+  *** ★ [near-RT FO] MỌI TRUY VẤN Ở FILE NÀY LỌC C_SRC='EOD' ***
+    Từ khi có job quét FO 15 phút/lần (db/11_JOB.sql), T_SI_BALANCE / T_MASTER_BALANCE chứa THÊM dòng
+    'RT' của NGÀY HÔM NAY — ảnh chụp giữa phiên, chưa chốt, KHÔNG có daily_return. Các proc ở file này
+    phục vụ báo cáo & hiệu suất, tức là chỉ được đọc SỐ CHỐT. Nguy hiểm nhất là các mốc
+    `MAX(C_BUSINESS_DATE)` / `TOP 1 ... ORDER BY C_BUSINESS_DATE DESC`: không lọc thì "phiên gần nhất"
+    lặng lẽ nhảy sang dòng RT lúc 9h01, và AUM/NAV trên báo cáo thành số giữa phiên mà không có bất kỳ
+    dấu hiệu nào trên màn hình. Dashboard near-realtime dùng proc RIÊNG: SP_GET_PM_RT_* (11_JOB.sql).
+    ⇒ Thêm proc mới đọc 2 bảng này thì PHẢI tự hỏi: proc này cần số chốt hay số giữa phiên?
+
   *** ERR-CODE CONVENTION (date-guard) ***
     0=OK · 1=not found (entity) · 2=alerts no-holdings (06_PM) / @p_mode sai · 3=không có data index @NGÀY
     (SP_GET_ASSET_INDEX_SNAPSHOT) · 4=fee multi-accrue guard (Option B) · 5=NGÀY-bừa-bãi cho entity
@@ -85,7 +94,7 @@ BEGIN
                     ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+b.C_DAILY_RETURN > 0 THEN 1.0+b.C_DAILY_RETURN ELSE 1 END))) - 1 AS DECIMAL(10,6))
                END AS C_RETURN_INCEPTION
         FROM T_SI_BALANCE b
-        WHERE b.C_SI_ACCOUNT = ip.C_SI_ACCOUNT AND b.C_DAILY_RETURN IS NOT NULL
+        WHERE b.C_SI_ACCOUNT = ip.C_SI_ACCOUNT AND b.C_DAILY_RETURN IS NOT NULL AND b.C_SRC='EOD'  -- ★RT
     ) ret
     WHERE  ip.C_CUST_CODE = @p_cust_code
     ORDER BY nc.C_LAST_AUM DESC;
@@ -139,18 +148,19 @@ BEGIN
 
     -- mốc CUỐI kỳ + AUM: 1 read (TOP 1 đuôi index IX_SI_NAV_BALANCE_ACCT (si,date) DESC).
     SELECT TOP 1 @end = C_BUSINESS_DATE, @end_nav = C_AUM
-    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE DESC;
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_SRC='EOD'  -- ★RT: mốc cuối kỳ = phiên CHỐT gần nhất
+    ORDER BY C_BUSINESS_DATE DESC;
 
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
 
     -- mốc ĐẦU kỳ + AUM: 1 read (mốc ≤ cutoff gần nhất); fallback = mốc sớm nhất nếu range trùm cả lịch sử.
     --   @base là mốc THAM CHIẾU (chưa tính return của chính ngày @base); TWR compound từ ngày > @base.
     SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_AUM
-    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD'  -- ★RT
     ORDER BY C_BUSINESS_DATE DESC;
     IF @base IS NULL
         SELECT TOP 1 @base = C_BUSINESS_DATE, @base_nav = C_AUM
-        FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account ORDER BY C_BUSINESS_DATE ASC;
+        FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_SRC='EOD' ORDER BY C_BUSINESS_DATE ASC;  -- ★RT
 
     -- [thin-layer] TWR kỳ = compound daily_return của si trên (@base,@end]: EXP(Σ LN(1+r))−1.
     --   Tập rỗng (không ngày nào có return) → NULL. Mỗi r ∈ T_SI_BALANCE (Asset gửi, đã khử CF).
@@ -161,7 +171,7 @@ BEGIN
                   END
     FROM T_SI_BALANCE
     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE > @base AND C_BUSINESS_DATE <= @end
-      AND C_DAILY_RETURN IS NOT NULL;
+      AND C_DAILY_RETURN IS NOT NULL AND C_SRC='EOD';  -- ★RT
 
     -- MWR Modified Dietz: cần lịch phiên cho trọng số w_i. Lấy từ T_MASTER_INDEX_DAILY (1 dòng/master/phiên)
     -- thay vì T_PRICE_DAILY (date×TẤT CẢ mã) — cùng tập ngày GD nhưng ~250 dòng thay vì hàng triệu.
@@ -204,7 +214,8 @@ BEGIN
     -- RS2: master-level mới nhất (đường "Hiệu suất master" tham chiếu).
     --   [thin-layer] bỏ C_UNIT_PRICE master (đã drop); C_DAILY_RETURN = master AUM-weighted daily return.
     SELECT TOP 1 C_BUSINESS_DATE, C_AUM, C_DAILY_RETURN, C_CASH
-    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE = @master ORDER BY C_BUSINESS_DATE DESC;
+    FROM T_MASTER_BALANCE WHERE C_MASTER_CODE = @master AND C_SRC='EOD'  -- ★RT
+    ORDER BY C_BUSINESS_DATE DESC;
     END TRY
     BEGIN CATCH
         IF @p_err_code = 0 BEGIN SET @p_err_code = -1; SET @p_err_msg = ERROR_MESSAGE(); END  -- lỗi runtime → OUT, KHÔNG THROW
@@ -245,10 +256,10 @@ BEGIN
 
     -- khung ngày: 1 read gộp MAX(cuối)+MIN(đầu) → fallback dùng @first (bỏ read MIN lần 3).
     SELECT @end = MAX(C_BUSINESS_DATE), @first = MIN(C_BUSINESS_DATE)
-    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_SRC='EOD';  -- ★RT
     SET @cutoff = dbo.UDF_RANGE_CUTOFF(@end, @p_range);
     SELECT @base = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE
-     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff;
+     WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @cutoff AND C_SRC='EOD';  -- ★RT
     IF @base IS NULL SET @base = @first;
 
     -- [thin-layer] CUMULATIVE compound return trong window:
@@ -272,10 +283,10 @@ BEGIN
             si.C_INDEX_VALUE         AS C_MASTER_INDEX,      -- (c) PR danh mục mẫu (mức thô, app rebase)
             bm.C_INDEX_VALUE         AS C_BENCHMARK          -- (d) PR benchmark ngoài (mức thô, app rebase)
     FROM        T_SI_BALANCE cd
-    LEFT JOIN   T_MASTER_BALANCE   sd ON sd.C_MASTER_CODE = @master AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
+    LEFT JOIN   T_MASTER_BALANCE   sd ON sd.C_MASTER_CODE = @master AND sd.C_BUSINESS_DATE = cd.C_BUSINESS_DATE AND sd.C_SRC='EOD'  -- ★RT
     LEFT JOIN   T_MASTER_INDEX_DAILY   si ON si.C_MASTER_CODE = @master AND si.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
     LEFT JOIN   T_BENCHMARK_DAILY      bm ON bm.C_BENCHMARK_CODE = @bench AND bm.C_BUSINESS_DATE = cd.C_BUSINESS_DATE
-    WHERE  cd.C_SI_ACCOUNT=@p_si_account AND cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end
+    WHERE  cd.C_SI_ACCOUNT=@p_si_account AND cd.C_BUSINESS_DATE >= @base AND cd.C_BUSINESS_DATE <= @end AND cd.C_SRC='EOD'  -- ★RT
     ORDER BY cd.C_BUSINESS_DATE;
     END TRY
     BEGIN CATCH
@@ -414,11 +425,13 @@ BEGIN
     -- [BRD asset-sync] Phí QL đã trừ sẵn trong NAV ròng Asset gửi (Asset KHÔNG gửi số phí lũy kế riêng) ⇒ AUM = NAV.
 
     IF @p_asof IS NULL
-        SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account;
+        SELECT @p_asof = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_SRC='EOD';  -- ★RT
 
     -- DATE GUARD (err=5): @p_asof phải có dòng EOD (T_SI_BALANCE) cho ĐÚNG sub-account này (chặn ngày
     --   nghỉ/tương lai/trước-mở/sau-đóng). [thin-layer] T_SI_BALANCE là nguồn trực tiếp (Asset ghi thẳng).
-    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof)
+    --   ★RT: guard này phải đếm dòng CHỐT. Dòng RT hôm nay làm guard PASS lúc 9h01 ⇒ báo cáo tài sản KH
+    --   xuất ra số giữa phiên mà vẫn ghi "EOD".
+    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof AND C_SRC='EOD')
     BEGIN SET @p_err_code = 5;
         SET @p_err_msg = CONCAT(N'Không có dữ liệu EOD cho sub-account ', @p_si_account, N' @ ',
             CONVERT(VARCHAR(10),@p_asof,23), N' (ngày nghỉ/tương lai/trước khi mở/sau khi đóng TK).');
@@ -428,7 +441,7 @@ BEGIN
     --   Stock value = AUM − cash (suy ra, vì AUM = stock + tổng tiền). cash = TỔNG tiền (gộp tiền mặt + bán chờ + cổ tức tiền).
     DECLARE @aum DECIMAL(20,0), @cash DECIMAL(20,0), @stock DECIMAL(20,0);
     SELECT @aum=C_AUM, @cash=C_CASH
-    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof;
+    FROM T_SI_BALANCE WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE=@p_asof AND C_SRC='EOD';  -- ★RT
     SET @stock = ISNULL(@aum,0) - ISNULL(@cash,0);   -- stock suy ra (Asset không gửi tách riêng)
 
     -- [thin-layer] return tích lũy INCEPTION→@asof = EXP(Σ LN(1+r))−1 (compound daily_return ≤ @asof).
@@ -438,7 +451,7 @@ BEGIN
                              ELSE CAST(EXP(SUM(LOG(CASE WHEN 1.0+C_DAILY_RETURN > 0 THEN 1.0+C_DAILY_RETURN ELSE 1 END))) - 1 AS DECIMAL(10,6))
                         END
     FROM T_SI_BALANCE
-    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_DAILY_RETURN IS NOT NULL;
+    WHERE C_SI_ACCOUNT=@p_si_account AND C_BUSINESS_DATE <= @p_asof AND C_DAILY_RETURN IS NOT NULL AND C_SRC='EOD';  -- ★RT
 
     -- Holdings chi tiết per-mã (FO holdings reconstruct @asof × giá ≤ asof) cho RS2. ⚠️ Σ(FO×giá) CÓ THỂ lệch
     --   stock value Asset-derive (đo ở reconcile HOLDINGS_MISMATCH); RS1 total dùng số Asset (authoritative).
@@ -583,7 +596,7 @@ BEGIN
     BEGIN TRY
 
     IF @p_to_date IS NULL
-        SELECT @p_to_date = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE;
+        SELECT @p_to_date = MAX(C_BUSINESS_DATE) FROM T_SI_BALANCE WHERE C_SRC='EOD';  -- ★RT: mặc định = phiên CHỐT gần nhất
 
     IF @p_to_date IS NULL
     BEGIN SET @p_err_code=3; SET @p_err_msg=N'Chưa có dữ liệu số dư nào trong hệ thống.';
@@ -597,7 +610,7 @@ BEGIN
     --   nếu không, báo cáo trả 0 dòng và người đọc tưởng "hôm đó không ai có tài sản".
     -- ⚠️ KHÔNG gate bằng lịch giao dịch: Asset gửi số dư MỌI ngày dương lịch (kể cả T7/CN) nên chốt
     --    AUM cuối tuần là hợp lệ. Lịch chỉ gate phần TÍNH TOÁN (index/EOD), không gate báo cáo.
-    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_to_date)
+    IF NOT EXISTS (SELECT 1 FROM T_SI_BALANCE WHERE C_BUSINESS_DATE=@p_to_date AND C_SRC='EOD')  -- ★RT
     BEGIN SET @p_err_code=3;
         SET @p_err_msg = CONCAT(N'Chưa có dữ liệu số dư @ ', CONVERT(VARCHAR(10),@p_to_date,23),
             N' (ngày tương lai hoặc Asset chưa đồng bộ).');
@@ -618,7 +631,7 @@ BEGIN
         INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
         LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
         LEFT  JOIN V_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE   -- ★ VIEW, không phải bảng: đổi nguồn sửa 1 chỗ
-        WHERE b.C_BUSINESS_DATE = @p_to_date
+        WHERE b.C_BUSINESS_DATE = @p_to_date AND b.C_SRC='EOD'  -- ★RT: báo cáo tài sản = số CHỐT
           -- "Từ ngày": tiểu khoản phải đã mở trước/trong kỳ và chưa đóng TRƯỚC kỳ
           AND (@p_from_date IS NULL
                OR (p.C_JOIN_DATE <= @p_to_date
@@ -678,7 +691,7 @@ BEGIN
     INNER JOIN T_SI_PORTFOLIO     p  ON p.C_SI_ACCOUNT    = b.C_SI_ACCOUNT
     LEFT  JOIN T_MASTER_PORTFOLIO mp ON mp.C_MASTER_CODE  = b.C_MASTER_CODE
     LEFT  JOIN V_CUSTOMER_INFO    ci ON ci.C_CUST_CODE    = b.C_CUST_CODE   -- ★ VIEW, không phải bảng: đổi nguồn sửa 1 chỗ
-    WHERE b.C_BUSINESS_DATE = @p_to_date
+    WHERE b.C_BUSINESS_DATE = @p_to_date AND b.C_SRC='EOD'  -- ★RT
       AND (@p_from_date IS NULL
            OR (p.C_JOIN_DATE <= @p_to_date
                AND (p.C_CLOSE_DATE IS NULL OR p.C_CLOSE_DATE >= @p_from_date)))

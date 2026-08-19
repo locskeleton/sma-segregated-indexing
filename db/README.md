@@ -27,13 +27,16 @@ Implement engine tính toán SDI **ALL-IN-DB** (set-based, no RBAR). App chỉ `
 05_API.sql         -- read API KH: UDF_RANGE_CUTOFF + SP_GET_SI_* (FR-01..06) cho UI riêng SDI (BRD 2026-06-22: gỡ 2 producer SP_GET_ASSET_SNAPSHOT + _MASTER_SNAPSHOT; GIỮ SP_GET_ASSET_INDEX_SNAPSHOT — đẩy Master Index khi BO price-ready)
 06_PM_API.sql      -- read API PM (master-keyed): UDF_PM_CONFIG + SP_GET_MASTER_*/PM_OVERVIEW_ALL + SP_SET_MASTER_PM_CONFIG
 09_FEE.sql         -- phí QL: 4 bảng phí + SP_FEE_RUN_DAILY (điểm vào — app gọi MỖI NGÀY LỊCH, NGOÀI EOD) = accrue + close; collect/BO-result + UDF nợ phí (DEBT/ACCRUING) + 3 báo cáo (SP_RPT_FEE_DAILY/_CHARGE/_COLLECTION). (Lịch GD T_TRADING_HOLIDAY + UDF_IS_BUSINESS_DATE đã lên CORE 01/02.)
+11_JOB.sql         -- [near-RT FO] khung job chạy nền GENERIC (T_JOB_DEFINITION/T_JOB_RUN + SP_JOB_ENQUEUE(_DUE)/_CLAIM/_HEARTBEAT/_COMPLETE/_REAP/_PURGE + SP_GET_JOB_STATUS) — chống trùng nhiều pod bằng UQ(job_code,fire_key) + UPDATE có điều kiện; guard khung giờ UDF_JOB_IN_WINDOW. Kèm tầng nghiệp vụ FO snapshot: SP_GET_FO_SNAPSHOT_SCOPE / SP_INGEST_FO_SNAPSHOT_RT (ghi C_SRC='RT') / SP_RT_MASTER_AGG / SP_GET_PM_RT_OVERVIEW. Chạy sau 02.
 03_SMOKE.sql       -- smoke test core (1 SI, 1 KH, 4 phiên) — verify số đúng
 07_PM_SMOKE.sql    -- smoke PM (1 master × 3 KH × 3 phiên) — verify AUM-weighted/TE/deviation/dist/top-N
+12_JOB_SMOKE.sql   -- smoke khung job + snapshot RT (40 ca: 2-pod tranh job, lease/zombie, 4 tầng guard giờ GD, RT không đè EOD, RT không lọt vào err=12/phí/báo cáo) — cần 11
 10_FEE_SMOKE.sql   -- smoke phí (case 30/4-1/5 tách 2 dòng + FIFO collect + BO result + hook) — cần 09
 04_BENCH.sql       -- (benchmark) seed dataset lớn theo scale + chạy EOD — dùng qua bench.ps1
 ```
 (`05_API`/`06_PM_API` chạy sau `02` — read-only, không cần cho EOD/bench; cần cho API. `07_PM_SMOKE` cần `06`.)
 (`09_FEE` chạy sau `02` — phí tách riêng AUM; hook trong `SP_EOD_SET_SOURCE_READY` resolve runtime qua deferred-name nên KHÔNG cài `09` thì EOD vẫn chạy (guard skip fee). `10_FEE_SMOKE` cần `09`.)
+(`11_JOB` chạy sau `02` — dùng `UDF_IS_BUSINESS_DATE`. **Thêm cột `C_SRC`/`C_RT_AT` vào `T_SI_BALANCE`+`T_MASTER_BALANCE`**: `'EOD'` = số chốt (mặc định, mọi đường ghi cũ không đổi), `'RT'` = ảnh chụp giữa phiên do job quét FO đổ về. ⚠️ **MỌI truy vấn ở `02`/`05`/`06`/`09` nay lọc `C_SRC='EOD'`** — không lọc thì cổng khoá EOD `err=12` PASS GIẢ, phí tính trên AUM lúc 9h15, và `MAX(C_BUSINESS_DATE)` ở read API nhảy sang dòng chưa chốt. Xem [docs/SDI-nearrt-fo-snapshot-design.md](../docs/SDI-nearrt-fo-snapshot-design.md).)
 (Tùy chọn `00_INFRA.sql` — DBA: filegroups, partition function/scheme, RCSI, resource governor — xem `docs/SDI-db-architecture.md`.)
 
 ## Benchmark perf (theo dõi regression sau refactor)
