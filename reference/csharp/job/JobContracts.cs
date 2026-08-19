@@ -103,6 +103,24 @@ public interface ISdiJobGateway
     /// KHÔNG hard-code trong C#. TradingWindowGuard gọi hàm này (nhớ theo ngày, 1 lượt/chu kỳ).</summary>
     Task<bool>                  IsBusinessDateAsync(DateTime d);
 
+    /// <summary>
+    /// Khung giờ HIỆU LỰC của job, đọc thẳng T_JOB_DEFINITION:
+    ///   SELECT C_ENABLED, C_WINDOW_FROM, C_WINDOW_TO, C_BUSINESS_DAY_ONLY
+    ///   FROM T_JOB_DEFINITION WHERE C_JOB_CODE = @code
+    /// TradingWindowGuard gọi hàm này (nhớ tạm 60s). KHÔNG nhận khung giờ qua hằng số DI: đổi cấu
+    /// hình trong DB mà tầng 4 vẫn gác theo khung cũ thì đúng cái tầng chạm FO là tầng hiểu sai luật.
+    /// </summary>
+    Task<JobWindow>             GetJobWindowAsync(string jobCode, CancellationToken ct);
+
+    /// <summary>
+    /// SP_SET_JOB_SCHEDULE — cổng đổi lịch. Trả về số lượt chờ của cấu hình CŨ đã bị dọn;
+    /// hãy LOG con số đó, đừng nuốt: nó là bằng chứng cấu hình mới đã có hiệu lực.
+    /// </summary>
+    Task<(int Err, string? Msg, int PurgedRuns)> SetJobScheduleAsync(
+        string jobCode, int? intervalSec, bool clearInterval, TimeSpan? windowFrom, TimeSpan? windowTo,
+        bool clearWindow, bool? businessDayOnly, bool? enabled, int? maxDelaySec, string? payload,
+        string user, CancellationToken ct);
+
     // --- nghiệp vụ FO snapshot (tầng B của 11_JOB.sql) ---
     Task<IReadOnlyList<ScopeRow>> GetFoSnapshotScopeAsync(string? masterCode, CancellationToken ct); // SP_GET_FO_SNAPSHOT_SCOPE
     Task<(int Err, string? Msg, long Rows, int SkippedEod)> IngestFoSnapshotRtAsync(

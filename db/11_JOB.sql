@@ -102,6 +102,20 @@ CREATE TABLE T_JOB_DEFINITION (
 );
 GO
 
+-- Cột bổ sung (file này chạy lại được trên DB đã có bảng — CREATE TABLE ở trên bị IF OBJECT_ID chặn).
+IF COL_LENGTH('T_JOB_DEFINITION','C_MAX_DELAY_SEC') IS NULL
+    ALTER TABLE T_JOB_DEFINITION ADD C_MAX_DELAY_SEC INT NULL;
+GO
+/*  C_MAX_DELAY_SEC — "lượt chạy này nằm chờ quá lâu thì THÔI, đừng chạy nữa".
+    Đo từ C_RUN_AFTER (thời điểm lượt chạy BẮT ĐẦU đủ điều kiện chạy), KHÔNG phải C_ENQUEUED_AT.
+      · Lượt mới : C_RUN_AFTER = lúc sinh ⇒ đo đúng "nằm chờ bao lâu mà không ai nhặt".
+      · Lượt RETRY: C_RUN_AFTER = lúc hết backoff ⇒ retry KHÔNG bị tính là "cũ" chỉ vì lượt gốc
+        sinh từ 15 phút trước. Đo từ C_ENQUEUED_AT sẽ giết sạch retry của job có chu kỳ ngắn.
+    NULL ⇒ lấy C_INTERVAL_SEC làm mặc định: một lượt của job 15 phút mà nằm chờ quá 15 phút thì
+      slot kế tiếp đã thay nó rồi — chạy nữa là chạy lại việc cũ.
+    NULL cho cả hai (job on-demand, không chu kỳ) ⇒ KHÔNG hết hạn: job người ta đẩy tay phải nằm
+      đó chờ tới lượt, không được tự bốc hơi.                                                     */
+
 /*===========================================================================
   T_JOB_RUN — HÀNG ĐỢI **VÀ** NHẬT KÝ trong CÙNG MỘT bảng. 1 dòng = 1 LƯỢT chạy.
     Không tách queue/log làm 2 bảng: tách ra thì "job này đã chạy chưa" phải hỏi 2 nơi, và
@@ -181,6 +195,140 @@ BEGIN
     --   lúc 15:00, không phải "còn được gọi thêm một nhịp lúc 15:00".
     IF CAST(@p_at AS TIME(0)) >= @wf AND CAST(@p_at AS TIME(0)) < @wt RETURN 1;
     RETURN 0;
+END
+GO
+
+/*===========================================================================
+  SP_SET_JOB_SCHEDULE — CỔNG DUY NHẤT để đổi lịch chạy của một job
+    (chu kỳ 15' / 30' / 1 tiếng…, khung giờ, bật/tắt, payload).
+
+  ★ ĐỔI CẤU HÌNH ⇒ XOÁ SẠCH LƯỢT CHẠY CÒN CHỜ CỦA CẤU HÌNH CŨ.
+    Vì sao bắt buộc: `T_JOB_RUN` giữ BẢN CHỤP của cấu hình tại lúc sinh — mốc slot nằm trong
+    `C_FIRE_KEY`, tham số nằm trong `C_PAYLOAD`. Đổi chu kỳ 15'→60' lúc 09:16 mà không dọn thì
+    lượt 09:15 của lưới CŨ vẫn nằm trong hàng đợi và vẫn chạy. Người vận hành vừa bấm "1 tiếng
+    một lần" xong lại thấy job chạy đúng nhịp 15 phút — và sẽ kết luận là cấu hình không ăn.
+
+  XOÁ CÁI GÌ: chỉ lượt `READY` (CHƯA ai chạy). KHÔNG đụng `RUNNING` — không thể dừng một pod
+    đang gọi FO dở bằng một câu DELETE; nó sẽ chạy nốt rồi tự đóng sổ. Muốn chặn hẳn thì tắt job
+    (`@p_enabled=0`): nhịp heartbeat kế tiếp trả `still_mine=0` và worker tự dừng trong ~20 giây.
+
+  VÌ SAO XOÁ HẲN, KHÔNG ĐÁNH DẤU (khác `SP_EOD_RESET` — proc đó CỐ Ý giữ lại `T_EOD_RUN`):
+    `T_EOD_RUN` ghi việc ĐÃ CHẠY ⇒ là bằng chứng, xoá là phá vết. Dòng `READY` bị dọn ở đây ghi
+    việc CHƯA BAO GIỜ CHẠY ⇒ nội dung duy nhất của nó là "đã từng được xếp lịch", mà điều đó đã
+    nằm trong chính lịch sử cấu hình. Giữ lại chỉ làm hàng đợi bẩn.
+    (Số lượt bị dọn trả qua @p_purged_runs — người gọi PHẢI log lại, đừng nuốt.)
+
+  err: 0 OK · 1 job_code không tồn tại · 20 tham số sai · -1 runtime.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_SET_JOB_SCHEDULE
+    @p_job_code      VARCHAR(40),
+    @p_interval_sec  INT           = NULL,   -- 900=15' · 1800=30' · 3600=1 tiếng · NULL + @p_clear_interval=1 ⇒ chỉ chạy khi đẩy tay
+    @p_clear_interval BIT          = 0,      -- 1 = XOÁ chu kỳ (chuyển job sang chạy-theo-yêu-cầu)
+    @p_window_from   TIME(0)       = NULL,
+    @p_window_to     TIME(0)       = NULL,
+    @p_clear_window  BIT           = 0,      -- 1 = XOÁ khung giờ (job chạy mọi giờ)
+    @p_business_day_only BIT       = NULL,
+    @p_enabled       BIT           = NULL,
+    @p_max_delay_sec INT           = NULL,
+    @p_payload       NVARCHAR(MAX) = NULL,
+    @p_user          VARCHAR(64)   = NULL,
+    @p_err_code      INT           OUTPUT,
+    @p_err_msg       NVARCHAR(400) OUTPUT,
+    @p_purged_runs   INT           = NULL OUTPUT   -- #lượt READY của cấu hình cũ đã bị dọn
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_purged_runs=0;
+    BEGIN TRY
+        IF NOT EXISTS (SELECT 1 FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code)
+            BEGIN SET @p_err_code=1; SET @p_err_msg=CONCAT(N'job_code không tồn tại: ', @p_job_code); RETURN; END
+
+        -- Giá trị SAU khi áp (NULL = giữ nguyên; cờ _clear_ = xoá về NULL). Tính TRƯỚC để validate
+        --   trên trạng thái ĐÍCH, không phải trên trạng thái hiện tại — nếu không thì đổi mỗi
+        --   window_to sẽ được so với window_from cũ và lọt qua một khung giờ đảo ngược.
+        DECLARE @newItv INT, @newWf TIME(0), @newWt TIME(0), @newBdo BIT, @newEn BIT, @newMax INT;
+        SELECT @newItv = CASE WHEN @p_clear_interval=1 THEN NULL ELSE COALESCE(@p_interval_sec, C_INTERVAL_SEC) END,
+               @newWf  = CASE WHEN @p_clear_window=1   THEN NULL ELSE COALESCE(@p_window_from, C_WINDOW_FROM) END,
+               @newWt  = CASE WHEN @p_clear_window=1   THEN NULL ELSE COALESCE(@p_window_to,   C_WINDOW_TO)   END,
+               @newBdo = COALESCE(@p_business_day_only, C_BUSINESS_DAY_ONLY),
+               @newEn  = COALESCE(@p_enabled, C_ENABLED),
+               @newMax = COALESCE(@p_max_delay_sec, C_MAX_DELAY_SEC)
+        FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code;
+
+        IF @newItv IS NOT NULL AND @newItv < 30
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'Chu kỳ tối thiểu 30 giây.'; RETURN; END
+        -- (T-SQL không so sánh được hai biểu thức luận lý với nhau ⇒ phải quy về 0/1)
+        IF (CASE WHEN @newWf IS NULL THEN 1 ELSE 0 END) <> (CASE WHEN @newWt IS NULL THEN 1 ELSE 0 END)
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'Khung giờ phải khai ĐỦ CẢ HAI đầu, hoặc bỏ trống cả hai (@p_clear_window=1).'; RETURN; END
+        IF @newWf IS NOT NULL AND @newWf >= @newWt
+            BEGIN SET @p_err_code=20;
+                  SET @p_err_msg=N'Khung giờ phải from < to (không hỗ trợ khung vắt qua nửa đêm).'; RETURN; END
+        IF @newMax IS NOT NULL AND @newMax < 30
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_max_delay_sec tối thiểu 30 giây.'; RETURN; END
+
+        BEGIN TRAN;
+        -- ★ DỌN TRƯỚC, ĐỔI SAU. Ngược lại thì trigger backstop (chạy trong câu UPDATE) đã dọn mất
+        --   rồi, DELETE ở đây đếm ra 0 và báo cáo trả về con số sai. Thứ tự này cũng bịt luôn khe
+        --   hở: nếu scheduler kịp sinh một lượt theo cấu hình CŨ giữa hai câu lệnh, trigger dọn nốt.
+        DELETE FROM T_JOB_RUN WHERE C_JOB_CODE=@p_job_code AND C_STATUS='READY';
+        SET @p_purged_runs = @@ROWCOUNT;
+
+        UPDATE T_JOB_DEFINITION
+           SET C_INTERVAL_SEC=@newItv, C_WINDOW_FROM=@newWf, C_WINDOW_TO=@newWt,
+               C_BUSINESS_DAY_ONLY=@newBdo, C_ENABLED=@newEn, C_MAX_DELAY_SEC=@newMax,
+               C_PAYLOAD=COALESCE(@p_payload, C_PAYLOAD),
+               C_UPDATED_BY=@p_user, C_UPDATED_AT=GETDATE()
+         WHERE C_JOB_CODE=@p_job_code;
+        COMMIT;
+
+        SET @p_err_msg = CONCAT(N'Đã đổi lịch ', @p_job_code, N': chu kỳ=',
+            ISNULL(CAST(@newItv AS VARCHAR(10)), N'(chạy theo yêu cầu)'), N' giây, khung=',
+            ISNULL(CAST(@newWf AS VARCHAR(8)), N'(mọi giờ)'), N'-', ISNULL(CAST(@newWt AS VARCHAR(8)), N''),
+            N', bật=', @newEn, N'. Đã dọn ', @p_purged_runs, N' lượt chờ của cấu hình cũ.');
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT>0 ROLLBACK;
+        SET @p_purged_runs=0;
+        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
+    END CATCH
+END
+GO
+
+/*===========================================================================
+  TR_JOB_DEFINITION_PURGE_PENDING — LƯỚI CHẶN CUỐI cho luật "đổi cấu hình ⇒ dọn lượt chờ".
+
+  ⚠️ ĐÂY LÀ TRIGGER DUY NHẤT TRONG REPO. Repo vốn theo lối "cổng proc" (xem SP_INGEST_MASTER_
+     PORTFOLIO_TICKER). Ngoại lệ ở đây là có lý do: cổng proc bảo vệ được TÍNH ĐÚNG CỦA DỮ LIỆU
+     GHI VÀO, còn thứ cần giữ ở đây là một BẤT BIẾN GIỮA HAI BẢNG — "không lượt chạy nào được
+     sống lâu hơn cấu hình sinh ra nó". Bất biến giữa hai bảng thì phải gác ở tầng dữ liệu, y như
+     UNIQUE/CHECK, nếu không thì chỉ cần một câu `UPDATE T_JOB_DEFINITION SET C_INTERVAL_SEC=3600`
+     gõ tay lúc 2 giờ sáng là luật vỡ — im lặng, và đúng vào lúc không ai ngồi xem.
+
+  CHỈ dọn khi giá trị THẬT SỰ đổi: `UPDATE(cột)` chỉ cho biết cột đó có mặt trong câu SET, nên
+     một câu `SET C_INTERVAL_SEC = C_INTERVAL_SEC` (hoặc UPDATE cả hàng từ ORM) sẽ kích hoạt oan
+     và xoá mất hàng đợi đang hợp lệ. So inserted vs deleted mới là thứ nói được "đổi thật".
+===========================================================================*/
+CREATE OR ALTER TRIGGER TR_JOB_DEFINITION_PURGE_PENDING
+ON T_JOB_DEFINITION
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT UPDATE(C_INTERVAL_SEC) AND NOT UPDATE(C_WINDOW_FROM) AND NOT UPDATE(C_WINDOW_TO)
+       AND NOT UPDATE(C_BUSINESS_DAY_ONLY) AND NOT UPDATE(C_ENABLED) AND NOT UPDATE(C_PAYLOAD)
+        RETURN;   -- đổi timeout/retry/priority… không làm lượt chờ mất hiệu lực
+
+    DELETE r
+    FROM T_JOB_RUN r
+    INNER JOIN inserted i ON i.C_JOB_CODE = r.C_JOB_CODE
+    INNER JOIN deleted  d ON d.C_JOB_CODE = i.C_JOB_CODE
+    WHERE r.C_STATUS = 'READY'
+      AND (   ISNULL(i.C_INTERVAL_SEC, -1)                  <> ISNULL(d.C_INTERVAL_SEC, -1)
+           OR ISNULL(CAST(i.C_WINDOW_FROM AS VARCHAR(8)),'') <> ISNULL(CAST(d.C_WINDOW_FROM AS VARCHAR(8)),'')
+           OR ISNULL(CAST(i.C_WINDOW_TO   AS VARCHAR(8)),'') <> ISNULL(CAST(d.C_WINDOW_TO   AS VARCHAR(8)),'')
+           OR i.C_BUSINESS_DAY_ONLY <> d.C_BUSINESS_DAY_ONLY
+           OR i.C_ENABLED           <> d.C_ENABLED
+           OR ISNULL(i.C_PAYLOAD, N'') <> ISNULL(d.C_PAYLOAD, N'') );
 END
 GO
 
@@ -360,9 +508,12 @@ BEGIN
     SET @p_err_code=0; SET @p_err_msg=NULL;
     BEGIN TRY
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-        DECLARE @code VARCHAR(40), @status VARCHAR(10), @attempt INT, @maxatt INT, @timeout INT;
+        DECLARE @code VARCHAR(40), @status VARCHAR(10), @attempt INT, @maxatt INT, @timeout INT,
+                @maxdelay INT, @runafter DATETIME, @age INT;
         SELECT @code=r.C_JOB_CODE, @status=r.C_STATUS, @attempt=r.C_ATTEMPT,
-               @maxatt=d.C_MAX_ATTEMPT, @timeout=d.C_TIMEOUT_SEC
+               @maxatt=d.C_MAX_ATTEMPT, @timeout=d.C_TIMEOUT_SEC,
+               @maxdelay=COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),  -- NULL (job on-demand) = không hết hạn
+               @runafter=r.C_RUN_AFTER
         FROM T_JOB_RUN r LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
         WHERE r.C_JOB_RUN_ID=@p_job_run_id;
 
@@ -388,6 +539,22 @@ BEGIN
             WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
             SET @p_err_code=3;
             SET @p_err_msg=N'Ngoài khung giờ tại thời điểm chạy — đã đóng dấu SKIPPED, KHÔNG gọi hệ ngoài.';
+            RETURN;
+        END
+
+        -- ★ GUARD HẾT HẠN — "đừng chạy lại việc của giờ trước / của hôm qua".
+        --   Ca thật: lượt sinh 14:59 không kịp chạy, nằm READY qua đêm. Sáng mai 09:00 nó lại
+        --   NẰM TRONG khung giờ và ĐÚNG ngày GD ⇒ guard khung giờ cho qua ⇒ job chạy lại một
+        --   lượt của HÔM QUA. Chỉ có mốc hết hạn mới chặn được ca này.
+        SET @age = DATEDIFF(SECOND, @runafter, @now);
+        IF @maxdelay IS NOT NULL AND @age > @maxdelay
+        BEGIN
+            UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
+                   C_MESSAGE=CONCAT(N'BỎ QUA: nằm chờ ', @age, N' giây (quá hạn ', @maxdelay,
+                        N's) — lượt kế tiếp đã thay nó, chạy lại là chạy lại việc cũ.')
+            WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
+            SET @p_err_code=3;
+            SET @p_err_msg=CONCAT(N'Lượt chạy đã quá hạn (chờ ', @age, N's > ', @maxdelay, N's) — SKIPPED.');
             RETURN;
         END
 
@@ -437,11 +604,17 @@ BEGIN
     DECLARE @timeout INT = (SELECT d.C_TIMEOUT_SEC FROM T_JOB_RUN r
                             INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
                             WHERE r.C_JOB_RUN_ID=@p_job_run_id);
-    UPDATE T_JOB_RUN
-       SET C_HEARTBEAT_AT=@now,
-           C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
-           C_ROWS=ISNULL(@p_rows, C_ROWS)
-     WHERE C_JOB_RUN_ID=@p_job_run_id AND C_OWNER=@p_owner AND C_STATUS='RUNNING';
+    -- ★ INNER JOIN + C_ENABLED=1: TẮT job là DỪNG ĐƯỢC CẢ CHU KỲ ĐANG CHẠY. Không có vế này thì
+    --   "tắt khẩn cấp" chỉ chặn được lượt SAU, còn chu kỳ đang bắn 1000 request sang FO vẫn bắn nốt
+    --   — tức là đúng lúc cần tắt nhất thì nút tắt không có tác dụng. Worker thấy still_mine=0 sẽ
+    --   tự huỷ token và dừng trong ~20 giây (nhịp heartbeat).
+    UPDATE r
+       SET r.C_HEARTBEAT_AT=@now,
+           r.C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
+           r.C_ROWS=ISNULL(@p_rows, r.C_ROWS)
+      FROM T_JOB_RUN r
+      INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE AND d.C_ENABLED=1
+     WHERE r.C_JOB_RUN_ID=@p_job_run_id AND r.C_OWNER=@p_owner AND r.C_STATUS='RUNNING';
     SET @p_still_mine = CASE WHEN @@ROWCOUNT=1 THEN 1 ELSE 0 END;
 END
 GO
@@ -498,16 +671,17 @@ END
 GO
 
 /*===========================================================================
-  SP_JOB_REAP — LƯỚI AN TOÀN, chạy trên MỌI pod (vd 30 giây/lần). Làm 2 việc:
+  SP_JOB_REAP — LƯỚI AN TOÀN, chạy trên MỌI pod (vd 30 giây/lần). Làm 3 việc:
 
   (1) THU HỒI lượt RUNNING quá hạn lease (pod chết/bị evict giữa chừng) → READY.
-  (2) TRẢ VỀ các lượt READY tới hạn để app XADD (lại) vào Redis Stream.
+  (2) ĐÓNG DẤU SKIPPED lượt nằm chờ QUÁ HẠN (C_MAX_DELAY_SEC) — chống chạy lại việc của giờ trước.
+  (3) TRẢ VỀ các lượt READY tới hạn để app XADD (lại) vào Redis Stream.
 
-  ★ (2) LÀ THỨ BÙ ĐẮP CHO VIỆC ĐẶT HÀNG ĐỢI Ở REDIS. Redis Streams giao message rất nhanh
+  ★ (3) LÀ THỨ BÙ ĐẮP CHO VIỆC ĐẶT HÀNG ĐỢI Ở REDIS. Redis Streams giao message rất nhanh
     nhưng nó KHÔNG phải sổ cái: FLUSHALL / mất pod Redis không bền / TTL / XADD hụt vì pod
     chết ngay sau khi INSERT xong — mọi trường hợp đó đều làm message BIẾN MẤT trong khi
-    T_JOB_RUN vẫn ghi READY. Không có (2) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
-    Có (2) thì: mất message ⇒ chậm tối đa một nhịp reaper, rồi tự hồi. XADD trùng cũng vô hại
+    T_JOB_RUN vẫn ghi READY. Không có (3) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
+    Có (3) thì: mất message ⇒ chậm tối đa một nhịp reaper, rồi tự hồi. XADD trùng cũng vô hại
     vì SP_JOB_CLAIM chỉ cho một pod thắng.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_JOB_REAP
@@ -529,14 +703,30 @@ BEGIN
                                 CONVERT(VARCHAR(19), C_LEASE_UNTIL, 120), N').')
          WHERE C_STATUS='RUNNING' AND C_LEASE_UNTIL < @now;
 
-        -- (2) Lượt READY tới hạn, nằm lâu bất thường ⇒ trả về cho app XADD lại.
+        -- (2) HẾT HẠN ⇒ SKIPPED ngay, KHÔNG để nằm lại hàng đợi.
+        --     ⚠️ Bản đầu KHÔNG có bước này và nó SAI THẬT: lượt sinh 14:59 không kịp chạy sẽ nằm
+        --       READY suốt đêm (bước (3) không đẩy vì ngoài khung giờ; không ai đóng dấu nó cả).
+        --       Sáng hôm sau 09:00 khung giờ MỞ LẠI ⇒ nó được đẩy ⇒ CHẠY LẠI LƯỢT CỦA HÔM QUA.
+        --       Guard khung giờ không cứu được, vì 09:00 hôm sau là hoàn toàn "trong giờ".
+        UPDATE r
+           SET r.C_STATUS='SKIPPED', r.C_ENDED_AT=@now,
+               r.C_MESSAGE=CONCAT(N'BỎ QUA: nằm chờ ', DATEDIFF(SECOND, r.C_RUN_AFTER, @now),
+                    N' giây, quá hạn ', COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),
+                    N's — lượt kế tiếp đã thay nó.')
+          FROM T_JOB_RUN r
+          INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
+         WHERE r.C_STATUS='READY'
+           AND COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) IS NOT NULL
+           AND DATEDIFF(SECOND, r.C_RUN_AFTER, @now) > COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC);
+
+        -- (3) Lượt READY tới hạn, nằm lâu bất thường ⇒ trả về cho app XADD lại.
         SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, r.C_PAYLOAD
         FROM T_JOB_RUN r
         WHERE r.C_STATUS='READY'
           AND r.C_RUN_AFTER <= @now
           AND DATEDIFF(SECOND, r.C_ENQUEUED_AT, @now) >= @p_stale_sec
-          -- Không đẩy lại job đã ra ngoài khung giờ: để nó nằm đó, lượt claim kế tiếp (nếu có)
-          --   sẽ đóng dấu SKIPPED. Đẩy lại chỉ tổ sinh vòng lặp vô nghĩa lúc 22h đêm.
+          -- Không đẩy lại job đã ra ngoài khung giờ: bước (2) hoặc lượt claim kế tiếp sẽ đóng dấu
+          --   SKIPPED. Đẩy lại chỉ tổ sinh vòng lặp vô nghĩa lúc 22h đêm.
           AND dbo.UDF_JOB_IN_WINDOW(r.C_JOB_CODE, @now) = 1
         ORDER BY r.C_JOB_RUN_ID;
     END TRY
@@ -557,6 +747,12 @@ CREATE OR ALTER PROCEDURE SP_JOB_PURGE
 AS
 BEGIN
     SET NOCOUNT ON;
+    -- ★ SÀN 1 NGÀY — KHÔNG cho dọn lượt của HÔM NAY. Đây không phải sự thận trọng thừa:
+    --   dọn một lượt DONE mà mốc slot của nó VẪN LÀ SLOT HIỆN TẠI thì `NOT EXISTS` trong
+    --   SP_JOB_ENQUEUE_DUE lại thấy trống ⇒ sinh lại đúng lượt vừa xong ⇒ JOB CHẠY HAI LẦN trong
+    --   một slot. Chính hàng rào chống trùng (UQ fire_key) bị chặt mất chân bởi thao tác dọn dẹp.
+    --   Từ 1 ngày trở lên thì fire_key mang ngày cũ, không thể trùng slot hiện tại.
+    IF @p_keep_days IS NULL OR @p_keep_days < 1 SET @p_keep_days = 1;
     DECLARE @cut DATETIME = DATEADD(DAY, -@p_keep_days, dbo.UDF_JOB_NOW());
     DELETE FROM T_JOB_RUN
     WHERE C_STATUS IN ('DONE','SKIPPED') AND C_ENDED_AT < @cut;
@@ -580,6 +776,13 @@ BEGIN
     BEGIN TRY
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
         SELECT d.C_JOB_CODE, d.C_JOB_NAME, d.C_ENABLED, d.C_INTERVAL_SEC,
+               -- ★ Nêu THẲNG chế độ, đừng bắt người xem tự suy từ chỗ C_INTERVAL_SEC bị NULL.
+               --   "Đã xoá chu kỳ" và "chưa bao giờ cấu hình chu kỳ" nhìn giống hệt nhau trên dữ
+               --   liệu, và cả hai đều làm job im lặng ngừng chạy — đó là thứ phải HIỆN RA.
+               CASE WHEN d.C_ENABLED = 0            THEN 'DISABLED'
+                    WHEN d.C_INTERVAL_SEC IS NULL   THEN 'ON_DEMAND'   -- chỉ chạy khi có người đẩy
+                    ELSE 'INTERVAL' END AS C_SCHEDULE_MODE,
+               COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) AS C_EFFECTIVE_MAX_DELAY_SEC,
                d.C_WINDOW_FROM, d.C_WINDOW_TO, d.C_BUSINESS_DAY_ONLY,
                dbo.UDF_JOB_IN_WINDOW(d.C_JOB_CODE, @now) AS C_IN_WINDOW_NOW,
                l.C_JOB_RUN_ID AS C_LAST_RUN_ID, l.C_STATUS AS C_LAST_STATUS,
@@ -937,10 +1140,13 @@ IF NOT EXISTS (SELECT 1 FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')
 INSERT INTO T_JOB_DEFINITION
     (C_JOB_CODE, C_JOB_NAME, C_HANDLER, C_ENABLED, C_INTERVAL_SEC,
      C_WINDOW_FROM, C_WINDOW_TO, C_BUSINESS_DAY_ONLY, C_TIMEOUT_SEC, C_MAX_ATTEMPT,
-     C_RETRY_DELAY_SEC, C_SINGLETON, C_PRIORITY, C_PAYLOAD, C_UPDATED_BY)
+     C_RETRY_DELAY_SEC, C_SINGLETON, C_PRIORITY, C_MAX_DELAY_SEC, C_PAYLOAD, C_UPDATED_BY)
 VALUES
     ('FO_SNAPSHOT_RT', N'Quét snapshot tài sản KH indexing từ FO (near-realtime)',
      'FoSnapshotJobHandler', 1, 900,
      '09:00:00', '15:00:00', 1, 840, 2,
-     60, 1, 10, N'{"batchSize":50,"parallel":4}', 'seed');
+     60, 1, 10,
+     600,   -- hết hạn sau 10 phút: lượt quét nằm chờ quá 10 phút thì slot 15 phút kế tiếp sắp
+            --   tới — chụp ảnh "bây giờ" bằng lượt MỚI vẫn đúng hơn là chạy lượt cũ.
+     N'{"batchSize":50,"parallel":4}', 'seed');
 GO

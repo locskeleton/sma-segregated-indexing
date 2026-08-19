@@ -1,4 +1,4 @@
-# Snapshot near-realtime từ FO + khung job chạy nền
+﻿# Snapshot near-realtime từ FO + khung job chạy nền
 
 > **Bài toán:** SDI định kỳ gọi sang FO lấy ảnh chụp tài sản của khách hàng indexing trong phiên, gộp lên cấp master để PM dashboard nhìn được số gần thời gian thực.
 >
@@ -100,11 +100,108 @@ Ngoài ra `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` chặn trùng **ngay từ kh�
 
 Tầng 4 là tầng **duy nhất** bắt được ca cuối: tầng 1 và 2 chỉ kiểm **một lần, lúc bắt đầu**, còn một chu kỳ quét thì kéo dài nhiều phút. Guard đặt **ngay trước mỗi HTTP call**, không phải mỗi N batch — kiểm thưa ra là mở lại một khe hở đúng bằng N batch, và khe đó sẽ được lấp vào đúng ngày chu kỳ chạy chậm nhất.
 
-**Luật giờ chỉ định nghĩa MỘT chỗ:** `UDF_JOB_IN_WINDOW` đọc `T_JOB_DEFINITION`. Cả tầng 1, 2, 3 đều gọi đúng hàm đó; tầng 4 nhận khung giờ qua DI từ chính bảng đó. Không hard-code 9h–15h trong code C#.
+**Luật giờ chỉ định nghĩa MỘT chỗ:** `T_JOB_DEFINITION`. Tầng 1, 2, 3 gọi `UDF_JOB_IN_WINDOW` (đọc bảng đó); tầng 4 **đọc thẳng bảng đó lúc chạy**, nhớ tạm 60 giây. Không hard-code 9h–15h trong C#, và không nhận khung giờ qua hằng số lúc khởi động — xem §3c câu 6.
 
 **Biên `[from, to)`**: 15:00:00 chẵn là **đã đóng**. "Đến 3h chiều" nghĩa là phiên hết lúc 3h, không phải "còn được gọi thêm một nhịp lúc 3h".
 
 **Đồng hồ**: `UDF_JOB_NOW()` neo `SYSUTCDATETIME()` rồi đổi sang giờ VN. `GETDATE()` trả giờ hệ điều hành — một pod SQL chạy UTC là khung 9h–15h lệch 7 tiếng, tức job gọi FO lúc 16h–22h giờ VN. Phía C# dùng `TimeZoneInfo` cùng múi, thử cả tên Windows lẫn Linux.
+
+---
+
+## 3b. Đổi cấu hình chu kỳ — và luật "cấu hình cũ chết theo cấu hình cũ"
+
+Chu kỳ (15 phút / 30 phút / 1 tiếng), khung giờ, bật/tắt, payload đều nằm ở `T_JOB_DEFINITION`. Đổi bằng **cổng** `SP_SET_JOB_SCHEDULE`, không deploy lại code:
+
+```sql
+DECLARE @ec INT, @em NVARCHAR(400), @purged INT;
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='FO_SNAPSHOT_RT', @p_interval_sec=3600,   -- 1 tiếng/lần
+     @p_user='ops', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purged OUTPUT;
+```
+
+### Vì sao đổi cấu hình BẮT BUỘC phải dọn hàng đợi
+
+`T_JOB_RUN` giữ **bản chụp** của cấu hình tại thời điểm sinh: mốc slot nằm trong `C_FIRE_KEY`, tham số nằm trong `C_PAYLOAD`. Đổi 15 phút thành 60 phút lúc 09:16 mà không dọn thì lượt 09:15 của lưới **cũ** vẫn nằm trong hàng đợi và vẫn chạy. Người vận hành vừa bấm "1 tiếng một lần" xong lại thấy job chạy đúng nhịp 15 phút — và sẽ kết luận là cấu hình không ăn.
+
+Cổng làm **dọn trước, ghi sau**, trong một giao dịch:
+
+| Trạng thái lượt chạy | Xử lý | Vì sao |
+|---|---|---|
+| `READY` (chưa ai chạy) | **XOÁ** | Nội dung duy nhất của nó là "đã từng được xếp lịch" — thông tin đó đã nằm trong lịch sử cấu hình |
+| `RUNNING` | **GIỮ** | Không thể dừng một pod đang gọi FO dở bằng một câu DELETE. Nó chạy nốt rồi tự đóng sổ |
+| `DONE`/`FAILED`/`DEAD` | **GIỮ** | Là bằng chứng việc đã chạy — xoá là phá vết |
+
+> Khác `SP_EOD_RESET` (proc đó **cố ý giữ** `T_EOD_RUN`): ở đó xoá là phá nhật ký việc **đã chạy**; ở đây dọn là bỏ một dòng **chưa bao giờ chạy**.
+
+Muốn chặn cả lượt đang chạy thì **tắt job** (`@p_enabled=0`): nhịp heartbeat kế tiếp trả `still_mine=0` và worker tự dừng trong ~20 giây. Không có vế này thì "tắt khẩn cấp" chỉ chặn được lượt sau, còn chu kỳ đang bắn 1000 request sang FO vẫn bắn nốt — tức là đúng lúc cần tắt nhất thì nút tắt không có tác dụng.
+
+### Trigger — ngoại lệ duy nhất trong repo, và vì sao
+
+`TR_JOB_DEFINITION_PURGE_PENDING` là **trigger duy nhất** trong toàn bộ `db/`. Repo vốn theo lối "cổng proc". Ngoại lệ ở đây có lý do: cổng proc bảo vệ **tính đúng của dữ liệu ghi vào**, còn thứ cần giữ ở đây là một **bất biến giữa hai bảng** — *"không lượt chạy nào được sống lâu hơn cấu hình sinh ra nó"*. Bất biến giữa hai bảng phải gác ở tầng dữ liệu, y như `UNIQUE`/`CHECK`; nếu không thì chỉ cần một câu `UPDATE T_JOB_DEFINITION SET C_INTERVAL_SEC=3600` gõ tay lúc 2 giờ sáng là luật vỡ — im lặng, và đúng vào lúc không ai ngồi xem.
+
+Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `deleted`), không phải khi cột chỉ xuất hiện trong câu `SET`. Một ORM ghi lại cả hàng với đúng giá trị cũ sẽ **không** làm bay hàng đợi đang hợp lệ.
+
+---
+
+## 3c. Bảy câu hỏi rủi ro cao — trả lời bằng cơ chế, không bằng niềm tin
+
+### 1. Pod mới init — có mất job không?
+
+**Không.** Bốn đường cứu, độc lập nhau:
+
+| Job kẹt ở đâu | Ai cứu | Sau bao lâu |
+|---|---|---|
+| Dòng `READY`, message chưa bao giờ vào stream (`XADD` hụt, pod chết ngay sau `INSERT`) | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Message đã vào stream nhưng Redis mất sạch (`FLUSHALL`, cụm không bền) | `SP_JOB_REAP` bước (3) | ≤ 30s |
+| Message đã giao cho pod rồi pod chết (nằm trong PEL của consumer đã chết) | `XAUTOCLAIM` | ≤ 60s + idle 2 phút |
+| Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_REAP` bước (1) | ≤ timeout + 30s |
+
+Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Redis chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Redis, nên không có trạng thái nào mất theo Redis.
+
+Consumer group tạo ở `$` (chỉ nhận message mới) — cố ý. Tạo ở `0` thì pod đầu tiên khởi động sẽ hút lại toàn bộ lịch sử stream và bắn hàng nghìn lượt claim vô nghĩa; tất cả đều bị `SP_JOB_CLAIM` chặn (trạng thái đã `DONE`), nhưng vẫn là một trận bão query mỗi lần deploy.
+
+### 2. Có sinh lại job cũ không?
+
+**Không**, ba lớp chặn:
+
+1. `UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY)` — cùng một slot không thể có hai dòng.
+2. `C_FIRE_KEY` chứa **ngày + giờ + phút + giây** ⇒ slot của hôm qua không thể trùng slot hôm nay.
+3. `SP_JOB_PURGE` có **sàn 1 ngày**. Đây không phải thận trọng thừa: dọn một lượt `DONE` mà mốc slot của nó **vẫn là slot hiện tại** thì `NOT EXISTS` trong `SP_JOB_ENQUEUE_DUE` lại thấy trống ⇒ sinh lại đúng lượt vừa xong ⇒ **job chạy hai lần trong một slot**. Chính hàng rào chống trùng bị chặt mất chân bởi thao tác dọn dẹp.
+
+### 3. Có quét và chạy lại job quá giờ không?
+
+**Không.** Và đây là chỗ bản đầu **sai thật**:
+
+> Lượt sinh 14:59 không kịp chạy → nằm `READY` suốt đêm (reaper không đẩy vì ngoài khung giờ, và không ai đóng dấu nó cả). Sáng hôm sau 09:00 khung giờ **mở lại** ⇒ nó được đẩy ⇒ **chạy lại một lượt của hôm qua**. Guard khung giờ hoàn toàn không cứu được, vì 09:00 hôm sau là "trong giờ" một cách chính đáng.
+
+Đã thêm `C_MAX_DELAY_SEC` (mặc định = `C_INTERVAL_SEC`), đo từ `C_RUN_AFTER`, chặn ở **hai** chỗ: `SP_JOB_REAP` đóng dấu `SKIPPED` chủ động, và `SP_JOB_CLAIM` từ chối nếu nó lọt tới tay worker bằng đường khác.
+
+Đo từ `C_RUN_AFTER` chứ không phải `C_ENQUEUED_AT` là có chủ đích: lượt **retry** có `C_RUN_AFTER` mới, nên nó không bị tính là "cũ" chỉ vì lượt gốc sinh từ 15 phút trước. Đo nhầm mốc là giết sạch retry của mọi job chu kỳ ngắn.
+
+**Cũng không back-fill:** scheduler chỉ tính **slot hiện tại**. Dừng dịch vụ nửa ngày rồi bật lại ⇒ sinh **1** lượt, không phải 20 lượt dồn toa. Với một job chụp ảnh "bây giờ" thì 20 ảnh của quá khứ là 20 lần vô nghĩa.
+
+### 4. Chưa có cấu hình thời gian thì job chạy thế nào?
+
+`C_INTERVAL_SEC IS NULL` ⇒ chế độ **`ON_DEMAND`**: scheduler không sinh lượt nào, job chỉ chạy khi có người đẩy qua `SP_JOB_ENQUEUE`. Đẩy tay vẫn chạy được ngay, đầy đủ claim/lease/retry như thường.
+
+Lượt của job `ON_DEMAND` **không tự hết hạn** (không có `C_INTERVAL_SEC` để suy ra mốc) — job người ta đẩy tay phải nằm đó chờ tới lượt, không được tự bốc hơi. Cần hết hạn thì khai `C_MAX_DELAY_SEC` tường minh.
+
+### 5. Có cấu hình rồi xong xoá đi thì sao?
+
+`@p_clear_interval=1` ⇒ dọn lượt chờ + ngừng sinh + job về `ON_DEMAND`. Lượt đang `RUNNING` vẫn chạy nốt.
+
+⚠️ **Job im lặng ngừng chạy là trạng thái nguy hiểm** — nhìn vào dữ liệu thì "đã xoá chu kỳ" và "chưa bao giờ cấu hình" giống hệt nhau. Vì thế `SP_GET_JOB_STATUS` trả thẳng cột `C_SCHEDULE_MODE` = `INTERVAL` | `ON_DEMAND` | `DISABLED`, thay vì bắt người xem tự suy từ chỗ `C_INTERVAL_SEC` bị `NULL`.
+
+### 6. Đổi cấu hình xong, tầng nào còn dùng cấu hình cũ?
+
+Không tầng nào — nhưng chỗ này **đã từng sai**: `TradingWindowGuard` (tầng 4, C#) bản đầu nhận `from`/`to` qua DI và giữ suốt đời tiến trình. Đổi khung giờ trong DB thì tầng 1/2/3 (nằm trong SQL) đổi tức thì, còn tầng 4 vẫn gác theo khung **cũ** cho tới lần deploy sau — mà tầng 4 lại đúng là tầng duy nhất trực tiếp gọi FO. Nay guard **đọc `T_JOB_DEFINITION` lúc chạy**, nhớ tạm 60 giây.
+
+Đọc DB hỏng ⇒ giữ giá trị đọc được lần cuối và đi tiếp. Chưa từng đọc được lần nào ⇒ **từ chối chạy**: chưa biết luật thì không gọi hệ ngoài.
+
+### 7. Đổi cấu hình có giết nhầm hàng đợi đang hợp lệ không?
+
+Không. Trigger so `inserted` vs `deleted`, chỉ dọn khi giá trị **thật sự đổi**. Đổi `C_TIMEOUT_SEC`/`C_MAX_ATTEMPT`, hoặc ORM ghi lại cả hàng với đúng giá trị cũ — hàng đợi nguyên vẹn.
+
+> Toàn bộ 7 câu trên có ca kiểm chứng trong `db/12_JOB_SMOKE.sql` khối **(C)** (20 ca), trừ ba dòng có chữ *Redis* ở câu 1 — chúng cần một cụm Redis thật để chạy; phần DB của chúng đã được kiểm.
 
 ---
 

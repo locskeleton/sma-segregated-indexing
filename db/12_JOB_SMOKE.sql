@@ -23,8 +23,8 @@ DECLARE @today DATE = CAST(@now AS DATE);
 DECLARE @isGD BIT = dbo.UDF_IS_BUSINESS_DATE(@today);
 
 /*--- dọn dữ liệu test cũ ---*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','FO_SNAPSHOT_RT');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL');
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','FO_SNAPSHOT_RT');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND');
 DELETE FROM T_SI_BALANCE     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_CURRENT     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_PORTFOLIO   WHERE C_SI_ACCOUNT LIKE 'RT%';
@@ -261,10 +261,15 @@ INSERT INTO @R SELECT 'A13 cột C_IN_WINDOW_NOW phản ánh ĐÚNG khung giờ 
 --    do may mắn chứ không đo được gì. Tự review bắt được, dựng dữ liệu tường minh tại chỗ.)
 INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT,C_ENDED_AT,C_MESSAGE)
 VALUES ('SMK_ANY','DEADONE','DEAD',@now,DATEADD(DAY,-99,@now),DATEADD(DAY,-99,@now),N'lỗi cũ, cần người xem');
+-- SP_JOB_PURGE có SÀN 1 NGÀY (chống dọn lượt hôm nay rồi bị sinh lại ⇒ chạy 2 lần trong 1 slot),
+--   nên phải LÀM CŨ các lượt đã đóng thì mới dọn được. Gọi keep_days=0 trên lượt vừa xong là
+--   KHÔNG dọn gì cả — và đó chính là hành vi đúng.
+UPDATE T_JOB_RUN SET C_ENDED_AT=DATEADD(DAY,-3,@now)
+ WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED');
 DECLARE @doneBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN
                            WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'));
 DECLARE @purged BIGINT;
-EXEC SP_JOB_PURGE @p_keep_days=0, @p_rows=@purged OUTPUT;
+EXEC SP_JOB_PURGE @p_keep_days=1, @p_rows=@purged OUTPUT;
 INSERT INTO @R SELECT 'A13 ★ SP_JOB_PURGE: dọn hết DONE/SKIPPED nhưng GIỮ NGUYÊN DEAD (thứ cần người xem)',
   CASE WHEN @doneBefore > 0 AND @purged = @doneBefore
         AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'))
@@ -288,8 +293,12 @@ INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C
  ('RT02','RTC2','RTM','2026-01-01','ACTIVE'),
  ('RT03','RTC3','RTM','2026-01-01','ACTIVE');
 
--- Phiên chốt HÔM QUA (mốc so sánh) — ghi tay, C_SRC mặc định 'EOD'
-DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DATE(@today);
+-- Phiên chốt HÔM QUA (mốc so sánh) — ghi tay, C_SRC mặc định 'EOD'.
+--   ⚠️ DÙNG UDF_PREV_BUSINESS_DAY (thuần LỊCH), KHÔNG dùng UDF_PREV_BUSINESS_DATE — hàm kia đòi
+--     ngày đó phải CÓ GIÁ trong T_PRICE_DAILY. Smoke này tự seed dữ liệu của nó và KHÔNG seed giá,
+--     nên hàm kia trả NULL ⇒ toàn bộ khối (B) seed hỏng im lặng (INSERT lỗi NOT NULL, các ca sau
+--     fail với thông điệp khó hiểu). Đây là phụ thuộc ngầm vào 03_SMOKE — đã cắt.
+DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DAY(@today);
 INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN,C_CASH) VALUES
  (@prev,'RT01','RTC1','RTM',1000000000,0.010000,100000000),
  (@prev,'RT02','RTC2','RTM', 500000000,0.010000, 50000000),
@@ -441,6 +450,208 @@ BEGIN
            ELSE 0 END,
       CONCAT('maxEOD=',CONVERT(VARCHAR(10),@maxEod,23),' maxALL=',CONVERT(VARCHAR(10),@maxAll,23));
 END
+
+/*==============================================================================
+  (C) ĐỔI CẤU HÌNH THỜI GIAN + CÁC ĐIỂM RỦI RO CAO
+      Mỗi ca dưới đây trả lời MỘT câu hỏi cụ thể, không phải test cho có.
+==============================================================================*/
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');
+
+-- Job có chu kỳ, KHÔNG khung giờ, KHÔNG singleton (cô lập đúng thứ đang đo).
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
+        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_CFG',N'Job đổi cấu hình (smoke)','SmokeHandler',1,900, NULL,NULL,0, 60, 3, 0, 0);
+-- Job CHƯA CÓ cấu hình chu kỳ (chạy theo yêu cầu).
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
+        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_OND',N'Job chạy theo yêu cầu (smoke)','SmokeHandler',1,NULL, NULL,NULL,0, 60, 3, 0, 0);
+
+DECLARE @purgedC INT, @cntC INT;
+CREATE TABLE #dueC (id BIGINT, code VARCHAR(40), payload NVARCHAR(MAX));
+
+/*---- C1. Đổi chu kỳ 15 phút -> 30 phút: lượt chờ của cấu hình CŨ bị dọn ----*/
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+SET @cntC = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY');
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=1800, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+INSERT INTO @R SELECT 'C1 * đổi chu kỳ 15p -> 30p: lượt chờ của cấu hình CŨ bị dọn sạch',
+  CASE WHEN @ec=0 AND @cntC=1 AND @purgedC=1
+        AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
+        AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_CFG')=1800
+       THEN 1 ELSE 0 END, CONCAT('trước=',@cntC,' đã dọn=',@purgedC);
+
+/*---- C2. LƯỚI CHẶN: UPDATE THẲNG bảng cấu hình (không qua cổng) cũng phải dọn ----*/
+DELETE #dueC; DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+SET @cntC = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY');
+UPDATE T_JOB_DEFINITION SET C_INTERVAL_SEC=3600 WHERE C_JOB_CODE='SMK_CFG';   -- gõ tay, bỏ qua cổng
+INSERT INTO @R SELECT 'C2 * UPDATE THẲNG bảng cấu hình (bỏ qua cổng): trigger vẫn dọn lượt chờ',
+  CASE WHEN @cntC=1 AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
+       THEN 1 ELSE 0 END, CONCAT('trước=',@cntC);
+
+/*---- C3. Trigger KHÔNG được dọn OAN ----*/
+DELETE #dueC; DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+UPDATE T_JOB_DEFINITION SET C_TIMEOUT_SEC=120 WHERE C_JOB_CODE='SMK_CFG';       -- cột không liên quan lịch
+INSERT INTO @R SELECT 'C3 đổi cột KHÔNG liên quan lịch (timeout): KHÔNG dọn hàng đợi',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
+       THEN 1 ELSE 0 END, NULL;
+UPDATE T_JOB_DEFINITION SET C_INTERVAL_SEC=C_INTERVAL_SEC WHERE C_JOB_CODE='SMK_CFG';  -- ghi lại ĐÚNG giá trị cũ
+INSERT INTO @R SELECT 'C3 * SET cột lịch = CHÍNH GIÁ TRỊ CŨ (ORM ghi cả hàng): KHÔNG dọn oan',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
+       THEN 1 ELSE 0 END, NULL;
+
+/*---- C4. Lượt ĐANG CHẠY không bị đổi cấu hình giết giữa chừng ----*/
+UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-A', C_LEASE_UNTIL=DATEADD(MINUTE,5,@now)
+ WHERE C_JOB_CODE='SMK_CFG';
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=900, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+INSERT INTO @R SELECT 'C4 đổi cấu hình KHÔNG giết lượt đang RUNNING (không DELETE được pod đang gọi FO)',
+  CASE WHEN @purgedC=0 AND EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='RUNNING')
+       THEN 1 ELSE 0 END, CONCAT('purged=',@purgedC);
+
+/*---- C5. TẮT job: chu kỳ ĐANG CHẠY phải dừng (nút tắt khẩn cấp có tác dụng thật) ----*/
+DECLARE @runId BIGINT = (SELECT TOP 1 C_JOB_RUN_ID FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='RUNNING');
+EXEC SP_JOB_HEARTBEAT @p_job_run_id=@runId, @p_owner='pod-A', @p_still_mine=@mine OUTPUT;
+DECLARE @beatOn BIT = @mine;
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_enabled=0, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+EXEC SP_JOB_HEARTBEAT @p_job_run_id=@runId, @p_owner='pod-A', @p_still_mine=@mine OUTPUT;
+INSERT INTO @R SELECT 'C5 * TẮT job: heartbeat trả still_mine=0 -> chu kỳ đang chạy TỰ DỪNG (~20s)',
+  CASE WHEN @beatOn=1 AND @mine=0 THEN 1 ELSE 0 END, CONCAT('trước=',@beatOn,' sau=',@mine);
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_enabled=1, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+
+/*---- C6. *** JOB QUÁ GIỜ KHÔNG ĐƯỢC CHẠY LẠI (lượt 14:59 hôm qua sống tới 9h hôm nay) ----*/
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
+VALUES ('SMK_CFG','HOMQUA1459','READY',DATEADD(HOUR,-18,@now),DATEADD(HOUR,-18,@now));
+DECLARE @oldId BIGINT = SCOPE_IDENTITY();
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_REAP @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C6 *** lượt 18 tiếng trước: REAP đóng dấu SKIPPED, KHÔNG đẩy lại để chạy',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId)='SKIPPED'
+        AND NOT EXISTS(SELECT 1 FROM #dueC WHERE id=@oldId) THEN 1 ELSE 0 END,
+  (SELECT CONCAT(C_STATUS,' | ',LEFT(C_MESSAGE,55)) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId);
+UPDATE T_JOB_RUN SET C_STATUS='READY', C_ENDED_AT=NULL WHERE C_JOB_RUN_ID=@oldId;
+EXEC SP_JOB_CLAIM @p_job_run_id=@oldId, @p_owner='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C6 * CLAIM lượt quá hạn: err=3 + SKIPPED (chốt chặn thứ hai)',
+  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId)='SKIPPED'
+       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+
+/*---- C7. CHƯA CÓ cấu hình chu kỳ: scheduler KHÔNG sinh, nhưng đẩy tay VẪN chạy ----*/
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C7 * chưa cấu hình chu kỳ (interval NULL): scheduler KHÔNG sinh lượt nào',
+  CASE WHEN NOT EXISTS(SELECT 1 FROM #dueC WHERE code='SMK_OND') THEN 1 ELSE 0 END, NULL;
+EXEC SP_JOB_ENQUEUE @p_job_code='SMK_OND', @p_fire_key='TAY1', @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@id2 OUTPUT;
+DECLARE @ecOnd INT = @ec;
+EXEC SP_JOB_CLAIM @p_job_run_id=@id2, @p_owner='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C7 * ...nhưng ĐẨY TAY thì vẫn chạy ngay (err=0 cả enqueue lẫn claim)',
+  CASE WHEN @ecOnd=0 AND @ec=0 THEN 1 ELSE 0 END, CONCAT('enqueue=',@ecOnd,' claim=',@ec);
+
+/*---- C8. Job chạy-theo-yêu-cầu KHÔNG được tự hết hạn ----*/
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
+VALUES ('SMK_OND','CHOLAU','READY',DATEADD(DAY,-3,@now),DATEADD(DAY,-3,@now));
+DECLARE @ondId BIGINT = SCOPE_IDENTITY();
+EXEC SP_JOB_REAP @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C8 * job on-demand: lượt đẩy tay KHÔNG tự bốc hơi dù đã chờ 3 ngày',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId)='READY' THEN 1 ELSE 0 END,
+  (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId);
+
+/*---- C9. XOÁ chu kỳ (đang có -> clear): dừng sinh + dọn lượt chờ ----*/
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+SET @cntC = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY');
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_clear_interval=1, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C9 * XOÁ chu kỳ: dọn lượt chờ + scheduler ngừng sinh (job về chạy-theo-yêu-cầu)',
+  CASE WHEN @cntC=1 AND @purgedC=1
+        AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_CFG') IS NULL
+        AND NOT EXISTS(SELECT 1 FROM #dueC WHERE code='SMK_CFG')
+        AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
+       THEN 1 ELSE 0 END, CONCAT('trước=',@cntC,' dọn=',@purgedC);
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=900, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+
+/*---- C10. Pod mới / mất message: lượt READY vẫn được nhặt lại (không mất job) ----*/
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
+VALUES ('SMK_CFG','MATMSG','READY',DATEADD(SECOND,-120,@now),DATEADD(SECOND,-120,@now));
+DECLARE @lostId BIGINT = SCOPE_IDENTITY();
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_REAP @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C10 * mất message Redis (XADD hụt/FLUSHALL/pod mới): REAP nhặt lại, KHÔNG mất job',
+  CASE WHEN EXISTS(SELECT 1 FROM #dueC WHERE id=@lostId) THEN 1 ELSE 0 END, NULL;
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
+VALUES ('SMK_CFG','VUASINH','READY',@now,@now);
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_REAP @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C10 lượt VỪA sinh (chưa quá stale_sec): REAP KHÔNG đẩy lại (khỏi XADD trùng mỗi 30s)',
+  CASE WHEN NOT EXISTS(SELECT 1 FROM #dueC WHERE code='SMK_CFG') THEN 1 ELSE 0 END, NULL;
+
+/*---- C11. KHÔNG back-fill: dừng dịch vụ nửa ngày rồi bật lại -> chỉ 1 lượt ----*/
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C11 * bật lại dịch vụ sau nhiều giờ: CHỈ sinh slot HIỆN TẠI, không dồn slot đã lỡ',
+  CASE WHEN (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG')=1 THEN 1 ELSE 0 END,
+  CONCAT('sinh=',(SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG'));
+
+/*---- C12. Dọn nhật ký KHÔNG được làm job chạy lại trong cùng slot ----*/
+UPDATE T_JOB_RUN SET C_STATUS='DONE', C_ENDED_AT=@now WHERE C_JOB_CODE='SMK_CFG';
+EXEC SP_JOB_PURGE @p_keep_days=0, @p_rows=@rows OUTPUT;   -- gọi ẩu: 0 ngày
+DELETE #dueC;
+INSERT #dueC EXEC SP_JOB_ENQUEUE_DUE @p_user='pod-A', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C12 * PURGE keep_days=0 bị ép sàn 1 ngày: lượt hôm nay còn -> KHÔNG sinh lại slot vừa chạy',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='DONE')
+        AND NOT EXISTS(SELECT 1 FROM #dueC WHERE code='SMK_CFG') THEN 1 ELSE 0 END,
+  CONCAT('purged=',@rows);
+
+/*---- C13. Cổng đổi lịch phải VALIDATE, không nhận cấu hình vô nghĩa ----*/
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=5, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+DECLARE @e1 INT = @ec;
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_window_from='15:00', @p_window_to='09:00', @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+DECLARE @e2 INT = @ec;
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_window_from='09:00', @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+DECLARE @e3 INT = @ec;
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='KHONG_CO', @p_interval_sec=900, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+INSERT INTO @R SELECT 'C13 cổng validate: chu kỳ 5s=20 - khung đảo ngược=20 - nửa khung=20 - job lạ=1',
+  CASE WHEN @e1=20 AND @e2=20 AND @e3=20 AND @ec=1 THEN 1 ELSE 0 END,
+  CONCAT(@e1,'/',@e2,'/',@e3,'/',@ec);
+INSERT INTO @R SELECT 'C13 * cấu hình KHÔNG bị sửa dở dang sau khi validate từ chối',
+  CASE WHEN (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_CFG')=900
+        AND (SELECT C_WINDOW_FROM FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_CFG') IS NULL
+       THEN 1 ELSE 0 END, NULL;
+
+/*---- C14. Đổi cấu hình job FO thật: 15 phút -> 1 tiếng, rồi trả lại ----*/
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='FO_SNAPSHOT_RT', @p_interval_sec=3600, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+INSERT INTO @R SELECT 'C14 đổi job FO sang 1 tiếng/lần: err=0, khung giờ 09:00-15:00 GIỮ NGUYÊN',
+  CASE WHEN @ec=0
+        AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=3600
+        AND (SELECT C_WINDOW_FROM  FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')='09:00:00'
+        AND (SELECT C_WINDOW_TO    FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')='15:00:00'
+       THEN 1 ELSE 0 END, ISNULL(@em,'');
+EXEC SP_SET_JOB_SCHEDULE @p_job_code='FO_SNAPSHOT_RT', @p_interval_sec=900, @p_user='ops',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
+INSERT INTO @R SELECT 'C14 trả lại 15 phút: err=0',
+  CASE WHEN @ec=0 AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=900
+       THEN 1 ELSE 0 END, NULL;
+
+DROP TABLE #dueC;
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');
 
 /*==============================================================================
   KẾT QUẢ

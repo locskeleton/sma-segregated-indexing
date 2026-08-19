@@ -25,3 +25,4 @@ timestamp_utc,commit,subject,scale,n_customers,n_positions,total_ms,J01_ms,J07_m
 2026-06-22T01:16:43Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",large,50000,6250000,40387,NULL,31194,556,37,333,6400,NULL
 2026-06-22T01:18:52Z,163d5b3,"perf(eod): unit_ledger + nav_balance về DELETE @p_d + INSERT (rollback MERGE) — sạch + nhanh",large,50000,6250000,41058,NULL,31813,710,46,286,6396,NULL
 2026-08-19T00:59:14Z,ed53116,"feat(job): khung job chß║íy nß╗ün generic (multi-pod, no-duplicate) + snapshot near-realtime FO",small,1000,60000,1217,NULL,60,140,126,127,577,NULL
+2026-08-19T01:25:46Z,d33fbad,"fix(job): 6 bug tự review bắt được — fire_key thiếu GIÂY, MERGE thiếu HOLDLOCK, 4 proc chưa có test",small,1000,60000,1319,NULL,74,200,120,126,636,NULL
