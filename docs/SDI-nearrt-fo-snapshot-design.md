@@ -161,7 +161,7 @@ Một chu kỳ quét FO chạy **vài phút** (1000 batch); `max.poll.interval.m
 
 **Cách né:** `Consume` → **commit offset ngay** → `SP_JOB_CLAIM_SLOT` → ném job sang Task nền → quay lại `Consume`. Vòng poll luôn rảnh.
 
-**Commit trước khi chạy** nghe ngược tai nhưng là lựa chọn đúng: message không phải sổ cái, `T_JOB_RUN` mới là. Pod chết sau commit ⇒ lease hết hạn ⇒ `SP_JOB_RECOVER` thu hồi ⇒ chạy lại. Còn commit *sau* khi job xong thì vòng poll phải chờ vài phút — đổi một lưới cứu đã có lấy một cái bẫy đã biết.
+**Commit trước khi chạy** nghe ngược tai nhưng là lựa chọn đúng: message không phải sổ cái, `T_JOB_RUN` mới là. Pod chết *trước* khi claim ⇒ chưa có dòng nào ⇒ mốc mất, mốc sau bù (với FO là 15 phút). Pod chết *sau* khi claim ⇒ với job có retry thì `SP_JOB_RECOVER` thu hồi; **với FO thì không** (§3(4b)). Còn commit *sau* khi job xong thì vòng poll phải chờ vài phút — đổi một lưới cứu đã có lấy một cái bẫy đã biết.
 
 > Khung job hiện tại có thứ luồng Asset cũ không có: **lease + heartbeat**. Pod bị đá vẫn heartbeat nên vẫn giữ lease, pod mới claim nhận `err=5` ⇒ vòng xoáy **không hình thành**. Nhưng đó là lưới cứu, không phải lý do để cố tình nhảy xuống vực.
 
@@ -343,6 +343,27 @@ Tầng 4 là tầng **duy nhất** bắt được ca cuối: tầng 1 và 2 ch�
 
 ---
 
+### (4b) ★ Job FO KHÔNG BAO GIỜ chạy lại một mốc — `C_MAX_ATTEMPT = 1`
+
+Quyết định **nghiệp vụ**, không phải mặc định kỹ thuật: gọi FO là chạm vào lõi giao dịch chứng khoán. Một lượt đã lỗi thì **dừng hẳn ở đó cho người xem**, không tự bắn lại.
+
+Một con số tắt **cả hai** đường chạy lại, vì cả hai đều đi qua cùng phép kiểm số lần thử:
+
+| Đường chạy lại | Bị chặn ở đâu | Kết cục |
+|---|---|---|
+| Retry sau lỗi | `SP_JOB_COMPLETE`: `@attempt < @maxatt` sai | `DEAD` ngay, không quay về `READY` |
+| Thu hồi từ pod chết | `SP_JOB_CLAIM_SLOT` đường (b): `@curAtt >= @maxatt` | `err=6` + `DEAD`, không ai giành lại |
+
+⇒ **Pod chết giữa chừng = mất mốc đó.** Chấp nhận có chủ đích: đây là ảnh chụp, mốc kế tiếp cách 15 phút sẽ bù, và *"mất một mốc"* rẻ hơn nhiều so với *"hai pod cùng bắn vào FO"*. Dòng `RUNNING` mồ côi để `SP_JOB_PURGE` dọn.
+
+**Hệ quả tốt, đáng ghi lại:** vì không còn đường nào để pod thứ hai giành một mốc đang chạy, tính an toàn của job FO **không còn phụ thuộc** bất biến `C_TIMEOUT_SEC > C_MAX_DELAY_SEC`.
+
+> Bất biến đó là thứ đang âm thầm chặn ca xấu nhất trước đây: pod mất kết nối DB thì **không heartbeat được và cũng không học được là mình đã mất quyền** — tin đó cũng nằm ở DB. `TradingWindowGuard` lúc đó dùng lại khung giờ đã cache nên tầng 4 không chặn. Thứ chặn được là guard **hạn tươi**, vì nó tính hoàn toàn cục bộ (`now − slotAt`, không cần DB): FO có `MaxDelaySec=600` còn lease `840` ⇒ pod zombie tự câm ở giây 600, **240 giây trước** khi ai đó được phép thu hồi.
+> Không có ràng buộc nào giữ bất biến này. Job khác **có** bật retry mà gọi hệ ngoài thì phải tự để ý.
+
+Khoá bằng ca kiểm `12_JOB_SMOKE.sql` khối A12 (3 ca): seed đúng `1`; lượt lỗi ra `DEAD` chứ không `READY`; pod chết ra `err=6 + DEAD`. Nâng lên `2` là bộ kiểm đỏ ngay — đổi số đó là **đổi nghiệp vụ**, không phải chỉnh tham số.
+
+
 ## 3b. Đổi cấu hình chu kỳ — và luật "cấu hình cũ chết theo cấu hình cũ"
 
 Chu kỳ (15 phút / 30 phút / 1 tiếng), khung giờ, bật/tắt, payload đều nằm ở `T_JOB_DEFINITION`. Đổi bằng **cổng** `SP_SET_JOB_SCHEDULE`, không deploy lại code:
@@ -419,7 +440,7 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 | **Redis chết** | Bộ quét **dừng nhịp**, không produce, không quét DB thay thế ⇒ **bỏ mốc**. Mốc sau lấp lại khi Redis trở lại | tối đa 1 chu kỳ mất số |
 | **Message thất lạc trước khi có pod nào giành** | ⚠️ **KHÔNG bắt được** — chưa có dòng `T_JOB_RUN` nào để `SP_JOB_RECOVER` tìm. Đây là cái giá của việc bỏ ghi DB lúc sinh job | mốc sau lấp lại |
 | Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
-| Lượt đã `RUNNING` rồi pod chết | lease hết hạn → `SP_JOB_RECOVER` bước (1) | ≤ timeout + 30s |
+| Lượt đã `RUNNING` rồi pod chết | **Job FO: KHÔNG thu hồi** (`C_MAX_ATTEMPT=1`) → `err=6` + `DEAD`, mất mốc, mốc sau bù. Job khác: lease hết → `SP_JOB_RECOVER` bước (1) | FO: không bao giờ · khác: ≤ timeout + 30s |
 
 Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Kafka chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Kafka, nên không có trạng thái nào mất theo broker.
 
@@ -568,7 +589,7 @@ Bản đầu cắt ở ranh giới **khách hàng** để "không xẻ đôi m�
 
 **Gộp master một lần, cuối chu kỳ.** Gộp sau mỗi batch cho ra con số master "nửa cũ nửa mới" mà dashboard không phân biệt được.
 
-**`C_SINGLETON=1` + `timeout 840s < 900s`**: chu kỳ trước chưa xong thì không mở chu kỳ mới (1000 batch chồng 2 chu kỳ là tự bắn vào chân mình ở phía FO); mà pod chết thì lượt đó được thu hồi **trước** khi slot kế tiếp tới.
+**`C_SINGLETON=1` + `timeout 840s < 900s`**: chu kỳ trước chưa xong thì không mở chu kỳ mới (1000 batch chồng 2 chu kỳ là tự bắn vào chân mình ở phía FO); mà lease hết hạn **không** tính là "đang chạy", nên một pod chết không khoá vĩnh viễn mốc kế tiếp.
 
 **Hết giờ giữa chừng là kết cục BÌNH THƯỜNG**, không phải lỗi: dừng vòng lặp, **vẫn** gộp master trên phần đã ghi, trả về số dòng đã xử lý, **không ném exception**. Ném thì lượt bị đánh FAILED rồi retry, và retry sau 15h chỉ đập vào tầng 2 rồi SKIPPED — nhật ký đầy tiếng ồn đỏ vô nghĩa.
 
@@ -604,7 +625,7 @@ Không có ba cột này thì một tổng AUM thiếu 200 khách hàng trông *
 |---|---|---|
 | Broker Kafka chết / topic bị xoá | Message biến mất, `T_JOB_RUN` vẫn READY → `SP_JOB_RECOVER` produce lại sau ≤30s | ❌ |
 | Produce hụt (broker chết lúc scheduler rung chuông) | Y như trên | ❌ |
-| Pod chết giữa chu kỳ | Lease hết hạn → RECOVER thu hồi → pod khác chạy lại. Ingest idempotent (MERGE) nên chạy lại vô hại | ❌ |
+| Pod chết giữa chu kỳ | **FO không chạy lại** (`C_MAX_ATTEMPT=1`, xem §3(4b)): mốc đó mất, mốc sau 15 phút bù. Đổi lại: không tình huống nào có hai pod cùng bắn vào FO | ❌ |
 | Pod **treo** rồi tỉnh lại (zombie) | Heartbeat trả `still_mine=false` → tự huỷ token → dừng. `SP_JOB_COMPLETE` của nó cũng bị từ chối (`err=5`) | ❌ |
 | Cùng một mốc giao cho 20 pod | `SP_JOB_CLAIM_SLOT`: đúng 1 thắng, 19 nhận `err=5` | ❌ |
 | 10 pod cùng quét slot 9:15 | `UQ_JOB_RUN_NK`: đúng 1 dòng | ❌ |

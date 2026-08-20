@@ -58,8 +58,8 @@ DECLARE @today DATE = CAST(@now AS DATE);
 DECLARE @isGD BIT = dbo.UDF_IS_BUSINESS_DATE(@today);
 
 /*--- dọn dữ liệu test cũ ---*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','FO_SNAPSHOT_RT');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE');
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','SMK_NORT','FO_SNAPSHOT_RT');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','SMK_NORT');
 DELETE FROM T_SI_BALANCE     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_CURRENT     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_PORTFOLIO   WHERE C_SI_ACCOUNT LIKE 'RT%';
@@ -315,6 +315,45 @@ INSERT INTO @R SELECT 'A12 seed FO_SNAPSHOT_RT: 15 phút · 09:00–15:00 · ch�
                      AND C_INTERVAL_SEC=900 AND C_WINDOW_FROM='09:00:00' AND C_WINDOW_TO='15:00:00'
                      AND C_BUSINESS_DAY_ONLY=1 AND C_SINGLETON=1 AND C_TIMEOUT_SEC<900)
        THEN 1 ELSE 0 END, NULL;
+
+-- A12 ★★ LUẬT NGHIỆP VỤ: job FO KHÔNG BAO GIỜ chạy lại một mốc. Gọi FO là chạm lõi giao dịch
+--   chứng khoán ⇒ lượt đã lỗi phải dừng hẳn cho người xem, không tự bắn lại.
+--   C_MAX_ATTEMPT=1 tắt cả retry lẫn thu hồi-pod-chết (cả hai qua cùng phép kiểm số lần thử).
+--   Ca này tồn tại để ai nâng lên 2 thì bộ kiểm đỏ ngay, chứ không lặng lẽ bật lại đường gọi lại FO.
+INSERT INTO @R SELECT 'A12 ★★ FO KHÔNG retry: C_MAX_ATTEMPT=1 (đổi số này = đổi nghiệp vụ)',
+  CASE WHEN (SELECT C_MAX_ATTEMPT FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=1
+       THEN 1 ELSE 0 END,
+  CONCAT('max_attempt=',(SELECT C_MAX_ATTEMPT FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT'));
+
+-- ...và chứng minh con số đó ĂN THẬT, không chỉ nằm trong bảng cấu hình.
+--   Dựng một job y hệt FO (max_attempt=1), cho nó chạy rồi BÁO LỖI ⇒ phải ra DEAD, KHÔNG ra READY.
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_NORT'; DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_NORT';
+INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
+        C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_MAX_DELAY_SEC,C_SINGLETON)
+VALUES ('SMK_NORT',N'Không retry (smoke)','SmokeHandler',1,60,0,300,1,60,86400,0);
+DECLARE @slotNR DATETIME = dbo.UDF_JOB_SLOT_AT('SMK_NORT', @now);
+DECLARE @idNR BIGINT;
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@idNR OUTPUT;
+EXEC SP_JOB_COMPLETE @p_job_run_id=@idNR, @p_owner='pod-A', @p_ok=0, @p_rows=0,
+     @p_message=N'FO tra 500', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A12 ★★ ...lượt FO lỗi ⇒ DEAD ngay, KHÔNG quay về READY để bắn lại',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='DEAD' THEN 1 ELSE 0 END,
+  (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR);
+
+-- ...và pod chết (lease hết hạn) cũng KHÔNG ai giành lại được: RECOVER trả dòng về READY, nhưng
+--   CLAIM_SLOT đóng dấu DEAD (err=6) chứ không cho chạy. Mốc đó mất — đúng ý đồ.
+UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-chet', C_ENDED_AT=NULL,
+       C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now) WHERE C_JOB_RUN_ID=@idNR;
+DELETE #scan; DELETE #rec;
+INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod-B', @p_source='recover',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A12 ★★ ...pod chết cũng KHÔNG ai giành lại ⇒ err=6 + DEAD (mất mốc, có chủ đích)',
+  CASE WHEN @ec=6 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='DEAD'
+       THEN 1 ELSE 0 END,
+  CONCAT('err=',@ec,' status=',(SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR));
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_NORT'; DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_NORT';
 -- Biên khung giờ tính TAY (không phụ thuộc lúc chạy smoke): 08:59 ngoài · 09:00 trong · 14:59 trong · 15:00 NGOÀI
 DECLARE @gd DATE = @today;
 WHILE dbo.UDF_IS_BUSINESS_DATE(@gd)=0 SET @gd = DATEADD(DAY,1,@gd);   -- lấy 1 ngày GD bất kỳ để test biên

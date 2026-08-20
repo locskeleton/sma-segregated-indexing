@@ -1300,7 +1300,24 @@ INSERT INTO T_JOB_DEFINITION
 VALUES
     ('FO_SNAPSHOT_RT', N'Quét snapshot tài sản KH indexing từ FO (near-realtime)',
      'FoSnapshotJobHandler', 1, 900,
-     '09:00:00', '15:00:00', 1, 840, 2,
+     '09:00:00', '15:00:00', 1, 840,
+     1,     -- ★★ C_MAX_ATTEMPT = 1 ⇒ JOB FO KHÔNG BAO GIỜ CHẠY LẠI MỘT MỐC. Quyết định nghiệp vụ,
+            --   không phải mặc định kỹ thuật: gọi FO là chạm vào lõi giao dịch chứng khoán, nên một
+            --   lượt đã lỗi thì DỪNG HẲN ở đó, để người xem, chứ không tự bắn lại.
+            --
+            --   Con số 1 này tắt CẢ HAI đường chạy lại, vì cả hai đều đi qua phép kiểm số lần thử:
+            --     · retry sau lỗi     — SP_JOB_COMPLETE: @attempt < @maxatt sai ⇒ đóng dấu DEAD;
+            --     · thu hồi pod chết  — SP_JOB_CLAIM_SLOT đường (b): @curAtt >= @maxatt ⇒ DEAD, err=6.
+            --   ⇒ Pod chết giữa chừng = MẤT mốc đó. Chấp nhận có chủ đích: đây là ảnh chụp, mốc kế
+            --     tiếp cách 15 phút sẽ bù, và "mất một mốc" rẻ hơn nhiều so với "hai pod cùng bắn
+            --     vào FO". Dòng RUNNING mồ côi để SP_JOB_PURGE dọn.
+            --
+            --   HỆ QUẢ TỐT: không có đường nào để pod thứ hai giành một mốc đang chạy ⇒ tính an toàn
+            --   của job FO KHÔNG còn phụ thuộc bất biến C_TIMEOUT_SEC > C_MAX_DELAY_SEC (thứ hiện
+            --   chặn zombie gọi FO trùng, nhưng không có ràng buộc nào giữ). Job khác bật retry thì
+            --   vẫn phải để ý bất biến đó.
+            --
+            --   ĐỔI SỐ NÀY LÀ ĐỔI NGHIỆP VỤ. Có ca kiểm khoá lại: 12_JOB_SMOKE.sql khối A12.
      60, 1, 10,
      600,   -- hết hạn sau 10 phút: lượt quét nằm chờ quá 10 phút thì slot 15 phút kế tiếp sắp
             --   tới — chụp ảnh "bây giờ" bằng lượt MỚI vẫn đúng hơn là chạy lượt cũ.
