@@ -438,6 +438,8 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 | Message đã commit nhưng pod chết trước khi claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
 | Pod vượt `max.poll.interval` bị đá, rebalance giao lại | `SP_JOB_CLAIM_SLOT` err=5 (zombie còn giữ lease) | ngay |
 | **Redis chết** | Bộ quét **dừng nhịp**, không produce, không quét DB thay thế ⇒ **bỏ mốc**. Mốc sau lấp lại khi Redis trở lại | tối đa 1 chu kỳ mất số |
+| **DB chết TRƯỚC khi giành được mốc** | `ClaimSlotAsync` ném ⇒ consumer log rồi bỏ. **Không có dòng `T_JOB_RUN` nào** ⇒ không kẹt gì, mốc sau chạy bình thường. Nhưng cũng không ai đếm được mốc đã mất | mất 1 mốc, **vô hình** |
+| **DB chết GIỮA chu kỳ** | ⚡ **NGẮT MẠCH**: 3 batch liên tiếp không ghi được ⇒ đóng chu kỳ, các batch còn lại **không gọi FO nữa**. Đo được: 100 batch ⇒ chỉ 4 lần chạm FO. Không có nó thì đủ 1000 batch vẫn nã FO rồi ném ở bước ghi — nhịp tim bị Timer nuốt ngoại lệ, khung giờ đọc cache, nên **không đường nào khác dừng được vòng lặp** | mất 1 mốc, FO không bị nã oan |
 | **Message thất lạc trước khi có pod nào giành** | ⚠️ **KHÔNG bắt được** — chưa có dòng `T_JOB_RUN` nào để `SP_JOB_RECOVER` tìm. Đây là cái giá của việc bỏ ghi DB lúc sinh job | mốc sau lấp lại |
 | Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
 | Lượt đã `RUNNING` rồi pod chết | **Job FO: KHÔNG thu hồi** (`C_MAX_ATTEMPT=1`) → `err=6` + `DEAD`, mất mốc, mốc sau bù. Job khác: lease hết → `SP_JOB_RECOVER` bước (1) | FO: không bao giờ · khác: ≤ timeout + 30s |

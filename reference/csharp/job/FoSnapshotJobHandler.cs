@@ -99,6 +99,25 @@ public class FoSnapshotJobHandler : IJobHandler
         long written = 0, skippedEod = 0, failedBatch = 0;
         var closed = false;
 
+        // ★★ NGẮT MẠCH GHI DB. Đếm số batch LIÊN TIẾP không ghi xuống DB được; chạm ngưỡng thì
+        //   đóng cả chu kỳ. Lý do phải có, đo từ ca thật:
+        //
+        //   Mất kết nối DB giữa chu kỳ KHÔNG dừng được vòng lặp này bằng bất cứ đường nào có sẵn:
+        //     · nhịp tim ném ⇒ Timer NUỐT ngoại lệ ⇒ ctx.IsStillMine() giữ nguyên `true`;
+        //     · TradingWindowGuard đọc khung giờ từ CACHE 60 giây ⇒ vẫn báo "còn mở";
+        //     · guard hạn tươi tính cục bộ ⇒ chỉ câm ở giây 600.
+        //   ⇒ Kết cục: đủ 1000 batch lần lượt GỌI FO rồi ném ở bước ghi. Toàn bộ tải đó đổ vào lõi
+        //     giao dịch chứng khoán mà KHÔNG thu về một dòng dữ liệu nào.
+        //
+        //   Ngưỡng 3 chứ không phải 1: một timeout lẻ không đáng giết cả chu kỳ. Nhưng DB là phụ
+        //   thuộc CHUNG của cả `parallel` luồng — chết thật thì chạm ngưỡng trong vài giây.
+        //
+        //   Chuỗi được ĐẶT LẠI mỗi lần ghi được. Với nhiều luồng chạy song song, một luồng ghi được
+        //   sẽ xoá chuỗi mà các luồng khác đang tích — tức là ngắt mạch chỉ nổ khi GẦN NHƯ KHÔNG CÓ
+        //   GÌ đi qua được. Lệch về phía thận trọng, đúng hướng cần lệch.
+        const int DbFailTrip = 3;
+        var dbFailStreak = 0;
+
         using var gate = new SemaphoreSlim(Math.Max(1, cfg.Parallel));
         var tasks = new List<Task>();
 
@@ -124,8 +143,37 @@ public class FoSnapshotJobHandler : IJobHandler
                     if (rows.Count == 0) return;
 
                     var json = JsonConvert.SerializeObject(rows);
-                    var (err, msg, n, skipped) = await _db.IngestFoSnapshotRtAsync(
-                        json, bizDate, TradingWindowGuard.NowVn(), ct);
+
+                    int err; string? msg; long n; int skipped;
+                    try
+                    {
+                        (err, msg, n, skipped) = await _db.IngestFoSnapshotRtAsync(
+                            json, bizDate, TradingWindowGuard.NowVn(), ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Huỷ token KHÔNG phải lỗi hạ tầng: đó là job vừa bị TẮT hoặc pod mất quyền.
+                        //   Đếm nó vào chuỗi lỗi DB là ghi một dòng ERROR sai sự thật vào đúng lúc
+                        //   người trực đang đọc log để tìm nguyên nhân — dẫn họ đi nhầm hướng.
+                        if (ex is OperationCanceledException) throw;
+
+                        // KHÔNG gọi được proc = lỗi HẠ TẦNG (mất kết nối, timeout, DB down).
+                        var streak = Interlocked.Increment(ref dbFailStreak);
+                        if (streak >= DbFailTrip && !Volatile.Read(ref closed))
+                        {
+                            Volatile.Write(ref closed, true);
+                            Log.Error(ex, "[FO-RT] {N} batch LIÊN TIẾP không ghi được xuống DB — NGẮT "
+                                        + "chu kỳ mốc {Slot}. Các batch còn lại KHÔNG gọi FO nữa: gọi "
+                                        + "tiếp là nã lõi giao dịch mà không giữ lại được gì.",
+                                streak, ctx.SlotAt);
+                        }
+                        throw;   // để catch ngoài đếm failedBatch + log chi tiết batch
+                    }
+
+                    // Proc TRẢ LỜI ĐƯỢC ⇒ DB còn sống, kể cả khi err≠0 — đó là lỗi DỮ LIỆU, không
+                    //   phải lỗi hạ tầng. Đặt lại chuỗi để một loạt batch data xấu không bị hiểu
+                    //   nhầm thành "mất DB" rồi giết oan cả chu kỳ.
+                    Interlocked.Exchange(ref dbFailStreak, 0);
 
                     if (err != 0)
                     {
