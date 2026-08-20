@@ -10,7 +10,7 @@
 | `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
 | `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé RECOVER · cache cấu hình |
 | `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · RECOVER (30s, có vé + cửa chặn khung giờ) |
-| `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM` → chạy handler **ngoài vòng poll** |
+| `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM_SLOT` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
 
@@ -73,13 +73,24 @@ Log.Information("[JOB] Đổi lịch: {Msg} (dọn {N} lượt chờ của cấu
 
 ## Đẩy job tuỳ ý (ngoài lịch) — "cứ có job đẩy vào là chạy"
 
+Đẩy tay = **produce một message**, y hệt bộ quét. Không có API riêng, không có đường tắt: dòng `T_JOB_RUN` vẫn do pod nhận message tạo ra qua `SP_JOB_CLAIM_SLOT`.
+
 ```csharp
-var (id, err) = await _db.EnqueueAsync("CLEANUP_TMP", fireKey: requestId, payload: null,
-                                       businessDate: null, user: "api", ct);
-if (err == 0)
-    await _producer.ProduceAsync(JobTopicKeys.Topic,
-        new Message<string, string> { Key = JobTopicKeys.KeyOf(id), Value = id.ToString() });
-// err == 4 ⇒ requestId này đã đẩy rồi, KHÔNG tạo trùng. Không phải lỗi, không cần retry.
+var slot = TradingWindowGuard.NowVn();     // job on-demand không có lưới mốc ⇒ mốc = lúc đẩy
+await _producer.ProduceAsync(JobTopicKeys.Topic, new Message<string, string> {
+    Key   = JobTopicKeys.KeyOf(requestId),                      // idempotent theo requestId
+    Value = JobMessage.Serialize("CLEANUP_TMP", slot, requestId)
+});
+```
+
+Đẩy hai lần cùng `requestId` ⇒ pod thứ hai vỡ `UQ (job_code, fire_key)` và nhận `err=5`: **không tạo lượt trùng**. Đó không phải lỗi và không cần retry.
+
+Muốn biết ngay kết quả (API đồng bộ) thì gọi thẳng `SP_JOB_CLAIM_SLOT` rồi chạy handler tại chỗ — cùng một cổng, chỉ bỏ bước đi vòng qua Kafka:
+
+```csharp
+var claim = await _db.ClaimSlotAsync("CLEANUP_TMP", slot, owner: podId,
+                                     fireKey: requestId, source: "manual", ct);
+if (claim.Err != 0) return claim;          // 2 job tắt · 3 ngoài khung · 5 đã đẩy rồi · 7 singleton
 ```
 
 Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất job: dòng `T_JOB_RUN` vẫn
@@ -96,17 +107,19 @@ Consumer nhận trong vài chục mili-giây. Produce hụt cũng không mất j
 | `SP_JOB_RECOVER` | 30s × 10 pod = 20 lượt/phút, 24/7 | có **vé Redis** (1 pod) + **cửa chặn khung giờ** ⇒ ~2 lượt/phút, và **0 ngoài 09:00–15:10** |
 | Đọc cấu hình | mỗi nhịp | cache Redis, app xoá khi đổi lịch ⇒ ~0 |
 
-**Redis không giữ mảnh tính đúng nào.** Mất khoá mốc ⇒ nhiều pod cùng gọi `SP_JOB_ENQUEUE` ⇒ `UQ (job_code, fire_key)` cho đúng một pod thắng, còn lại `err=4`. Tệ nhất của việc mất sạch Redis: vài lượt gọi DB thừa — **không job nào chạy hai lần, không job nào mất**.
+**Redis không giữ mảnh tính đúng nào.** Mất khoá mốc ⇒ nhiều pod cùng gọi `SP_JOB_CLAIM_SLOT` ⇒ `UQ (job_code, fire_key)` cho đúng một pod thắng, còn lại `err=5`. Tệ nhất của việc mất *khoá*: vài lượt gọi DB thừa — **không job nào chạy hai lần, không job nào mất**.
 
-**Pod tính mốc, DB đối chiếu.** Bộ quét tự tính mốc để khỏi hỏi DB; `SP_JOB_ENQUEUE` so lại với `UDF_JOB_SLOT_AT`. Pod lệch múi giờ / chạy bản cũ / sai chu kỳ ⇒ **bị từ chối `err=20`**, không trôi lệch âm thầm. Phép tính mốc vẫn có ca kiểm chứng trong `12_JOB_SMOKE.sql` vì bản tham chiếu nằm ở SQL.
+**Nhưng Redis *lỗi* thì bộ quét DỪNG nhịp** (`return`), không produce và **không** rơi về quét DB. Mất khoá ≠ mất Redis: mất khoá là vài query thừa, còn mất Redis là *không còn ai lọc* — 10 pod × 6 nhịp/phút bắn message cho mọi mốc. Đây là số near-realtime nên bỏ một mốc là chấp nhận được; nuôi một nhánh dự phòng không bao giờ chạy lúc bình thường thì không.
+
+**Pod tính mốc, DB đối chiếu.** Bộ quét tự tính mốc để khỏi hỏi DB; `SP_JOB_CLAIM_SLOT` so lại với `UDF_JOB_SLOT_AT`. Pod lệch múi giờ / chạy bản cũ / sai chu kỳ ⇒ **bị từ chối `err=20`**, không trôi lệch âm thầm. Phép tính mốc vẫn có ca kiểm chứng trong `12_JOB_SMOKE.sql` vì bản tham chiếu nằm ở SQL.
 
 ## Ba câu hỏi sẽ bị hỏi khi review
 
-### 1. "Kafka consumer group đã chống trùng rồi, sao còn `SP_JOB_CLAIM`?"
+### 1. "Kafka consumer group đã chống trùng rồi, sao còn `SP_JOB_CLAIM_SLOT`?"
 
 Consumer group hứa *mỗi partition giao cho một consumer*, **không** hứa *mỗi message xử lý đúng một lần*. Ba đường làm nó giao lại cùng một `jobRunId`: rebalance khi pod vào/ra group; pod vượt `max.poll.interval` bị đá nhưng **thread vẫn chạy** (zombie); và `SP_JOB_RECOVER` produce lại.
 
-`SP_JOB_CLAIM` là một `UPDATE ... WHERE C_STATUS='READY'`. Ai đổi được trạng thái người đó chạy — thứ **không thể có hai người thắng**, và nó nằm ở nơi mọi pod nhìn thấy cùng một sự thật.
+`SP_JOB_CLAIM_SLOT` là một `INSERT` vào `UQ (job_code, fire_key)`: ai chèn được dòng người đó chạy — thứ **không thể có hai người thắng**, và nó nằm ở nơi mọi pod nhìn thấy cùng một sự thật. Dòng đã tồn tại (retry / lượt bị hồi phục / pod chết) thì rơi sang `UPDATE` có điều kiện, cũng nguyên tử.
 
 ### 2. "Chạy job trong consumer có sao không?"
 
@@ -128,8 +141,8 @@ Không. Mỗi tầng bắt một ca mà tầng khác **không thể** bắt:
 
 | Tầng | Ở đâu | Bắt ca gì |
 |---|---|---|
-| 1 | `SP_JOB_ENQUEUE(_DUE)` | Không sinh lượt chạy lúc 15h30 |
-| 2 | `SP_JOB_CLAIM` | Job sinh lúc 14h59, pod nhặt lúc 15h02 (stream tồn đọng / pod restart / bộ hồi phục trả lại) |
+| 1 | Bộ quét trong pod | Không produce message cho mốc 15h30 |
+| 2 | `SP_JOB_CLAIM_SLOT` | Mốc 14h59, pod nhặt lúc 15h02 (message tồn đọng / pod restart / bộ hồi phục trả lại) |
 | 3 | `SP_INGEST_FO_SNAPSHOT_RT` | Ai đó gọi proc bằng tay; job ghi ngày không phải hôm nay |
 | **4** | `TradingWindowGuard` (C#) | **Chu kỳ 1000 batch khởi động lúc 14h50, tới batch 700 thì đã 15h02** |
 

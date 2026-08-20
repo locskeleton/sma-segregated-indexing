@@ -11,7 +11,7 @@ GO
   ┌─ TẦNG A. KHUNG JOB (generic, KHÔNG biết FO là gì) ────────────────────────┐
   │  T_JOB_DEFINITION  : khai báo loại job (chu kỳ, khung giờ, timeout, retry)│
   │  T_JOB_RUN         : hàng đợi + nhật ký, 1 dòng = 1 LƯỢT chạy            │
-  │  SP_JOB_ENQUEUE / _CLAIM / _HEARTBEAT / _COMPLETE / _RECOVER / _PURGE       │
+  │  SP_JOB_CLAIM_SLOT / _HEARTBEAT / _COMPLETE / _RECOVER / _PURGE             │
   │  SP_SET_JOB_SCHEDULE · SP_GET_SCHEDULABLE_JOBS · SP_GET_JOB_STATUS       │
   │  UDF_JOB_SLOT_AT (bản THAM CHIẾU của phép tính mốc — pod tính, DB đối chiếu)│
   │  Thêm loại job mới = INSERT 1 dòng T_JOB_DEFINITION + 1 handler C#.      │
@@ -35,10 +35,11 @@ GO
    ③ Dòng RT KHÔNG BAO GIỜ đè dòng EOD, và KHÔNG BAO GIỜ được coi là số chốt (cột C_SRC).
 
   *** GUARD KHUNG GIỜ — 3 TẦNG, CỐ Ý TRÙNG NHAU ***
-    Tầng 1 — SINH JOB   : SP_JOB_ENQUEUE không tạo lượt chạy có MỐC ngoài khung.
+    Tầng 1 — SINH JOB   : bộ quét trên pod chỉ đặt khoá mốc trong Redis rồi produce Kafka —
+                          KHÔNG ghi DB. Mốc ngoài khung thì nó không produce.
                           Biên [09:00, 15:00] ĐÓNG HAI ĐẦU và kiểm trên MỐC SLOT ⇒ 15:00 là mốc
                           cuối cùng được sinh; 15:15 thì không, phải đợi phiên GD kế tiếp.
-    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM kiểm HAI thứ, trên MỐC SLOT của chính lượt đó:
+    Tầng 2 — NHẬN JOB   : SP_JOB_CLAIM_SLOT kiểm HAI thứ, trên MỐC gửi kèm message:
                           (a) mốc có nằm trong khung + đúng ngày GD không (UDF_JOB_IN_WINDOW);
                           (b) còn TƯƠI không (C_MAX_DELAY_SEC tính từ mốc).
                           Trượt cái nào cũng đóng dấu SKIPPED, worker KHÔNG chạm FO.
@@ -54,7 +55,7 @@ GO
 
     ┌ LUỒNG CHÍNH (chạy mỗi lượt job) ────────────────────────────────────────────────────────┐
     │ UDF_JOB_NOW · UDF_JOB_IN_WINDOW                                                          │
-    │ SP_JOB_ENQUEUE → SP_JOB_CLAIM → SP_JOB_HEARTBEAT → SP_JOB_COMPLETE                       │
+    │ SP_JOB_CLAIM_SLOT → SP_JOB_HEARTBEAT → SP_JOB_COMPLETE                                   │
     │ SP_JOB_RECOVER  (30s/lần, CHỈ khi có khung giờ đang mở)                                  │
     │ [tầng B] SP_GET_FO_SNAPSHOT_SCOPE → SP_INGEST_FO_SNAPSHOT_RT → SP_RT_MASTER_AGG          │
     └──────────────────────────────────────────────────────────────────────────────────────────┘
@@ -66,7 +67,8 @@ GO
     │ SP_GET_JOB_STATUS                   → API theo dõi cho ops/UI, CHƯA CÓ CONSUMER          │
     │ SP_GET_PM_RT_OVERVIEW               → API đọc cho dashboard PM, không thuộc khung job     │
     └──────────────────────────────────────────────────────────────────────────────────────────┘
-    ĐÃ XOÁ (đừng đi tìm): SP_JOB_ENQUEUE_DUE (pod thay thế) · UDF_JOB_CAN_RUN (hạn tươi thay thế).
+    ĐÃ XOÁ (đừng đi tìm): SP_JOB_ENQUEUE_DUE · UDF_JOB_CAN_RUN · SP_JOB_ENQUEUE + SP_JOB_CLAIM
+      (hai proc sau gộp thành SP_JOB_CLAIM_SLOT — bộ quét KHÔNG ghi DB lúc sinh job nữa).
 
   *** ERR-CODE ***
     0=OK · 1=job_code không tồn tại · 2=job đang tắt (DISABLED) · 3=NGOÀI khung giờ/không phải
@@ -96,6 +98,23 @@ GO
     C_HANDLER = khoá tra trong JobRegistry của C#. DB không biết handler làm gì — đó là điểm
     khiến khung này generic thật, không phải "generic trên giấy".
 ===========================================================================*/
+/*==============================================================================
+  DỌN OBJECT ĐÃ BỊ XOÁ KHỎI THIẾT KẾ — phải chạy TRƯỚC mọi thứ khác.
+
+  ★ VÌ SAO CẦN: file này toàn `CREATE OR ALTER`, tức là nó chỉ biết SỬA và THÊM, không biết XOÁ.
+    Deploy bản mới lên một CSDL đã từng chạy bản cũ ⇒ mấy proc đã bị bỏ VẪN CÒN SỐNG nguyên.
+    Đó không phải rác vô hại: code cũ / script cũ / smoke cũ gọi chúng vẫn CHẠY ĐƯỢC, theo LUẬT CŨ.
+    Ca thật đã cắn: bộ smoke còn sót lời gọi `SP_JOB_CLAIM` chạy XANH trên CSDL cũ (vì proc cũ còn
+    đó) và chỉ ĐỎ khi dựng CSDL sạch — 8 ca kiểm bị che mắt suốt nhiều lượt chạy.
+  ⇒ Xoá tường minh. Deploy hai lần liên tiếp vẫn sạch (IF EXISTS).
+==============================================================================*/
+DROP PROCEDURE IF EXISTS SP_JOB_ENQUEUE;       -- gộp vào SP_JOB_CLAIM_SLOT
+DROP PROCEDURE IF EXISTS SP_JOB_CLAIM;         -- gộp vào SP_JOB_CLAIM_SLOT
+DROP PROCEDURE IF EXISTS SP_JOB_ENQUEUE_DUE;   -- bộ quét chuyển lên pod (Redis + Kafka)
+DROP PROCEDURE IF EXISTS SP_JOB_REAP;          -- đổi tên thành SP_JOB_RECOVER
+DROP FUNCTION  IF EXISTS UDF_JOB_CAN_RUN;      -- thay bằng hạn tươi neo vào MỐC (C_MAX_DELAY_SEC)
+GO
+
 IF OBJECT_ID('T_JOB_DEFINITION') IS NULL
 CREATE TABLE T_JOB_DEFINITION (
     C_JOB_CODE          VARCHAR(40)   NOT NULL,       -- 'FO_SNAPSHOT_RT', 'EOD_KICK', ...
@@ -103,7 +122,7 @@ CREATE TABLE T_JOB_DEFINITION (
     C_JOB_NAME          NVARCHAR(200) NOT NULL,
     C_HANDLER           VARCHAR(100)  NOT NULL,       -- khoá handler phía C# (JobRegistry)
     C_ENABLED           BIT           NOT NULL CONSTRAINT DF_JOB_DEF_EN DEFAULT 1,
-    -- CHU KỲ: NULL = job KHÔNG định kỳ (chỉ chạy khi có người đẩy qua SP_JOB_ENQUEUE).
+    -- CHU KỲ: NULL = job KHÔNG định kỳ (chỉ chạy khi có người produce message cho nó).
     --   Slot được neo vào 00:00 giờ VN ⇒ 900s = 9:00, 9:15, 9:30... (không trôi theo giờ pod khởi động).
     C_INTERVAL_SEC      INT           NULL,
     -- KHUNG GIỜ chạy. NULL/NULL = mọi giờ. Chỉ hỗ trợ khung TRONG NGÀY (from < to) — khung vắt
@@ -259,7 +278,7 @@ GO
 /*===========================================================================
   [NGOÀI LUỒNG CHÍNH — BẢN THAM CHIẾU]
     Bộ quét trên pod mới là nơi TÍNH mốc (để khỏi chạm DB mỗi 10 giây). Hàm này tồn tại để
-    (a) SP_JOB_ENQUEUE ĐỐI CHIẾU lại mốc pod gửi lên, và (b) giữ phép tính mốc còn ca kiểm chứng
+    (a) SP_JOB_CLAIM_SLOT ĐỐI CHIẾU lại mốc pod gửi lên, và (b) giữ phép tính mốc còn ca kiểm chứng
     trong 12_JOB_SMOKE. GIỮ — bỏ đi là mất cả hai. Nhưng đừng nhầm nó là nơi sinh mốc.
 
   UDF_JOB_SLOT_AT — MỐC SLOT của job tại thời điểm @p_at. Neo vào 00:00 giờ VN:
@@ -271,7 +290,7 @@ GO
     thứ TINH TẾ NHẤT của cả khung: lệch một giây là mất mốc đóng cửa, lệch cách neo là mốc trôi
     theo giờ pod khởi động. Để nó CHỈ tồn tại trong C# nghĩa là nó không còn ca kiểm chứng nào
     trong repo này.
-    ⇒ Giữ bản tham chiếu ở đây (có smoke test), và SP_JOB_ENQUEUE ĐỐI CHIẾU mốc mà C# gửi lên với
+    ⇒ Giữ bản tham chiếu ở đây (có smoke test), và SP_JOB_CLAIM_SLOT ĐỐI CHIẾU mốc mà C# gửi lên với
       hàm này. C# tính sai ⇒ bị TỪ CHỐI ngay, có mã lỗi, thay vì trôi lệch âm thầm hàng tháng.
   Trả NULL nếu job không có chu kỳ (job chạy theo yêu cầu — không có khái niệm mốc).
 ===========================================================================*/
@@ -293,7 +312,7 @@ GO
   UDF_JOB_FIRE_KEY — KHOÁ CHỐNG TRÙNG của một mốc: 'yyyyMMddHHmmss'.
     ★ PHẢI CÓ GIÂY: C_INTERVAL_SEC cho phép tới 30s ⇒ khoá chỉ tới phút thì hai mốc trong cùng một
       phút trùng khoá, UQ nuốt mốc thứ hai, và job khai 30 giây LẶNG LẼ chạy 60 giây/lần.
-    Bộ quét trên pod KHÔNG cần tự format khoá này — cứ gửi mốc, SP_JOB_ENQUEUE tự suy ra. Bớt một
+    Bộ quét trên pod KHÔNG cần tự format khoá này — cứ gửi mốc, SP_JOB_CLAIM_SLOT tự suy ra. Bớt một
     chỗ để C# và SQL có thể hiểu khác nhau.
 ===========================================================================*/
 CREATE OR ALTER FUNCTION UDF_JOB_FIRE_KEY (@p_slot DATETIME)
@@ -311,7 +330,7 @@ GO
 
   SP_GET_SCHEDULABLE_JOBS — danh sách job định kỳ + cấu hình lịch, cho bộ quét trên pod nạp vào
     bộ nhớ (và đẩy lên Redis cache). Đọc 1 lần/phút/pod là cùng, hoặc 0 lần nếu cache Redis còn.
-    KHÔNG trả gì ngoài thứ bộ quét cần — payload/handler/timeout để SP_JOB_CLAIM lo.
+    KHÔNG trả gì ngoài thứ bộ quét cần — payload/handler/timeout để SP_JOB_CLAIM_SLOT lo.
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_SCHEDULABLE_JOBS
     @p_err_code INT           OUTPUT,
@@ -476,229 +495,208 @@ END
 GO
 
 /*===========================================================================
-  SP_JOB_ENQUEUE — ĐẨY MỘT JOB (bất kỳ loại nào) vào hàng đợi. "Cứ có job đẩy vào là chạy":
-    proc trả @p_job_run_id để app PUBLISH ngay lên kênh Redis; worker đang SUBSCRIBE nhận
-    trong khoảng một mili-giây (đẩy thật, không hỏi thăm). Không có vòng chờ nào.
-  IDEMPOTENT theo (job_code, fire_key): gọi lại cùng fire_key ⇒ err=4 + trả id CŨ, KHÔNG sinh lượt mới.
-  err: 0 OK · 1 không có job_code · 2 job tắt · 3 ngoài khung giờ (KHÔNG tạo lượt) · 4 đã tồn tại · -1 runtime.
+  SP_JOB_MARK_SKIPPED — đóng dấu một lượt ĐÃ TỒN TẠI là SKIPPED khi guard tầng 2 chặn nó.
+
+  ★ VÌ SAO PHẢI CÓ: từ khi bộ quét thôi ghi DB, đường thường KHÔNG để lại dòng nào — guard chặn
+    là chặn trong không khí, đúng và rẻ. Nhưng vẫn còn HAI nguồn sinh ra dòng nằm chờ:
+      · lượt RETRY (SP_JOB_COMPLETE thất bại ⇒ đặt lại READY + backoff),
+      · lượt bị SP_JOB_RECOVER thu về READY.
+    Những dòng đó có thể sống qua giờ đóng cửa / quá hạn tươi. Nếu guard chỉ RETURN err=3 mà không
+    đụng vào dòng, nó nằm READY VĨNH VIỄN: mỗi lần được đẩy lại đều bị chặn, không bao giờ kết thúc,
+    và SP_GET_JOB_STATUS đếm nó là "đang tồn đọng" mãi mãi.
+  ⇒ Đóng dấu SKIPPED = trạng thái CUỐI, có lý do ghi kèm, và SP_JOB_PURGE dọn được.
+
+  KHÔNG đụng tới dòng RUNNING/DONE/DEAD: RUNNING là của pod khác đang giữ, DONE/DEAD đã chốt rồi.
 ===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_JOB_ENQUEUE
-    @p_job_code      VARCHAR(40),
-    @p_fire_key      VARCHAR(64)   = NULL,           -- NULL ⇒ NEWID() (mỗi lần gọi = 1 lượt riêng)
-    @p_payload       NVARCHAR(MAX) = NULL,
-    @p_business_date DATE          = NULL,
-    @p_slot_at       DATETIME      = NULL,   -- mốc slot (bộ quét trên pod gửi lên). NULL = đẩy tay ⇒ mốc = bây giờ.
-    @p_user          VARCHAR(64)   = NULL,
-    @p_err_code      INT           OUTPUT,
-    @p_err_msg       NVARCHAR(400) OUTPUT,
-    @p_job_run_id    BIGINT        = NULL OUTPUT
+CREATE OR ALTER PROCEDURE SP_JOB_MARK_SKIPPED
+    @p_job_code VARCHAR(40),
+    @p_fire_key VARCHAR(64),
+    @p_reason   NVARCHAR(400)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE T_JOB_RUN
+       SET C_STATUS='SKIPPED', C_ENDED_AT=dbo.UDF_JOB_NOW(), C_MESSAGE=@p_reason
+     WHERE C_JOB_CODE=@p_job_code AND C_FIRE_KEY=@p_fire_key
+       AND C_STATUS IN ('READY','FAILED');
+END
+GO
+
+/*===========================================================================
+  SP_JOB_CLAIM_SLOT — CỔNG DUY NHẤT để một pod xin chạy một MỐC.
+
+  ★ GỘP hai proc cũ (SP_JOB_ENQUEUE + SP_JOB_CLAIM, đã xoá) LÀM MỘT. Trước đây mỗi lượt job phải ghi DB HAI lần:
+    bộ quét INSERT một dòng READY, rồi worker UPDATE nó thành RUNNING. Trạng thái READY đó chỉ
+    sống vài chục mili-giây và không ai đọc, nhưng lại kéo theo hai lần validate y hệt nhau
+    (khung giờ, hạn tươi, singleton) ở hai proc khác nhau — hai chỗ để lệch nhau.
+    Nay: bộ quét KHÔNG chạm DB. Pod nào nhận được message thì gọi thẳng proc này; dòng T_JOB_RUN
+    sinh ra ĐÃ Ở TRẠNG THÁI RUNNING, do đúng pod sẽ chạy nó tạo ra.
+
+  ★ CHỐNG TRÙNG vẫn nằm ở DB, không nằm ở Redis:
+    UQ_JOB_RUN_NK (C_JOB_CODE, C_FIRE_KEY). 10 pod cùng nhận message của một mốc ⇒ 10 lệnh INSERT
+    ⇒ CSDL cho đúng MỘT pod thắng, 9 pod còn lại vỡ khoá và nhận err=5.
+    ⇒ Redis mất khoá lọc / Kafka giao lại / bộ hồi phục phát trùng: đều vô hại.
+
+  HAI ĐƯỜNG VÀO, một kết quả:
+    (a) INSERT — mốc chưa từng có dòng nào. Đường thường.
+    (b) UPDATE — dòng đã tồn tại: lượt RETRY (SP_JOB_COMPLETE đặt lại READY), lượt bị bộ hồi phục
+        thu về READY, hoặc lượt RUNNING của một pod đã chết (lease hết hạn) ⇒ giành lại được.
+        Không giành được ⇒ err=5, pod này đứng ngoài.
+
+  err: 0 OK (trả result set 1 dòng) · 1 job lạ · 2 job tắt · 3 mốc ngoài khung / quá hạn tươi
+       · 5 pod khác đang giữ · 6 hết lượt thử (DEAD) · 7 singleton đang chạy · 20 mốc không khớp lưới.
+===========================================================================*/
+CREATE OR ALTER PROCEDURE SP_JOB_CLAIM_SLOT
+    @p_job_code VARCHAR(40),
+    @p_slot_at  DATETIME,
+    @p_owner    VARCHAR(64),
+    @p_fire_key VARCHAR(64)   = NULL,   -- NULL ⇒ suy từ mốc (UDF_JOB_FIRE_KEY). Job đẩy tay có thể truyền requestId.
+    @p_source   VARCHAR(40)   = NULL,   -- 'kafka' | 'recover' | 'manual'
+    @p_err_code INT           OUTPUT,
+    @p_err_msg  NVARCHAR(400) OUTPUT,
+    @p_job_run_id BIGINT      = NULL OUTPUT   -- tiện cho caller/test; C# vẫn đọc result set
 AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_job_run_id=NULL;
     BEGIN TRY
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-        DECLARE @en BIT = (SELECT C_ENABLED FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code);
+        DECLARE @en BIT, @timeout INT, @maxatt INT, @maxdelay INT, @payload NVARCHAR(MAX), @singleton BIT;
+        SELECT @en=C_ENABLED, @timeout=C_TIMEOUT_SEC, @maxatt=C_MAX_ATTEMPT,
+               @maxdelay=COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC),
+               @payload=C_PAYLOAD, @singleton=C_SINGLETON
+        FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code;
+
         IF @en IS NULL
             BEGIN SET @p_err_code=1; SET @p_err_msg=CONCAT(N'job_code không tồn tại: ', @p_job_code); RETURN; END
         IF @en = 0
             BEGIN SET @p_err_code=2; SET @p_err_msg=CONCAT(N'Job đang TẮT: ', @p_job_code); RETURN; END
+        IF @p_slot_at IS NULL
+            BEGIN SET @p_err_code=20; SET @p_err_msg=N'@p_slot_at bắt buộc.'; RETURN; END
 
-        DECLARE @slot DATETIME = ISNULL(@p_slot_at, @now);
-
-        -- ★ ĐỐI CHIẾU MỐC do bộ quét trên pod gửi lên với bản THAM CHIẾU trong DB.
-        --   Bộ quét tự tính mốc để khỏi hỏi DB mỗi 10 giây (Redis lọc trước). Đổi lại, DB phải
-        --   kiểm lại — nếu không thì một pod chạy bản cũ, lệch múi giờ, hay tính sai công thức sẽ
-        --   lặng lẽ sinh job ở mốc lệch, và không có gì phát hiện ra. Sai lệch ⇒ TỪ CHỐI, có mã lỗi.
-        IF @p_slot_at IS NOT NULL
+        -- ★ ĐỐI CHIẾU MỐC với bản THAM CHIẾU trong DB. Bộ quét trên pod tự tính mốc để khỏi hỏi DB
+        --   mỗi 10 giây; đổi lại DB phải kiểm lại. Pod lệch múi giờ / chạy bản cũ / sai chu kỳ thì
+        --   bị TỪ CHỐI có mã lỗi, không trôi lệch âm thầm hàng tháng.
+        DECLARE @ref DATETIME = dbo.UDF_JOB_SLOT_AT(@p_job_code, @p_slot_at);
+        IF @ref IS NOT NULL AND @ref <> @p_slot_at
         BEGIN
-            DECLARE @ref DATETIME = dbo.UDF_JOB_SLOT_AT(@p_job_code, @p_slot_at);
-            IF @ref IS NOT NULL AND @ref <> @p_slot_at
-            BEGIN
-                SET @p_err_code=20;
-                SET @p_err_msg=CONCAT(N'Mốc slot không khớp lưới của job: nhận ',
-                    CONVERT(VARCHAR(19),@p_slot_at,120), N', lưới cho ra ', CONVERT(VARCHAR(19),@ref,120),
-                    N'. Bộ quét trên pod tính sai (lệch múi giờ / chạy bản cũ / sai chu kỳ).');
-                RETURN;
-            END
+            SET @p_err_code=20;
+            SET @p_err_msg=CONCAT(N'Mốc slot không khớp lưới của job: nhận ',
+                CONVERT(VARCHAR(19),@p_slot_at,120), N', lưới cho ra ', CONVERT(VARCHAR(19),@ref,120),
+                N'. Bộ quét trên pod tính sai (lệch múi giờ / chạy bản cũ / sai chu kỳ).');
+            RETURN;
         END
 
-        -- ★ SINGLETON — lượt trước còn chạy (lease còn hiệu lực) thì KHÔNG mở lượt mới.
-        --   Trước đây nằm trong SP_JOB_ENQUEUE_DUE; chuyển vào đây khi proc đó bị xoá. Áp cho CẢ
-        --   job đẩy tay: 1000 batch chồng hai chu kỳ là tự bắn vào chân mình ở phía FO, bất kể ai đẩy.
-        IF EXISTS (SELECT 1 FROM T_JOB_DEFINITION d
-                   INNER JOIN T_JOB_RUN r ON r.C_JOB_CODE=d.C_JOB_CODE
-                   WHERE d.C_JOB_CODE=@p_job_code AND d.C_SINGLETON=1
-                     AND r.C_STATUS='RUNNING' AND r.C_LEASE_UNTIL > @now)
+        DECLARE @fk VARCHAR(64) = ISNULL(@p_fire_key, dbo.UDF_JOB_FIRE_KEY(@p_slot_at));
+
+        -- ★ GUARD KHUNG GIỜ — áp lên MỐC, không phải lên @now. Mốc 15:00 nhận lúc 15:00:03 vẫn hợp lệ;
+        --   áp khung lên @now là giết chính ảnh chụp đóng cửa mà mốc đó sinh ra để lấy.
+        IF dbo.UDF_JOB_IN_WINDOW(@p_job_code, @p_slot_at) = 0
+        BEGIN
+            SET @p_err_code=3;
+            SET @p_err_msg=CONCAT(N'Mốc ', CONVERT(VARCHAR(19),@p_slot_at,120),
+                                  N' nằm ngoài khung giờ cho phép của job ', @p_job_code, N'.');
+            EXEC SP_JOB_MARK_SKIPPED @p_job_code, @fk, @p_err_msg;
+            RETURN;
+        END
+
+        -- ★ GUARD HẠN TƯƠI — đo từ MỐC nên là mốc TUYỆT ĐỐI: lượt 15:00 hết hiệu lực lúc 15:10,
+        --   bất kể nó đã nằm chờ hay đã thử lại mấy lần. Số near-realtime trễ 40 phút là số rác.
+        DECLARE @age INT = DATEDIFF(SECOND, @p_slot_at, @now);
+        IF @maxdelay IS NOT NULL AND @age > @maxdelay
+        BEGIN
+            SET @p_err_code=3;
+            SET @p_err_msg=CONCAT(N'Đã ', @age, N' giây kể từ mốc ', CONVERT(VARCHAR(19),@p_slot_at,120),
+                                  N' (hạn tươi ', @maxdelay, N's) — số không còn là near-realtime.');
+            EXEC SP_JOB_MARK_SKIPPED @p_job_code, @fk, @p_err_msg;
+            RETURN;
+        END
+
+        -- ★ SINGLETON — lượt TRƯỚC còn chạy (lease còn hiệu lực) thì không mở lượt mới.
+        --   Lease HẾT HẠN không tính là "đang chạy": pod đó đã chết, để bộ hồi phục thu về.
+        IF @singleton = 1 AND EXISTS (SELECT 1 FROM T_JOB_RUN r
+                                      WHERE r.C_JOB_CODE=@p_job_code AND r.C_STATUS='RUNNING'
+                                        AND r.C_LEASE_UNTIL > @now AND r.C_FIRE_KEY <> @fk)
         BEGIN
             SET @p_err_code=7;
             SET @p_err_msg=CONCAT(N'Job ', @p_job_code, N' đang chạy (singleton) — không mở lượt mới.');
             RETURN;
         END
 
-        -- ★ GUARD TẦNG 1 — KHÔNG CÓ CỬA HẬU.
-        --   Bản trước có tham số @p_ignore_window cho vận hành "chạy tay ngoài khung". Đã BỎ:
-        --   một cửa hậu mà job gọi hệ ngoài cũng đi qua được thì nó không còn là cửa hậu, nó là
-        --   cái lỗ. Cần chạy job ngoài khung thì sửa khung bằng SP_SET_JOB_SCHEDULE — có dấu vết,
-        --   có người chịu trách nhiệm, và tự dọn lượt chờ của cấu hình cũ.
-        --   Kiểm trên MỐC, không phải trên @now: bộ quét chạy lúc 15:00:04 cho mốc 15:00:00 —
-        --   áp khung lên @now là mất mốc đóng cửa (xem §2c của doc thiết kế).
-        IF dbo.UDF_JOB_IN_WINDOW(@p_job_code, @slot) = 0
-        BEGIN
-            SET @p_err_code=3;
-            SET @p_err_msg=CONCAT(N'Mốc ', CONVERT(VARCHAR(19), @slot, 120),
-                N' nằm ngoài khung giờ cho phép của job ', @p_job_code, N' — KHÔNG tạo lượt chạy.');
-            RETURN;
-        END
+        DECLARE @id BIGINT = NULL;
 
-        -- Khoá chống trùng: người gọi truyền, hoặc suy từ MỐC (job định kỳ), hoặc NEWID (đẩy tay).
-        DECLARE @fk VARCHAR(64) = COALESCE(@p_fire_key,
-                                           CASE WHEN @p_slot_at IS NOT NULL THEN dbo.UDF_JOB_FIRE_KEY(@p_slot_at) END,
-                                           CONVERT(VARCHAR(36), NEWID()));
-
-        -- Đã có lượt với fire_key này ⇒ trả id cũ. Kiểm TRƯỚC để đường đi bình thường không
-        --   phải dựa vào bắt lỗi trùng khoá; nhưng vẫn có TRY/CATCH bên dưới cho ca 2 pod
-        --   INSERT đúng cùng mili-giây (kiểm trước KHÔNG phải là khoá).
-        SELECT @p_job_run_id = C_JOB_RUN_ID FROM T_JOB_RUN
-        WHERE C_JOB_CODE=@p_job_code AND C_FIRE_KEY=@fk;
-        IF @p_job_run_id IS NOT NULL
-        BEGIN
-            SET @p_err_code=4;
-            SET @p_err_msg=CONCAT(N'Lượt chạy đã tồn tại (fire_key=', @fk, N') — bỏ qua, không tạo trùng.');
-            RETURN;
-        END
-
+        -- ── (a) ĐƯỜNG THƯỜNG: mốc chưa có dòng nào ⇒ INSERT thẳng ở trạng thái RUNNING.
+        --
+        -- ★★ XACT_ABORT PHẢI TẮT QUANH ĐÚNG LỆNH INSERT NÀY. Không phải chi tiết vặt — đo được:
+        --    với XACT_ABORT ON, việc BẮT lỗi 2601 trong TRY vẫn làm transaction của NGƯỜI GỌI rơi
+        --    vào trạng thái KHÔNG THỂ COMMIT (XACT_STATE() = -1). Lệnh UPDATE ở đường (b) ngay sau
+        --    đó chết luôn, proc trả err=-1 kèm "The current transaction cannot be committed"
+        --    thay vì err=5, và transaction của app phải rollback.
+        --    Mà đây KHÔNG phải ca hiếm: 10 pod cùng nhận một mốc thì 9 pod đi vào đúng nhánh này,
+        --    mỗi mốc, mỗi lần. Chỉ cần app bọc lời gọi trong một transaction (TransactionScope /
+        --    unit-of-work / Dapper transaction) là hỏng — và nó hỏng theo kiểu khó lần: lỗi báo là
+        --    "transaction cannot be committed", không dính dáng gì tới job hay khoá trùng.
+        --    Ca kiểm: 12_JOB_SMOKE.sql khối A4 ("gọi TRONG transaction của caller").
+        SET XACT_ABORT OFF;
         BEGIN TRY
-            INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT,C_MESSAGE)
-            VALUES (@p_job_code, @fk, 'READY', @p_business_date,
-                    ISNULL(@p_payload, (SELECT C_PAYLOAD FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code)),
-                    @now, @slot,
-                    @now, CONCAT(N'enqueue by ', ISNULL(@p_user,'(system)')));
-            SET @p_job_run_id = SCOPE_IDENTITY();
+            INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,
+                                   C_ATTEMPT,C_OWNER,C_LEASE_UNTIL,C_HEARTBEAT_AT,
+                                   C_RUN_AFTER,C_SLOT_AT,C_CLAIM_SOURCE,C_ENQUEUED_AT,C_STARTED_AT,C_MESSAGE)
+            VALUES (@p_job_code, @fk, 'RUNNING', CAST(@p_slot_at AS DATE), @payload,
+                    1, @p_owner, DATEADD(SECOND, ISNULL(@timeout,300), @now), @now,
+                    @now, @p_slot_at, @p_source, @now, @now,
+                    CONCAT(N'claim slot ', @fk));
+            SET @id = SCOPE_IDENTITY();
         END TRY
         BEGIN CATCH
-            IF ERROR_NUMBER() IN (2601,2627)   -- vỡ UQ_JOB_RUN_NK = pod khác vừa thắng. ĐÚNG Ý ĐỒ, không phải lỗi.
-            BEGIN
-                SELECT @p_job_run_id = C_JOB_RUN_ID FROM T_JOB_RUN
-                WHERE C_JOB_CODE=@p_job_code AND C_FIRE_KEY=@fk;
-                SET @p_err_code=4; SET @p_err_msg=N'Lượt chạy đã tồn tại (pod khác vừa tạo) — bỏ qua.';
-            END
-            ELSE THROW;
+            SET @id = NULL;                               -- vỡ UQ ⇒ dòng đã tồn tại ⇒ sang đường (b)
+            IF ERROR_NUMBER() NOT IN (2601,2627)
+            BEGIN SET XACT_ABORT ON; THROW; END           -- lỗi khác thì để CATCH ngoài xử lý
         END CATCH
-    END TRY
-    BEGIN CATCH
-        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
-    END CATCH
-END
-GO
+        SET XACT_ABORT ON;
 
-/*===========================================================================
-  SP_JOB_CLAIM — WORKER XIN CẦM MỘT LƯỢT CHẠY. Đây là CHỐT CHẶN TRÙNG THẬT SỰ.
-    Một câu UPDATE có điều kiện: chỉ pod nào đổi được trạng thái READY→RUNNING mới được chạy.
-    20 pod cùng nhận một message (Redis giao lại, XAUTOCLAIM, người ta XADD nhầm 2 lần...) thì
-    19 pod nhận @@ROWCOUNT=0 → err=5 → XACK và đi tiếp. KHÔNG có đường nào cho 2 pod cùng chạy.
-
-    Nhận cả lượt RUNNING đã QUÁ HẠN LEASE (pod cũ chết): giành lại được. Đây là lý do phải có
-    heartbeat — pod còn sống thì lease không bao giờ hết hạn, nên không ai giật được job của nó.
-
-  ★ GUARD TẦNG 2 nằm ở đây: kiểm khung giờ tại ĐÚNG thời điểm chạy (không phải lúc sinh job).
-  err: 0 OK (trả result set 1 dòng) · 5 claim hụt · 3 ngoài khung ⇒ SKIPPED · 6 quá số lần thử ⇒ DEAD.
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_JOB_CLAIM
-    @p_job_run_id BIGINT,
-    @p_owner      VARCHAR(64),                       -- định danh pod (hostname + pid)
-    @p_source     VARCHAR(40)   = NULL,              -- 'kafka' | 'recover' | 'manual' — xem C_CLAIM_SOURCE
-    @p_err_code   INT           OUTPUT,
-    @p_err_msg    NVARCHAR(400) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON; SET XACT_ABORT ON;
-    SET @p_err_code=0; SET @p_err_msg=NULL;
-    BEGIN TRY
-        DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-        DECLARE @code VARCHAR(40), @status VARCHAR(10), @attempt INT, @maxatt INT, @timeout INT,
-                @maxdelay INT, @slotat DATETIME, @age INT;
-        SELECT @code=r.C_JOB_CODE, @status=r.C_STATUS, @attempt=r.C_ATTEMPT,
-               @maxatt=d.C_MAX_ATTEMPT, @timeout=d.C_TIMEOUT_SEC,
-               @maxdelay=COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),  -- NULL (job on-demand) = không hết hạn
-               @slotat=ISNULL(r.C_SLOT_AT, r.C_ENQUEUED_AT)              -- dòng cũ trước migration: lùi về enqueued
-        FROM T_JOB_RUN r LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-        WHERE r.C_JOB_RUN_ID=@p_job_run_id;
-
-        IF @code IS NULL
-            BEGIN SET @p_err_code=1; SET @p_err_msg=CONCAT(N'Không có lượt chạy id=', @p_job_run_id); RETURN; END
-
-        -- Hết lượt thử → DEAD. Chốt ở đây (chứ không chỉ ở COMPLETE) vì lượt bị RECOVER trả về READY
-        --   nhiều lần cũng phải có điểm dừng, nếu không job hỏng sẽ quay vòng mãi mãi.
-        IF @attempt >= @maxatt
+        -- ── (b) DÒNG ĐÃ TỒN TẠI: retry / bộ hồi phục trả về / pod khác đã chết.
+        IF @id IS NULL
         BEGIN
-            UPDATE T_JOB_RUN SET C_STATUS='DEAD', C_ENDED_AT=@now,
-                   C_MESSAGE=CONCAT(N'Vượt số lần thử (', @maxatt, N') — dừng hẳn, cần người xem.')
-            WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
-            SET @p_err_code=6; SET @p_err_msg=N'Lượt chạy đã vượt số lần thử → DEAD.'; RETURN;
+            DECLARE @curId BIGINT, @curAtt INT;
+            SELECT @curId=C_JOB_RUN_ID, @curAtt=C_ATTEMPT
+            FROM T_JOB_RUN WHERE C_JOB_CODE=@p_job_code AND C_FIRE_KEY=@fk;
+
+            -- Hết lượt thử ⇒ DEAD, dừng hẳn. Chốt ở đây vì lượt bị thu hồi nhiều lần cũng phải có
+            --   điểm dừng, nếu không job hỏng sẽ quay vòng mãi mãi.
+            IF @curAtt >= ISNULL(@maxatt,3)
+            BEGIN
+                UPDATE T_JOB_RUN SET C_STATUS='DEAD', C_ENDED_AT=@now,
+                       C_MESSAGE=CONCAT(N'Vượt số lần thử (', @maxatt, N') — dừng hẳn, cần người xem.')
+                WHERE C_JOB_RUN_ID=@curId AND C_STATUS IN ('READY','FAILED');
+                SET @p_err_code=6; SET @p_err_msg=N'Lượt chạy đã vượt số lần thử → DEAD.'; RETURN;
+            END
+
+            -- ★ GIÀNH NGUYÊN TỬ. Điều kiện WHERE là toàn bộ cơ chế chống hai pod cùng chạy.
+            UPDATE T_JOB_RUN
+               SET C_STATUS='RUNNING', C_OWNER=@p_owner, C_ATTEMPT=C_ATTEMPT+1,
+                   C_STARTED_AT=@now, C_HEARTBEAT_AT=@now,
+                   C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
+                   C_CLAIM_SOURCE=ISNULL(@p_source, C_CLAIM_SOURCE), C_ENDED_AT=NULL
+             WHERE C_JOB_RUN_ID=@curId
+               AND ( C_STATUS IN ('READY','FAILED')
+                  OR (C_STATUS='RUNNING' AND C_LEASE_UNTIL < @now) );   -- giành lại từ pod đã chết
+
+            IF @@ROWCOUNT = 0
+            BEGIN
+                SET @p_err_code=5;
+                SET @p_err_msg=CONCAT(N'Mốc ', @fk, N' đã có pod khác giữ hoặc đã xong — bỏ qua, KHÔNG chạy.');
+                RETURN;
+            END
+            SET @id = @curId;
         END
 
-        -- ★ GUARD TẦNG 2 — kiểm khung giờ trên MỐC SLOT của chính lượt này, KHÔNG phải trên @now.
-        --   Lượt sinh đúng mốc 15:00 phải claim được lúc 15:00:03; áp khung lên @now là giết chính
-        --   cái ảnh chụp đóng cửa mà mốc đó sinh ra để lấy.
-        --   Vẫn chặn: lượt của phiên HÔM QUA / ngày nghỉ (UDF_IS_BUSINESS_DATE trong hàm này) và
-        --   lượt có mốc nằm ngoài khung (job đẩy tay lúc 22h). "Còn tươi không" là việc của guard
-        --   HẠN TƯƠI ngay bên dưới — hai câu hỏi khác nhau, đừng gộp.
-        IF dbo.UDF_JOB_IN_WINDOW(@code, @slotat) = 0
-        BEGIN
-            UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
-                   C_MESSAGE=CONCAT(N'BỎ QUA: mốc ', CONVERT(VARCHAR(19),@slotat,120),
-                                    N' nằm ngoài khung giờ cho phép của job ', @code, N'.')
-            WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
-            SET @p_err_code=3;
-            SET @p_err_msg=N'Ngoài khung giờ tại thời điểm chạy — đã đóng dấu SKIPPED, KHÔNG gọi hệ ngoài.';
-            RETURN;
-        END
-
-        -- ★ GUARD HẠN TƯƠI — con số DUY NHẤT quyết định "muộn quá thì thôi".
-        --   Số liệu near-realtime chỉ có nghĩa TRONG phiên để PM ra quyết định; trễ 40 phút thì nó
-        --   là số rác, chạy cho có chỉ tổ gọi FO ngoài giờ. KHÔNG xây cơ chế "gửi bằng được".
-        --   Đo từ MỐC SLOT nên hạn tươi là tuyệt đối: lượt 15:00 hết hiệu lực lúc 15:10, bất kể
-        --   nó đã nằm chờ hay đã thử lại mấy lần.
-        SET @age = DATEDIFF(SECOND, @slotat, @now);
-        IF @maxdelay IS NOT NULL AND @age > @maxdelay
-        BEGIN
-            UPDATE T_JOB_RUN SET C_STATUS='SKIPPED', C_ENDED_AT=@now, C_OWNER=@p_owner,
-                   C_MESSAGE=CONCAT(N'BỎ QUA: đã ', @age, N' giây kể từ mốc ',
-                        CONVERT(VARCHAR(19),@slotat,120), N' (hạn tươi ', @maxdelay,
-                        N's) — số không còn là near-realtime, lượt kế tiếp đã thay nó.')
-            WHERE C_JOB_RUN_ID=@p_job_run_id AND C_STATUS IN ('READY','FAILED');
-            SET @p_err_code=3;
-            SET @p_err_msg=CONCAT(N'Lượt chạy đã quá hạn tươi (', @age, N's > ', @maxdelay, N's) — SKIPPED.');
-            RETURN;
-        END
-
-        -- ★ CLAIM NGUYÊN TỬ. Điều kiện WHERE là toàn bộ cơ chế chống trùng của hệ.
-        UPDATE T_JOB_RUN
-           SET C_STATUS='RUNNING', C_OWNER=@p_owner, C_ATTEMPT=C_ATTEMPT+1,
-               C_STARTED_AT=@now, C_HEARTBEAT_AT=@now,
-               C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
-               C_CLAIM_SOURCE=ISNULL(@p_source, C_CLAIM_SOURCE), C_ENDED_AT=NULL
-         WHERE C_JOB_RUN_ID=@p_job_run_id
-           AND ( C_STATUS IN ('READY','FAILED')
-              OR (C_STATUS='RUNNING' AND C_LEASE_UNTIL < @now) );   -- giành lại từ pod đã chết
-
-        IF @@ROWCOUNT = 0
-        BEGIN
-            SET @p_err_code=5;
-            SET @p_err_msg=CONCAT(N'Claim hụt (id=', @p_job_run_id, N', trạng thái=', @status,
-                                  N') — pod khác đang giữ hoặc đã xong. Bỏ qua, KHÔNG chạy.');
-            RETURN;
-        END
-
-        -- Trả kèm C_HANDLER + C_TIMEOUT_SEC (JOIN cấu hình): worker cần handler để biết gọi ai, và
-        --   cần timeout để tự chọn nhịp tim (nhịp = timeout/4). Thiếu 2 cột này thì tầng C# phải
-        --   bắn thêm một query nữa cho MỖI lượt chạy chỉ để đọc hai con số đã nằm sẵn ở đây.
+        SET @p_job_run_id = @id;
         SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, d.C_HANDLER, r.C_FIRE_KEY, r.C_BUSINESS_DATE,
-               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC, r.C_CLAIM_SOURCE
+               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC, r.C_SLOT_AT, r.C_CLAIM_SOURCE
         FROM T_JOB_RUN r
         LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-        WHERE r.C_JOB_RUN_ID=@p_job_run_id;
+        WHERE r.C_JOB_RUN_ID=@id;
     END TRY
     BEGIN CATCH
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
@@ -796,16 +794,16 @@ GO
 
   (1) THU HỒI lượt RUNNING quá hạn lease (pod chết/bị evict giữa chừng) → READY.
   (2) ĐÓNG DẤU SKIPPED lượt nằm chờ QUÁ HẠN (C_MAX_DELAY_SEC) — chống chạy lại việc của giờ trước.
-  (3) TRẢ VỀ các lượt READY tới hạn để app produce (lại) lên topic Kafka.
+  (3) TRẢ VỀ MỐC của các lượt READY tới hạn để app produce (lại) lên topic Kafka.
 
-  ★ (3) LÀ LƯỚI AN TOÀN. Kafka CÓ LƯU nên message sống qua restart pod/broker — khác hẳn thời
-    Pub/Sub (bắn-rồi-quên, mọi trục trặc kết nối đều mất tin). Còn lại ba ca hiếm mà (3) lo:
-      · produce hụt (broker chết đúng lúc scheduler rung chuông);
-      · MỌI pod đều bận (hết hạn mức job đồng thời) nên không ai claim;
-      · pod chết sau khi commit offset nhưng trước khi claim xong.
-    Cả ba đều để lại dòng T_JOB_RUN ở trạng thái READY mà không ai đánh thức.
-    Không có (3) thì job đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
-    Produce trùng thì vô hại: SP_JOB_CLAIM chỉ cho một pod thắng.
+  ⚠️ SAU KHI BỎ GHI DB LÚC SINH JOB, (3) CHỈ CÒN THẤY LƯỢT ĐÃ TỪNG CHẠY: retry (SP_JOB_COMPLETE
+     đặt lại READY) và lượt vừa bị bước (1) thu về từ pod chết. Nó KHÔNG còn bắt được ca "message
+     thất lạc trước khi có pod nào nhận" — lúc đó KHÔNG CÓ dòng T_JOB_RUN nào để mà tìm. Mốc đó
+     mất luôn và nhịp kế tiếp bù. Đánh đổi đã chấp nhận: dữ liệu snapshot, mất một nhịp không sao.
+
+  ★ (3) LÀ LƯỚI AN TOÀN cho lượt ĐÃ CHẠY DỞ: retry sau khi lỗi, và lượt vừa bị bước (1) thu về từ
+    một pod chết. Không có (3) thì hai loại đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
+    Produce trùng thì vô hại: SP_JOB_CLAIM_SLOT chỉ cho một pod thắng (UQ fire_key).
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_JOB_RECOVER
     @p_stale_sec INT           = 30,                 -- READY quá ngần này giây mà chưa ai chạy ⇒ nghi mất message
@@ -819,7 +817,7 @@ BEGIN
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
 
         -- (1) Pod chết giữa chừng: lease hết hạn ⇒ trả về hàng đợi. C_ATTEMPT KHÔNG tăng ở đây
-        --     (SP_JOB_CLAIM mới tăng) ⇒ số lần thử luôn đếm đúng số lần THỰC SỰ chạy.
+        --     (SP_JOB_CLAIM_SLOT mới tăng) ⇒ số lần thử luôn đếm đúng số lần THỰC SỰ chạy.
         UPDATE T_JOB_RUN
            SET C_STATUS='READY', C_OWNER=NULL, C_LEASE_UNTIL=NULL, C_RUN_AFTER=@now,
                C_MESSAGE=CONCAT(N'Thu hồi: pod ', ISNULL(C_OWNER,'?'), N' mất tín hiệu (lease hết hạn ',
@@ -843,8 +841,10 @@ BEGIN
            AND DATEDIFF(SECOND, ISNULL(r.C_SLOT_AT,r.C_ENQUEUED_AT), @now)
                  > COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC);
 
-        -- (3) Lượt READY tới hạn, nằm lâu bất thường ⇒ trả về cho app XADD lại.
-        SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, r.C_PAYLOAD
+        -- (3) Lượt READY tới hạn ⇒ trả MỐC để app produce lại.
+        --     ⚠️ Trả (job_code, slot_at, fire_key) chứ KHÔNG trả job_run_id: message Kafka nay chở
+        --       MỐC, vì bộ quét không còn ghi DB lúc sinh job nên không có id nào để chở.
+        SELECT r.C_JOB_CODE, r.C_SLOT_AT, r.C_FIRE_KEY
         FROM T_JOB_RUN r
         WHERE r.C_STATUS='READY'
           AND r.C_RUN_AFTER <= @now
@@ -853,7 +853,7 @@ BEGIN
           --   đánh thức lại lúc 15:00:35, nếu không thì mốc cuối phiên mất trắng mỗi khi Kafka nấc
           --   một nhịp. Lượt quá hạn tươi thì bước (2) đã đóng dấu SKIPPED rồi.
           AND dbo.UDF_JOB_IN_WINDOW(r.C_JOB_CODE, ISNULL(r.C_SLOT_AT, r.C_ENQUEUED_AT)) = 1
-        ORDER BY r.C_JOB_RUN_ID;
+        ORDER BY r.C_JOB_RUN_ID;   -- id chỉ để thứ tự ổn định, không trả ra ngoài
     END TRY
     BEGIN CATCH
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
@@ -933,6 +933,10 @@ BEGIN
         FROM T_JOB_DEFINITION d
         OUTER APPLY (SELECT TOP 1 * FROM T_JOB_RUN r WHERE r.C_JOB_CODE=d.C_JOB_CODE
                      ORDER BY r.C_JOB_RUN_ID DESC) l
+        -- ⚠️ C_QUEUED (số dòng READY) nay gần như LUÔN BẰNG 0, và đó là ĐÚNG: từ khi bộ quét thôi
+        --    ghi DB, dòng sinh ra đã ở 'RUNNING' nên không có hàng đợi để mà xếp. Còn READY chỉ khi
+        --    (a) lượt retry đang chờ backoff, (b) lượt vừa bị SP_JOB_RECOVER thu về.
+        --    ⇒ C_QUEUED > 0 kéo dài KHÔNG còn nghĩa "đang bận" như trước — nó nghĩa là ĐANG CÓ LỖI.
         OUTER APPLY (SELECT SUM(CASE WHEN r.C_STATUS='READY'   THEN 1 ELSE 0 END) AS C_QUEUED,
                             SUM(CASE WHEN r.C_STATUS='RUNNING' THEN 1 ELSE 0 END) AS C_RUNNING,
                             SUM(CASE WHEN r.C_STATUS='DEAD' AND r.C_ENDED_AT > DATEADD(DAY,-7,@now) THEN 1 ELSE 0 END) AS C_DEAD_7D,

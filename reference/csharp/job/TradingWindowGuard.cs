@@ -20,7 +20,7 @@ public sealed class JobWindow
     public bool      BusinessDayOnly { get; init; }
     /// <summary>
     /// HẠN TƯƠI của một lượt chạy, tính từ MỐC SLOT của nó.
-    /// = COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) — CÙNG con số SP_JOB_CLAIM dùng, nên tầng 2 và
+    /// = COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) — CÙNG con số SP_JOB_CLAIM_SLOT dùng, nên tầng 2 và
     /// tầng 4 không thể lệch pha. Null = không hết hạn (job on-demand không chu kỳ).
     /// </summary>
     public int?      MaxDelaySec     { get; init; }

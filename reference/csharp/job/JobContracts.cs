@@ -87,7 +87,7 @@ public sealed class JobRegistry : IJobRegistry
         => _map.TryGetValue(handlerKey, out var h) ? h : null;
 }
 
-/// <summary>Một lượt chạy đã claim được (kết quả SP_JOB_CLAIM).</summary>
+/// <summary>Một lượt chạy đã giành được (kết quả SP_JOB_CLAIM_SLOT).</summary>
 public sealed class JobClaim
 {
     public int       Err          { get; init; }   // 0 OK · 3 ngoài khung (SKIPPED) · 5 pod khác giữ · 6 DEAD
@@ -110,10 +110,12 @@ public sealed class JobClaim
     public DateTime  SlotAt       { get; init; }
 }
 
+/// <summary>Một MỐC cần được produce lại (kết quả SP_JOB_RECOVER).</summary>
 public sealed class DueJob
 {
-    public long    JobRunId { get; init; }
-    public string  JobCode  { get; init; } = "";
+    public string   JobCode { get; init; } = "";
+    public DateTime SlotAt  { get; init; }
+    public string   FireKey { get; init; } = "";
 }
 
 /// <summary>
@@ -129,22 +131,19 @@ public interface ISdiJobGateway
     /// </summary>
     Task<IReadOnlyList<SchedulableJob>> GetSchedulableJobsAsync(CancellationToken ct);
     Task<IReadOnlyList<DueJob>> RecoverAsync(int staleSec, CancellationToken ct);               // SP_JOB_RECOVER
-    /// <summary>SP_JOB_CLAIM. `source` = 'notify' | 'recover' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
+    /// <summary>`source` = 'kafka' | 'recover' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
     /// Đừng bỏ tham số này: nó là thứ duy nhất phân biệt "chuông Pub/Sub đang chạy" với "chuông
     /// đã tắt từ lâu mà bộ hồi phục vẫn gánh" — hai trạng thái nhìn từ ngoài giống hệt nhau.</summary>
-    Task<JobClaim>              ClaimAsync(long jobRunId, string owner, string source, CancellationToken ct);
+    /// <summary>
+    /// SP_JOB_CLAIM_SLOT — CỔNG DUY NHẤT xin chạy một mốc. Vừa TẠO dòng T_JOB_RUN (đã ở RUNNING)
+    /// vừa giành quyền, trong một lượt gọi. Gộp hai proc cũ (SP_JOB_ENQUEUE + SP_JOB_CLAIM, đã xoá) làm một.
+    /// err: 0 OK · 1 job lạ · 2 job tắt · 3 mốc ngoài khung / quá hạn tươi · 5 pod khác đang giữ
+    ///      · 6 hết lượt thử (DEAD) · 7 singleton đang chạy · 20 mốc không khớp lưới.
+    /// </summary>
+    Task<JobClaim>              ClaimSlotAsync(string jobCode, DateTime slotAt, string owner,
+                                               string? fireKey, string source, CancellationToken ct);
     Task<bool>                  HeartbeatAsync(long jobRunId, string owner, long? rows, CancellationToken ct);  // SP_JOB_HEARTBEAT
     Task                        CompleteAsync(long jobRunId, string owner, bool ok, long? rows, string? msg, CancellationToken ct); // SP_JOB_COMPLETE
-    /// <summary>
-    /// SP_JOB_ENQUEUE. `slotAt` = MỐC mà lượt này đáng lẽ chạy (bộ quét tự tính); truyền null cho
-    /// job đẩy tay. `fireKey` để null khi đã có `slotAt` — SQL tự suy khoá bằng UDF_JOB_FIRE_KEY,
-    /// bớt một chỗ để C# và SQL có thể định dạng khác nhau.
-    /// err: 0 OK · 1 job lạ · 2 job tắt · 3 mốc ngoài khung · 4 mốc đã có (idempotent) · 7 singleton
-    ///      đang chạy · 20 mốc không khớp lưới (bộ quét tính sai).
-    /// </summary>
-    Task<(long Id, int Err)>    EnqueueAsync(string jobCode, string? fireKey, string? payload,
-                                             DateTime? businessDate, DateTime? slotAt, string user, CancellationToken ct);
-
     /// <summary>SELECT dbo.UDF_IS_BUSINESS_DATE(@d) — lịch nghỉ nằm ở DB (T_TRADING_HOLIDAY),
     /// KHÔNG hard-code trong C#. TradingWindowGuard gọi hàm này (nhớ theo ngày, 1 lượt/chu kỳ).</summary>
     Task<bool>                  IsBusinessDateAsync(DateTime d);
@@ -156,7 +155,7 @@ public interface ISdiJobGateway
     ///   FROM T_JOB_DEFINITION WHERE C_JOB_CODE = @code
     /// TradingWindowGuard gọi hàm này (nhớ tạm 60s). KHÔNG nhận khung giờ qua hằng số DI: đổi cấu
     /// hình trong DB mà tầng 4 vẫn gác theo khung cũ thì đúng cái tầng chạm FO là tầng hiểu sai luật.
-    /// MaxDelaySec = CÙNG con số SP_JOB_CLAIM dùng ⇒ tầng 2 và tầng 4 không thể lệch pha.
+    /// MaxDelaySec = CÙNG con số SP_JOB_CLAIM_SLOT dùng ⇒ tầng 2 và tầng 4 không thể lệch pha.
     /// </summary>
     Task<JobWindow>             GetJobWindowAsync(string jobCode, CancellationToken ct);
 

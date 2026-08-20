@@ -11,7 +11,7 @@ namespace SdiCoreMessagingProcess.Jobs;
 /// WORKER — chạy trên MỌI pod. Consumer Kafka của topic `sdi.job.notify`.
 ///
 /// ★★ LUẬT SỐ MỘT: VÒNG POLL KHÔNG BAO GIỜ ĐƯỢC CHẶN.
-///   Trình tự: `Consume` → commit offset → `SP_JOB_CLAIM` → ném job sang Task nền → quay lại
+///   Trình tự: `Consume` → commit offset → `SP_JOB_CLAIM_SLOT` → ném job sang Task nền → quay lại
 ///   `Consume`. Chu kỳ FO chạy vài phút nằm HOÀN TOÀN ngoài vòng poll.
 ///   Chạy job trong vòng poll = vượt `max.poll.interval.ms` = Kafka đá pod khỏi group, NHƯNG
 ///   không giết thread ⇒ pod cũ thành zombie vẫn ghi DB trong khi pod mới xử lý lại cùng message.
@@ -25,7 +25,7 @@ namespace SdiCoreMessagingProcess.Jobs;
 ///
 /// ★ VÌ SAO KHÔNG XỬ LÝ TRÙNG TRÊN NHIỀU POD (yêu cầu BRD #3) — hai lớp:
 ///   1. Kafka consumer group: mỗi partition giao cho một consumer. Đủ cho đường chạy bình thường.
-///   2. `SP_JOB_CLAIM` (`UPDATE ... WHERE C_STATUS='READY'`) — **chốt thật**. Rebalance giao lại,
+///   2. `SP_JOB_CLAIM_SLOT` (`INSERT` vỡ `UQ` → `UPDATE` có điều kiện) — **chốt thật**. Rebalance giao lại,
 ///      pod zombie, bộ hồi phục phát trùng: đúng một pod đổi được trạng thái, còn lại nhận `err=5`.
 ///   Lớp phụ: heartbeat kiểm chủ sở hữu ⇒ pod mất lease tự dừng, không ghi song song.
 ///
@@ -94,9 +94,10 @@ public class JobDispatcherService : BackgroundService
                 // ★ COMMIT NGAY. Vòng poll phải luôn rảnh (xem chú thích đầu lớp).
                 consumer.Commit(cr);
 
-                if (!long.TryParse(cr.Message.Value, out var jobRunId))
+                var msg = JobMessage.Parse(cr.Message.Value);
+                if (msg == null || string.IsNullOrEmpty(msg.JobCode))
                 {
-                    Log.Warning("[JOB] Message không đọc được jobRunId: {V}", cr.Message.Value);
+                    Log.Warning("[JOB] Message không đọc được: {V}", cr.Message.Value);
                     continue;
                 }
 
@@ -104,14 +105,14 @@ public class JobDispatcherService : BackgroundService
                 //   RẺ hơn claim rồi mới phát hiện mình không có chỗ chạy.
                 if (!_slots.Wait(0))
                 {
-                    Log.Debug("[JOB] Pod đang chạy đủ {N} job — bỏ qua runId={Id}", MaxConcurrentJobs, jobRunId);
+                    Log.Debug("[JOB] Pod đang chạy đủ {N} job — bỏ qua mốc {Key}", MaxConcurrentJobs, msg.FireKey);
                     continue;
                 }
 
                 _ = Task.Run(async () =>
                 {
-                    try { await RunOneAsync(jobRunId, JobTopicKeys.SourceKafka, ct); }
-                    catch (Exception ex) { Log.Error(ex, "[JOB] runId={Id} lỗi ngoài dự kiến", jobRunId); }
+                    try { await RunOneAsync(msg, JobTopicKeys.SourceKafka, ct); }
+                    catch (Exception ex) { Log.Error(ex, "[JOB] mốc {Key} lỗi ngoài dự kiến", msg.FireKey); }
                     finally { _slots.Release(); }
                 }, ct);
             }
@@ -129,18 +130,21 @@ public class JobDispatcherService : BackgroundService
         try { consumer.Close(); } catch { }
     }
 
-    private async Task RunOneAsync(long jobRunId, string source, CancellationToken ct)
+    private async Task RunOneAsync(JobMessage msg, string source, CancellationToken ct)
     {
-        // ★ CHỐT CHỐNG TRÙNG. err≠0 ⇒ pod này KHÔNG chạy.
-        var claim = await _db.ClaimAsync(jobRunId, _owner, source, ct);
+        // ★ CHỐT CHỐNG TRÙNG — và cũng là chỗ DUY NHẤT ghi DB cho một lượt job. err≠0 ⇒ KHÔNG chạy.
+        var claim = await _db.ClaimSlotAsync(msg.JobCode, msg.SlotAt, _owner, msg.FireKey, source, ct);
+        var jobRunId = claim.JobRunId;
         if (claim.Err != 0)
         {
-            // err=3 (quá hạn chót / sai ngày GD → SKIPPED) · 5 (pod khác giữ) · 6 (DEAD) đều là
-            //   kết cục HỢP LỆ, không phải sự cố.
-            if (claim.Err == 3)
-                Log.Warning("[JOB] runId={Id} BỎ QUA: {Msg}", jobRunId, claim.Msg);
+            // err=3 (ngoài khung / quá hạn tươi) · 5 (pod khác giữ) · 6 (DEAD) · 7 (singleton) đều
+            //   là kết cục HỢP LỆ, không phải sự cố. err=20 thì KHÁC: bộ quét trên pod tính sai mốc.
+            if (claim.Err == 20)
+                Log.Error("[JOB] mốc {Key} BỊ TỪ CHỐI — bộ quét tính sai: {Msg}", msg.FireKey, claim.Msg);
+            else if (claim.Err == 3)
+                Log.Warning("[JOB] mốc {Key} BỎ QUA: {Msg}", msg.FireKey, claim.Msg);
             else
-                Log.Debug("[JOB] runId={Id} không claim được (err={Err}): {Msg}", jobRunId, claim.Err, claim.Msg);
+                Log.Debug("[JOB] mốc {Key} không giành được (err={Err}): {Msg}", msg.FireKey, claim.Err, claim.Msg);
             return;
         }
 
