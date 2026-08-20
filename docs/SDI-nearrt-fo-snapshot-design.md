@@ -475,7 +475,7 @@ Nói cách khác: dòng mồ côi là **triệu chứng nhìn thấy được** 
 
 ```
 SP_GET_FO_SNAPSHOT_SCOPE        → tiểu khoản indexing ACTIVE, ORDER BY cust_code
-   ↓ cắt 50 KHÁCH HÀNG/batch (ranh giới KH, không xẻ đôi một khách hàng)
+   ↓ cắt đều 50 TIỂU KHOẢN/batch (không quan tâm khách hàng)
 song song 4  ──► TradingWindowGuard.EnsureOpen()   ← tầng 4, TRƯỚC MỖI CALL
                  ↓
                  FO API
@@ -485,7 +485,15 @@ song song 4  ──► TradingWindowGuard.EnsureOpen()   ← tầng 4, TRƯỚC 
 SP_RT_MASTER_AGG                → gộp master ĐÚNG MỘT LẦN, cuối chu kỳ
 ```
 
-**50 KH ≠ 50 tiểu khoản.** `UQ_SI_PORTFOLIO_ACTIVE` cho mỗi KH **1 tiểu khoản ACTIVE trên mỗi master** ⇒ một KH đầu tư K master mang theo K tiểu khoản. Batch cắt theo **khách hàng** (đúng BRD) nên payload gửi FO có thể tới 50×K dòng. Scope sắp theo `cust_code` để ranh giới batch không bao giờ rơi vào giữa các tiểu khoản của cùng một người — nếu rơi thì cùng một KH bị hỏi ở hai batch, hai thời điểm, và số của họ khớp nhau chỉ do may mắn.
+**Chia đều 50 tiểu khoản/batch, không quan tâm khách hàng.**
+
+Bản đầu cắt ở ranh giới **khách hàng** để "không xẻ đôi một khách". Lý do đó **không đứng vững**: `UQ_SI_PORTFOLIO_ACTIVE` chỉ cho mỗi KH **một tiểu khoản ACTIVE trên mỗi master**, nên hai tiểu khoản của cùng một khách hàng **luôn thuộc hai master khác nhau** — tách chúng ra không thể gây lệch số trong cùng một master, mà master mới là đơn vị `SP_RT_MASTER_AGG` gộp.
+
+Đổi lại, cắt theo khách hàng làm **kích thước batch dao động**: 50 KH có thể ra 50 hay 150 dòng tuỳ mỗi người đầu tư mấy master. FO nhận payload lúc to lúc nhỏ, và `batchSize` không còn nói lên điều gì về tải thật sự gửi đi.
+
+⇒ Chia đều: mọi batch đúng 50 dòng (trừ batch cuối), payload đoán trước được, các luồng song song gánh đều nhau.
+
+**Scope sắp theo `C_MASTER_CODE` trước** (không phải `cust_code`): thứ tự này quyết định tiểu khoản nào bị chụp gần nhau về thời gian. Xếp theo master ⇒ tiểu khoản cùng một master nằm liền nhau ⇒ vào cùng batch hoặc các batch kề nhau ⇒ `SP_RT_MASTER_AGG` gộp trên một tập nhất quán hơn về thời điểm.
 
 **Ghi ngay từng batch, không gom.** Gom hết rồi ghi nghĩa là hỏng ở batch 999 thì mất trắng 998 batch trước.
 

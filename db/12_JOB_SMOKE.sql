@@ -344,9 +344,9 @@ INSERT INTO T_MASTER_PORTFOLIO (C_MASTER_CODE,C_MASTER_NAME,C_STATUS,C_INCEPTION
 --     theo K tiểu khoản. Worker cắt batch theo KHÁCH HÀNG (đúng BRD) nên payload gửi FO có thể
 --     tới 50×K dòng — đó là lý do SP_GET_FO_SNAPSHOT_SCOPE trả per-tiểu-khoản và sắp theo KH.
 INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C_STATUS) VALUES
- ('RT01','RTC1','RTM','2026-01-01','ACTIVE'),
- ('RT02','RTC2','RTM','2026-01-01','ACTIVE'),
- ('RT03','RTC3','RTM','2026-01-01','ACTIVE');
+ ('RT01','RTC9','RTM','2026-01-01','ACTIVE'),   -- ★ mã KH cố tình ĐẢO so với mã tiểu khoản:
+ ('RT02','RTC5','RTM','2026-01-01','ACTIVE'),   --   xếp theo KH ra RT03,RT02,RT01 còn xếp theo
+ ('RT03','RTC1','RTM','2026-01-01','ACTIVE');   --   master/si ra RT01,RT02,RT03 ⇒ ca B0 phân biệt được
 
 -- Phiên chốt HÔM QUA (mốc so sánh) — ghi tay, C_SRC mặc định 'EOD'.
 --   ⚠️ DÙNG UDF_PREV_BUSINESS_DAY (thuần LỊCH), KHÔNG dùng UDF_PREV_BUSINESS_DATE — hàm kia đòi
@@ -355,20 +355,28 @@ INSERT INTO T_SI_PORTFOLIO (C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_JOIN_DATE,C
 --     fail với thông điệp khó hiểu). Đây là phụ thuộc ngầm vào 03_SMOKE — đã cắt.
 DECLARE @prev DATE = dbo.UDF_PREV_BUSINESS_DAY(@today);
 INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN,C_CASH) VALUES
- (@prev,'RT01','RTC1','RTM',1000000000,0.010000,100000000),
- (@prev,'RT02','RTC2','RTM', 500000000,0.010000, 50000000),
- (@prev,'RT03','RTC3','RTM', 200000000,0.010000, 20000000);
+ (@prev,'RT01','RTC9','RTM',1000000000,0.010000,100000000),
+ (@prev,'RT02','RTC5','RTM', 500000000,0.010000, 50000000),
+ (@prev,'RT03','RTC1','RTM', 200000000,0.010000, 20000000);
 INSERT INTO T_MASTER_BALANCE (C_BUSINESS_DATE,C_MASTER_CODE,C_CASH,C_AUM,C_DAILY_RETURN,C_TOTAL_ACCOUNT)
  VALUES (@prev,'RTM',170000000,1700000000,0.010000,3);
 
 -- B0. Scope cho worker chia batch
-CREATE TABLE #scope (cust VARCHAR(10), si VARCHAR(20), sub VARCHAR(30), master VARCHAR(20));
-INSERT #scope EXEC SP_GET_FO_SNAPSHOT_SCOPE @p_master_code='RTM',
+-- Cột seq giữ ĐÚNG thứ tự SP trả về — không có nó thì ca kiểm thứ tự chỉ là tautology
+--   (bản trước tự ORDER BY lại trong chính câu assert, nên nó không đo được gì).
+CREATE TABLE #scope (seq INT IDENTITY(1,1), cust VARCHAR(10), si VARCHAR(20), sub VARCHAR(30), master VARCHAR(20));
+INSERT #scope (cust, si, sub, master) EXEC SP_GET_FO_SNAPSHOT_SCOPE @p_master_code='RTM',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'B0 SCOPE: 3 tiểu khoản, xếp theo KH (batch không xẻ đôi 1 khách hàng)',
+INSERT INTO @R SELECT 'B0 ★ SCOPE xếp theo MASTER rồi tiểu khoản (KHÔNG theo khách hàng)',
   CASE WHEN (SELECT COUNT(*) FROM #scope)=3
-        AND (SELECT TOP 1 cust FROM #scope ORDER BY cust, si)='RTC1' THEN 1 ELSE 0 END,
-  CONCAT('rows=',(SELECT COUNT(*) FROM #scope));
+        -- thứ tự thật phải là RT01,RT02,RT03; nếu SP còn xếp theo KH thì ra RT03,RT02,RT01
+        AND (SELECT si FROM #scope WHERE seq=1)='RT01'
+        AND (SELECT si FROM #scope WHERE seq=3)='RT03'
+        -- và không có chỗ nào master bị xen kẽ (kiểm tổng quát, đúng cả khi thêm master sau này)
+        AND NOT EXISTS (SELECT 1 FROM #scope a JOIN #scope b ON b.seq > a.seq
+                        WHERE b.master < a.master)
+       THEN 1 ELSE 0 END,
+  (SELECT STRING_AGG(si, '>') WITHIN GROUP (ORDER BY seq) FROM #scope);
 DROP TABLE #scope;
 
 -- B1. ★ GUARD TẦNG 3 — ngày quá khứ bị từ chối (chạy được MỌI ngày, kể cả T7/CN)
@@ -415,7 +423,7 @@ BEGIN
 
     -- B4. ★★ LUẬT BẤT DI BẤT DỊCH: RT KHÔNG BAO GIỜ ĐÈ SỐ CHỐT
     INSERT INTO T_SI_BALANCE (C_BUSINESS_DATE,C_SI_ACCOUNT,C_CUST_CODE,C_MASTER_CODE,C_AUM,C_DAILY_RETURN,C_CASH,C_SRC)
-     VALUES (@today,'RT03','RTC3','RTM',222000000,0.020000,22000000,'EOD');   -- Asset đã chốt RT03
+     VALUES (@today,'RT03','RTC1','RTM',222000000,0.020000,22000000,'EOD');   -- Asset đã chốt RT03
     EXEC SP_INGEST_FO_SNAPSHOT_RT
          @p_json=N'[{"si_account":"RT03","aum":999999999,"cash":1}]',
          @p_business_date=@today, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT,

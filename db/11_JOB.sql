@@ -961,10 +961,16 @@ GO
 
 /*===========================================================================
   SP_GET_FO_SNAPSHOT_SCOPE — danh sách tiểu khoản indexing ĐANG MỞ, để worker chia batch.
-    Trả cả C_CUST_CODE và C_SUB_ACCOUNT_NO vì FO định danh theo SỐ TÀI KHOẢN, còn BRD chia
-    batch theo KHÁCH HÀNG (50 KH/batch) — worker gom theo C_CUST_CODE rồi cắt 50.
-    ORDER BY C_CUST_CODE: một khách hàng có nhiều tiểu khoản thì các tiểu khoản đó nằm LIỀN
-    NHAU ⇒ cắt batch không bao giờ xẻ đôi một khách hàng.
+    Trả cả C_CUST_CODE và C_SUB_ACCOUNT_NO vì FO định danh theo SỐ TÀI KHOẢN.
+
+    ★ ORDER BY C_MASTER_CODE trước: worker cắt đều 50 TIỂU KHOẢN/batch (không quan tâm khách
+      hàng), nên thứ tự này quyết định tiểu khoản nào bị chụp gần nhau về thời gian. Xếp theo
+      master ⇒ các tiểu khoản CÙNG MỘT MASTER nằm liền nhau ⇒ chúng vào cùng batch hoặc các batch
+      kề nhau ⇒ SP_RT_MASTER_AGG gộp trên một tập nhất quán hơn về thời điểm.
+      (Bản trước xếp theo C_CUST_CODE để "batch không xẻ đôi khách hàng". Lý do đó đã bỏ:
+       UQ_SI_PORTFOLIO_ACTIVE chỉ cho mỗi KH một tiểu khoản ACTIVE TRÊN MỖI master, nên hai tiểu
+       khoản của cùng một KH luôn thuộc hai master khác nhau — tách ra không gây lệch trong cùng
+       một master, mà master mới là đơn vị được gộp.)
 ===========================================================================*/
 CREATE OR ALTER PROCEDURE SP_GET_FO_SNAPSHOT_SCOPE
     @p_master_code VARCHAR(20)   = NULL,             -- NULL = toàn bộ master
@@ -980,7 +986,7 @@ BEGIN
         FROM T_SI_PORTFOLIO p
         WHERE p.C_STATUS='ACTIVE'
           AND (@p_master_code IS NULL OR p.C_MASTER_CODE=@p_master_code)
-        ORDER BY p.C_CUST_CODE, p.C_SI_ACCOUNT;
+        ORDER BY p.C_MASTER_CODE, p.C_SI_ACCOUNT;
     END TRY
     BEGIN CATCH
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();

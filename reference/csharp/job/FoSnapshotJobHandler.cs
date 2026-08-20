@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -30,11 +29,9 @@ public interface IFoSnapshotClient
 ///
 /// LUỒNG (mô hình "một worker chạy cả chu kỳ"):
 ///   1. Lấy toàn bộ tiểu khoản indexing đang mở (SP_GET_FO_SNAPSHOT_SCOPE).
-///   2. Gom theo KHÁCH HÀNG rồi cắt 50 KH/batch (đúng BRD).
-///      ⚠️ 50 KH ≠ 50 tiểu khoản: một KH đầu tư K master thì mang theo K tiểu khoản
-///        (UQ_SI_PORTFOLIO_ACTIVE cho phép mỗi KH 1 tiểu khoản ACTIVE TRÊN MỖI master).
-///        Scope trả về đã sắp theo KH nên cắt batch không bao giờ xẻ đôi một khách hàng — nếu xẻ
-///        thì cùng một KH bị hỏi ở hai batch, hai thời điểm, và số của họ khớp nhau chỉ do may mắn.
+///   2. Cắt đều 50 TIỂU KHOẢN/batch, không quan tâm khách hàng (xem ChunkBySubAccount).
+///      Scope sắp theo MASTER nên các tiểu khoản của cùng một master nằm liền nhau ⇒ chúng được
+///      chụp gần nhau về thời gian, và SP_RT_MASTER_AGG gộp trên một tập nhất quán hơn.
 ///   3. Chạy song song có giới hạn (mặc định 4). Trước MỖI call: TradingWindowGuard (tầng 4).
 ///   4. Mỗi batch trả về → ghi ngay (SP_INGEST_FO_SNAPSHOT_RT). KHÔNG gom hết rồi ghi một lần:
 ///      gom hết nghĩa là hỏng ở batch 999 thì mất trắng 998 batch trước đó.
@@ -61,6 +58,7 @@ public class FoSnapshotJobHandler : IJobHandler
 
     private sealed class Payload
     {
+        /// <summary>Số TIỂU KHOẢN mỗi batch (không phải số khách hàng) — xem ChunkBySubAccount.</summary>
         [JsonProperty("batchSize")]  public int BatchSize { get; set; } = 50;
         [JsonProperty("parallel")]   public int Parallel  { get; set; } = 4;
         [JsonProperty("masterCode")] public string? MasterCode { get; set; }
@@ -94,9 +92,9 @@ public class FoSnapshotJobHandler : IJobHandler
             return 0;
         }
 
-        var batches = ChunkByCustomer(scope, cfg.BatchSize);
-        Log.Information("[FO-RT] {Si} tiểu khoản / {Cust} KH → {N} batch ({B} KH/batch), song song {P}",
-            scope.Count, scope.Select(s => s.CustCode).Distinct().Count(), batches.Count, cfg.BatchSize, cfg.Parallel);
+        var batches = ChunkBySubAccount(scope, cfg.BatchSize);
+        Log.Information("[FO-RT] {Si} tiểu khoản → {N} batch ({B} tiểu khoản/batch), song song {P}",
+            scope.Count, batches.Count, cfg.BatchSize, cfg.Parallel);
 
         long written = 0, skippedEod = 0, failedBatch = 0;
         var closed = false;
@@ -135,7 +133,8 @@ public class FoSnapshotJobHandler : IJobHandler
                         //   Nhịp 15 phút sau sẽ ghi đè lại toàn bộ, nên thiệt hại tối đa = một nhịp
                         //   thiếu vài chục KH, và coverage n/N trên dashboard nói rõ điều đó.
                         Interlocked.Increment(ref failedBatch);
-                        Log.Error("[FO-RT] Batch {Cust} ghi lỗi err={Err}: {Msg}", batch[0].CustCode, err, msg);
+                        Log.Error("[FO-RT] Batch [{First}..{Last}] ({N} tiểu khoản) ghi lỗi err={Err}: {Msg}",
+                            batch[0].SiAccount, batch[^1].SiAccount, batch.Count, err, msg);
                         return;
                     }
 
@@ -159,7 +158,8 @@ public class FoSnapshotJobHandler : IJobHandler
                 catch (Exception ex)
                 {
                     Interlocked.Increment(ref failedBatch);
-                    Log.Error(ex, "[FO-RT] Batch {Cust} lỗi", batch[0].CustCode);
+                    Log.Error(ex, "[FO-RT] Batch [{First}..{Last}] ({N} tiểu khoản) lỗi",
+                        batch[0].SiAccount, batch[^1].SiAccount, batch.Count);
                 }
                 finally { gate.Release(); }
             }, ct));
@@ -183,34 +183,31 @@ public class FoSnapshotJobHandler : IJobHandler
     }
 
     /// <summary>
-    /// Cắt batch theo KHÁCH HÀNG. Scope đã ORDER BY cust nên chỉ cần đếm số KH đã gặp — một KH
-    /// không bao giờ bị chia vào hai batch.
+    /// Cắt batch: **50 TIỂU KHOẢN một batch, chia đều, không quan tâm khách hàng**.
+    ///
+    /// Bản đầu cắt ở ranh giới KHÁCH HÀNG để "không xẻ đôi một khách". Lý do đó KHÔNG đứng vững:
+    /// `UQ_SI_PORTFOLIO_ACTIVE` chỉ cho mỗi KH **một tiểu khoản ACTIVE trên mỗi master**, nên hai
+    /// tiểu khoản của cùng một khách hàng LUÔN thuộc hai master khác nhau — tách chúng ra không
+    /// thể gây lệch số trong cùng một master, mà master mới là đơn vị `SP_RT_MASTER_AGG` gộp.
+    ///
+    /// Đổi lại, cắt theo khách hàng làm **kích thước batch dao động**: 50 KH có thể ra 50 hay 150
+    /// dòng tuỳ mỗi người đầu tư mấy master. FO nhận payload lúc to lúc nhỏ, và tham số
+    /// `batchSize` không còn nói lên điều gì về tải thật sự gửi đi.
+    ///
+    /// ⇒ Chia đều theo tiểu khoản: mọi batch đúng `size` dòng (trừ batch cuối), payload gửi FO
+    ///   đoán trước được, các luồng song song gánh đều nhau.
     /// </summary>
-    internal static List<List<ScopeRow>> ChunkByCustomer(IReadOnlyList<ScopeRow> scope, int custPerBatch)
+    internal static List<List<ScopeRow>> ChunkBySubAccount(IReadOnlyList<ScopeRow> scope, int size)
     {
-        var result  = new List<List<ScopeRow>>();
-        var current = new List<ScopeRow>();
-        string? lastCust = null;
-        var custCount = 0;
-
-        foreach (var r in scope)
+        if (size < 1) size = 1;
+        var result = new List<List<ScopeRow>>((scope.Count + size - 1) / size);
+        for (var i = 0; i < scope.Count; i += size)
         {
-            if (r.CustCode != lastCust)
-            {
-                // Ranh giới KH mới: chỉ ở ĐÂY mới được đóng batch (không đóng giữa các tiểu khoản
-                //   của cùng một khách hàng).
-                if (custCount >= custPerBatch && current.Count > 0)
-                {
-                    result.Add(current);
-                    current = new List<ScopeRow>();
-                    custCount = 0;
-                }
-                lastCust = r.CustCode;
-                custCount++;
-            }
-            current.Add(r);
+            var take = Math.Min(size, scope.Count - i);
+            var batch = new List<ScopeRow>(take);
+            for (var k = 0; k < take; k++) batch.Add(scope[i + k]);
+            result.Add(batch);
         }
-        if (current.Count > 0) result.Add(current);
         return result;
     }
 }
