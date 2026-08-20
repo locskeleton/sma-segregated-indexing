@@ -43,14 +43,28 @@ public static class JobRedisKeys
     public const string RecoverTicket = "SDI:JOB:RECOVER";
 
     /// <summary>
-    /// Cache cấu hình lịch (HASH: jobCode → JSON). App XOÁ khoá này ngay sau khi đổi cấu hình qua
-    /// `SP_SET_JOB_SCHEDULE`, nên nhịp quét kế tiếp đã thấy cấu hình mới.
-    /// TTL 1 giờ là lưới an toàn: quên xoá thì cấu hình mới vẫn có hiệu lực chậm nhất sau 1 giờ,
-    /// thay vì kẹt vĩnh viễn cho tới lần restart pod.
+    /// Cache cấu hình lịch (HASH: jobCode → JSON) — thứ bộ quét thật sự đọc để tính mốc.
+    ///
+    /// ★ HAI ĐƯỜNG GHI, đều đi qua <see cref="JobConfigCache.WriteAsync"/>:
+    ///   · <see cref="JobConfigService"/> — ngay sau khi ops đổi lịch (đường CHÍNH);
+    ///   · <see cref="JobSchedulerService"/> — nạp lại khi thấy cache trống (đường lấp).
+    /// KHÔNG được `HashSet` chồng lên khoá cũ — lý do ở JobConfigCache.WriteAsync.
     /// </summary>
     public const string ConfigHash = "SDI:JOB:CFG";
 
-    public static readonly TimeSpan ConfigTtl = TimeSpan.FromHours(1);
+    /// <summary>
+    /// TTL của cache cấu hình = LƯỚI CUỐI, không phải cơ chế chính.
+    ///
+    /// Đường chính là nạp lại ngay lúc đổi lịch (JobConfigService). TTL chỉ đỡ cho ca cấu hình bị
+    /// đổi mà KHÔNG đi qua cổng đó — `UPDATE T_JOB_DEFINITION` thẳng bằng script vận hành / tool DB.
+    /// Lúc đó trigger vẫn dọn lượt chờ ở DB, nhưng KHÔNG ai dọn cache, và bộ quét vẫn sinh mốc theo
+    /// chu kỳ cũ cho tới khi khoá này hết hạn.
+    ///
+    /// Vì thế 5 phút, không phải 1 giờ: 1 giờ là con số hợp lý hồi TTL còn là đường DUY NHẤT, nay
+    /// nó chỉ còn là thời gian TỐI ĐA một thay đổi "đi cửa sau" nằm im. Giá phải trả cho 5 phút gần
+    /// như bằng 0 — cache hết hạn thì đúng một pod đọc DB một lần rồi ghi lại cho cả cụm.
+    /// </summary>
+    public static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
     public static readonly TimeSpan RecoverTicketTtl = TimeSpan.FromSeconds(25);   // < nhịp RECOVER 30s
 
     public static TimeSpan SlotTtl(int intervalSec) => TimeSpan.FromSeconds(Math.Max(60, intervalSec * 2));

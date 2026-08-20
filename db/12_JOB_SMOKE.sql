@@ -750,6 +750,27 @@ INSERT INTO @R SELECT 'C9 * XOÁ chu kỳ: dọn lượt chờ + scheduler ngừ
         AND NOT EXISTS(SELECT 1 FROM #scan WHERE code='SMK_CFG')
         AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY')
        THEN 1 ELSE 0 END, CONCAT('trước=',@cntC,' dọn=',@purgedC);
+
+-- C9 ★★ ...NHƯNG DB KHÔNG CHẶN ĐƯỢC POD CÒN GIỮ CACHE CŨ — và đó là CỐ Ý.
+--   Xoá chu kỳ xong, một pod chưa kịp nạp lại cache vẫn tính mốc theo lưới 900 cũ và vẫn produce.
+--   Mốc đó tới SP_JOB_CLAIM_SLOT: job nay KHÔNG còn chu kỳ ⇒ UDF_JOB_SLOT_AT trả NULL ⇒ phép đối
+--   chiếu lưới TỰ BỎ QUA (err=20 không bắn) ⇒ mốc đi thẳng tới guard giờ giấc và CHẠY THẬT.
+--   Không thể sửa ở DB: bỏ qua đối chiếu khi interval NULL chính là thứ cho phép job
+--   chạy-theo-yêu-cầu đẩy tay với mốc bất kỳ. Hai nhu cầu dùng chung một đường.
+--   ⇒ Chốt chặn nằm ở tầng ứng dụng: JobConfigService PHẢI xoá+nạp lại SDI:JOB:CFG ngay khi đổi
+--     lịch, và PHẢI xoá khoá trước khi ghi (HashSet chồng lên KHÔNG xoá được field của job vừa bị
+--     gỡ lịch). Ca kiểm này tồn tại để ai định bỏ bước đó thì thấy trước hậu quả.
+DECLARE @slotClr DATETIME = DATEADD(SECOND, -(DATEDIFF(SECOND, CAST(CAST(@now AS DATE) AS DATETIME), @now) % 900), @now);
+DECLARE @idClr BIGINT;
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_CFG', @p_slot_at=@slotClr, @p_owner='pod-cu', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@idClr OUTPUT;
+INSERT INTO @R SELECT 'C9 ★★ xoá chu kỳ mà pod còn cache cũ VẪN chạy được ⇒ dọn cache là BẮT BUỘC',
+  CASE WHEN @ec=0 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idClr)='RUNNING'
+       THEN 1 ELSE 0 END,
+  CONCAT('err=',@ec,' status=',ISNULL((SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idClr),'(khong tao dong)'));
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
+
 EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=900, @p_user='ops',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
 

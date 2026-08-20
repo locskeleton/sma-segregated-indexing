@@ -149,7 +149,7 @@ produce Kafka {code, slot, key}
 consumer → SP_JOB_CLAIM_SLOT → sinh dòng RUNNING + chạy   ← lần chạm DB DUY NHẤT
 ```
 
-**Redis chỉ trả lời *"có đáng gọi DB không"*, không trả lời *"ai được chạy"*.** Đó là lý do nó được phép sai. Cấu hình `period` nằm ở DB (nguồn sự thật) và được cache sang Redis khi update.
+**Redis chỉ trả lời *"có đáng gọi DB không"*, không trả lời *"ai được chạy"*.** Đó là lý do nó được phép sai. Cấu hình `period` nằm ở DB (nguồn sự thật) và được **nạp lại sang Redis ngay khi đổi**, qua cổng `JobConfigService` — xem §3b.
 
 ### ⚠️⚠️ Cái bẫy: KHÔNG BAO GIỜ chạy job trong vòng poll
 
@@ -368,6 +368,33 @@ Cổng làm **dọn trước, ghi sau**, trong một giao dịch:
 > Khác `SP_EOD_RESET` (proc đó **cố ý giữ** `T_EOD_RUN`): ở đó xoá là phá nhật ký việc **đã chạy**; ở đây dọn là bỏ một dòng **chưa bao giờ chạy**.
 
 Muốn chặn cả lượt đang chạy thì **tắt job** (`@p_enabled=0`): nhịp heartbeat kế tiếp trả `still_mine=0` và worker tự dừng trong ~20 giây. Không có vế này thì "tắt khẩn cấp" chỉ chặn được lượt sau, còn chu kỳ đang bắn 1000 request sang FO vẫn bắn nốt — tức là đúng lúc cần tắt nhất thì nút tắt không có tác dụng.
+
+### ★ Đổi cấu hình phải chạm HAI nơi: DB và cache Redis
+
+`SP_SET_JOB_SCHEDULE` chỉ với tới được DB. Nhưng **bộ quét đọc chu kỳ từ cache Redis, không đọc DB** (đó là toàn bộ lý do §2b tồn tại). Ghi DB xong mà không ai đụng vào `SDI:JOB:CFG` thì DB nói 30 phút, Redis vẫn nói 15 phút, **và pod tin Redis**.
+
+Cửa `err=20` ở `SP_JOB_CLAIM_SLOT` (đối chiếu mốc với lưới) chặn được chuyện *chạy sai mốc*, nhưng **không** chặn được chuyện *cấu hình mới không tới nơi*. Hai chiều đổi hỏng theo hai kiểu khác hẳn nhau:
+
+| Đổi | Lưới pod vs lưới DB | Biểu hiện |
+|---|---|---|
+| 15p → 30p | 900 ⊄ 1800 | Nửa số mốc lệch lưới ⇒ `err=20`, chặn đúng. Log đầy lỗi, cấu hình mới coi như chưa ăn |
+| 30p → 15p | 1800 ⊂ 900 | **Mọi mốc đều lọt, không một lỗi nào.** Job lặng lẽ chạy nửa tần suất — sai mà không kêu |
+
+Ca thứ hai là ca nguy hiểm, và nó **không** tự lộ ra ở đâu cả.
+
+⇒ Cổng phía ứng dụng là **`JobConfigService`** (`reference/csharp/job/JobConfigService.cs`). API/màn hình vận hành đi qua đây, không gọi thẳng `SetJobScheduleAsync`:
+
+```
+① SP_SET_JOB_SCHEDULE          — DB là nguồn sự thật, ghi TRƯỚC
+② JobConfigCache.WriteAsync    — XOÁ SDI:JOB:CFG rồi ghi lại từ DB
+③ pod thấy ở nhịp ConfigEvery kế tiếp   (≤ 60 giây)
+```
+
+Thứ tự không được đảo: ghi cache trước rồi DB lỗi thì cache đang quảng cáo một cấu hình chưa từng tồn tại. Và bước ② hụt cũng không hỏng gì — DB đã đúng, `ConfigTtl` là lưới cuối.
+
+**Phải XOÁ khoá rồi mới ghi, không được `HashSet` chồng lên.** `HashSet` chỉ thêm/sửa field, không xoá field cũ. Ops *xoá chu kỳ* của một job ⇒ job biến mất khỏi `SP_GET_SCHEDULABLE_JOBS`, nhưng field cũ vẫn nằm trong hash ⇒ bộ quét vẫn đọc được chu kỳ cũ và vẫn sinh mốc. Và ca đó **không** bị `err=20` chặn: job không còn chu kỳ thì `UDF_JOB_SLOT_AT` trả `NULL`, phép đối chiếu lưới tự bỏ qua, mốc đi thẳng tới guard giờ giấc và **có thể chạy thật**. Tức là *"xoá chu kỳ mà job vẫn chạy"* — đúng câu hỏi rủi ro §3c.
+
+`ConfigTtl` hạ từ 1 giờ xuống **5 phút**: 1 giờ hợp lý hồi TTL còn là đường *duy nhất*; nay nó chỉ còn là thời gian tối đa một thay đổi "đi cửa sau" (`UPDATE T_JOB_DEFINITION` thẳng bằng script) nằm im.
 
 ### Trigger — ngoại lệ duy nhất trong repo, và vì sao
 

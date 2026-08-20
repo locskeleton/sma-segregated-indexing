@@ -4,7 +4,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
-using Newtonsoft.Json;
 using Serilog;
 using StackExchange.Redis;
 
@@ -219,44 +218,31 @@ public class JobSchedulerService : BackgroundService
         //   (30 giây) sẽ thấy lại và đẩy lại. Khác hẳn đường sinh mốc ở ScanAsync ④.
     }
 
+    /// <summary>
+    /// Nạp cấu hình lịch cho nhịp quét. Đây là ĐƯỜNG ĐỌC; đường GHI (lúc ops đổi lịch) nằm ở
+    /// <see cref="JobConfigService"/>, và cả hai ghi cache qua cùng một <see cref="JobConfigCache"/>.
+    ///
+    /// Cache trống KHÔNG phải lỗi — đó là trạng thái ngay sau khi ai đó đổi cấu hình, hoặc sau khi
+    /// TTL hết. Nạp từ DB rồi ghi lại cache cho các pod khác đỡ phải hỏi.
+    /// </summary>
     private async Task RefreshConfigAsync(CancellationToken ct)
     {
         _lastConfig = DateTime.UtcNow;
         try
         {
-            var cached = await _redis.HashGetAllAsync(JobRedisKeys.ConfigHash);
-            if (cached.Length > 0)
-            {
-                var list = new List<SchedulableJob>(cached.Length);
-                foreach (var e in cached)
-                {
-                    var j = JsonConvert.DeserializeObject<SchedulableJob>(e.Value!);
-                    if (j != null) list.Add(j);
-                }
-                _jobs = list;
-                return;
-            }
+            var cached = await JobConfigCache.ReadAsync(_redis);
+            if (cached != null) { _jobs = cached; return; }
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "[JOB] Đọc cache cấu hình lỗi — nạp thẳng từ DB");
         }
 
-        // Cache trống/hỏng ⇒ nạp từ DB (nguồn sự thật) rồi nạp lại cache cho các pod khác.
+        // Cache trống/hỏng ⇒ nạp từ DB (nguồn sự thật) rồi ghi lại cache cho các pod khác.
         var fromDb = await _db.GetSchedulableJobsAsync(ct);
         _jobs = fromDb;
-        try
-        {
-            var entries = new HashEntry[fromDb.Count];
-            for (var i = 0; i < fromDb.Count; i++)
-                entries[i] = new HashEntry(fromDb[i].JobCode, JsonConvert.SerializeObject(fromDb[i]));
-            if (entries.Length > 0)
-            {
-                await _redis.HashSetAsync(JobRedisKeys.ConfigHash, entries);
-                await _redis.KeyExpireAsync(JobRedisKeys.ConfigHash, JobRedisKeys.ConfigTtl);
-            }
-        }
-        catch (Exception ex) { Log.Warning(ex, "[JOB] Nạp lại cache cấu hình lỗi — bỏ qua"); }
+        try { await JobConfigCache.WriteAsync(_redis, fromDb); }
+        catch (Exception ex) { Log.Warning(ex, "[JOB] Ghi lại cache cấu hình lỗi — bỏ qua"); }
     }
 
     /// <summary>Lịch nghỉ ở T_TRADING_HOLIDAY. Nhớ theo NGÀY ⇒ tối đa 1 lượt hỏi DB mỗi ngày mỗi pod.</summary>

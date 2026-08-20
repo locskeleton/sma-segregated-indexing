@@ -10,6 +10,7 @@
 | `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
 | `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé RECOVER · cache cấu hình |
 | `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · RECOVER (30s, có vé + cửa chặn khung giờ) |
+| `JobConfigService.cs` | Cổng đổi lịch phía app: `SP_SET_JOB_SCHEDULE` → **nạp lại cache `SDI:JOB:CFG` ngay**. Bộ quét đọc chu kỳ từ cache chứ không từ DB, nên thiếu bước này thì đổi cấu hình không tới nơi |
 | `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM_SLOT` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |
 | `FoSnapshotJobHandler.cs` | Nghiệp vụ: scope → cắt 50 KH/batch → gọi FO → ingest RT → gộp master |
@@ -66,6 +67,8 @@ var (err, msg, purged) = await _db.SetJobScheduleAsync(
     user: currentUser, ct);
 Log.Information("[JOB] Đổi lịch: {Msg} (dọn {N} lượt chờ của cấu hình cũ)", msg, purged);
 ```
+
+Gọi qua **`JobConfigService.SetPeriodAsync`**, đừng gọi thẳng `SetJobScheduleAsync`: bộ quét đọc chu kỳ từ cache Redis, nên đổi lịch mà không nạp lại `SDI:JOB:CFG` thì DB nói 30 phút còn pod vẫn chạy 15 phút — tới hết `ConfigTtl`. Chiều 30p→15p còn tệ hơn: lưới cũ nằm gọn trong lưới mới nên **không sinh một lỗi nào**, job chỉ lặng lẽ chạy nửa tần suất.
 
 `SP_SET_JOB_SCHEDULE` làm hai việc trong **một giao dịch**: dọn sạch lượt `READY` sinh bởi cấu hình cũ, rồi mới ghi cấu hình mới. Nếu ai đó `UPDATE T_JOB_DEFINITION` thẳng (script vận hành, tool DB), **trigger `TR_JOB_DEFINITION_PURGE_PENDING` vẫn dọn** — luật không phụ thuộc vào việc người ta có đi qua cổng hay không.
 
