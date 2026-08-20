@@ -10,6 +10,7 @@
 | `JobTopicKeys.cs` | Topic/consumer group Kafka + hằng số nguồn đánh thức |
 | `JobRedisKeys.cs` | Khoá Redis: lọc mốc (`SET NX`) · vé RECOVER · cache cấu hình |
 | `JobSchedulerService.cs` | Quét lịch (10s, **0 lượt gọi DB/nhịp**) · RECOVER (30s, có vé + cửa chặn khung giờ) |
+| ⚠️ **Bản tối giản** | Đã gỡ lease, singleton, hạn tươi, `SP_JOB_RECOVER`. Xem banner đầu `docs/SDI-nearrt-fo-snapshot-design.md` |
 | `JobConfigService.cs` | Cổng đổi lịch phía app: `SP_SET_JOB_SCHEDULE` → **nạp lại cache `SDI:JOB:CFG` ngay**. Bộ quét đọc chu kỳ từ cache chứ không từ DB, nên thiếu bước này thì đổi cấu hình không tới nơi |
 | `JobDispatcherService.cs` | Consumer: `Consume` → **commit ngay** → `SP_JOB_CLAIM_SLOT` → chạy handler **ngoài vòng poll** |
 | `TradingWindowGuard.cs` | **Guard tầng 4** — chặn ngay trước từng HTTP call sang FO |

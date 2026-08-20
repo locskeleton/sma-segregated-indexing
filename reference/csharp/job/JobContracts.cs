@@ -110,14 +110,6 @@ public sealed class JobClaim
     public DateTime  SlotAt       { get; init; }
 }
 
-/// <summary>Một MỐC cần được produce lại (kết quả SP_JOB_RECOVER).</summary>
-public sealed class DueJob
-{
-    public string   JobCode { get; init; } = "";
-    public DateTime SlotAt  { get; init; }
-    public string   FireKey { get; init; } = "";
-}
-
 /// <summary>
 /// Cầu nối DB — map 1-1 sang proc trong db/11_JOB.sql. Cài bằng Dapper/ADO theo repo sẵn có.
 /// KHÔNG nhét logic vào đây: mọi quyết định (ai được chạy, còn trong giờ không) nằm TRONG SP,
@@ -130,7 +122,6 @@ public interface ISdiJobGateway
     /// thái ổn định gần như không gọi tới.
     /// </summary>
     Task<IReadOnlyList<SchedulableJob>> GetSchedulableJobsAsync(CancellationToken ct);
-    Task<IReadOnlyList<DueJob>> RecoverAsync(int staleSec, CancellationToken ct);               // SP_JOB_RECOVER
     /// <summary>`source` = 'kafka' | 'recover' | 'manual' → ghi vào T_JOB_RUN.C_CLAIM_SOURCE.
     /// Đừng bỏ tham số này: nó là thứ duy nhất phân biệt "chuông Pub/Sub đang chạy" với "chuông
     /// đã tắt từ lâu mà bộ hồi phục vẫn gánh" — hai trạng thái nhìn từ ngoài giống hệt nhau.</summary>

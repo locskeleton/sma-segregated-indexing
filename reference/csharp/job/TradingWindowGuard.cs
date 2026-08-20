@@ -23,6 +23,7 @@ public sealed class JobWindow
     /// = COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC) — CÙNG con số SP_JOB_CLAIM_SLOT dùng, nên tầng 2 và
     /// tầng 4 không thể lệch pha. Null = không hết hạn (job on-demand không chu kỳ).
     /// </summary>
+    /// <summary>⚠️ KHÔNG CÒN DÙNG (đã bỏ hạn tươi). Giữ để không phải sửa tầng đọc DB.</summary>
     public int?      MaxDelaySec     { get; init; }
 }
 
@@ -87,11 +88,10 @@ public sealed class TradingWindowGuard
     ///   ① Job còn bật không?
     ///   ② MỐC của lượt này có nằm trong khung giờ không? (mốc, KHÔNG phải `now` — lượt 15:00
     ///      claim lúc 15:00:03 vẫn hợp lệ; áp khung lên `now` là giết ảnh chụp đóng cửa)
-    ///   ③ Lượt này còn TƯƠI không — `now - slot &lt;= MaxDelaySec`?
+    ///   ③ ⚠️ ĐÃ BỎ — "lượt này còn tươi không". Xem chú thích trong thân hàm.
     ///
-    /// ③ là thứ thay cho toàn bộ khái niệm "khung + ân hạn" của bản trước. Số liệu near-realtime
-    /// chỉ có nghĩa TRONG phiên để PM ra quyết định; trễ 40 phút thì nó là số rác, và gọi FO lúc đó
-    /// vừa vô ích vừa vi phạm "ngoài giờ không gọi FO". Nên KHÔNG có cơ chế "gửi bằng được".
+    /// ⚠️ Bỏ ③ nghĩa là chấp nhận: một lượt trễ 40 phút vẫn gọi FO, và một chu kỳ của mốc cuối
+    /// phiên vẫn có thể gọi FO sau 15h. Cận trên duy nhất còn lại là timeout của HTTP client.
     /// </summary>
     /// <param name="slotAt">Mốc mà lượt chạy này đáng lẽ chạy (JobContext.SlotAt).</param>
     public async Task EnsureOpenAsync(DateTime slotAt, CancellationToken ct)
@@ -112,15 +112,18 @@ public sealed class TradingWindowGuard
                     $"Moc {slotAt:yyyy-MM-dd HH:mm:ss} nam ngoai khung {from}-{to}. DUNG goi FO.");
         }
 
-        // ③ HẠN TƯƠI — con số duy nhất quyết định "muộn quá thì thôi".
-        if (w.MaxDelaySec is { } maxDelay)
-        {
-            var age = (now - slotAt).TotalSeconds;
-            if (age > maxDelay)
-                throw new TradingWindowClosedException(
-                    $"Da {age:F0}s ke tu moc {slotAt:HH:mm:ss} (han tuoi {maxDelay}s) - so khong con " +
-                    $"la near-realtime. DUNG goi FO.");
-        }
+        // ③ ⚠️ ĐÃ BỎ HẠN TƯƠI (C_MAX_DELAY_SEC) — quyết định nghiệp vụ, và nó có giá:
+        //
+        //   Guard ② áp lên MỐC, không áp lên `now`. Mốc 15:00 vì thế hợp lệ VĨNH VIỄN. Hạn tươi
+        //   từng là con số DUY NHẤT trả lời "muộn thế này thì thôi", tức là thứ duy nhất chặn một
+        //   chu kỳ bò qua giờ đóng cửa. Bỏ nó ⇒ chu kỳ của mốc 15:00 mà FO trả lời chậm VẪN gọi FO
+        //   lúc 16h, 17h — qua sạch mọi tầng guard.
+        //
+        //   ⇒ CẬN TRÊN THỜI LƯỢNG CHU KỲ NAY NẰM HOÀN TOÀN Ở TIMEOUT CỦA HTTP CLIENT:
+        //         thời lượng ≈ ⌈số batch / parallel⌉ × timeout HTTP
+        //     và nó phải nhỏ hơn C_INTERVAL_SEC, nếu không các chu kỳ chồng lên nhau và SDI tự
+        //     nhân tải lên chính FO. KHÔNG có ràng buộc nào gác phép tính này — đặt timeout HTTP
+        //     quá lớn (hoặc 0 = vô hạn) là mở đúng cái cửa đó.
 
         // Lịch nghỉ nằm ở T_TRADING_HOLIDAY, không hard-code trong C#. Nhớ theo NGÀY: một chu kỳ
         //   chỉ nằm trong một ngày nên tối đa 1 lượt hỏi DB cho cả chu kỳ.

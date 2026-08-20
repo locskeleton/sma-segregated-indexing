@@ -44,11 +44,12 @@ BEGIN
 END
 GO
 
--- 3 cột: khớp CẢ result set của SP_SMK_SCAN (id,code) lẫn SP_JOB_RECOVER (id,code,payload).
---   Lệch cột thì INSERT..EXEC lỗi, và vì SP_JOB_RECOVER có XACT_ABORT ON nên nó ROLLBACK luôn cả
+-- 3 cột khớp result set của SP_SMK_SCAN.
+--   Lệch cột thì INSERT..EXEC lỗi, và vì proc có XACT_ABORT ON nên nó ROLLBACK luôn cả
 --   phần UPDATE đã chạy trước đó — hỏng im lặng, khó lần.
 CREATE TABLE #scan (id BIGINT, code VARCHAR(40), payload NVARCHAR(MAX));
--- SP_JOB_RECOVER nay trả MỐC (code, slot_at, fire_key) chứ không trả job_run_id — bộ quét không
+-- ⚠️ #rec: bảng tạm cũ dùng cho SP_JOB_RECOVER (đã bỏ). Giữ khai báo để các khối cũ không vỡ.
+-- (bộ quét không
 --   còn ghi DB lúc sinh job nên không có id nào để chở trong message Kafka.
 CREATE TABLE #rec (code VARCHAR(40), slot_at DATETIME, fire_key VARCHAR(64));
 DECLARE @R TABLE (id INT IDENTITY, name VARCHAR(90), ok BIT, detail NVARCHAR(300));
@@ -58,8 +59,10 @@ DECLARE @today DATE = CAST(@now AS DATE);
 DECLARE @isGD BIT = dbo.UDF_IS_BUSINESS_DATE(@today);
 
 /*--- dọn dữ liệu test cũ ---*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','SMK_NORT','FO_SNAPSHOT_RT');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_SGL','SMK_CFG','SMK_OND','SMK_FRESH','SMK_LATE','SMK_NORT');
+-- ⚠️ Danh sách này phải là TẬP CHA: giữ cả job của BẢN CŨ (SMK_SGL/FRESH/LATE) để dòng sót
+--   từ lần chạy trước bị dọn. Bỏ tên khỏi đây = ca kiểm đọc phải rác của phiên bản cũ.
+DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_CFG','SMK_OND','SMK_NORT','SMK_SGL','SMK_FRESH','SMK_LATE','FO_SNAPSHOT_RT');
+DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN','SMK_CFG','SMK_OND','SMK_NORT','SMK_SGL','SMK_FRESH','SMK_LATE');
 DELETE FROM T_SI_BALANCE     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_CURRENT     WHERE C_SI_ACCOUNT LIKE 'RT%';
 DELETE FROM T_SI_PORTFOLIO   WHERE C_SI_ACCOUNT LIKE 'RT%';
@@ -110,7 +113,7 @@ EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_ANY', @p_slot_at=@slotAny, @p_owner='pod
 INSERT INTO @R SELECT 'A2 ★ nhận mốc ⇒ err=0 + dòng sinh ra ĐÃ ở RUNNING (không qua trạng thái READY)',
   CASE WHEN @ec=0 AND @id IS NOT NULL
         AND EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='RUNNING'
-                     AND C_ATTEMPT=1 AND C_OWNER='pod-A' AND C_LEASE_UNTIL IS NOT NULL)
+                     AND C_ATTEMPT=1 AND C_OWNER='pod-A')
        THEN 1 ELSE 0 END, CONCAT('err=',@ec,' id=',@id);
 
 INSERT INTO @R SELECT 'A2 ★ fire_key tự suy từ MỐC (pod không phải tự format khoá)',
@@ -174,19 +177,23 @@ EXEC SP_JOB_HEARTBEAT @p_job_run_id=@id, @p_owner='pod-B', @p_still_mine=@mine O
 INSERT INTO @R SELECT 'A5 ★ heartbeat SAI chủ (pod zombie) ⇒ still_mine=0 ⇒ pod đó phải tự dừng',
   CASE WHEN @mine=0 THEN 1 ELSE 0 END, NULL;
 
--- A6. Lease hết hạn = pod chết → SP_JOB_RECOVER thu hồi, pod khác giành được
-UPDATE T_JOB_RUN SET C_LEASE_UNTIL=DATEADD(MINUTE,-5,@now) WHERE C_JOB_RUN_ID=@id;
-EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A6 SP_JOB_RECOVER: lease quá hạn ⇒ RUNNING→READY (không tăng attempt)',
-  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='READY'
-                     AND C_ATTEMPT=1 AND C_OWNER IS NULL) THEN 1 ELSE 0 END,
-  (SELECT CONCAT(C_STATUS,' attempt=',C_ATTEMPT) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
+-- A6. ⚠️ ĐÃ BỎ — "lease hết hạn ⇒ pod khác giành lại".
+--   Bản tối giản không có lease, nên KHÔNG có cách nào biết pod đã chết. Dòng RUNNING là bất khả
+--   xâm phạm. Ca kiểm thay thế nằm ở A6b bên dưới: nó chốt đúng hành vi MỚI (không ai giành lại).
 
--- A7. Lỗi → retry; hết lượt thử → FAILED (max_attempt=2)
+-- A7. Lỗi → retry; hết lượt thử → FAILED (max_attempt=2).
+--   ⚠️ Bản tối giản KHÔNG còn bộ hồi phục, nên dòng READY sau lần lỗi đầu KHÔNG ai đánh thức.
+--   Ca này gọi CLAIM_SLOT thẳng để đo đúng phần còn sống: đường (b) và bộ đếm số lần thử.
+--   Trong vận hành thật với FO (C_MAX_ATTEMPT=1) thì cả nhánh này không bao giờ chạy.
+EXEC SP_JOB_COMPLETE @p_job_run_id=@id, @p_owner='pod-A', @p_ok=0, @p_message=N'lỗi lần 1',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'A7 COMPLETE(lỗi) lần 1/2 ⇒ về READY chờ thử lại (nhưng KHÔNG ai đánh thức)',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id)='READY' THEN 1 ELSE 0 END,
+  (SELECT CONCAT(C_STATUS,' attempt=',C_ATTEMPT) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
 -- Cùng MỐC ⇒ SP_JOB_CLAIM_SLOT đi đường (b): dòng đã tồn tại, giành lại (READY→RUNNING, attempt+1).
 EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_ANY', @p_slot_at=@slotAny, @p_owner='pod-C',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-EXEC SP_JOB_COMPLETE @p_job_run_id=@id, @p_owner='pod-C', @p_ok=0, @p_message=N'lỗi giả lập',
+EXEC SP_JOB_COMPLETE @p_job_run_id=@id, @p_owner='pod-C', @p_ok=0, @p_message=N'lỗi lần 2',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 INSERT INTO @R SELECT 'A7 COMPLETE(lỗi) lần 2/2 ⇒ FAILED (không quay vòng vô tận)',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='FAILED') THEN 1 ELSE 0 END,
@@ -215,10 +222,10 @@ INSERT INTO @R SELECT 'A8 COMPLETE bởi ĐÚNG chủ ⇒ DONE + ghi số dòng'
 -- A9. Scheduler: job định kỳ, 2 lần quét trong CÙNG slot ⇒ đúng 1 lượt (10 pod cũng vậy)
 UPDATE T_JOB_DEFINITION SET C_INTERVAL_SEC=900, C_SINGLETON=0 WHERE C_JOB_CODE='SMK_ANY';
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY';
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;                       -- pod A quét
 DECLARE @pass1 INT = (SELECT COUNT(*) FROM #scan WHERE code='SMK_ANY');
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;                       -- pod B quét CÙNG slot, ngay sau đó
 DECLARE @pass2 INT = (SELECT COUNT(*) FROM #scan WHERE code='SMK_ANY');
 INSERT INTO @R SELECT 'A9 ★ 2 pod cùng quét slot ⇒ pod đầu tạo 1, pod sau tạo 0 (UQ fire_key quyết)',
@@ -242,39 +249,11 @@ DECLARE @k2 VARCHAR(64) = CONVERT(CHAR(8), DATEADD(SECOND,(DATEDIFF(SECOND,@m0,D
 INSERT INTO @R SELECT 'A9 ★ chu kỳ 30s: 2 slot trong CÙNG một phút ra 2 fire_key KHÁC nhau',
   CASE WHEN @k1 <> @k2 THEN 1 ELSE 0 END, CONCAT(@k1,' vs ',@k2);
 
--- A10. Singleton — dùng JOB RIÊNG (SMK_SGL), KHÔNG dùng lại SMK_ANY.
---   Vì sao: hai chu kỳ khác nhau vẫn có thể cho ra CÙNG một mốc slot (900s và 60s trùng nhau tại
---   mọi phút chia hết cho 15) ⇒ dùng lại job của A9 thì ca này PASS/FAIL theo giờ chạy smoke.
---   Đó chính là cách bug fire_key-thiếu-giây lộ ra: ca A10 fail trên DB sạch, pass trên DB cũ.
---   Test phải tất định — nếu nó phụ thuộc đồng hồ thì lần đỏ tiếp theo sẽ bị cho là "flaky" và bỏ qua.
-INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
-        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_SINGLETON)
-VALUES ('SMK_SGL',N'Job singleton (smoke)','SmokeHandler',1,60, NULL,NULL,0, 60, 2, 0, 1);
-
-EXEC SP_SMK_SCAN;
-INSERT INTO @R SELECT 'A10 job singleton mới ⇒ sinh đúng 1 lượt ở nhịp đầu',
-  CASE WHEN (SELECT COUNT(*) FROM #scan WHERE code='SMK_SGL')=1 THEN 1 ELSE 0 END, NULL;
-
--- lượt đó đang chạy (lease còn hiệu lực) ⇒ nhịp sau KHÔNG mở lượt mới
-UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-A', C_LEASE_UNTIL=DATEADD(MINUTE,5,@now)
- WHERE C_JOB_CODE='SMK_SGL';
-DECLARE @cntBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_SGL');
-DELETE #scan; DELETE #rec;
-EXEC SP_SMK_SCAN;
-INSERT INTO @R SELECT 'A10 singleton: lượt trước còn RUNNING ⇒ KHÔNG sinh lượt mới',
-  CASE WHEN (SELECT COUNT(*) FROM #scan WHERE code='SMK_SGL')=0
-        AND (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_SGL')=@cntBefore THEN 1 ELSE 0 END, NULL;
-
--- ... nhưng lease CHẾT thì slot kế tiếp KHÔNG bị chặn vĩnh viễn.
---   Lùi mốc slot của lượt cũ về quá khứ để nhịp này chắc chắn rơi vào slot KHÁC (tất định,
---   không phụ thuộc smoke chạy vào giây thứ mấy của phút).
-UPDATE T_JOB_RUN SET C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now), C_FIRE_KEY='19000101000000'
- WHERE C_JOB_CODE='SMK_SGL';
-DELETE #scan; DELETE #rec;
-EXEC SP_SMK_SCAN;
-INSERT INTO @R SELECT 'A10 ★ singleton + pod chết (lease hết hạn) ⇒ slot mới VẪN mở (không kẹt vĩnh viễn)',
-  CASE WHEN (SELECT COUNT(*) FROM #scan WHERE code='SMK_SGL')=1 THEN 1 ELSE 0 END,
-  CONCAT('sinh=',(SELECT COUNT(*) FROM #scan WHERE code='SMK_SGL'));
+-- A10. ⚠️ ĐÃ BỎ — singleton.
+--   Chặn chồng chu kỳ cần lease để biết lượt trước còn sống không. Bỏ lease ⇒ singleton vô nghĩa.
+--   Thứ chặn chồng chu kỳ nay nằm NGOÀI DB: (thời lượng chu kỳ) < C_INTERVAL_SEC, mà thời lượng
+--   = ⌈số batch / parallel⌉ × timeout HTTP client. KHÔNG có ca kiểm SQL nào phủ được nó.
+--   Ca A10b bên dưới chốt điều ngược lại: cấu hình KHÔNG được ghi C_SINGLETON=1 (nói dối).
 
 -- A11. GUARD TẦNG 2 + DỌN XÁC. Một lượt RETRY nằm chờ backoff, tới lúc được đẩy lại thì mốc của nó
 --   đã ra ngoài khung. Guard phải làm HAI việc: (1) chặn — err=3, và (2) ĐÓNG DẤU SKIPPED cho chính
@@ -310,10 +289,10 @@ INSERT INTO @R SELECT 'A11 ★ ...nhưng KHÔNG đụng dòng RUNNING của pod 
   CONCAT('err=',@ec,' status=',(SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idRun));
 
 -- A12. Job FO thật: khung 09:00–15:00 + chỉ ngày GD (đọc từ seed, không hard-code lại)
-INSERT INTO @R SELECT 'A12 seed FO_SNAPSHOT_RT: 15 phút · 09:00–15:00 · chỉ ngày GD · singleton',
+INSERT INTO @R SELECT 'A12 seed FO_SNAPSHOT_RT: 15 phút · 09:00–15:00 · chỉ ngày GD · KHÔNG singleton',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT'
                      AND C_INTERVAL_SEC=900 AND C_WINDOW_FROM='09:00:00' AND C_WINDOW_TO='15:00:00'
-                     AND C_BUSINESS_DAY_ONLY=1 AND C_SINGLETON=1 AND C_TIMEOUT_SEC<900)
+                     AND C_BUSINESS_DAY_ONLY=1 AND C_SINGLETON=0)
        THEN 1 ELSE 0 END, NULL;
 
 -- A12 ★★ LUẬT NGHIỆP VỤ: job FO KHÔNG BAO GIỜ chạy lại một mốc. Gọi FO là chạm lõi giao dịch
@@ -343,33 +322,31 @@ INSERT INTO @R SELECT 'A12 ★★ ...lượt FO lỗi ⇒ FAILED ngay, KHÔNG qu
 
 -- ...và pod chết (lease hết hạn) cũng KHÔNG ai giành lại được: RECOVER trả dòng về READY, nhưng
 --   CLAIM_SLOT đóng dấu FAILED (err=6) chứ không cho chạy. Mốc đó mất — đúng ý đồ.
-UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-chet', C_ENDED_AT=NULL,
-       C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now) WHERE C_JOB_RUN_ID=@idNR;
-DELETE #scan; DELETE #rec;
-INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 
--- ★★ RECOVER đóng dấu FAILED NGAY, KHÔNG đi vòng qua READY.
---   Trước đây dòng này phải qua RUNNING → READY → (produce lại vào Kafka) → CLAIM_SLOT → err=6
---   → FAILED: ba bước thừa để tới đúng một kết cục đã biết trước. Và ở khúc giữa nó nằm READY,
---   nên màn hình theo dõi báo "đang chờ chạy" cho một lượt đã hỏng hẳn.
---   Ca này chốt CẢ HAI vế: trạng thái đúng, VÀ không sinh message rác.
-INSERT INTO @R SELECT 'A12 ★★ ...RECOVER đóng dấu FAILED NGAY (không qua READY, không đẩy lại)',
-  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='FAILED'
-        AND NOT EXISTS(SELECT 1 FROM #rec WHERE code='SMK_NORT')
-       THEN 1 ELSE 0 END,
-  CONCAT((SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR),
-         ' · số mốc RECOVER đẩy lại=', (SELECT COUNT(*) FROM #rec WHERE code='SMK_NORT'));
-
-INSERT INTO @R SELECT 'A12 ★ ...và GIỮ C_OWNER của pod đã chết (manh mối đầu tiên khi đi tìm)',
-  CASE WHEN (SELECT C_OWNER FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='pod-chet' THEN 1 ELSE 0 END,
-  ISNULL((SELECT C_OWNER FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR),'(null)');
-
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod-B', @p_source='recover',
+-- ★★ A6b/A12: POD CHẾT ⇒ DÒNG NẰM 'RUNNING' VĨNH VIỄN, KHÔNG AI GIÀNH LẠI, KHÔNG AI ĐÓNG SỔ.
+--   Đây là hành vi ĐÃ CHẤP NHẬN của bản tối giản, không phải lỗi. Ca kiểm tồn tại để nó là một
+--   lựa chọn được ghi thành văn, chứ không phải một chỗ ai đó "sửa nhầm" thành đúng.
+UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-chet', C_ENDED_AT=NULL WHERE C_JOB_RUN_ID=@idNR;
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod-B', @p_source='kafka',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A12 ★★ ...pod chết cũng KHÔNG ai giành lại ⇒ err=6 + FAILED (mất mốc, có chủ đích)',
-  CASE WHEN @ec=6 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='FAILED'
+INSERT INTO @R SELECT 'A6b ★★ pod chết ⇒ dòng kẹt RUNNING vĩnh viễn, pod khác KHÔNG giành lại được',
+  CASE WHEN @ec<>0 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='RUNNING'
        THEN 1 ELSE 0 END,
   CONCAT('err=',@ec,' status=',(SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR));
+
+-- ...và SP_JOB_PURGE KHÔNG dọn nó (chỉ xoá DONE/SKIPPED) ⇒ tích tụ vĩnh viễn.
+DECLARE @pg BIGINT;
+UPDATE T_JOB_RUN SET C_STARTED_AT=DATEADD(DAY,-99,@now) WHERE C_JOB_RUN_ID=@idNR;
+EXEC SP_JOB_PURGE @p_keep_days=1, @p_rows=@pg OUTPUT;
+INSERT INTO @R SELECT 'A6b ★ ...và PURGE KHÔNG dọn xác RUNNING ⇒ cột "đang chạy" cộng dồn xác chết',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR AND C_STATUS='RUNNING')
+       THEN 1 ELSE 0 END, 'vẫn còn sau purge';
+
+-- A10b. Cấu hình KHÔNG được ghi C_SINGLETON=1: nó sẽ không chặn gì mà người đọc lại tin là có.
+INSERT INTO @R SELECT 'A10b ★ KHÔNG job nào để C_SINGLETON=1 (cấu hình không được nói dối)',
+  CASE WHEN NOT EXISTS(SELECT 1 FROM T_JOB_DEFINITION WHERE C_SINGLETON=1) THEN 1 ELSE 0 END,
+  CONCAT('số job còn bật singleton=',(SELECT COUNT(*) FROM T_JOB_DEFINITION WHERE C_SINGLETON=1));
+
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_NORT'; DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_NORT';
 -- Biên khung giờ tính TAY (không phụ thuộc lúc chạy smoke): 08:59 ngoài · 09:00 trong · 14:59 trong · 15:00 NGOÀI
 DECLARE @gd DATE = @today;
@@ -381,12 +358,9 @@ INSERT INTO @R SELECT 'A12 ★ SINH job: 08:59 NGOÀI · 09:00 TRONG · 15:00 TR
         AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60,    CAST(@gd AS DATETIME)))=1
         AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60+1,  CAST(@gd AS DATETIME)))=0
        THEN 1 ELSE 0 END, CONCAT('ngày GD dùng để test = ', CONVERT(VARCHAR(10),@gd,23));
--- CHẠY: KHÔNG còn khái niệm "khung + ân hạn". Chỉ còn HẠN TƯƠI (C_MAX_DELAY_SEC=600s) đo từ MỐC.
---   ⇒ lượt 15:00 hết hiệu lực lúc 15:10, bất kể nó nằm chờ hay đã thử lại mấy lần.
-INSERT INTO @R SELECT 'A12 ★★ hạn tươi neo vào MỐC: 15:00 mốc hợp lệ, hết hiệu lực sau 600s (15:10)',
-  CASE WHEN (SELECT C_MAX_DELAY_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=600
-        AND dbo.UDF_JOB_IN_WINDOW('FO_SNAPSHOT_RT', DATEADD(MINUTE,15*60, CAST(@gd AS DATETIME)))=1
-       THEN 1 ELSE 0 END, NULL;
+-- ⚠️ ĐÃ BỎ hạn tươi. Mốc 15:00 nay hợp lệ VĨNH VIỄN ⇒ một chu kỳ của mốc đó mà FO trả lời chậm
+--   VẪN gọi FO sau 15h. Ca kiểm A12z bên dưới chốt đúng sự thật đó, để nó không bị hiểu nhầm là
+--   "đã chặn rồi".
 -- Đếm ĐÚNG số mốc trong phiên — ví dụ nghiệp vụ đã chốt: khung 9h-15h, chu kỳ 1 tiếng ⇒ 7 mốc.
 DECLARE @n1h INT=0, @n15m INT=0, @sec INT;
 SET @sec = 9*3600;
@@ -744,30 +718,20 @@ INSERT INTO @R SELECT 'C5 * TẮT job: heartbeat trả still_mine=0 -> chu kỳ 
 EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_enabled=1, @p_user='ops',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
 
-/*---- C6. *** JOB QUÁ GIỜ KHÔNG ĐƯỢC CHẠY LẠI (lượt 14:59 hôm qua sống tới 9h hôm nay) ----*/
+/*---- C6. ⚠️ ĐÃ BỎ — "lượt 14:59 hôm qua không được chạy lại lúc 9h hôm nay".
+  Cả hai chốt chặn cũ đều dựa vào hạn tươi: SP_JOB_RECOVER đóng dấu SKIPPED, và SP_JOB_CLAIM_SLOT
+  từ chối mốc quá hạn. Bỏ hạn tươi ⇒ mốc cũ tồn đọng trong Kafka mà chưa từng chạy SẼ chạy khi
+  được consume, dù đã qua nhiều giờ. Ca C6b chốt lại đúng hành vi mới.                        ----*/
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
-VALUES ('SMK_CFG','HOMQUA1459','READY',DATEADD(HOUR,-18,@now),DATEADD(HOUR,-18,@now));
-DECLARE @oldId BIGINT = SCOPE_IDENTITY();
-DELETE #scan; DELETE #rec;
-INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C6 *** lượt 18 tiếng trước: RECOVER đóng dấu SKIPPED, KHÔNG đẩy lại để chạy',
-  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId)='SKIPPED'
-        AND NOT EXISTS(SELECT 1 FROM #rec WHERE fire_key='HOMQUA1459') THEN 1 ELSE 0 END,
-  (SELECT CONCAT(C_STATUS,' | ',LEFT(C_MESSAGE,55)) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId);
--- Chốt chặn THỨ HAI, độc lập với bộ hồi phục: giả sử RECOVER bỏ sót và message của lượt 18 tiếng
---   trước vẫn được đẩy lại vào Kafka, thì SP_JOB_CLAIM_SLOT vẫn phải chặn ở HẠN TƯƠI.
 DECLARE @slotHQ DATETIME = dbo.UDF_JOB_SLOT_AT('SMK_CFG', DATEADD(HOUR,-18,@now));
-UPDATE T_JOB_RUN SET C_STATUS='READY', C_ENDED_AT=NULL, C_SLOT_AT=@slotHQ,
-       C_FIRE_KEY=dbo.UDF_JOB_FIRE_KEY(@slotHQ) WHERE C_JOB_RUN_ID=@oldId;
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_CFG', @p_slot_at=@slotHQ, @p_owner='pod-A',
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_CFG', @p_slot_at=@slotHQ, @p_owner='pod-A', @p_source='kafka',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C6 * CLAIM lượt quá hạn: err=3 + SKIPPED (chốt chặn thứ hai, độc lập RECOVER)',
-  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@oldId)='SKIPPED'
-       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+INSERT INTO @R SELECT 'C6b ★★ mốc 18 TIẾNG TRƯỚC vẫn CHẠY ĐƯỢC (đã bỏ hạn tươi — đánh đổi đã chấp nhận)',
+  CASE WHEN @ec=0 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
 
 /*---- C7. CHƯA CÓ cấu hình chu kỳ: scheduler KHÔNG sinh, nhưng đẩy tay VẪN chạy ----*/
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;
 INSERT INTO @R SELECT 'C7 * chưa cấu hình chu kỳ (interval NULL): scheduler KHÔNG sinh lượt nào',
   CASE WHEN NOT EXISTS(SELECT 1 FROM #scan WHERE code='SMK_OND') THEN 1 ELSE 0 END, NULL;
@@ -785,8 +749,10 @@ INSERT INTO @R SELECT 'C7 * ...nhưng ĐẨY TAY thì vẫn chạy ngay (err=0, 
 INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
 VALUES ('SMK_OND','CHOLAU','READY',DATEADD(DAY,-3,@now),DATEADD(DAY,-3,@now));
 DECLARE @ondId BIGINT = SCOPE_IDENTITY();
-EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C8 * job on-demand: lượt đẩy tay KHÔNG tự bốc hơi dù đã chờ 3 ngày',
+-- Không còn bộ hồi phục nên KHÔNG có gì đụng vào dòng READY này — nó nằm đó vĩnh viễn.
+--   Trước đây ca này chứng minh "RECOVER không giết oan lượt on-demand"; nay nó chứng minh một
+--   điều yếu hơn nhưng vẫn đáng chốt: KHÔNG có đường nào tự đổi trạng thái sau lưng.
+INSERT INTO @R SELECT 'C8 * lượt đẩy tay chờ 3 ngày: KHÔNG ai tự đổi trạng thái (không có bộ hồi phục)',
   CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId)='READY' THEN 1 ELSE 0 END,
   (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@ondId);
 
@@ -798,7 +764,7 @@ VALUES ('SMK_CFG','RETRY9','READY',DATEADD(SECOND,30,@now),@now,@now,1);
 SET @cntC = (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='READY');
 EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_clear_interval=1, @p_user='ops',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;
 INSERT INTO @R SELECT 'C9 * XOÁ chu kỳ: dọn lượt chờ + scheduler ngừng sinh (job về chạy-theo-yêu-cầu)',
   CASE WHEN @cntC=1 AND @purgedC=1
@@ -830,26 +796,14 @@ DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
 EXEC SP_SET_JOB_SCHEDULE @p_job_code='SMK_CFG', @p_interval_sec=900, @p_user='ops',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_purged_runs=@purgedC OUTPUT;
 
-/*---- C10. Pod mới / mất message: lượt READY vẫn được nhặt lại (không mất job) ----*/
-DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
-VALUES ('SMK_CFG','MATMSG','READY',DATEADD(SECOND,-120,@now),DATEADD(SECOND,-120,@now));
-DECLARE @lostId BIGINT = SCOPE_IDENTITY();
-DELETE #scan; DELETE #rec;
-INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C10 * mất message Kafka ⇒ RECOVER trả MỐC để produce lại (lượt đã chạy dở không mất)',
-  CASE WHEN EXISTS(SELECT 1 FROM #rec WHERE fire_key='MATMSG') THEN 1 ELSE 0 END, NULL;
-DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT)
-VALUES ('SMK_CFG','VUASINH','READY',@now,@now);
-DELETE #scan; DELETE #rec;
-INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=60, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C10 lượt VỪA sinh (chưa quá stale_sec): RECOVER KHÔNG đẩy lại (khỏi produce trùng mỗi 30s)',
-  CASE WHEN NOT EXISTS(SELECT 1 FROM #rec WHERE code='SMK_CFG') THEN 1 ELSE 0 END, NULL;
+/*---- C10. ⚠️ ĐÃ BỎ — "mất message thì bộ hồi phục nhặt lại".
+  Không còn SP_JOB_RECOVER. Message thất lạc = MẤT MỐC, không dấu vết nào trong DB.
+  Không có cách nào viết ca kiểm cho một thứ không để lại dấu vết — đó chính là vấn đề: cách
+  duy nhất phát hiện là ĐẾM SỐ MỐC ĐÁNG LẼ CÓ rồi so với số dòng thực tế (chưa làm).      ----*/
 
 /*---- C11. KHÔNG back-fill: dừng dịch vụ nửa ngày rồi bật lại -> chỉ 1 lượt ----*/
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG';
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;
 INSERT INTO @R SELECT 'C11 * bật lại dịch vụ sau nhiều giờ: CHỈ sinh slot HIỆN TẠI, không dồn slot đã lỡ',
   CASE WHEN (SELECT COUNT(*) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG')=1 THEN 1 ELSE 0 END,
@@ -858,7 +812,7 @@ INSERT INTO @R SELECT 'C11 * bật lại dịch vụ sau nhiều giờ: CHỈ si
 /*---- C12. Dọn nhật ký KHÔNG được làm job chạy lại trong cùng slot ----*/
 UPDATE T_JOB_RUN SET C_STATUS='DONE', C_ENDED_AT=@now WHERE C_JOB_CODE='SMK_CFG';
 EXEC SP_JOB_PURGE @p_keep_days=0, @p_rows=@rows OUTPUT;   -- gọi ẩu: 0 ngày
-DELETE #scan; DELETE #rec;
+DELETE #scan;
 EXEC SP_SMK_SCAN;
 INSERT INTO @R SELECT 'C12 * PURGE keep_days=0 bị ép sàn 1 ngày: lượt hôm nay còn -> KHÔNG sinh lại slot vừa chạy',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_CFG' AND C_STATUS='DONE')
@@ -900,85 +854,17 @@ INSERT INTO @R SELECT 'C14 trả lại 15 phút: err=0',
   CASE WHEN @ec=0 AND (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT')=900
        THEN 1 ELSE 0 END, NULL;
 
-/*---- C15. HẠN TƯƠI neo vào MỐC SLOT — thay cho khái niệm "khung + ân hạn" đã bỏ ----*/
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
--- Khung 00:00-23:59 để mọi mốc đều nằm trong khung ⇒ cô lập đúng phép đo HẠN TƯƠI,
---   không phụ thuộc smoke chạy vào giờ nào trong ngày.
-INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_INTERVAL_SEC,
-        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_MAX_DELAY_SEC,C_SINGLETON)
---   Chu kỳ 60 giây: mốc lưới gần nhất luôn cũ dưới 60 giây ⇒ ca "còn tươi" KHÔNG phụ thuộc smoke
---   chạy vào lúc nào trong bucket. Để 900 thì mốc có thể cũ tới 899s và ca (a) đỏ theo giờ chạy.
-VALUES ('SMK_FRESH',N'Hạn tươi (smoke)','SmokeHandler',60,'00:00:00','23:59:00',0,300,3,600,0);
--- Job có khung giờ HẸP: dùng để kiểm "mốc nằm ngoài khung thì chặn", tách khỏi phép đo hạn tươi.
-INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_INTERVAL_SEC,
-        C_WINDOW_FROM,C_WINDOW_TO,C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_MAX_DELAY_SEC,C_SINGLETON)
---   Chu kỳ 1 ngày ⇒ lưới mốc = đúng nửa đêm. Khung 12:00–12:01 ⇒ mốc nửa đêm CHẮC CHẮN ngoài khung.
---   Hạn tươi 2 ngày ⇒ mốc đó VẪN còn tươi ⇒ ca này đo ĐÚNG guard khung giờ, không lẫn hạn tươi.
-VALUES ('SMK_LATE',N'Mốc ngoài khung (smoke)','SmokeHandler',86400,'12:00:00','12:01:00',0,300,3,172800,0);
+/*---- C15. ⚠️ ĐÃ BỎ TOÀN BỘ — hạn tươi (C_MAX_DELAY_SEC).
+  Bốn ca cũ ở đây (mốc còn tươi / quá hạn / retry không làm mới hạn / mốc ngoài khung) đều đo
+  một cơ chế nay không còn. Thay bằng MỘT ca nói đúng sự thật mới.                          ----*/
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY';
+DECLARE @slotXa DATETIME = DATEADD(SECOND,-86400,dbo.UDF_JOB_SLOT_AT('SMK_ANY',@now));
+EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_ANY', @p_slot_at=@slotXa, @p_owner='pod-A', @p_source='kafka',
+     @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+INSERT INTO @R SELECT 'C15 ★★ mốc cũ 24 TIẾNG vẫn claim được ⇒ KHÔNG còn cận trên tuổi mốc',
+  CASE WHEN @ec=0 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
+DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY';
 
--- (a) MỐC CÒN TƯƠI (60 giây trước) ⇒ CHẠY ĐƯỢC. Đây chính là ca "mốc 15:00 claim lúc 15:00:03":
---     nếu áp khung giờ lên @now thay vì lên MỐC thì ca này trượt và ảnh chụp đóng cửa chết yểu.
---   Mốc phải NẰM TRÊN LƯỚI của job, nếu không SP_JOB_CLAIM_SLOT từ chối err=20 (đúng như thiết kế).
-DECLARE @slotFresh DATETIME = dbo.UDF_JOB_SLOT_AT('SMK_FRESH', @now);              -- cũ 0..59 giây
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
-VALUES ('SMK_FRESH','TUOI','READY',@now,@slotFresh,@now);
-DECLARE @freshId BIGINT = SCOPE_IDENTITY();
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_FRESH', @p_slot_at=@slotFresh, @p_owner='pod-A',
-     @p_fire_key='TUOI', @p_source='kafka', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C15 ★ mốc còn TƯƠI (60s) ⇒ claim OK (mốc cuối phiên KHÔNG chết yểu)',
-  CASE WHEN @ec=0 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@freshId)='RUNNING'
-       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
-
--- (b) MỐC QUÁ HẠN TƯƠI (700 giây > 600) ⇒ SKIPPED, dù mốc vẫn nằm trong khung.
-DECLARE @slotStale DATETIME = DATEADD(SECOND,-1200,@slotFresh);   -- vẫn trên lưới, cũ 1200..1259 giây
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
-VALUES ('SMK_FRESH','HET','READY',@now,@slotStale,@now);
-DECLARE @staleId BIGINT = SCOPE_IDENTITY();
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_FRESH', @p_slot_at=@slotStale, @p_owner='pod-A',
-     @p_fire_key='HET', @p_source='kafka', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C15 ★ mốc quá HẠN TƯƠI (1200s > 600s) ⇒ err=3 + SKIPPED, dù vẫn trong khung',
-  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@staleId)='SKIPPED'
-       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
-
--- (c) RETRY KHÔNG làm mới hạn tươi. Đẩy C_RUN_AFTER lên hiện tại (giả lập vừa hết backoff) nhưng
---     giữ nguyên mốc cũ ⇒ vẫn phải SKIPPED. Nếu đo hạn tươi từ C_RUN_AFTER thì ca này lọt, và một
---     lượt thử lại mãi sẽ tự làm mới hạn của chính nó rồi bò qua giờ đóng cửa.
-UPDATE T_JOB_RUN SET C_STATUS='READY', C_ENDED_AT=NULL, C_RUN_AFTER=@now, C_ATTEMPT=1
- WHERE C_JOB_RUN_ID=@staleId;
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_FRESH', @p_slot_at=@slotStale, @p_owner='pod-A',
-     @p_fire_key='HET', @p_source='kafka', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C15 ★★ RETRY KHÔNG làm mới hạn tươi (đo từ MỐC, không phải C_RUN_AFTER)',
-  CASE WHEN @ec=3 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
-
--- (d) MỐC NGOÀI KHUNG ⇒ chặn, DÙ CÒN TƯƠI (hạn tươi của SMK_LATE để 2 ngày). Hai guard độc lập.
-DECLARE @slotOut DATETIME = dbo.UDF_JOB_SLOT_AT('SMK_LATE', @now);   -- lưới 1 ngày ⇒ đúng nửa đêm
-INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_SLOT_AT,C_ENQUEUED_AT)
-VALUES ('SMK_LATE','NGOAI','READY',@now,@slotOut,@now);
-DECLARE @outId BIGINT = SCOPE_IDENTITY();
-EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_LATE', @p_slot_at=@slotOut, @p_owner='pod-A',
-     @p_fire_key='NGOAI', @p_source='kafka', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'C15 ★ mốc NGOÀI khung (mốc nửa đêm vs khung 12:00-12:01) ⇒ chặn, dù còn tươi',
-  CASE WHEN @ec=3 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@outId)='SKIPPED'
-       THEN 1 ELSE 0 END, CONCAT('err=',@ec);
-
--- (e) Bộ quét ghi đúng MỐC SLOT (không phải thời điểm quét).
---   Chu kỳ SMK_FRESH là 60 giây nên mốc lưới gần nhất luôn cũ dưới 60 giây < hạn tươi 600 giây
---   ⇒ ca này KHÔNG phụ thuộc smoke chạy vào lúc nào trong ngày.
-DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH';
-DELETE #scan; DELETE #rec;
-EXEC SP_SMK_SCAN;
-INSERT INTO @R SELECT 'C15 ★ bộ quét ghi C_SLOT_AT = mốc slot (giây = 00, chia hết chu kỳ)',
-  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH'
-                     AND C_SLOT_AT IS NOT NULL
-                     AND DATEPART(SECOND, C_SLOT_AT)=0
-                     AND DATEDIFF(SECOND, CAST(CAST(C_SLOT_AT AS DATE) AS DATETIME), C_SLOT_AT)
-                         % (SELECT C_INTERVAL_SEC FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_FRESH') = 0)
-       THEN 1 ELSE 0 END,
-  (SELECT TOP 1 CONVERT(VARCHAR(19),C_SLOT_AT,120) FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_FRESH');
-
-DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
-DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_FRESH','SMK_LATE');
 
 DELETE FROM T_JOB_RUN        WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');
 DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE IN ('SMK_CFG','SMK_OND');

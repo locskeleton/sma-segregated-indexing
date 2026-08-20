@@ -36,11 +36,6 @@ public static class JobRedisKeys
     /// </summary>
     public static string SlotLock(string jobCode, string fireKey) => $"SDI:JOB:SLOT:{jobCode}:{fireKey}";
 
-    /// <summary>
-    /// Vé chạy `SP_JOB_RECOVER`. RECOVER idempotent nên chạy trùng KHÔNG sai — vé này thuần tuý để 10 pod
-    /// không cùng làm một việc mỗi 30 giây (20 lượt/phút → 2). Lấy hụt vé thì bỏ qua nhịp, không chờ.
-    /// </summary>
-    public const string RecoverTicket = "SDI:JOB:RECOVER";
 
     /// <summary>
     /// Cache cấu hình lịch (HASH: jobCode → JSON) — thứ bộ quét thật sự đọc để tính mốc.
@@ -65,7 +60,6 @@ public static class JobRedisKeys
     /// như bằng 0 — cache hết hạn thì đúng một pod đọc DB một lần rồi ghi lại cho cả cụm.
     /// </summary>
     public static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
-    public static readonly TimeSpan RecoverTicketTtl = TimeSpan.FromSeconds(25);   // < nhịp RECOVER 30s
 
     public static TimeSpan SlotTtl(int intervalSec) => TimeSpan.FromSeconds(Math.Max(60, intervalSec * 2));
 }

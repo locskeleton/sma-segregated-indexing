@@ -46,7 +46,6 @@ public sealed class SchedulableJob
 public class JobSchedulerService : BackgroundService
 {
     private static readonly TimeSpan ScanEvery   = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan RecoverEvery   = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ConfigEvery = TimeSpan.FromSeconds(60);
 
     private readonly IDatabase                 _redis;
@@ -56,7 +55,6 @@ public class JobSchedulerService : BackgroundService
 
     private IReadOnlyList<SchedulableJob> _jobs = Array.Empty<SchedulableJob>();
     private DateTime _lastConfig = DateTime.MinValue;
-    private DateTime _lastRecover   = DateTime.MinValue;
     private DateTime _bizDay     = DateTime.MinValue;
     private bool     _bizOk;
 
@@ -79,11 +77,6 @@ public class JobSchedulerService : BackgroundService
                 if (DateTime.UtcNow - _lastConfig > ConfigEvery) await RefreshConfigAsync(ct);
                 await ScanAsync(ct);
 
-                if (DateTime.UtcNow - _lastRecover > RecoverEvery)
-                {
-                    _lastRecover = DateTime.UtcNow;
-                    await RecoverAsync(ct);
-                }
 
             }
             catch (Exception ex)
@@ -159,72 +152,13 @@ public class JobSchedulerService : BackgroundService
     /// <summary>Cùng định dạng với UDF_JOB_FIRE_KEY. PHẢI có giây — xem chú thích hàm SQL đó.</summary>
     internal static string FireKey(DateTime slot) => slot.ToString("yyyyMMddHHmmss");
 
-    /// <summary>
-    /// ★ CỬA CHẶN TRƯỚC RECOVER — thứ giết nốt phần "quét DB liên tục" còn lại.
-    ///
-    /// RECOVER chỉ có việc khi CÓ THỂ đang tồn tại một lượt chạy sống: lượt READY chưa ai nhặt, hoặc
-    /// lượt RUNNING của một pod đã chết. Cả hai chỉ sinh ra trong khung giờ của job, và chết hẳn
-    /// sau `windowTo + maxDelay`. Ngoài khoảng đó **không có gì để thu hồi** — quét là quét không.
-    ///
-    /// Job FO chạy 09:00–15:00 ⇒ RECOVER chỉ cần chạy ~09:00–15:10. 18 tiếng còn lại mỗi ngày, cộng
-    /// toàn bộ T7/CN/lễ, bộ quét **không gửi một câu truy vấn nào**.
-    /// Job KHÔNG khai khung giờ ⇒ luôn coi là mở (đúng: nó có thể chạy bất cứ lúc nào).
-    ///
-    /// ★ PHẢI kiểm cả NGÀY GD, không chỉ giờ. Thiếu vế đó thì mỗi thứ Bảy/Chủ nhật, từ 09:00 đến
-    ///   15:10, RECOVER vẫn nã DB mỗi 30 giây để tìm thứ không thể tồn tại — đúng cái mà chú thích
-    ///   ngay trên đã hứa là không xảy ra. `IsBusinessDayAsync` nhớ theo ngày nên tốn tối đa 1 lượt
-    ///   hỏi DB mỗi ngày mỗi pod.
-    /// </summary>
-    private async Task<bool> AnyWindowOpenAsync(DateTime now)
-    {
-        foreach (var j in _jobs)
-        {
-            if (j.WindowFrom is not { } from || j.WindowTo is not { } to) return true;  // không khai khung ⇒ luôn mở
-            var until = to + TimeSpan.FromSeconds(j.MaxDelaySec ?? j.IntervalSec);
-            if (now.TimeOfDay < from || now.TimeOfDay > until) continue;
-            if (j.BusinessDayOnly && !await IsBusinessDayAsync(now.Date)) continue;
-            return true;
-        }
-        return false;
-    }
+    // ⚠️ ĐÃ BỎ: AnyWindowOpenAsync + RecoverAsync (bộ hồi phục).
+    //   SP_JOB_RECOVER chỉ kích hoạt bằng `C_LEASE_UNTIL < now`. Bản tối giản không ghi lease nên
+    //   nó vĩnh viễn không làm gì ⇒ giữ lại chỉ là một proc nằm im giả vờ có tác dụng.
+    //   HỆ QUẢ ĐÃ CHẤP NHẬN: message Kafka thất lạc = MẤT MỐC, không dấu vết nào trong DB;
+    //   pod chết giữa chừng = dòng nằm RUNNING vĩnh viễn, không ai đóng sổ.
+    //   Cách phát hiện duy nhất còn lại là ĐẾM SỐ MỐC ĐÁNG LẼ CÓ rồi so với số dòng thực tế.
 
-    private async Task RecoverAsync(CancellationToken ct)
-    {
-        // Không có khung nào đang mở ⇒ không thể có lượt chạy nào sống ⇒ khỏi hỏi DB.
-        if (!await AnyWindowOpenAsync(TradingWindowGuard.NowVn())) return;
-
-        try
-        {
-            // Vé: lấy hụt thì pod khác đang lo, bỏ qua nhịp này.
-            var got = await _redis.StringSetAsync(JobRedisKeys.RecoverTicket, _owner,
-                JobRedisKeys.RecoverTicketTtl, When.NotExists);
-            if (!got) return;
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "[JOB] Redis lỗi khi lấy vé RECOVER — chạy RECOVER luôn (idempotent)");
-        }
-
-        // SP_JOB_RECOVER thu về hai loại: lượt RUNNING của pod đã chết (lease hết hạn) và lượt
-        //   READY nằm quá lâu không ai nhặt. Cả hai đều đã có dòng T_JOB_RUN nên đẩy lại được.
-        // ⚠️ Cái nó KHÔNG bắt được: message thất lạc TRƯỚC khi có pod nào giành mốc — lúc đó chưa
-        //   có dòng nào để tìm. Đó là cái giá đã biết của việc bỏ ghi DB lúc sinh job.
-        var revived = await _db.RecoverAsync(staleSec: 30, ct);
-        if (revived.Count > 0)
-            Log.Warning("[JOB] RECOVER: {N} lượt bị bỏ rơi (pod chết / không ai nhặt) — produce lại", revived.Count);
-        foreach (var r in revived)
-            await NotifyAsync(r.JobCode, r.SlotAt, r.FireKey, JobTopicKeys.SourceRecover, ct);
-        // Ở đây KHÔNG trả khoá mốc khi produce hụt: dòng T_JOB_RUN vẫn còn, nhịp RECOVER sau
-        //   (30 giây) sẽ thấy lại và đẩy lại. Khác hẳn đường sinh mốc ở ScanAsync ④.
-    }
-
-    /// <summary>
-    /// Nạp cấu hình lịch cho nhịp quét. Đây là ĐƯỜNG ĐỌC; đường GHI (lúc ops đổi lịch) nằm ở
-    /// <see cref="JobConfigService"/>, và cả hai ghi cache qua cùng một <see cref="JobConfigCache"/>.
-    ///
-    /// Cache trống KHÔNG phải lỗi — đó là trạng thái ngay sau khi ai đó đổi cấu hình, hoặc sau khi
-    /// TTL hết. Nạp từ DB rồi ghi lại cache cho các pod khác đỡ phải hỏi.
-    /// </summary>
     private async Task RefreshConfigAsync(CancellationToken ct)
     {
         _lastConfig = DateTime.UtcNow;

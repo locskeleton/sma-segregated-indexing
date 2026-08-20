@@ -27,11 +27,13 @@ GO
   *** BA NGUYÊN TẮC (kế thừa docs/SDI-kafka-batch-sync-design.md) ***
    ① TẦNG NHẮN TIN lo TỐC ĐỘ, DB lo TÍNH ĐÚNG. Kafka là CHUÔNG CỬA (đánh thức worker), Redis là
      BỘ LỌC TRƯỚC (để bộ quét lịch không chạm DB mỗi nhịp); quyền "ai được chạy lượt này" nằm ở
-     T_JOB_RUN — một UPDATE có điều kiện. Kafka/Redis chết ⇒ job chậm tối đa một nhịp
-     SP_JOB_RECOVER, KHÔNG BAO GIỜ chạy hai lần, KHÔNG mất.
-   ② Ngoài khung giờ GD thì TUYỆT ĐỐI không gọi FO — chặn ở 3 tầng ĐỘC LẬP (§ dưới), vì
-     một tầng bất kỳ cũng có thể bị qua mặt (job nằm chờ trong hàng đợi vắt qua 15h00 là tình
-     huống BÌNH THƯỜNG, không phải ngoại lệ hiếm).
+     T_JOB_RUN — INSERT vào UQ(job_code, fire_key). Kafka/Redis chết ⇒ KHÔNG BAO GIỜ chạy hai
+     lần. Nhưng CÓ THỂ MẤT một mốc: bản tối giản này KHÔNG có lưới hồi phục (xem khối dưới).
+   ② Ngoài khung giờ GD thì không SINH mốc mới — guard áp lên MỐC ở cả bộ quét lẫn
+     SP_JOB_CLAIM_SLOT. ⚠️ LƯU Ý ĐÁNH ĐỔI ĐÃ CHẤP NHẬN: guard neo vào MỐC, không neo vào "bây
+     giờ", nên một chu kỳ của mốc 15:00 mà FO trả lời chậm VẪN có thể gọi FO sau 15h. Bản đầy đủ
+     chặn ca này bằng hạn tươi (C_MAX_DELAY_SEC); bản tối giản đã BỎ hạn tươi theo quyết định
+     nghiệp vụ, nên cận trên thời lượng chu kỳ giờ hoàn toàn nằm ở timeout của HTTP client.
    ③ Dòng RT KHÔNG BAO GIỜ đè dòng EOD, và KHÔNG BAO GIỜ được coi là số chốt (cột C_SRC).
 
   *** GUARD KHUNG GIỜ — 3 TẦNG, CỐ Ý TRÙNG NHAU ***
@@ -56,7 +58,6 @@ GO
     ┌ LUỒNG CHÍNH (chạy mỗi lượt job) ────────────────────────────────────────────────────────┐
     │ UDF_JOB_NOW · UDF_JOB_IN_WINDOW                                                          │
     │ SP_JOB_CLAIM_SLOT → SP_JOB_HEARTBEAT → SP_JOB_COMPLETE                                   │
-    │ SP_JOB_RECOVER  (30s/lần, CHỈ khi có khung giờ đang mở)                                  │
     │ [tầng B] SP_GET_FO_SNAPSHOT_SCOPE → SP_INGEST_FO_SNAPSHOT_RT → SP_RT_MASTER_AGG          │
     └──────────────────────────────────────────────────────────────────────────────────────────┘
     ┌ NGOÀI LUỒNG CHÍNH ───────────────────────────────────────────────────────────────────────┐
@@ -111,7 +112,8 @@ GO
 DROP PROCEDURE IF EXISTS SP_JOB_ENQUEUE;       -- gộp vào SP_JOB_CLAIM_SLOT
 DROP PROCEDURE IF EXISTS SP_JOB_CLAIM;         -- gộp vào SP_JOB_CLAIM_SLOT
 DROP PROCEDURE IF EXISTS SP_JOB_ENQUEUE_DUE;   -- bộ quét chuyển lên pod (Redis + Kafka)
-DROP PROCEDURE IF EXISTS SP_JOB_REAP;          -- đổi tên thành SP_JOB_RECOVER
+DROP PROCEDURE IF EXISTS SP_JOB_REAP;          -- đổi tên thành SP_JOB_RECOVER (rồi cũng bị bỏ)
+DROP PROCEDURE IF EXISTS SP_JOB_RECOVER;       -- BỎ: không còn lease ⇒ không có cách nào biết pod đã chết
 DROP FUNCTION  IF EXISTS UDF_JOB_CAN_RUN;      -- thay bằng hạn tươi neo vào MỐC (C_MAX_DELAY_SEC)
 GO
 
@@ -155,7 +157,9 @@ CREATE TABLE T_JOB_DEFINITION (
     C_TIMEOUT_SEC       INT           NOT NULL CONSTRAINT DF_JOB_DEF_TO  DEFAULT 300, -- lease: quá hạn mà không heartbeat ⇒ coi như pod chết
     C_MAX_ATTEMPT       INT           NOT NULL CONSTRAINT DF_JOB_DEF_MA  DEFAULT 3,
     C_RETRY_DELAY_SEC   INT           NOT NULL CONSTRAINT DF_JOB_DEF_RD  DEFAULT 60,
-    C_SINGLETON         BIT           NOT NULL CONSTRAINT DF_JOB_DEF_SGL DEFAULT 1,  -- 1 = lượt trước còn chạy thì KHÔNG sinh lượt mới
+    -- ⚠️ KHÔNG CÒN DÙNG: chặn chồng chu kỳ cần lease để biết lượt trước còn sống hay không.
+    --    Bỏ lease ⇒ cột này vô nghĩa. Mặc định đổi sang 0 để cấu hình không nói dối.
+    C_SINGLETON         BIT           NOT NULL CONSTRAINT DF_JOB_DEF_SGL DEFAULT 0,
     C_PRIORITY          INT           NOT NULL CONSTRAINT DF_JOB_DEF_PRI DEFAULT 100,
     C_PAYLOAD           NVARCHAR(MAX) NULL,           -- payload mặc định (JSON) cho lượt định kỳ
     C_UPDATED_BY        VARCHAR(64)   NULL,
@@ -207,11 +211,22 @@ GO
     ⇒ Chống trùng nằm ở RÀNG BUỘC DỮ LIỆU, không nằm ở lock, không nằm ở Redis, không nằm ở
       "hy vọng consumer group giao đúng một lần".
 
-  VÒNG ĐỜI:  READY ──claim──> RUNNING ──> DONE
-                ▲                 │  └──> FAILED ──(còn lượt thử)──> READY (sau C_RETRY_DELAY_SEC)
-                │                 │                └──(hết lượt)──> FAILED
-                └── SP_JOB_RECOVER ──┘ (lease quá hạn = pod chết giữa chừng)
-                              └────> SKIPPED (ra ngoài khung giờ khi tới lượt chạy)
+  VÒNG ĐỜI (bản tối giản — MỘT chiều, không có đường quay lại):
+
+        (không có dòng) ──claim──> RUNNING ──> DONE
+                                      │
+                                      ├──> FAILED    (chạy lỗi, hoặc hết lượt thử)
+                                      ├──> SKIPPED   (mốc ra ngoài khung giờ khi tới lượt chạy)
+                                      └──> RUNNING VĨNH VIỄN  ⚠️ pod chết giữa chừng
+
+  ⚠️ NHÁNH CUỐI LÀ CÓ CHỦ Ý, KHÔNG PHẢI THIẾU SÓT. Không có lease ⇒ không có cách nào phân biệt
+     "pod đang chạy thật" với "pod đã chết từ tháng trước": cả hai đều là RUNNING. Nên không ai
+     được phép đụng vào dòng RUNNING, và không có bộ hồi phục nào để đóng sổ nó.
+     Hệ quả: pod chết = MẤT mốc đó (mốc sau 15 phút bù) + để lại một dòng RUNNING không bao giờ
+     được dọn (SP_JOB_PURGE chỉ xoá DONE/SKIPPED).
+  ⚠️ ⇒ Cột "đang chạy" trên màn hình theo dõi là số CỘNG DỒN cả xác chết. Đừng dựng cảnh báo trên
+     nó, và cũng đừng dựng cảnh báo trên C_STATUS='DONE' — một chu kỳ chỉ lấy được 40% khách hàng
+     vẫn là DONE. Thứ nói lên sự thật là C_SI_COUNT_RT / C_SI_COUNT_TOTAL (coverage).
 ===========================================================================*/
 IF OBJECT_ID('T_JOB_RUN') IS NULL
 CREATE TABLE T_JOB_RUN (
@@ -224,7 +239,7 @@ CREATE TABLE T_JOB_RUN (
     C_PAYLOAD        NVARCHAR(MAX)  NULL,
     C_ATTEMPT        INT            NOT NULL CONSTRAINT DF_JOB_RUN_AT  DEFAULT 0,
     C_OWNER          VARCHAR(64)    NULL,             -- pod đang giữ (hostname/podname)
-    C_LEASE_UNTIL    DATETIME       NULL,             -- hết hạn mà không heartbeat ⇒ SP_JOB_RECOVER thu hồi
+    C_LEASE_UNTIL    DATETIME       NULL,             -- ⚠️ KHÔNG CÒN DÙNG (bỏ lease). Giữ cột để không phải migration ngược nếu bật lại.
     C_HEARTBEAT_AT   DATETIME       NULL,
     C_RUN_AFTER      DATETIME       NOT NULL CONSTRAINT DF_JOB_RUN_RA  DEFAULT GETDATE(),  -- backoff sau khi FAILED
     -- ★ MỐC mà lượt này ĐÁNG LẼ chạy. Job định kỳ: đúng mốc slot (09:00, 09:15…). Job đẩy tay:
@@ -232,7 +247,7 @@ CREATE TABLE T_JOB_RUN (
     --   Không suy ra từ C_ENQUEUED_AT được: bộ quét chạy mỗi 10 giây nên nó tạo lượt 15:00 vào lúc
     --   15:00:04, và mọi phép so khung giờ dựa trên con số đó sẽ trượt mốc cuối phiên.
     C_SLOT_AT        DATETIME       NULL,
-    -- AI ĐÁNH THỨC lượt chạy này: 'kafka' (đường bình thường) | 'recover' (SP_JOB_RECOVER nhặt lại
+    -- AI ĐÁNH THỨC lượt chạy này: 'kafka' (đường bình thường) | 'recover' (đã bỏ, giữ giá trị cũ
     --   vì message thất lạc / pod chết) | 'manual'. ⚠️ KHÔNG phải cột trang trí: nếu chuông Kafka
     --   hỏng thì hệ VẪN CHẠY ĐÚNG nhờ bộ hồi phục, chỉ chậm ~30 giây — và không ai nhận ra.
     --   Thấy cột này toàn 'recover' nghĩa là chuông cửa đã tắt từ lâu.
@@ -249,10 +264,10 @@ CREATE TABLE T_JOB_RUN (
     CONSTRAINT CK_JOB_RUN_STATUS CHECK (C_STATUS IN ('READY','RUNNING','DONE','FAILED','SKIPPED'))
 );
 GO
--- Quét của SP_JOB_RECOVER: luôn lọc theo trạng thái trước.
+-- Quét theo trạng thái (SP_GET_JOB_STATUS, SP_JOB_PURGE).
 IF IndexProperty(OBJECT_ID('T_JOB_RUN'),'IX_JOB_RUN_STATUS','IndexID') IS NULL
 CREATE INDEX IX_JOB_RUN_STATUS ON T_JOB_RUN (C_STATUS, C_RUN_AFTER)
-    INCLUDE (C_JOB_CODE, C_LEASE_UNTIL, C_ATTEMPT, C_ENQUEUED_AT);
+    INCLUDE (C_JOB_CODE, C_ATTEMPT, C_ENQUEUED_AT);
 GO
 -- Màn hình theo dõi + SP_JOB_PURGE: tra theo job & thời gian.
 IF IndexProperty(OBJECT_ID('T_JOB_RUN'),'IX_JOB_RUN_CODE_TIME','IndexID') IS NULL
@@ -523,7 +538,7 @@ GO
   ★ VÌ SAO PHẢI CÓ: từ khi bộ quét thôi ghi DB, đường thường KHÔNG để lại dòng nào — guard chặn
     là chặn trong không khí, đúng và rẻ. Nhưng vẫn còn HAI nguồn sinh ra dòng nằm chờ:
       · lượt RETRY (SP_JOB_COMPLETE thất bại ⇒ đặt lại READY + backoff),
-      · lượt bị SP_JOB_RECOVER thu về READY.
+      · (không còn nguồn nào khác — bộ hồi phục đã bị bỏ).
     Những dòng đó có thể sống qua giờ đóng cửa / quá hạn tươi. Nếu guard chỉ RETURN err=3 mà không
     đụng vào dòng, nó nằm READY VĨNH VIỄN: mỗi lần được đẩy lại đều bị chặn, không bao giờ kết thúc,
     và SP_GET_JOB_STATUS đếm nó là "đang tồn đọng" mãi mãi.
@@ -585,10 +600,8 @@ BEGIN
     SET @p_err_code=0; SET @p_err_msg=NULL; SET @p_job_run_id=NULL;
     BEGIN TRY
         DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-        DECLARE @en BIT, @timeout INT, @maxatt INT, @maxdelay INT, @payload NVARCHAR(MAX), @singleton BIT;
-        SELECT @en=C_ENABLED, @timeout=C_TIMEOUT_SEC, @maxatt=C_MAX_ATTEMPT,
-               @maxdelay=COALESCE(C_MAX_DELAY_SEC, C_INTERVAL_SEC),
-               @payload=C_PAYLOAD, @singleton=C_SINGLETON
+        DECLARE @en BIT, @maxatt INT, @payload NVARCHAR(MAX);
+        SELECT @en=C_ENABLED, @maxatt=C_MAX_ATTEMPT, @payload=C_PAYLOAD
         FROM T_JOB_DEFINITION WHERE C_JOB_CODE=@p_job_code;
 
         IF @en IS NULL
@@ -624,29 +637,6 @@ BEGIN
             RETURN;
         END
 
-        -- ★ GUARD HẠN TƯƠI — đo từ MỐC nên là mốc TUYỆT ĐỐI: lượt 15:00 hết hiệu lực lúc 15:10,
-        --   bất kể nó đã nằm chờ hay đã thử lại mấy lần. Số near-realtime trễ 40 phút là số rác.
-        DECLARE @age INT = DATEDIFF(SECOND, @p_slot_at, @now);
-        IF @maxdelay IS NOT NULL AND @age > @maxdelay
-        BEGIN
-            SET @p_err_code=3;
-            SET @p_err_msg=CONCAT(N'Đã ', @age, N' giây kể từ mốc ', CONVERT(VARCHAR(19),@p_slot_at,120),
-                                  N' (hạn tươi ', @maxdelay, N's) — số không còn là near-realtime.');
-            EXEC SP_JOB_MARK_SKIPPED @p_job_code, @fk, @p_err_msg;
-            RETURN;
-        END
-
-        -- ★ SINGLETON — lượt TRƯỚC còn chạy (lease còn hiệu lực) thì không mở lượt mới.
-        --   Lease HẾT HẠN không tính là "đang chạy": pod đó đã chết, để bộ hồi phục thu về.
-        IF @singleton = 1 AND EXISTS (SELECT 1 FROM T_JOB_RUN r
-                                      WHERE r.C_JOB_CODE=@p_job_code AND r.C_STATUS='RUNNING'
-                                        AND r.C_LEASE_UNTIL > @now AND r.C_FIRE_KEY <> @fk)
-        BEGIN
-            SET @p_err_code=7;
-            SET @p_err_msg=CONCAT(N'Job ', @p_job_code, N' đang chạy (singleton) — không mở lượt mới.');
-            RETURN;
-        END
-
         DECLARE @id BIGINT = NULL;
 
         -- ── (a) ĐƯỜNG THƯỜNG: mốc chưa có dòng nào ⇒ INSERT thẳng ở trạng thái RUNNING.
@@ -664,12 +654,15 @@ BEGIN
         SET XACT_ABORT OFF;
         BEGIN TRY
             INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_BUSINESS_DATE,C_PAYLOAD,
-                                   C_ATTEMPT,C_OWNER,C_LEASE_UNTIL,C_HEARTBEAT_AT,
+                                   C_ATTEMPT,C_OWNER,C_HEARTBEAT_AT,
                                    C_RUN_AFTER,C_SLOT_AT,C_CLAIM_SOURCE,C_ENQUEUED_AT,C_STARTED_AT,C_MESSAGE)
             VALUES (@p_job_code, @fk, 'RUNNING', CAST(@p_slot_at AS DATE), @payload,
-                    1, @p_owner, DATEADD(SECOND, ISNULL(@timeout,300), @now), @now,
+                    1, @p_owner, @now,
                     @now, @p_slot_at, @p_source, @now, @now,
-                    CONCAT(N'claim slot ', @fk));
+                    -- ★ GHI OWNER VÀO CẢ C_MESSAGE: khoá Redis giữ owner nhưng có TTL, còn dòng
+                    --   RUNNING mồ côi thì sống vĩnh viễn ⇒ sau khi khoá hết hạn, đây là manh mối
+                    --   DUY NHẤT còn lại để biết pod nào đã chết.
+                    CONCAT(N'claim slot ', @fk, N' · pod=', @p_owner));
             SET @id = SCOPE_IDENTITY();
         END TRY
         BEGIN CATCH
@@ -700,13 +693,13 @@ BEGIN
             UPDATE T_JOB_RUN
                SET C_STATUS='RUNNING', C_OWNER=@p_owner, C_ATTEMPT=C_ATTEMPT+1,
                    C_STARTED_AT=@now, C_HEARTBEAT_AT=@now,
-                   C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
                    C_CLAIM_SOURCE=ISNULL(@p_source, C_CLAIM_SOURCE), C_ENDED_AT=NULL
-             WHERE C_JOB_RUN_ID=@curId
-               AND ( C_STATUS='READY'                                    -- retry / vừa bị thu hồi
-                  OR (C_STATUS='RUNNING' AND C_LEASE_UNTIL < @now) );   -- giành lại từ pod đã chết
-            --   ★ KHÔNG có 'FAILED' ở đây: FAILED là trạng thái KẾT THÚC. Cho nó vào là một lượt đã
-            --     chốt hỏng bị đánh thức lại — đúng thứ mà C_MAX_ATTEMPT sinh ra để chặn.
+             WHERE C_JOB_RUN_ID=@curId AND C_STATUS='READY';
+            --   ★ CHỈ 'READY'. KHÔNG còn nhánh "giành lại từ pod đã chết" (C_LEASE_UNTIL < @now):
+            --     bỏ lease nghĩa là bỏ luôn khả năng biết pod đã chết hay chưa, nên dòng RUNNING
+            --     là BẤT KHẢ XÂM PHẠM — kể cả khi chủ của nó đã biến mất từ lâu.
+            --     Hệ quả đã được chấp nhận: pod chết = mất mốc đó, dòng nằm RUNNING vĩnh viễn.
+            --   ★ KHÔNG có 'FAILED': FAILED là trạng thái KẾT THÚC.
 
             IF @@ROWCOUNT = 0
             BEGIN
@@ -719,7 +712,7 @@ BEGIN
 
         SET @p_job_run_id = @id;
         SELECT r.C_JOB_RUN_ID, r.C_JOB_CODE, d.C_HANDLER, r.C_FIRE_KEY, r.C_BUSINESS_DATE,
-               r.C_PAYLOAD, r.C_ATTEMPT, r.C_LEASE_UNTIL, d.C_TIMEOUT_SEC, r.C_SLOT_AT, r.C_CLAIM_SOURCE
+               r.C_PAYLOAD, r.C_ATTEMPT, r.C_SLOT_AT, r.C_CLAIM_SOURCE
         FROM T_JOB_RUN r
         LEFT JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
         WHERE r.C_JOB_RUN_ID=@id;
@@ -746,16 +739,12 @@ AS
 BEGIN
     SET NOCOUNT ON;
     DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-    DECLARE @timeout INT = (SELECT d.C_TIMEOUT_SEC FROM T_JOB_RUN r
-                            INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-                            WHERE r.C_JOB_RUN_ID=@p_job_run_id);
     -- ★ INNER JOIN + C_ENABLED=1: TẮT job là DỪNG ĐƯỢC CẢ CHU KỲ ĐANG CHẠY. Không có vế này thì
     --   "tắt khẩn cấp" chỉ chặn được lượt SAU, còn chu kỳ đang bắn 1000 request sang FO vẫn bắn nốt
     --   — tức là đúng lúc cần tắt nhất thì nút tắt không có tác dụng. Worker thấy still_mine=0 sẽ
     --   tự huỷ token và dừng trong ~20 giây (nhịp heartbeat).
     UPDATE r
        SET r.C_HEARTBEAT_AT=@now,
-           r.C_LEASE_UNTIL=DATEADD(SECOND, ISNULL(@timeout,300), @now),
            r.C_ROWS=ISNULL(@p_rows, r.C_ROWS)
       FROM T_JOB_RUN r
       INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE AND d.C_ENABLED=1
@@ -766,7 +755,8 @@ GO
 
 /*===========================================================================
   SP_JOB_COMPLETE — đóng lượt chạy. OK → DONE. Lỗi → FAILED, và nếu còn lượt thử thì tự
-    đặt lại READY + C_RUN_AFTER = now + retry_delay (SP_JOB_RECOVER sẽ đánh thức lại).
+    đặt lại READY + C_RUN_AFTER = now + retry_delay. ⚠️ KHÔNG CÒN AI ĐÁNH THỨC dòng READY đó
+    (bộ hồi phục đã bị bỏ) ⇒ với job để C_MAX_ATTEMPT=1 như FO thì nhánh này không bao giờ chạy.
     ⚠️ Job đã hết giờ (vd FO 15h00) mà FAILED thì lần thử sau sẽ bị GUARD TẦNG 2 đóng dấu
       SKIPPED — đúng ý đồ: thà bỏ một nhịp 15 phút còn hơn gọi FO ngoài giờ.
 ===========================================================================*/
@@ -791,15 +781,15 @@ BEGIN
 
         IF @p_ok = 1
             UPDATE T_JOB_RUN SET C_STATUS='DONE', C_ENDED_AT=@now, C_ROWS=@p_rows,
-                   C_MESSAGE=@p_message, C_LEASE_UNTIL=NULL
+                   C_MESSAGE=@p_message
              WHERE C_JOB_RUN_ID=@p_job_run_id AND C_OWNER=@p_owner AND C_STATUS='RUNNING';
         ELSE IF @attempt < @maxatt
             UPDATE T_JOB_RUN SET C_STATUS='READY', C_ENDED_AT=@now, C_ROWS=@p_rows,
-                   C_RUN_AFTER=DATEADD(SECOND, ISNULL(@delay,60), @now), C_LEASE_UNTIL=NULL, C_OWNER=NULL,
+                   C_RUN_AFTER=DATEADD(SECOND, ISNULL(@delay,60), @now), C_OWNER=NULL,
                    C_MESSAGE=CONCAT(N'Lỗi lần ', @attempt, N'/', @maxatt, N': ', @p_message)
              WHERE C_JOB_RUN_ID=@p_job_run_id AND C_OWNER=@p_owner AND C_STATUS='RUNNING';
         ELSE
-            UPDATE T_JOB_RUN SET C_STATUS='FAILED', C_ENDED_AT=@now, C_ROWS=@p_rows, C_LEASE_UNTIL=NULL,
+            UPDATE T_JOB_RUN SET C_STATUS='FAILED', C_ENDED_AT=@now, C_ROWS=@p_rows,
                    C_MESSAGE=CONCAT(N'Lỗi lần cuối (', @attempt, N'/', @maxatt, N'): ', @p_message)
              WHERE C_JOB_RUN_ID=@p_job_run_id AND C_OWNER=@p_owner AND C_STATUS='RUNNING';
 
@@ -808,99 +798,6 @@ BEGIN
             SET @p_err_code=5;
             SET @p_err_msg=N'Không đóng được lượt chạy: pod này KHÔNG còn là chủ (lease đã bị thu hồi) hoặc lượt đã đóng.';
         END
-    END TRY
-    BEGIN CATCH
-        SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
-    END CATCH
-END
-GO
-
-/*===========================================================================
-  SP_JOB_RECOVER — LƯỚI AN TOÀN, chạy trên MỌI pod (vd 30 giây/lần). Làm 3 việc:
-
-  (1) THU HỒI lượt RUNNING quá hạn lease (pod chết/bị evict giữa chừng) → READY.
-  (2) ĐÓNG DẤU SKIPPED lượt nằm chờ QUÁ HẠN (C_MAX_DELAY_SEC) — chống chạy lại việc của giờ trước.
-  (3) TRẢ VỀ MỐC của các lượt READY tới hạn để app produce (lại) lên topic Kafka.
-
-  ⚠️ SAU KHI BỎ GHI DB LÚC SINH JOB, (3) CHỈ CÒN THẤY LƯỢT ĐÃ TỪNG CHẠY: retry (SP_JOB_COMPLETE
-     đặt lại READY) và lượt vừa bị bước (1) thu về từ pod chết. Nó KHÔNG còn bắt được ca "message
-     thất lạc trước khi có pod nào nhận" — lúc đó KHÔNG CÓ dòng T_JOB_RUN nào để mà tìm. Mốc đó
-     mất luôn và nhịp kế tiếp bù. Đánh đổi đã chấp nhận: dữ liệu snapshot, mất một nhịp không sao.
-
-  ★ (3) LÀ LƯỚI AN TOÀN cho lượt ĐÃ CHẠY DỞ: retry sau khi lỗi, và lượt vừa bị bước (1) thu về từ
-    một pod chết. Không có (3) thì hai loại đó nằm im vĩnh viễn và KHÔNG AI BIẾT.
-    Produce trùng thì vô hại: SP_JOB_CLAIM_SLOT chỉ cho một pod thắng (UQ fire_key).
-===========================================================================*/
-CREATE OR ALTER PROCEDURE SP_JOB_RECOVER
-    @p_stale_sec INT           = 30,                 -- READY quá ngần này giây mà chưa ai chạy ⇒ nghi mất message
-    @p_err_code  INT           OUTPUT,
-    @p_err_msg   NVARCHAR(400) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON; SET XACT_ABORT ON;
-    SET @p_err_code=0; SET @p_err_msg=NULL;
-    BEGIN TRY
-        DECLARE @now DATETIME = dbo.UDF_JOB_NOW();
-
-        -- (1a) ★ LƯỢT QUÉT KHÔNG HOÀN THÀNH VÀ KHÔNG CÒN LƯỢT THỬ ⇒ ĐÓNG DẤU 'FAILED' NGAY.
-        --      Job FO nằm trọn trong nhánh này (C_MAX_ATTEMPT=1): nó không bao giờ chạy lại một mốc.
-        --      Trước đây dòng đó phải đi vòng RUNNING → READY → (produce lại) → CLAIM_SLOT → err=6
-        --      → FAILED. Ba bước thừa để tới đúng một kết cục đã biết trước, và ở giữa nó nằm READY
-        --      nên màn hình theo dõi báo "đang chờ chạy" cho một lượt đã hỏng hẳn.
-        --      Ghi thẳng FAILED: đúng ngữ nghĩa (lượt này ĐÃ chạy và KHÔNG xong), và không sinh
-        --      message rác vào Kafka.
-        --      GIỮ C_OWNER: cần biết pod nào chết, đó là manh mối đầu tiên khi đi tìm nguyên nhân.
-        UPDATE r
-           SET r.C_STATUS='FAILED', r.C_ENDED_AT=@now, r.C_LEASE_UNTIL=NULL,
-               r.C_MESSAGE=CONCAT(N'HỎNG: pod ', ISNULL(r.C_OWNER,'?'), N' mất tín hiệu (lease hết hạn ',
-                    CONVERT(VARCHAR(19), r.C_LEASE_UNTIL, 120), N') và hết lượt thử — lượt quét KHÔNG hoàn thành.')
-          FROM T_JOB_RUN r
-          INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-         WHERE r.C_STATUS='RUNNING' AND r.C_LEASE_UNTIL < @now
-           AND r.C_ATTEMPT >= ISNULL(d.C_MAX_ATTEMPT,3);
-
-        -- (1b) Còn lượt thử (job KHÁC, không phải FO) ⇒ trả về hàng đợi để chạy lại.
-        --      C_ATTEMPT KHÔNG tăng ở đây (SP_JOB_CLAIM_SLOT mới tăng) ⇒ số lần thử luôn đếm đúng
-        --      số lần THỰC SỰ chạy.
-        UPDATE r
-           SET r.C_STATUS='READY', r.C_OWNER=NULL, r.C_LEASE_UNTIL=NULL, r.C_RUN_AFTER=@now,
-               r.C_MESSAGE=CONCAT(N'Thu hồi: pod ', ISNULL(r.C_OWNER,'?'), N' mất tín hiệu (lease hết hạn ',
-                                  CONVERT(VARCHAR(19), r.C_LEASE_UNTIL, 120), N').')
-          FROM T_JOB_RUN r
-          INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-         WHERE r.C_STATUS='RUNNING' AND r.C_LEASE_UNTIL < @now
-           AND r.C_ATTEMPT < ISNULL(d.C_MAX_ATTEMPT,3);
-
-        -- (2) HẾT HẠN ⇒ SKIPPED ngay, KHÔNG để nằm lại hàng đợi.
-        --     ⚠️ Bản đầu KHÔNG có bước này và nó SAI THẬT: lượt sinh 14:59 không kịp chạy sẽ nằm
-        --       READY suốt đêm (bước (3) không đẩy vì ngoài khung giờ; không ai đóng dấu nó cả).
-        --       Sáng hôm sau 09:00 khung giờ MỞ LẠI ⇒ nó được đẩy ⇒ CHẠY LẠI LƯỢT CỦA HÔM QUA.
-        --       Guard khung giờ không cứu được, vì 09:00 hôm sau là hoàn toàn "trong giờ".
-        UPDATE r
-           SET r.C_STATUS='SKIPPED', r.C_ENDED_AT=@now,
-               r.C_MESSAGE=CONCAT(N'BỎ QUA: đã ', DATEDIFF(SECOND, ISNULL(r.C_SLOT_AT,r.C_ENQUEUED_AT), @now),
-                    N' giây kể từ mốc, quá hạn tươi ', COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC),
-                    N's — số không còn là near-realtime.')
-          FROM T_JOB_RUN r
-          INNER JOIN T_JOB_DEFINITION d ON d.C_JOB_CODE=r.C_JOB_CODE
-         WHERE r.C_STATUS='READY'
-           AND COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC) IS NOT NULL
-           AND DATEDIFF(SECOND, ISNULL(r.C_SLOT_AT,r.C_ENQUEUED_AT), @now)
-                 > COALESCE(d.C_MAX_DELAY_SEC, d.C_INTERVAL_SEC);
-
-        -- (3) Lượt READY tới hạn ⇒ trả MỐC để app produce lại.
-        --     ⚠️ Trả (job_code, slot_at, fire_key) chứ KHÔNG trả job_run_id: message Kafka nay chở
-        --       MỐC, vì bộ quét không còn ghi DB lúc sinh job nên không có id nào để chở.
-        SELECT r.C_JOB_CODE, r.C_SLOT_AT, r.C_FIRE_KEY
-        FROM T_JOB_RUN r
-        WHERE r.C_STATUS='READY'
-          AND r.C_RUN_AFTER <= @now
-          AND DATEDIFF(SECOND, r.C_ENQUEUED_AT, @now) >= @p_stale_sec
-          -- Khung giờ áp lên MỐC SLOT của lượt, không phải @now: lượt 15:00 mất message phải được
-          --   đánh thức lại lúc 15:00:35, nếu không thì mốc cuối phiên mất trắng mỗi khi Kafka nấc
-          --   một nhịp. Lượt quá hạn tươi thì bước (2) đã đóng dấu SKIPPED rồi.
-          AND dbo.UDF_JOB_IN_WINDOW(r.C_JOB_CODE, ISNULL(r.C_SLOT_AT, r.C_ENQUEUED_AT)) = 1
-        ORDER BY r.C_JOB_RUN_ID;   -- id chỉ để thứ tự ổn định, không trả ra ngoài
     END TRY
     BEGIN CATCH
         SET @p_err_code=-1; SET @p_err_msg=ERROR_MESSAGE();
@@ -983,7 +880,7 @@ BEGIN
                      ORDER BY r.C_JOB_RUN_ID DESC) l
         -- ⚠️ C_QUEUED (số dòng READY) nay gần như LUÔN BẰNG 0, và đó là ĐÚNG: từ khi bộ quét thôi
         --    ghi DB, dòng sinh ra đã ở 'RUNNING' nên không có hàng đợi để mà xếp. Còn READY chỉ khi
-        --    (a) lượt retry đang chờ backoff, (b) lượt vừa bị SP_JOB_RECOVER thu về.
+        --    (a) lượt retry đang chờ backoff — và không còn ai đánh thức nó nữa.
         --    ⇒ C_QUEUED > 0 kéo dài KHÔNG còn nghĩa "đang bận" như trước — nó nghĩa là ĐANG CÓ LỖI.
         OUTER APPLY (SELECT SUM(CASE WHEN r.C_STATUS='READY'   THEN 1 ELSE 0 END) AS C_QUEUED,
                             SUM(CASE WHEN r.C_STATUS='RUNNING' THEN 1 ELSE 0 END) AS C_RUNNING,
@@ -1390,4 +1287,22 @@ UPDATE T_JOB_DEFINITION
    SET C_MAX_ATTEMPT = 1,
        C_UPDATED_BY  = 'migration:fo-no-retry'
  WHERE C_JOB_CODE = 'FO_SNAPSHOT_RT' AND C_MAX_ATTEMPT <> 1;
+GO
+
+/*------------------------------------------------------------------------------
+  DI TRÚ (bản tối giản): tắt singleton cho MỌI job.
+
+  Chặn chồng chu kỳ cần lease để trả lời "lượt trước còn sống không". Bỏ lease ⇒ điều kiện
+  `C_LEASE_UNTIL > @now` luôn cho ra NULL ⇒ singleton KHÔNG chặn gì cả, dù cột ghi 1.
+  Một cấu hình ghi 1 mà không làm gì là cấu hình NÓI DỐI: người đọc tin rằng chồng chu kỳ đã
+  được chặn. Đặt hẳn 0 để bảng nói đúng thứ hệ thống thật sự làm.
+
+  ⚠️ Thứ thay thế: KHÔNG CÓ Ở TẦNG DB. Chồng chu kỳ giờ chỉ được chặn bởi bất biến
+        (thời lượng chu kỳ)  <  C_INTERVAL_SEC
+     mà thời lượng chu kỳ = ⌈số batch / parallel⌉ × timeout của HTTP client.
+     Không ai gác bất biến này. Đặt timeout HTTP quá lớn (hoặc bằng 0 = vô hạn) là mở đường cho
+     các chu kỳ chồng lên nhau và tự nhân tải lên FO.
+------------------------------------------------------------------------------*/
+UPDATE T_JOB_DEFINITION SET C_SINGLETON = 0, C_UPDATED_BY = 'migration:no-singleton'
+ WHERE C_SINGLETON <> 0;
 GO

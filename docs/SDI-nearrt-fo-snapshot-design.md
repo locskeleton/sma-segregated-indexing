@@ -1,3 +1,34 @@
+> ## ⚠️ NHÁNH `feat/job-minimal` — BẢN TỐI GIẢN
+>
+> Tài liệu này mô tả bản **đầy đủ**. Nhánh này đã **gỡ bỏ** các cơ chế dưới đây theo quyết định
+> nghiệp vụ. Mọi mục nói về chúng bên dưới là **lịch sử**, không phải hành vi hiện tại.
+>
+> | Đã gỡ | Kéo theo |
+> |---|---|
+> | `C_TIMEOUT_SEC` / lease | Không phân biệt được "pod đang chạy" với "pod đã chết" — cả hai là `RUNNING` |
+> | `C_SINGLETON` | Không còn chặn chồng chu kỳ ở tầng DB |
+> | `C_MAX_DELAY_SEC` / hạn tươi | Không còn cận trên tuổi mốc, và **không còn gì chặn gọi FO sau 15h** |
+> | `SP_JOB_RECOVER` | Message thất lạc = mất mốc, không dấu vết. Pod chết = dòng `RUNNING` vĩnh viễn |
+> | Nhịp tim gia hạn lease | Nhịp tim chỉ còn ghi tiến độ + phục vụ nút tắt |
+>
+> **Ba rủi ro còn mở, không có gì trong repo này gác:**
+>
+> 1. **Gọi FO sau giờ giao dịch.** Guard khung giờ neo vào MỐC, nên mốc 15:00 hợp lệ vĩnh viễn.
+>    Một chu kỳ của mốc đó mà FO chậm vẫn gọi FO lúc 16h, 17h. Đây là yêu cầu #4 của BRD.
+> 2. **Chồng chu kỳ.** Cận trên duy nhất là `⌈số batch / parallel⌉ × timeout HTTP`, và nó phải
+>    nhỏ hơn `C_INTERVAL_SEC`. Phép tính này nằm rải ở ba nơi cấu hình khác nhau (DB, HttpClient,
+>    ADO `CommandTimeout`) và **không ai kiểm nó**. Đặt timeout HTTP quá lớn ⇒ các chu kỳ chồng
+>    lên nhau ⇒ SDI tự nhân tải lên chính FO.
+> 3. **Mốc mất không đo được.** Ba đường mất mốc (message thất lạc, pod chết, DB lỗi trước khi
+>    `INSERT`) đều không để lại dấu vết phân biệt được. Cách phát hiện duy nhất là **đếm số mốc
+>    đáng lẽ có** rồi so với số dòng thực tế — **chưa làm**.
+>
+> **Vẫn còn nguyên:** chống chạy trùng (`UQ`), không sinh mốc ngoài khung, nút tắt khẩn cấp
+> (`C_ENABLED`, ≤60s), ngắt mạch khi mất DB, ingest idempotent (`MERGE ... HOLDLOCK`),
+> lọc `C_SRC='EOD'` ở mọi reader EOD/phí/báo cáo.
+
+---
+
 ﻿# Snapshot near-realtime từ FO + khung job chạy nền
 
 > **Bài toán:** SDI định kỳ gọi sang FO lấy ảnh chụp tài sản của khách hàng indexing trong phiên, gộp lên cấp master để PM dashboard nhìn được số gần thời gian thực.
