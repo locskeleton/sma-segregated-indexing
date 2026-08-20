@@ -137,7 +137,7 @@ public class JobDispatcherService : BackgroundService
         var jobRunId = claim.JobRunId;
         if (claim.Err != 0)
         {
-            // err=3 (ngoài khung / quá hạn tươi) · 5 (pod khác giữ) · 6 (DEAD) · 7 (singleton) đều
+            // err=3 (ngoài khung / quá hạn tươi) · 5 (pod khác giữ) · 6 (FAILED) · 7 (singleton) đều
             //   là kết cục HỢP LỆ, không phải sự cố. err=20 thì KHÁC: bộ quét trên pod tính sai mốc.
             if (claim.Err == 20)
                 Log.Error("[JOB] mốc {Key} BỊ TỪ CHỐI — bộ quét tính sai: {Msg}", msg.FireKey, claim.Msg);

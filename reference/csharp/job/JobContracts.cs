@@ -90,7 +90,7 @@ public sealed class JobRegistry : IJobRegistry
 /// <summary>Một lượt chạy đã giành được (kết quả SP_JOB_CLAIM_SLOT).</summary>
 public sealed class JobClaim
 {
-    public int       Err          { get; init; }   // 0 OK · 3 ngoài khung (SKIPPED) · 5 pod khác giữ · 6 DEAD
+    public int       Err          { get; init; }   // 0 OK · 3 ngoài khung (SKIPPED) · 5 pod khác giữ · 6 hết lượt thử (FAILED)
     public string?   Msg          { get; init; }
     public long      JobRunId     { get; init; }
     public string    JobCode      { get; init; } = "";
@@ -138,7 +138,7 @@ public interface ISdiJobGateway
     /// SP_JOB_CLAIM_SLOT — CỔNG DUY NHẤT xin chạy một mốc. Vừa TẠO dòng T_JOB_RUN (đã ở RUNNING)
     /// vừa giành quyền, trong một lượt gọi. Gộp hai proc cũ (SP_JOB_ENQUEUE + SP_JOB_CLAIM, đã xoá) làm một.
     /// err: 0 OK · 1 job lạ · 2 job tắt · 3 mốc ngoài khung / quá hạn tươi · 5 pod khác đang giữ
-    ///      · 6 hết lượt thử (DEAD) · 7 singleton đang chạy · 20 mốc không khớp lưới.
+    ///      · 6 hết lượt thử (FAILED) · 7 singleton đang chạy · 20 mốc không khớp lưới.
     /// </summary>
     Task<JobClaim>              ClaimSlotAsync(string jobCode, DateTime slotAt, string owner,
                                                string? fireKey, string source, CancellationToken ct);

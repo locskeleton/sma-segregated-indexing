@@ -78,7 +78,7 @@ Hai dòng có ⚠️ là thứ đáng chú ý:
         │   ┌──────────────────────────────────────────────────────┤
         │   ▼ err=0                                                │ err≠0 → không chạy
         │  T_JOB_RUN: dòng SINH RA ĐÃ Ở 'RUNNING' ──► DONE          │  3 ngoài khung/quá hạn → SKIPPED
-        │        ▲                                                  │  5 pod khác giữ  · 6 DEAD
+        │        ▲                                                  │  5 pod khác giữ  · 6 FAILED
         │        │                                                  │  7 singleton     · 20 sai lưới
         │        └──── SP_JOB_RECOVER ◄──── lease hết hạn (pod chết)
         │              (30s, mọi pod — chỉ khi có khung đang mở)
@@ -351,8 +351,8 @@ Một con số tắt **cả hai** đường chạy lại, vì cả hai đều đ
 
 | Đường chạy lại | Bị chặn ở đâu | Kết cục |
 |---|---|---|
-| Retry sau lỗi | `SP_JOB_COMPLETE`: `@attempt < @maxatt` sai | `DEAD` ngay, không quay về `READY` |
-| Thu hồi từ pod chết | `SP_JOB_CLAIM_SLOT` đường (b): `@curAtt >= @maxatt` | `err=6` + `DEAD`, không ai giành lại |
+| Retry sau lỗi | `SP_JOB_COMPLETE`: `@attempt < @maxatt` sai | `FAILED` ngay, không quay về `READY` |
+| Thu hồi từ pod chết | `SP_JOB_CLAIM_SLOT` đường (b): `@curAtt >= @maxatt` | `err=6` + `FAILED`, không ai giành lại |
 
 ⇒ **Pod chết giữa chừng = mất mốc đó.** Chấp nhận có chủ đích: đây là ảnh chụp, mốc kế tiếp cách 15 phút sẽ bù, và *"mất một mốc"* rẻ hơn nhiều so với *"hai pod cùng bắn vào FO"*. Dòng `RUNNING` mồ côi để `SP_JOB_PURGE` dọn.
 
@@ -361,7 +361,7 @@ Một con số tắt **cả hai** đường chạy lại, vì cả hai đều đ
 > Bất biến đó là thứ đang âm thầm chặn ca xấu nhất trước đây: pod mất kết nối DB thì **không heartbeat được và cũng không học được là mình đã mất quyền** — tin đó cũng nằm ở DB. `TradingWindowGuard` lúc đó dùng lại khung giờ đã cache nên tầng 4 không chặn. Thứ chặn được là guard **hạn tươi**, vì nó tính hoàn toàn cục bộ (`now − slotAt`, không cần DB): FO có `MaxDelaySec=600` còn lease `840` ⇒ pod zombie tự câm ở giây 600, **240 giây trước** khi ai đó được phép thu hồi.
 > Không có ràng buộc nào giữ bất biến này. Job khác **có** bật retry mà gọi hệ ngoài thì phải tự để ý.
 
-Khoá bằng ca kiểm `12_JOB_SMOKE.sql` khối A12 (3 ca): seed đúng `1`; lượt lỗi ra `DEAD` chứ không `READY`; pod chết ra `err=6 + DEAD`. Nâng lên `2` là bộ kiểm đỏ ngay — đổi số đó là **đổi nghiệp vụ**, không phải chỉnh tham số.
+Khoá bằng ca kiểm `12_JOB_SMOKE.sql` khối A12 (3 ca): seed đúng `1`; lượt lỗi ra `FAILED` chứ không `READY`; pod chết ra `err=6 + FAILED`. Nâng lên `2` là bộ kiểm đỏ ngay — đổi số đó là **đổi nghiệp vụ**, không phải chỉnh tham số.
 
 
 ## 3b. Đổi cấu hình chu kỳ — và luật "cấu hình cũ chết theo cấu hình cũ"
@@ -384,7 +384,7 @@ Cổng làm **dọn trước, ghi sau**, trong một giao dịch:
 |---|---|---|
 | `READY` (chưa ai chạy) | **XOÁ** | Nội dung duy nhất của nó là "đã từng được xếp lịch" — thông tin đó đã nằm trong lịch sử cấu hình |
 | `RUNNING` | **GIỮ** | Không thể dừng một pod đang gọi FO dở bằng một câu DELETE. Nó chạy nốt rồi tự đóng sổ |
-| `DONE`/`FAILED`/`DEAD` | **GIỮ** | Là bằng chứng việc đã chạy — xoá là phá vết |
+| `DONE`/`FAILED`/`FAILED` | **GIỮ** | Là bằng chứng việc đã chạy — xoá là phá vết |
 
 > Khác `SP_EOD_RESET` (proc đó **cố ý giữ** `T_EOD_RUN`): ở đó xoá là phá nhật ký việc **đã chạy**; ở đây dọn là bỏ một dòng **chưa bao giờ chạy**.
 
@@ -442,7 +442,7 @@ Trigger chỉ bắn khi giá trị **thật sự đổi** (so `inserted` vs `del
 | **DB chết GIỮA chu kỳ** | ⚡ **NGẮT MẠCH**: 3 batch liên tiếp không ghi được ⇒ đóng chu kỳ, các batch còn lại **không gọi FO nữa**. Đo được: 100 batch ⇒ chỉ 4 lần chạm FO. Không có nó thì đủ 1000 batch vẫn nã FO rồi ném ở bước ghi — nhịp tim bị Timer nuốt ngoại lệ, khung giờ đọc cache, nên **không đường nào khác dừng được vòng lặp** | mất 1 mốc, FO không bị nã oan |
 | **Message thất lạc trước khi có pod nào giành** | ⚠️ **KHÔNG bắt được** — chưa có dòng `T_JOB_RUN` nào để `SP_JOB_RECOVER` tìm. Đây là cái giá của việc bỏ ghi DB lúc sinh job | mốc sau lấp lại |
 | Mọi pod đều bận (hết hạn mức job đồng thời) nên không ai claim | `SP_JOB_RECOVER` bước (3) | ≤ 30s |
-| Lượt đã `RUNNING` rồi pod chết | **Job FO: KHÔNG thu hồi** (`C_MAX_ATTEMPT=1`) → `err=6` + `DEAD`, mất mốc, mốc sau bù. Job khác: lease hết → `SP_JOB_RECOVER` bước (1) | FO: không bao giờ · khác: ≤ timeout + 30s |
+| Lượt đã `RUNNING` rồi pod chết | **Job FO: KHÔNG thu hồi** (`C_MAX_ATTEMPT=1`) → `err=6` + `FAILED`, mất mốc, mốc sau bù. Job khác: lease hết → `SP_JOB_RECOVER` bước (1) | FO: không bao giờ · khác: ≤ timeout + 30s |
 
 Điểm cốt lõi: **`T_JOB_RUN` là sổ cái, Kafka chỉ là đường vận chuyển.** Không có trạng thái nào chỉ tồn tại trong Kafka, nên không có trạng thái nào mất theo broker.
 
@@ -659,7 +659,7 @@ Khi thêm proc mới đọc hai bảng này, câu hỏi bắt buộc: **proc nà
 | Tiểu khoản | ~50k ⇒ ~1.000 batch/chu kỳ (50 KH/batch) |
 | Dòng `T_JOB_RUN` | ~24/ngày (một worker chạy cả chu kỳ ⇒ **không** sinh dòng cho từng batch) |
 | Dòng `T_SI_BALANCE` phát sinh | **0** — RT upsert đè lên chính dòng của hôm nay, và cuối ngày bị dòng EOD thay thế |
-| Dọn nhật ký | `SP_JOB_PURGE @p_keep_days=30` (không bao giờ xoá `DEAD`) |
+| Dọn nhật ký | `SP_JOB_PURGE @p_keep_days=30` (không bao giờ xoá `FAILED`) |
 
 Điểm đáng chú ý: **RT không làm bảng lịch sử phình thêm một dòng nào**. Mỗi tiểu khoản vẫn đúng 1 dòng/ngày — đó là hệ quả trực tiếp của việc upsert theo đúng khoá tự nhiên `UQ_SI_NAV_BALANCE_NK (date, si)` thay vì thêm dòng mới mỗi nhịp.
 
@@ -687,7 +687,7 @@ UPDATE T_JOB_DEFINITION SET C_WINDOW_TO    = '14:45' WHERE C_JOB_CODE = 'FO_SNAP
 UPDATE T_JOB_DEFINITION SET C_ENABLED      = 0       WHERE C_JOB_CODE = 'FO_SNAPSHOT_RT';  -- tắt khẩn cấp
 ```
 
-Theo dõi: `EXEC SP_GET_JOB_STATUS @p_err_code=..., @p_err_msg=...` — RS1 sức khoẻ từng job (có cột `C_IN_WINDOW_NOW`), RS2 các lượt `DEAD`/`FAILED` cần người xử lý.
+Theo dõi: `EXEC SP_GET_JOB_STATUS @p_err_code=..., @p_err_msg=...` — RS1 sức khoẻ từng job (có cột `C_IN_WINDOW_NOW`), RS2 các lượt `FAILED`/`FAILED` cần người xử lý.
 
 ---
 

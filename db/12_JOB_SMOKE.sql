@@ -182,18 +182,18 @@ INSERT INTO @R SELECT 'A6 SP_JOB_RECOVER: lease quá hạn ⇒ RUNNING→READY (
                      AND C_ATTEMPT=1 AND C_OWNER IS NULL) THEN 1 ELSE 0 END,
   (SELECT CONCAT(C_STATUS,' attempt=',C_ATTEMPT) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
 
--- A7. Lỗi → retry; hết lượt thử → DEAD (max_attempt=2)
+-- A7. Lỗi → retry; hết lượt thử → FAILED (max_attempt=2)
 -- Cùng MỐC ⇒ SP_JOB_CLAIM_SLOT đi đường (b): dòng đã tồn tại, giành lại (READY→RUNNING, attempt+1).
 EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_ANY', @p_slot_at=@slotAny, @p_owner='pod-C',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
 EXEC SP_JOB_COMPLETE @p_job_run_id=@id, @p_owner='pod-C', @p_ok=0, @p_message=N'lỗi giả lập',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A7 COMPLETE(lỗi) lần 2/2 ⇒ DEAD (không quay vòng vô tận)',
-  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='DEAD') THEN 1 ELSE 0 END,
+INSERT INTO @R SELECT 'A7 COMPLETE(lỗi) lần 2/2 ⇒ FAILED (không quay vòng vô tận)',
+  CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id AND C_STATUS='FAILED') THEN 1 ELSE 0 END,
   (SELECT CONCAT(C_STATUS,' attempt=',C_ATTEMPT) FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@id);
 EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_ANY', @p_slot_at=@slotAny, @p_owner='pod-D',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A7 nhận lại mốc đã DEAD ⇒ err=6, KHÔNG chạy lại',
+INSERT INTO @R SELECT 'A7 nhận lại mốc đã FAILED ⇒ err=6, KHÔNG chạy lại',
   CASE WHEN @ec=6 THEN 1 ELSE 0 END, CONCAT('err=',@ec);
 
 -- A8. COMPLETE bởi pod KHÔNG phải chủ ⇒ từ chối (err=5)
@@ -326,7 +326,7 @@ INSERT INTO @R SELECT 'A12 ★★ FO KHÔNG retry: C_MAX_ATTEMPT=1 (đổi số 
   CONCAT('max_attempt=',(SELECT C_MAX_ATTEMPT FROM T_JOB_DEFINITION WHERE C_JOB_CODE='FO_SNAPSHOT_RT'));
 
 -- ...và chứng minh con số đó ĂN THẬT, không chỉ nằm trong bảng cấu hình.
---   Dựng một job y hệt FO (max_attempt=1), cho nó chạy rồi BÁO LỖI ⇒ phải ra DEAD, KHÔNG ra READY.
+--   Dựng một job y hệt FO (max_attempt=1), cho nó chạy rồi BÁO LỖI ⇒ phải ra FAILED, KHÔNG ra READY.
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_NORT'; DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_NORT';
 INSERT INTO T_JOB_DEFINITION (C_JOB_CODE,C_JOB_NAME,C_HANDLER,C_ENABLED,C_INTERVAL_SEC,
         C_BUSINESS_DAY_ONLY,C_TIMEOUT_SEC,C_MAX_ATTEMPT,C_RETRY_DELAY_SEC,C_MAX_DELAY_SEC,C_SINGLETON)
@@ -337,20 +337,37 @@ EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT, @p_job_run_id=@idNR OUTPUT;
 EXEC SP_JOB_COMPLETE @p_job_run_id=@idNR, @p_owner='pod-A', @p_ok=0, @p_rows=0,
      @p_message=N'FO tra 500', @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A12 ★★ ...lượt FO lỗi ⇒ DEAD ngay, KHÔNG quay về READY để bắn lại',
-  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='DEAD' THEN 1 ELSE 0 END,
+INSERT INTO @R SELECT 'A12 ★★ ...lượt FO lỗi ⇒ FAILED ngay, KHÔNG quay về READY để bắn lại',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='FAILED' THEN 1 ELSE 0 END,
   (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR);
 
 -- ...và pod chết (lease hết hạn) cũng KHÔNG ai giành lại được: RECOVER trả dòng về READY, nhưng
---   CLAIM_SLOT đóng dấu DEAD (err=6) chứ không cho chạy. Mốc đó mất — đúng ý đồ.
+--   CLAIM_SLOT đóng dấu FAILED (err=6) chứ không cho chạy. Mốc đó mất — đúng ý đồ.
 UPDATE T_JOB_RUN SET C_STATUS='RUNNING', C_OWNER='pod-chet', C_ENDED_AT=NULL,
        C_LEASE_UNTIL=DATEADD(MINUTE,-1,@now) WHERE C_JOB_RUN_ID=@idNR;
 DELETE #scan; DELETE #rec;
 INSERT #rec EXEC SP_JOB_RECOVER @p_stale_sec=0, @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
+
+-- ★★ RECOVER đóng dấu FAILED NGAY, KHÔNG đi vòng qua READY.
+--   Trước đây dòng này phải qua RUNNING → READY → (produce lại vào Kafka) → CLAIM_SLOT → err=6
+--   → FAILED: ba bước thừa để tới đúng một kết cục đã biết trước. Và ở khúc giữa nó nằm READY,
+--   nên màn hình theo dõi báo "đang chờ chạy" cho một lượt đã hỏng hẳn.
+--   Ca này chốt CẢ HAI vế: trạng thái đúng, VÀ không sinh message rác.
+INSERT INTO @R SELECT 'A12 ★★ ...RECOVER đóng dấu FAILED NGAY (không qua READY, không đẩy lại)',
+  CASE WHEN (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='FAILED'
+        AND NOT EXISTS(SELECT 1 FROM #rec WHERE code='SMK_NORT')
+       THEN 1 ELSE 0 END,
+  CONCAT((SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR),
+         ' · số mốc RECOVER đẩy lại=', (SELECT COUNT(*) FROM #rec WHERE code='SMK_NORT'));
+
+INSERT INTO @R SELECT 'A12 ★ ...và GIỮ C_OWNER của pod đã chết (manh mối đầu tiên khi đi tìm)',
+  CASE WHEN (SELECT C_OWNER FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='pod-chet' THEN 1 ELSE 0 END,
+  ISNULL((SELECT C_OWNER FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR),'(null)');
+
 EXEC SP_JOB_CLAIM_SLOT @p_job_code='SMK_NORT', @p_slot_at=@slotNR, @p_owner='pod-B', @p_source='recover',
      @p_err_code=@ec OUTPUT, @p_err_msg=@em OUTPUT;
-INSERT INTO @R SELECT 'A12 ★★ ...pod chết cũng KHÔNG ai giành lại ⇒ err=6 + DEAD (mất mốc, có chủ đích)',
-  CASE WHEN @ec=6 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='DEAD'
+INSERT INTO @R SELECT 'A12 ★★ ...pod chết cũng KHÔNG ai giành lại ⇒ err=6 + FAILED (mất mốc, có chủ đích)',
+  CASE WHEN @ec=6 AND (SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR)='FAILED'
        THEN 1 ELSE 0 END,
   CONCAT('err=',@ec,' status=',(SELECT C_STATUS FROM T_JOB_RUN WHERE C_JOB_RUN_ID=@idNR));
 DELETE FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_NORT'; DELETE FROM T_JOB_DEFINITION WHERE C_JOB_CODE='SMK_NORT';
@@ -413,11 +430,11 @@ INSERT INTO @R SELECT 'A13 cột C_IN_WINDOW_NOW phản ánh ĐÚNG khung giờ 
   CASE WHEN dbo.UDF_JOB_IN_WINDOW('SMK_ANY',@now)=1 AND dbo.UDF_JOB_IN_WINDOW('SMK_WIN',@now)=0
        THEN 1 ELSE 0 END, NULL;
 
--- Dựng 1 lượt DEAD để chứng minh SP_JOB_PURGE KHÔNG bao giờ xoá nó.
---   (Ca cũ dùng lượt DEAD của A7 — nhưng A9 đã DELETE sạch SMK_ANY trước đó, nên nó chỉ PASS
+-- Dựng 1 lượt FAILED để chứng minh SP_JOB_PURGE KHÔNG bao giờ xoá nó.
+--   (Ca cũ dùng lượt FAILED của A7 — nhưng A9 đã DELETE sạch SMK_ANY trước đó, nên nó chỉ PASS
 --    do may mắn chứ không đo được gì. Tự review bắt được, dựng dữ liệu tường minh tại chỗ.)
 INSERT INTO T_JOB_RUN (C_JOB_CODE,C_FIRE_KEY,C_STATUS,C_RUN_AFTER,C_ENQUEUED_AT,C_ENDED_AT,C_MESSAGE)
-VALUES ('SMK_ANY','DEADONE','DEAD',@now,DATEADD(DAY,-99,@now),DATEADD(DAY,-99,@now),N'lỗi cũ, cần người xem');
+VALUES ('SMK_ANY','FAILEDONE','FAILED',@now,DATEADD(DAY,-99,@now),DATEADD(DAY,-99,@now),N'lỗi cũ, cần người xem');
 -- SP_JOB_PURGE có SÀN 1 NGÀY (chống dọn lượt hôm nay rồi bị sinh lại ⇒ chạy 2 lần trong 1 slot),
 --   nên phải LÀM CŨ các lượt đã đóng thì mới dọn được. Gọi keep_days=0 trên lượt vừa xong là
 --   KHÔNG dọn gì cả — và đó chính là hành vi đúng.
@@ -427,10 +444,10 @@ DECLARE @doneBefore INT = (SELECT COUNT(*) FROM T_JOB_RUN
                            WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'));
 DECLARE @purged BIGINT;
 EXEC SP_JOB_PURGE @p_keep_days=1, @p_rows=@purged OUTPUT;
-INSERT INTO @R SELECT 'A13 ★ SP_JOB_PURGE: dọn hết DONE/SKIPPED nhưng GIỮ NGUYÊN DEAD (thứ cần người xem)',
+INSERT INTO @R SELECT 'A13 ★ SP_JOB_PURGE: dọn hết DONE/SKIPPED nhưng GIỮ NGUYÊN FAILED (thứ cần người xem)',
   CASE WHEN @doneBefore > 0 AND @purged = @doneBefore
         AND NOT EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE IN ('SMK_ANY','SMK_WIN') AND C_STATUS IN ('DONE','SKIPPED'))
-        AND EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY' AND C_FIRE_KEY='DEADONE' AND C_STATUS='DEAD')
+        AND EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY' AND C_FIRE_KEY='FAILEDONE' AND C_STATUS='FAILED')
        THEN 1 ELSE 0 END, CONCAT('trước=',@doneBefore,' đã dọn=',@purged);
 INSERT INTO @R SELECT 'A13 SP_JOB_PURGE KHÔNG đụng lượt đang RUNNING/READY (chỉ dọn lượt đã đóng)',
   CASE WHEN EXISTS(SELECT 1 FROM T_JOB_RUN WHERE C_JOB_CODE='SMK_ANY' AND C_STATUS IN ('RUNNING','READY'))
