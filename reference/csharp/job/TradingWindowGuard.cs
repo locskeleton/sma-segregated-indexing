@@ -114,10 +114,12 @@ public sealed class TradingWindowGuard
 
         // ③ ⚠️ ĐÃ BỎ HẠN TƯƠI (C_MAX_DELAY_SEC) — quyết định nghiệp vụ, và nó có giá:
         //
-        //   Guard ② áp lên MỐC, không áp lên `now`. Mốc 15:00 vì thế hợp lệ VĨNH VIỄN. Hạn tươi
-        //   từng là con số DUY NHẤT trả lời "muộn thế này thì thôi", tức là thứ duy nhất chặn một
-        //   chu kỳ bò qua giờ đóng cửa. Bỏ nó ⇒ chu kỳ của mốc 15:00 mà FO trả lời chậm VẪN gọi FO
-        //   lúc 16h, 17h — qua sạch mọi tầng guard.
+        //   Guard ② áp lên MỐC, không áp lên `now` — ĐÚNG như thiết kế: mốc 15:00 là mốc cuối
+        //   cùng cần lấy dữ liệu, và chu kỳ của nó HOÀN THÀNH SAU 15h LÀ HỢP LỆ. Cái bị cấm là
+        //   SINH thêm mốc mới sau phiên, và bộ quét đã lo việc đó.
+        //   Hạn tươi không trả lời "mốc này có hợp lệ không" — nó trả lời "MUỘN THẾ NÀY THÌ THÔI".
+        //   Bỏ nó ⇒ câu hỏi đó không còn ai trả lời: chu kỳ của mốc 15:00 gặp FO chậm vẫn gọi FO
+        //   lúc 16h, 17h, và không có gì nói được đâu là quá.
         //
         //   ⇒ CẬN TRÊN THỜI LƯỢNG CHU KỲ NAY NẰM HOÀN TOÀN Ở TIMEOUT CỦA HTTP CLIENT:
         //         thời lượng ≈ ⌈số batch / parallel⌉ × timeout HTTP

@@ -11,15 +11,26 @@
 > | `SP_JOB_RECOVER` | Message thất lạc = mất mốc, không dấu vết. Pod chết = dòng `RUNNING` vĩnh viễn |
 > | Nhịp tim gia hạn lease | Nhịp tim chỉ còn ghi tiến độ + phục vụ nút tắt |
 >
-> **Ba rủi ro còn mở, không có gì trong repo này gác:**
+> **Yêu cầu #4 của BRD KHÔNG bị ảnh hưởng** — nói cho rõ vì chỗ này dễ đọc nhầm:
 >
-> 1. **Gọi FO sau giờ giao dịch.** Guard khung giờ neo vào MỐC, nên mốc 15:00 hợp lệ vĩnh viễn.
->    Một chu kỳ của mốc đó mà FO chậm vẫn gọi FO lúc 16h, 17h. Đây là yêu cầu #4 của BRD.
-> 2. **Chồng chu kỳ.** Cận trên duy nhất là `⌈số batch / parallel⌉ × timeout HTTP`, và nó phải
->    nhỏ hơn `C_INTERVAL_SEC`. Phép tính này nằm rải ở ba nơi cấu hình khác nhau (DB, HttpClient,
->    ADO `CommandTimeout`) và **không ai kiểm nó**. Đặt timeout HTTP quá lớn ⇒ các chu kỳ chồng
->    lên nhau ⇒ SDI tự nhân tải lên chính FO.
-> 3. **Mốc mất không đo được.** Ba đường mất mốc (message thất lạc, pod chết, DB lỗi trước khi
+> > *"Ngoài khung giờ giao dịch tuyệt đối không gọi sang FO"* nói về việc **SINH MỐC**. Mốc 15:00
+> > là **mốc cuối cùng cần lấy dữ liệu**, và **chu kỳ của nó hoàn thành sau 15h là ĐÚNG**, không
+> > cần chặn. Điều bị cấm là sinh thêm mốc mới sau khi hết phiên.
+>
+> Phần đó vẫn đúng nguyên và đã đo: guard khung giờ áp lên mốc ⇒ mốc cuối là 15:00, từ 15:15 trở
+> đi bộ quét không produce gì nữa (32 nhịp quét liên tiếp, 0 message).
+>
+> **Hai rủi ro còn mở, không có gì trong repo này gác:**
+>
+> 1. **Không còn cận trên THỜI LƯỢNG chu kỳ.** Cận trên duy nhất nay là
+>    `⌈số batch / parallel⌉ × timeout HTTP`, và nó phải nhỏ hơn `C_INTERVAL_SEC`. Phép tính này
+>    nằm rải ở ba nơi cấu hình khác nhau (DB, HttpClient, ADO `CommandTimeout`) và **không ai
+>    kiểm nó**. Hai hệ quả khi FO suy giảm:
+>    - **Chồng chu kỳ** — chu kỳ dài hơn chu kỳ sinh mốc ⇒ nhiều chu kỳ chạy song song ⇒ SDI tự
+>      nhân tải lên chính FO, và càng nhân thì FO càng chậm.
+>    - **Chu kỳ của mốc cuối kéo dài quá lâu sau 15h.** Hoàn thành sau 15h là đúng; câu hỏi còn
+>      lại chỉ là *bao lâu thì quá*. Trước đây hạn tươi trả lời (15:10); nay không ai trả lời.
+> 2. **Mốc mất không đo được.** Ba đường mất mốc (message thất lạc, pod chết, DB lỗi trước khi
 >    `INSERT`) đều không để lại dấu vết phân biệt được. Cách phát hiện duy nhất là **đếm số mốc
 >    đáng lẽ có** rồi so với số dòng thực tế — **chưa làm**.
 >
